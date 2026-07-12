@@ -44,7 +44,13 @@ export class EdgeStore {
     this.db.prepare(`
       INSERT INTO local_deliveries(delivery_id, generation, status, delivery_json, updated_at)
       VALUES (?, ?, 'received', ?, ?)
-      ON CONFLICT(delivery_id) DO NOTHING
+      ON CONFLICT(delivery_id) DO UPDATE SET
+        generation=excluded.generation,
+        status='received',
+        provider_receipt=NULL,
+        delivery_json=excluded.delivery_json,
+        updated_at=excluded.updated_at
+      WHERE excluded.generation > local_deliveries.generation
     `).run(delivery.id, generation, JSON.stringify(delivery), now);
     return this.get(delivery.id)!;
   }

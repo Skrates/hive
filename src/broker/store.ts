@@ -484,6 +484,13 @@ export class BrokerStore {
 
   markAmbiguousForExpiredDispatches(): number {
     const now = iso(this.clock);
+    this.db.prepare(`
+      UPDATE deliveries
+      SET status='pending', reasons_json='[]', lease_generation=NULL, claimed_by=NULL,
+          accepted_at=NULL, updated_at=?
+      WHERE status IN ('claimed', 'accepted_local')
+        AND actor IN (SELECT actor FROM actor_leases WHERE expires_at<=?)
+    `).run(now, now);
     const rows = this.db.prepare(`
       SELECT d.delivery_id
       FROM deliveries d

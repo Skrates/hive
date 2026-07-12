@@ -137,6 +137,20 @@ test("delivery transitions require the current fenced lease", () => {
   store.close();
 });
 
+test("expired pre-dispatch claim is safely requeued with a new fence", () => {
+  const { store, clock } = fixture();
+  store.ingestEvent(event());
+  const first = store.claimNext("mac", 0)!;
+  store.transition(first.id, "mac", 1, "claimed", "accepted_local");
+  clock.advance(2_001);
+  store.markAmbiguousForExpiredDispatches();
+  assert.equal(store.getDelivery(first.id).status, "pending");
+  const second = store.claimNext("dev", 0)!;
+  assert.equal(second.leaseGeneration, 2);
+  assert.equal(second.claimedBy, "dev");
+  store.close();
+});
+
 test("expired dispatching lease becomes ambiguous rather than redelivered", () => {
   const { store, clock } = fixture();
   store.ingestEvent(event());
