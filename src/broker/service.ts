@@ -47,6 +47,14 @@ export class BrokerService {
     return this.store.transition(deliveryId, edgeId, generation, "dispatching", "dispatched");
   }
 
+  renew(deliveryId: number, edgeId: string, generation: number): Delivery {
+    return this.store.renewDeliveryLease(deliveryId, edgeId, generation);
+  }
+
+  reconcile(deliveryId: number, disposition: "processed" | "requeue", detail: string): Delivery {
+    return this.store.reconcile(deliveryId, disposition, detail);
+  }
+
   finish(deliveryId: number, edgeId: string, result: DeliveryResultInput): Delivery {
     return this.store.finish(deliveryId, edgeId, result.generation, result.status, result.reasons);
   }

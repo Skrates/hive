@@ -25,6 +25,10 @@ export class BrokerClient {
     return this.transition(delivery, "dispatched");
   }
 
+  renew(delivery: Delivery): Promise<Delivery> {
+    return this.transition(delivery, "renew");
+  }
+
   async finish(delivery: Delivery, result: DeliveryResultInput): Promise<Delivery> {
     const response = await this.request(`/v1/deliveries/${delivery.id}/result`, {
       method: "POST",

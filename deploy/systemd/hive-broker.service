@@ -1,0 +1,22 @@
+[Unit]
+Description=Hive Slack wake broker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hive
+Group=hive
+WorkingDirectory=/opt/hive
+EnvironmentFile=/etc/hive/broker.env
+ExecStart=/usr/bin/env node /opt/hive/dist/cli.js broker
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/hive
+
+[Install]
+WantedBy=multi-user.target

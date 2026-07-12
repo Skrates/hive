@@ -47,7 +47,7 @@ export class EdgeService {
     this.store.setStatus(current.id, generation, "dispatching");
 
     try {
-      const dispatch = await this.dispatch(current, framed);
+      const dispatch = await this.withLeaseHeartbeat(current, () => this.dispatch(current, framed));
       this.store.setStatus(current.id, generation, "dispatched", dispatch.receipt);
       current = await this.broker.markDispatched(current);
       if (dispatch.processed) {
@@ -63,6 +63,21 @@ export class EdgeService {
       await this.broker.finish(current, { generation, status, reasons: [reason], providerReceipt: null });
       this.store.setStatus(current.id, generation, status);
       return true;
+    }
+  }
+
+  private async withLeaseHeartbeat<T>(delivery: Delivery, operation: () => Promise<T>): Promise<T> {
+    const intervalMs = Math.max(250, Math.floor(delivery.subscription.leaseTtlMs / 3));
+    let heartbeatError: unknown = null;
+    const timer = setInterval(() => {
+      void this.broker.renew(delivery).catch((error: unknown) => { heartbeatError = error; });
+    }, intervalMs);
+    try {
+      const result = await operation();
+      if (heartbeatError) throw heartbeatError;
+      return result;
+    } finally {
+      clearInterval(timer);
     }
   }
 

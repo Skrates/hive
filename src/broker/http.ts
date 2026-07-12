@@ -2,7 +2,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { URL } from "node:url";
 import { DeliveryResultInputSchema, SubscriptionInputSchema } from "../domain.js";
 import { BrokerService } from "./service.js";
-import { InvalidTransitionError, StaleLeaseError } from "./store.js";
+import { InvalidTransitionError, ReconciliationError, StaleLeaseError } from "./store.js";
 
 export interface BrokerHttpConfig {
   host: string;
@@ -58,6 +58,14 @@ export class BrokerHttpServer {
         const input = SubscriptionInputSchema.parse({ ...body, actor });
         return json(response, 200, this.broker.upsertSubscription(input));
       }
+      const reconcile = /^\/v1\/admin\/deliveries\/(\d+)\/reconcile$/.exec(url.pathname);
+      if (request.method === "POST" && reconcile?.[1]) {
+        const body = await readJson(request);
+        const disposition = body.disposition;
+        if (disposition !== "processed" && disposition !== "requeue") throw new HttpError(400, "invalid_disposition");
+        const detail = requiredString(body.detail, "detail");
+        return json(response, 200, this.broker.reconcile(Number(reconcile[1]), disposition, detail));
+      }
       return json(response, 404, { error: "not_found" });
     }
 
@@ -69,7 +77,7 @@ export class BrokerHttpServer {
       return delivery ? json(response, 200, delivery) : json(response, 204, null);
     }
 
-    const transition = /^\/v1\/deliveries\/(\d+)\/(accept|dispatch|dispatched|result|reply)$/.exec(url.pathname);
+    const transition = /^\/v1\/deliveries\/(\d+)\/(accept|dispatch|dispatched|renew|result|reply)$/.exec(url.pathname);
     if (request.method === "POST" && transition?.[1] && transition[2]) {
       const deliveryId = Number(transition[1]);
       const body = await readJson(request);
@@ -78,6 +86,7 @@ export class BrokerHttpServer {
         case "accept": return json(response, 200, this.broker.accept(deliveryId, edgeId, generation));
         case "dispatch": return json(response, 200, this.broker.beginDispatch(deliveryId, edgeId, generation));
         case "dispatched": return json(response, 200, this.broker.markDispatched(deliveryId, edgeId, generation));
+        case "renew": return json(response, 200, this.broker.renew(deliveryId, edgeId, generation));
         case "result": {
           const result = DeliveryResultInputSchema.parse(body);
           return json(response, 200, this.broker.finish(deliveryId, edgeId, result));
@@ -119,6 +128,7 @@ export class BrokerHttpServer {
     if (error instanceof HttpError) return json(response, error.status, { error: error.message });
     if (error instanceof StaleLeaseError) return json(response, 409, { error: "stale_lease" });
     if (error instanceof InvalidTransitionError) return json(response, 409, { error: "invalid_transition", detail: error.message });
+    if (error instanceof ReconciliationError) return json(response, 409, { error: "invalid_reconciliation", detail: error.message });
     if (error instanceof SyntaxError) return json(response, 400, { error: "invalid_json" });
     const message = error instanceof Error ? error.message : String(error);
     return json(response, 400, { error: "bad_request", detail: message });

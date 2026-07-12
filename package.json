@@ -6,7 +6,8 @@
   "type": "module",
   "bin": {
     "hive": "./dist/cli.js",
-    "hive-claude-channel": "./dist/channel/claude.js"
+    "hive-claude-channel": "./dist/channel/claude.js",
+    "hive-codex-live": "./dist/codex/live.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",

@@ -6,6 +6,7 @@ and Git executable truth.
 
 The implementation is governed by [ADR-0001](docs/adr/0001-broker-edge-architecture.md) and
 [KRA-717](https://linear.app/krates-ehf/issue/KRA-717/hive-ears-v03-brokeredge-architecture).
+Deployment and secret-store requirements are in [the operations guide](docs/operations.md).
 
 ## Shape
 

@@ -1,0 +1,16 @@
+[Unit]
+Description=Hive provider edge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/hive/edge.env
+ExecStart=/usr/bin/env node %h/.local/lib/hive/dist/cli.js edge
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

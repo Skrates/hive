@@ -151,6 +151,41 @@ test("expired dispatching lease becomes ambiguous rather than redelivered", () =
   store.close();
 });
 
+test("lease renewal preserves the fence during a long provider dispatch", () => {
+  const { store, clock } = fixture();
+  store.ingestEvent(event());
+  const claimed = store.claimNext("mac", 0)!;
+  store.transition(claimed.id, "mac", claimed.leaseGeneration!, "claimed", "accepted_local");
+  store.transition(claimed.id, "mac", claimed.leaseGeneration!, "accepted_local", "dispatching");
+  clock.advance(800);
+  store.renewDeliveryLease(claimed.id, "mac", claimed.leaseGeneration!);
+  clock.advance(800);
+  assert.equal(store.markAmbiguousForExpiredDispatches(), 0);
+  assert.equal(store.getDelivery(claimed.id).status, "dispatching");
+  store.close();
+});
+
+test("ambiguous delivery requires explicit processed or requeue reconciliation", () => {
+  const { store, clock } = fixture();
+  store.ingestEvent(event());
+  const claimed = store.claimNext("mac", 0)!;
+  store.transition(claimed.id, "mac", claimed.leaseGeneration!, "claimed", "accepted_local");
+  store.transition(claimed.id, "mac", claimed.leaseGeneration!, "accepted_local", "dispatching");
+  clock.advance(1_001);
+  store.markAmbiguousForExpiredDispatches();
+  assert.equal(store.reconcile(claimed.id, "requeue", "provider transcript showed no injection").status, "pending");
+  const reclaimed = store.claimNext("mac", 0)!;
+  assert.equal(reclaimed.leaseGeneration, 2);
+  store.transition(reclaimed.id, "mac", 2, "claimed", "accepted_local");
+  store.transition(reclaimed.id, "mac", 2, "accepted_local", "dispatching");
+  clock.advance(1_001);
+  store.markAmbiguousForExpiredDispatches();
+  const processed = store.reconcile(reclaimed.id, "processed", "provider transcript contained the wake");
+  assert.equal(processed.status, "processed");
+  assert.equal(processed.reasons[0]?.code, "operator_reconciled_processed");
+  store.close();
+});
+
 test("terminal and out-of-order transitions fail closed", () => {
   const { store } = fixture();
   store.ingestEvent(event());

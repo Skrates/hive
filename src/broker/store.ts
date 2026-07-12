@@ -24,6 +24,7 @@ const TERMINAL = new Set<DeliveryStatus>([
 
 export class StaleLeaseError extends Error {}
 export class InvalidTransitionError extends Error {}
+export class ReconciliationError extends Error {}
 
 export class BrokerStore {
   readonly db: Database.Database;
@@ -347,6 +348,36 @@ export class BrokerStore {
       now.toISOString(),
     );
     return result.changes === 1;
+  }
+
+  renewDeliveryLease(deliveryId: number, edgeId: string, generation: number): Delivery {
+    this.assertLease(deliveryId, edgeId, generation);
+    const delivery = this.getDelivery(deliveryId);
+    if (TERMINAL.has(delivery.status)) throw new InvalidTransitionError("terminal delivery has no renewable lease");
+    if (!this.renewLease(delivery.actor, edgeId, generation, delivery.subscription.leaseTtlMs)) {
+      throw new StaleLeaseError(`stale lease for delivery ${deliveryId}`);
+    }
+    return this.getDelivery(deliveryId);
+  }
+
+  reconcile(deliveryId: number, disposition: "processed" | "requeue", detail: string): Delivery {
+    const delivery = this.getDelivery(deliveryId);
+    if (delivery.status !== "ambiguous") throw new ReconciliationError("only ambiguous deliveries may be reconciled");
+    const now = iso(this.clock);
+    if (disposition === "processed") {
+      this.db.prepare(`
+        UPDATE deliveries SET status='processed', reasons_json=?, terminal_at=?, updated_at=?
+        WHERE delivery_id=? AND status='ambiguous'
+      `).run(JSON.stringify([{ code: "operator_reconciled_processed", detail }]), now, now, deliveryId);
+    } else {
+      this.db.prepare(`
+        UPDATE deliveries
+        SET status='pending', reasons_json='[]', lease_generation=NULL, claimed_by=NULL,
+            accepted_at=NULL, dispatch_started_at=NULL, dispatched_at=NULL, terminal_at=NULL, updated_at=?
+        WHERE delivery_id=? AND status='ambiguous'
+      `).run(now, deliveryId);
+    }
+    return this.getDelivery(deliveryId);
   }
 
   transition(
