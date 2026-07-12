@@ -73,6 +73,7 @@ test("a burst in one actor thread coalesces into one pending delivery", () => {
   assert.equal(store.ingestEvent(event()).deliveryId, 1);
   assert.equal(store.ingestEvent(event({ eventId: "Ev2", messageTs: "100.3" })).deliveryId, 1);
   assert.equal(store.listDeliveries().length, 1);
+  assert.deepEqual(store.getDelivery(1).coalescedEventIds, ["Ev1", "Ev2"]);
   store.close();
 });
 
@@ -151,6 +152,19 @@ test("expired dispatching lease becomes ambiguous rather than redelivered", () =
   store.close();
 });
 
+test("live dispatch awaiting acknowledgement becomes ambiguous when its lease expires", () => {
+  const { store, clock } = fixture();
+  store.ingestEvent(event());
+  const claimed = store.claimNext("mac", 0)!;
+  store.transition(claimed.id, "mac", 1, "claimed", "accepted_local");
+  store.transition(claimed.id, "mac", 1, "accepted_local", "dispatching");
+  store.transition(claimed.id, "mac", 1, "dispatching", "dispatched");
+  clock.advance(1_001);
+  assert.equal(store.markAmbiguousForExpiredDispatches(), 1);
+  assert.equal(store.getDelivery(claimed.id).status, "ambiguous");
+  store.close();
+});
+
 test("lease renewal preserves the fence during a long provider dispatch", () => {
   const { store, clock } = fixture();
   store.ingestEvent(event());
@@ -162,6 +176,23 @@ test("lease renewal preserves the fence during a long provider dispatch", () => 
   clock.advance(800);
   assert.equal(store.markAmbiguousForExpiredDispatches(), 0);
   assert.equal(store.getDelivery(claimed.id).status, "dispatching");
+  store.close();
+});
+
+test("spawn reservations enforce the per-actor minute window", () => {
+  const { store } = fixture({ sessionId: null, spawnRateLimit: 1 });
+  store.ingestEvent(event());
+  const first = store.claimNext("mac", 0)!;
+  store.transition(first.id, "mac", 1, "claimed", "accepted_local");
+  store.transition(first.id, "mac", 1, "accepted_local", "dispatching");
+  assert.equal(store.reserveSpawn(first.id, "mac", 1), true);
+  assert.equal(store.reserveSpawn(first.id, "mac", 1), true);
+  store.finish(first.id, "mac", 1, "processed", []);
+  store.ingestEvent(event({ eventId: "Ev2", messageTs: "101.1", threadTs: "101.0" }));
+  const second = store.claimNext("mac", 0)!;
+  store.transition(second.id, "mac", 1, "claimed", "accepted_local");
+  store.transition(second.id, "mac", 1, "accepted_local", "dispatching");
+  assert.equal(store.reserveSpawn(second.id, "mac", 1), false);
   store.close();
 });
 

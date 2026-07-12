@@ -29,6 +29,14 @@ export class BrokerClient {
     return this.transition(delivery, "renew");
   }
 
+  async reserveSpawn(delivery: Delivery): Promise<boolean> {
+    const response = await this.request(`/v1/deliveries/${delivery.id}/reserve-spawn`, {
+      method: "POST",
+      body: JSON.stringify({ generation: requiredGeneration(delivery) }),
+    });
+    return (await this.json<{ reserved: boolean }>(response)).reserved;
+  }
+
   async finish(delivery: Delivery, result: DeliveryResultInput): Promise<Delivery> {
     const response = await this.request(`/v1/deliveries/${delivery.id}/result`, {
       method: "POST",

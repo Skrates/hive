@@ -119,6 +119,30 @@ export class BrokerStore {
 
       CREATE INDEX IF NOT EXISTS deliveries_pending_idx
         ON deliveries(status, delivery_id);
+
+      CREATE TABLE IF NOT EXISTS delivery_events (
+        delivery_id INTEGER NOT NULL,
+        event_id TEXT NOT NULL,
+        relation TEXT NOT NULL,
+        PRIMARY KEY(delivery_id, event_id),
+        FOREIGN KEY(delivery_id) REFERENCES deliveries(delivery_id),
+        FOREIGN KEY(event_id) REFERENCES slack_events(event_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS spawn_windows (
+        actor TEXT NOT NULL,
+        window_start TEXT NOT NULL,
+        count INTEGER NOT NULL,
+        PRIMARY KEY(actor, window_start)
+      );
+
+      CREATE TABLE IF NOT EXISTS spawn_reservations (
+        delivery_id INTEGER PRIMARY KEY,
+        actor TEXT NOT NULL,
+        window_start TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(delivery_id) REFERENCES deliveries(delivery_id)
+      );
     `);
   }
 
@@ -225,7 +249,13 @@ export class BrokerStore {
         WHERE coalesce_key=? AND status='pending'
         ORDER BY delivery_id LIMIT 1
       `).get(coalesceKey) as Row | undefined;
-      if (pending) return { created: true, deliveryId: Number(pending.delivery_id) };
+      if (pending) {
+        const deliveryId = Number(pending.delivery_id);
+        this.db.prepare(`
+          INSERT OR IGNORE INTO delivery_events(delivery_id, event_id, relation) VALUES (?, ?, 'coalesced')
+        `).run(deliveryId, event.eventId);
+        return { created: true, deliveryId };
+      }
       const result = this.db.prepare(`
         INSERT INTO deliveries(
           event_id, actor, status, coalesce_key, initial_snapshot_json, snapshot_ts,
@@ -240,7 +270,11 @@ export class BrokerStore {
         now,
         now,
       );
-      return { created: true, deliveryId: Number(result.lastInsertRowid) };
+      const deliveryId = Number(result.lastInsertRowid);
+      this.db.prepare(`
+        INSERT INTO delivery_events(delivery_id, event_id, relation) VALUES (?, ?, 'primary')
+      `).run(deliveryId, event.eventId);
+      return { created: true, deliveryId };
     })();
   }
 
@@ -360,6 +394,32 @@ export class BrokerStore {
     return this.getDelivery(deliveryId);
   }
 
+  reserveSpawn(deliveryId: number, edgeId: string, generation: number): boolean {
+    return this.db.transaction(() => {
+      this.assertLease(deliveryId, edgeId, generation);
+      const delivery = this.getDelivery(deliveryId);
+      if (delivery.subscription.wakePolicy !== "spawn") throw new InvalidTransitionError("spawn not allowed by subscription");
+      if (delivery.status !== "dispatching") throw new InvalidTransitionError("spawn reservation requires dispatching state");
+      const existing = this.db.prepare("SELECT delivery_id FROM spawn_reservations WHERE delivery_id=?").get(deliveryId);
+      if (existing) return true;
+      const now = this.clock.now();
+      const windowStart = new Date(Math.floor(now.getTime() / 60_000) * 60_000).toISOString();
+      const row = this.db.prepare(`
+        SELECT count FROM spawn_windows WHERE actor=? AND window_start=?
+      `).get(delivery.actor, windowStart) as Row | undefined;
+      const count = row ? Number(row.count) : 0;
+      if (count >= delivery.subscription.spawnRateLimit) return false;
+      this.db.prepare(`
+        INSERT INTO spawn_windows(actor, window_start, count) VALUES (?, ?, 1)
+        ON CONFLICT(actor, window_start) DO UPDATE SET count=count+1
+      `).run(delivery.actor, windowStart);
+      this.db.prepare(`
+        INSERT INTO spawn_reservations(delivery_id, actor, window_start, created_at) VALUES (?, ?, ?, ?)
+      `).run(deliveryId, delivery.actor, windowStart, now.toISOString());
+      return true;
+    })();
+  }
+
   reconcile(deliveryId: number, disposition: "processed" | "requeue", detail: string): Delivery {
     const delivery = this.getDelivery(deliveryId);
     if (delivery.status !== "ambiguous") throw new ReconciliationError("only ambiguous deliveries may be reconciled");
@@ -428,15 +488,15 @@ export class BrokerStore {
       SELECT d.delivery_id
       FROM deliveries d
       JOIN actor_leases l ON l.actor=d.actor
-      WHERE d.status='dispatching' AND l.expires_at<=?
+      WHERE d.status IN ('dispatching', 'dispatched') AND l.expires_at<=?
     `).all(now) as Row[];
     const update = this.db.prepare(`
       UPDATE deliveries SET status='ambiguous', reasons_json=?, terminal_at=?, updated_at=?
-      WHERE delivery_id=? AND status='dispatching'
+      WHERE delivery_id=? AND status IN ('dispatching', 'dispatched')
     `);
     for (const row of rows) {
       update.run(
-        JSON.stringify([{ code: "dispatch_outcome_unknown", detail: "lease expired after dispatch began and before durable completion" }]),
+        JSON.stringify([{ code: "dispatch_outcome_unknown", detail: "lease expired after provider dispatch began and before durable completion or acknowledgement" }]),
         now,
         now,
         Number(row.delivery_id),
@@ -459,7 +519,11 @@ export class BrokerStore {
       WHERE d.delivery_id=?
     `).get(deliveryId) as Row | undefined;
     if (!row) throw new Error(`delivery ${deliveryId} not found`);
-    return deliveryFromRow(row);
+    const delivery = deliveryFromRow(row);
+    const events = this.db.prepare(`
+      SELECT event_id FROM delivery_events WHERE delivery_id=? ORDER BY rowid
+    `).all(deliveryId) as Row[];
+    return { ...delivery, coalescedEventIds: events.map((event) => String(event.event_id)) };
   }
 
   listDeliveries(): Delivery[] {
@@ -549,6 +613,7 @@ function deliveryFromRow(row: Row): Delivery {
     claimedBy: row.claimed_by === null ? null : String(row.claimed_by),
     attempts: Number(row.attempts),
     coalesceKey: String(row.coalesce_key),
+    coalescedEventIds: [],
     initialSnapshot: row.initial_snapshot_json === null ? null : JSON.parse(String(row.initial_snapshot_json)),
     snapshotTs: row.snapshot_ts === null ? null : String(row.snapshot_ts),
     createdAt: String(row.created_at),

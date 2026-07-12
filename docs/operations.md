@@ -42,8 +42,10 @@ while the service is stopped; copying a live database without its WAL is not a b
 Run `hive edge` on each mapped workstation. `HIVE_EDGE_LOCAL_TOKEN` is shared only with local live
 surface processes and the edge HTTP listener remains on loopback.
 
-For Codex live steering, run `hive-codex-live` with the current Codex thread ID. This uses the Codex
-app-server proxy and therefore requires a daemon-capable standalone Codex installation.
+For Codex live steering, run `hive-codex-live` with the current Codex thread ID. It connects by
+WebSocket to the app-server Unix control socket and registers only when that same server reports the
+thread `active` or `idle`. A persisted Desktop-owned thread that the standalone daemon reports as
+`notLoaded` is not a live target; Hive fails closed rather than opening a competing session.
 
 For Claude Code, register `hive-claude-channel` as a custom channel MCP server. During the Channels
 preview Claude Code also requires its custom-channel development flag. Headless resume/spawn does

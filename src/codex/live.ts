@@ -9,12 +9,13 @@ interface Config {
   edgeUrl: string;
   localToken: string;
   surfaceVersion: string;
-  codexCommand: string;
+  appServerSocket?: string;
 }
 
 export async function runCodexLive(config: Config): Promise<void> {
-  const client = new CodexAppServerClient(config.codexCommand);
+  const client = new CodexAppServerClient(config.appServerSocket);
   await client.connect();
+  await client.assertLiveThread(config.threadId);
   const http = createServer((request, response) => {
     void handle(request, response, config.localToken, async (delivery, framed) => {
       return client.deliver(config.threadId, framed, delivery.id);
@@ -82,6 +83,8 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     edgeUrl: process.env.HIVE_EDGE_URL ?? "http://127.0.0.1:8791",
     localToken: required("HIVE_EDGE_LOCAL_TOKEN"),
     surfaceVersion: process.env.HIVE_PROVIDER_VERSION ?? "unknown",
-    codexCommand: process.env.HIVE_CODEX_COMMAND ?? "codex",
+    ...(process.env.HIVE_CODEX_APP_SERVER_SOCKET
+      ? { appServerSocket: process.env.HIVE_CODEX_APP_SERVER_SOCKET }
+      : {}),
   });
 }

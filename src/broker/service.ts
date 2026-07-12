@@ -51,6 +51,10 @@ export class BrokerService {
     return this.store.renewDeliveryLease(deliveryId, edgeId, generation);
   }
 
+  reserveSpawn(deliveryId: number, edgeId: string, generation: number): boolean {
+    return this.store.reserveSpawn(deliveryId, edgeId, generation);
+  }
+
   reconcile(deliveryId: number, disposition: "processed" | "requeue", detail: string): Delivery {
     return this.store.reconcile(deliveryId, disposition, detail);
   }

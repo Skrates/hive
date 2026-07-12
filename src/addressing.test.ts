@@ -10,12 +10,17 @@ test("WAKE envelope addresses exactly one normalized actor", () => {
   assert.equal(parseAddressedWake("FYI: fable | no action"), null);
 });
 
-test("NEXT wakes only the actor other than the declared sender", () => {
+test("NEXT explicitly addresses its named recipient", () => {
   assert.deepEqual(parseAddressedWake("[actor=ariadne]\nNEXT fable — checksum"), {
     actor: "fable",
     envelope: "NEXT fable",
   });
-  assert.equal(parseAddressedWake("[actor=ariadne]\nNEXT ariadne — continue"), null);
+  assert.equal(parseAddressedWake("[actor=ariadne]\nNEXT ariadne — continue")?.actor, "ariadne");
+});
+
+test("NEXT routing does not trust or require a body-declared sender", () => {
+  assert.equal(parseAddressedWake("[actor=ariadne]\nNEXT ariadne")?.actor, "ariadne");
+  assert.equal(parseAddressedWake("NEXT fable")?.actor, "fable");
 });
 
 test("admission gates workspace, channel, and sender identity", () => {

@@ -88,6 +88,7 @@ export interface Delivery {
   claimedBy: string | null;
   attempts: number;
   coalesceKey: string;
+  coalescedEventIds: string[];
   initialSnapshot: unknown | null;
   snapshotTs: string | null;
   createdAt: string;

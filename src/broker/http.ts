@@ -77,7 +77,7 @@ export class BrokerHttpServer {
       return delivery ? json(response, 200, delivery) : json(response, 204, null);
     }
 
-    const transition = /^\/v1\/deliveries\/(\d+)\/(accept|dispatch|dispatched|renew|result|reply)$/.exec(url.pathname);
+    const transition = /^\/v1\/deliveries\/(\d+)\/(accept|dispatch|dispatched|renew|reserve-spawn|result|reply)$/.exec(url.pathname);
     if (request.method === "POST" && transition?.[1] && transition[2]) {
       const deliveryId = Number(transition[1]);
       const body = await readJson(request);
@@ -87,6 +87,7 @@ export class BrokerHttpServer {
         case "dispatch": return json(response, 200, this.broker.beginDispatch(deliveryId, edgeId, generation));
         case "dispatched": return json(response, 200, this.broker.markDispatched(deliveryId, edgeId, generation));
         case "renew": return json(response, 200, this.broker.renew(deliveryId, edgeId, generation));
+        case "reserve-spawn": return json(response, 200, { reserved: this.broker.reserveSpawn(deliveryId, edgeId, generation) });
         case "result": {
           const result = DeliveryResultInputSchema.parse(body);
           return json(response, 200, this.broker.finish(deliveryId, edgeId, result));

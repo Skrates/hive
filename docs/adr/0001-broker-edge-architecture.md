@@ -70,6 +70,10 @@ Foreign edges never resume machine-local sessions. Hive never opens a desktop UI
 - Inactive Claude Code uses `claude -p --resume <session-id>`.
 - Spawn creates a new headless session under the subscription permission profile and records its ID.
 
+For one-shot headless adapters, provider process exit zero after a complete streamed turn is the
+provider acknowledgement and terminalizes the delivery as `processed`; the captured output is its
+receipt. Live adapters remain `dispatched` until the agent explicitly acknowledges through Hive.
+
 Provider versions and capabilities are recorded and proven by deployed acceptance tests.
 
 ### Replay

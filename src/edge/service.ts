@@ -23,6 +23,7 @@ export class EdgeService {
     if (this.running) throw new Error("edge service already running");
     this.running = true;
     try {
+      await this.recoverInterruptedDispatches();
       while (!signal?.aborted) {
         const worked = await this.processOne(25_000);
         if (!worked) await delay(100);
@@ -30,6 +31,27 @@ export class EdgeService {
     } finally {
       this.running = false;
     }
+  }
+
+  async recoverInterruptedDispatches(): Promise<number> {
+    let recovered = 0;
+    for (const local of this.store.listAmbiguousAfterRestart()) {
+      const delivery = this.store.delivery(local.delivery_id);
+      if (!delivery) continue;
+      try {
+        await this.broker.finish(delivery, {
+          generation: local.generation,
+          status: "ambiguous",
+          reasons: [{ code: "edge_restarted_during_dispatch", detail: "local edge restarted before provider dispatch outcome was durably recorded" }],
+          providerReceipt: local.provider_receipt,
+        });
+        this.store.setStatus(local.delivery_id, local.generation, "ambiguous", local.provider_receipt);
+        recovered += 1;
+      } catch {
+        // A stale fence means the broker is authoritative and its lease-expiry sweep owns recovery.
+      }
+    }
+    return recovered;
   }
 
   async processOne(waitMs = 0): Promise<boolean> {
@@ -70,7 +92,9 @@ export class EdgeService {
     const intervalMs = Math.max(250, Math.floor(delivery.subscription.leaseTtlMs / 3));
     let heartbeatError: unknown = null;
     const timer = setInterval(() => {
-      void this.broker.renew(delivery).catch((error: unknown) => { heartbeatError = error; });
+      void this.broker.renew(delivery)
+        .then(() => { heartbeatError = null; })
+        .catch((error: unknown) => { heartbeatError = error; });
     }, intervalMs);
     try {
       const result = await operation();
@@ -109,6 +133,7 @@ export class EdgeService {
       return adapter.resume(subscription, workspace.cwd, framed);
     }
     if (subscription.wakePolicy === "resume") throw new Error("resume_target_missing");
+    if (!await this.broker.reserveSpawn(delivery)) throw new Error("spawn_rate_limited");
     return adapter.spawn(subscription, workspace.cwd, framed);
   }
 }
@@ -125,6 +150,7 @@ function classifyProviderError(error: unknown): Reason {
     "resume_target_missing",
     "workspace_not_mapped",
     "provider_adapter_missing",
+    "spawn_rate_limited",
   ].find((code) => detail.includes(code));
   return { code: known ?? "provider_dispatch_unknown", detail };
 }

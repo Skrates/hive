@@ -2,7 +2,6 @@ import { z } from "zod";
 import type { AddressedWake } from "./domain.js";
 
 const WAKE_PATTERN = /^\s*WAKE:\s*([a-z][a-z0-9_-]*)\b/im;
-const ACTOR_PATTERN = /^\s*\[?actor=([a-z][a-z0-9_-]*)\]?/im;
 
 export function parseAddressedWake(text: string): AddressedWake | null {
   const wake = WAKE_PATTERN.exec(text);
@@ -10,11 +9,10 @@ export function parseAddressedWake(text: string): AddressedWake | null {
     return { actor: wake[1].toLowerCase(), envelope: wake[0].trim() };
   }
 
-  // Actor tags identify a sender, not a recipient. They are accepted only when an explicit NEXT
-  // line addresses the other agent, which keeps ordinary FYI and RECORDED traffic from waking.
-  const sender = ACTOR_PATTERN.exec(text)?.[1]?.toLowerCase();
+  // NEXT is an explicit recipient envelope. Sender authority comes from Slack admission, never
+  // from the decorative in-body actor tag used by the shared Hive app.
   const next = /^\s*NEXT\s+([a-z][a-z0-9_-]*)\b/im.exec(text);
-  if (sender && next?.[1] && next[1].toLowerCase() !== sender) {
+  if (next?.[1]) {
     return { actor: next[1].toLowerCase(), envelope: next[0].trim() };
   }
   return null;
