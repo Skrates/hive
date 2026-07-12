@@ -79,7 +79,9 @@ export class SlackSocketIngress {
   }
 
   async start(): Promise<void> {
-    this.socket.on("events_api", async ({ body, ack, envelope_id }) => {
+    // @slack/socket-mode unwraps Events API envelopes and emits the inner event type ("message"),
+    // not the outer "events_api" envelope type.
+    this.socket.on("message", async ({ body, ack, envelope_id }) => {
       await ack();
       try {
         const event = body.event as SlackMessageEvent | undefined;

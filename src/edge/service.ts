@@ -73,6 +73,7 @@ export class EdgeService {
       this.store.setStatus(current.id, generation, "dispatched", dispatch.receipt);
       current = await this.broker.markDispatched(current);
       if (dispatch.processed) {
+        await this.broker.reply(current, headlessAcknowledgement(dispatch.receipt));
         await this.broker.finish(current, { generation, status: "processed", reasons: [], providerReceipt: dispatch.receipt });
         this.store.setStatus(current.id, generation, "processed", dispatch.receipt);
       }
@@ -136,6 +137,23 @@ export class EdgeService {
     if (!await this.broker.reserveSpawn(delivery)) throw new Error("spawn_rate_limited");
     return adapter.spawn(subscription, workspace.cwd, framed);
   }
+}
+
+export function headlessAcknowledgement(receipt: string): string {
+  let best = "Headless provider turn completed successfully.";
+  for (const line of receipt.split("\n")) {
+    try {
+      const value = JSON.parse(line) as Record<string, unknown>;
+      if (value.type === "result" && typeof value.result === "string") best = value.result;
+      const item = value.item as Record<string, unknown> | undefined;
+      if (value.type === "item.completed" && item?.type === "agent_message" && typeof item.text === "string") {
+        best = item.text;
+      }
+    } catch {
+      // Provider receipts are JSONL on supported surfaces; non-JSON diagnostics are ignored.
+    }
+  }
+  return best.length <= 2_500 ? best : `${best.slice(0, 2_497)}…`;
 }
 
 function requiredGeneration(delivery: Delivery): number {
