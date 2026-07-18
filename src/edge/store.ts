@@ -15,6 +15,7 @@ interface LocalRow {
   generation: number;
   status: LocalDispatchStatus;
   provider_receipt: string | null;
+	spawned_session_id: string | null;
   delivery_json: string;
   updated_at: string;
 }
@@ -31,10 +32,15 @@ export class EdgeStore {
         generation INTEGER NOT NULL,
         status TEXT NOT NULL,
         provider_receipt TEXT,
+		spawned_session_id TEXT,
         delivery_json TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
     `);
+	const columns = this.db.pragma("table_info(local_deliveries)") as Array<{ name: string }>;
+	if (!columns.some((column) => column.name === "spawned_session_id")) {
+		this.db.exec("ALTER TABLE local_deliveries ADD COLUMN spawned_session_id TEXT");
+	}
   }
 
   close(): void { this.db.close(); }
@@ -48,6 +54,7 @@ export class EdgeStore {
         generation=excluded.generation,
         status='received',
         provider_receipt=NULL,
+		spawned_session_id=NULL,
         delivery_json=excluded.delivery_json,
         updated_at=excluded.updated_at
       WHERE excluded.generation > local_deliveries.generation
@@ -55,11 +62,18 @@ export class EdgeStore {
     return this.get(delivery.id)!;
   }
 
-  setStatus(deliveryId: number, generation: number, status: LocalDispatchStatus, receipt: string | null = null): LocalRow {
+	setStatus(
+		deliveryId: number,
+		generation: number,
+		status: LocalDispatchStatus,
+		receipt: string | null = null,
+		spawnedSessionId: string | null = null,
+	): LocalRow {
     const result = this.db.prepare(`
-      UPDATE local_deliveries SET status=?, provider_receipt=?, updated_at=?
+	  UPDATE local_deliveries
+	  SET status=?, provider_receipt=?, spawned_session_id=?, updated_at=?
       WHERE delivery_id=? AND generation=?
-    `).run(status, receipt, new Date().toISOString(), deliveryId, generation);
+	`).run(status, receipt, spawnedSessionId, new Date().toISOString(), deliveryId, generation);
     if (result.changes !== 1) throw new Error(`local delivery ${deliveryId} generation mismatch`);
     return this.get(deliveryId)!;
   }
@@ -68,8 +82,12 @@ export class EdgeStore {
     return this.db.prepare("SELECT * FROM local_deliveries WHERE delivery_id=?").get(deliveryId) as LocalRow | undefined ?? null;
   }
 
-  listAmbiguousAfterRestart(): LocalRow[] {
-    return this.db.prepare("SELECT * FROM local_deliveries WHERE status='dispatching' ORDER BY delivery_id").all() as LocalRow[];
+	listAmbiguousAfterRestart(limit = 100): LocalRow[] {
+	const boundedLimit = Math.min(Math.max(limit, 1), 500);
+	return this.db.prepare(`
+		SELECT * FROM local_deliveries
+		WHERE status IN ('dispatching', 'dispatched') ORDER BY delivery_id LIMIT ?
+	`).all(boundedLimit) as LocalRow[];
   }
 
   delivery(deliveryId: number): Delivery | null {

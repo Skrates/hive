@@ -5,8 +5,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+UMask=0077
 EnvironmentFile=%h/.config/hive/edge.env
-ExecStart=/usr/bin/env node %h/.local/lib/hive/dist/cli.js edge
+Environment="PATH=__HIVE_SERVICE_PATH__"
+Environment="DISABLE_AUTOUPDATER=1"
+ExecStart=__HIVE_NODE__ %h/.local/lib/hive/dist/cli.js edge
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true

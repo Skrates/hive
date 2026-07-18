@@ -1,5 +1,5 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { ProviderSchema } from "../domain.js";
+import { AutoBindingUpdateSchema, LivePresenceInputSchema, ProviderSchema } from "../domain.js";
 import { EdgeService } from "./service.js";
 
 export interface EdgeHttpConfig {
@@ -40,28 +40,56 @@ export class EdgeHttpServer {
   }
 
   private async route(request: IncomingMessage, response: ServerResponse): Promise<void> {
-    if (request.method === "GET" && request.url === "/health") return json(response, 200, { ok: true });
+    const url = new URL(request.url ?? "/", "http://127.0.0.1");
+		if (request.method === "GET" && url.pathname === "/health") {
+			const readiness = this.edge.readiness();
+			return json(response, readiness.ok ? 200 : 503, readiness);
+		}
     this.authorize(request);
-    if (request.method === "POST" && request.url === "/v1/live/register") {
+    if (request.method === "GET" && url.pathname === "/v1/live/target") {
+      const actor = requiredString(url.searchParams.get("actor"), "actor");
+      const provider = ProviderSchema.parse(url.searchParams.get("provider"));
+      return json(response, 200, await this.edge.liveTarget(actor, provider));
+    }
+    if (request.method === "GET" && url.pathname === "/v1/live/auto-target") {
+      const actor = requiredString(url.searchParams.get("actor"), "actor");
+      return json(response, 200, await this.edge.autoBindingTarget(actor));
+    }
+    if (request.method === "PATCH" && url.pathname === "/v1/live/auto-bind") {
+      const body = await readJson(request);
+      const actor = requiredString(body.actor, "actor");
+      const update = AutoBindingUpdateSchema.parse(body);
+      return json(response, 200, await this.edge.autoBind(actor, update));
+    }
+    if (request.method === "POST" && url.pathname === "/v1/live/register") {
       const body = await readJson(request);
       const actor = requiredString(body.actor, "actor");
       const provider = ProviderSchema.parse(body.provider);
       const callbackUrl = requiredLocalCallback(body.callbackUrl);
+      const providerSurface = requiredString(body.providerSurface, "providerSurface");
       const surfaceVersion = requiredString(body.surfaceVersion, "surfaceVersion");
       const sessionId = body.sessionId === null || body.sessionId === undefined
         ? null
         : requiredString(body.sessionId, "sessionId");
+      const bindingRevision = Number(body.bindingRevision);
+      if (!Number.isInteger(bindingRevision) || bindingRevision < 1) throw new Error("invalid bindingRevision");
       const ttlMs = Number(body.ttlMs ?? 30_000);
       if (!Number.isInteger(ttlMs) || ttlMs < 1_000 || ttlMs > 120_000) throw new Error("invalid ttlMs");
-      return json(response, 200, this.edge.live.register({
+      return json(response, 200, await this.edge.registerLive({
         actor,
         provider,
         callbackUrl,
         sessionId,
+        bindingRevision,
+        providerSurface,
         surfaceVersion,
       }, ttlMs));
     }
-    if (request.method === "POST" && request.url === "/v1/live/ack") {
+    if (request.method === "POST" && url.pathname === "/v1/live/presence") {
+      const presence = LivePresenceInputSchema.parse(await readJson(request));
+      return json(response, 200, await this.edge.reportLivePresence(presence));
+    }
+    if (request.method === "POST" && url.pathname === "/v1/live/ack") {
       const body = await readJson(request);
       const deliveryId = Number(body.deliveryId);
       if (!Number.isInteger(deliveryId) || deliveryId < 1) throw new Error("invalid deliveryId");
@@ -79,7 +107,13 @@ export class EdgeHttpServer {
 
 async function readJson(request: IncomingMessage): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = [];
-  for await (const chunk of request) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+	let length = 0;
+	for await (const chunk of request) {
+		const value = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+		length += value.length;
+		if (length > 1_000_000) throw new Error("payload_too_large");
+		chunks.push(value);
+	}
   return JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
 }
 

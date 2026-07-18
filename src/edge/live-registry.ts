@@ -1,10 +1,12 @@
-import type { Provider } from "../domain.js";
+import type { Provider, Subscription } from "../domain.js";
 
 export interface LiveIngress {
   actor: string;
   provider: Provider;
   callbackUrl: string;
   sessionId: string | null;
+  bindingRevision: number;
+  providerSurface: string;
   surfaceVersion: string;
   expiresAt: number;
 }
@@ -18,10 +20,14 @@ export class LiveIngressRegistry {
     return entry;
   }
 
-  get(actor: string, provider: Provider): LiveIngress | null {
+  get(actor: string, provider: Provider, binding: Subscription): LiveIngress | null {
     const entry = this.entries.get(key(actor, provider));
     if (!entry) return null;
-    if (entry.expiresAt <= Date.now()) {
+    if (entry.expiresAt <= Date.now()
+      || entry.sessionId !== binding.sessionId
+      || entry.bindingRevision !== binding.bindingRevision
+      || entry.providerSurface !== binding.providerSurface
+      || entry.surfaceVersion !== binding.providerVersion) {
       this.entries.delete(key(actor, provider));
       return null;
     }

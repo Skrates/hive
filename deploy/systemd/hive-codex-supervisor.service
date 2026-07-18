@@ -1,0 +1,21 @@
+[Unit]
+Description=Hive Codex live-session supervisor
+After=network-online.target hive-edge.service
+Wants=network-online.target hive-edge.service
+
+[Service]
+Type=simple
+UMask=0077
+Environment=HIVE_ACTOR=ariadne
+Environment=HIVE_EDGE_URL=http://127.0.0.1:8791
+Environment=HIVE_PROVIDER_SURFACE=codex-desktop-ipc
+Environment=HIVE_PROVIDER_VERSION=desktop-ipc-v1
+EnvironmentFile=%h/.config/hive/codex-supervisor.env
+ExecStart=/usr/bin/env node %h/.local/lib/hive/dist/codex/live.js
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

@@ -5,6 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+UMask=0077
 User=hive
 Group=hive
 WorkingDirectory=/opt/hive

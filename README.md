@@ -12,10 +12,14 @@ Deployment and secret-store requirements are in [the operations guide](docs/oper
 
 - A central broker owns Slack Socket Mode, Slack credentials, admission, replay, durable events,
   deliveries, subscriptions, and fenced actor leases.
-- A thin edge on each workstation owns provider-local session discovery, live steering, headless
-  resume/spawn, and the provider dispatch journal.
+- A thin edge on each workstation owns provider-local session discovery, supervised live steering,
+  fenced headless resume/spawn, and the provider dispatch journal. Codex Desktop rebinding follows
+  the latest matching primary task automatically; there is no listener ritual.
 - Wake policies are `live_only`, `resume`, and `spawn`.
 - Slack content is always untrusted data. A wake authorizes dispatch, never mutation authority.
+- Explicit `WAKE:`/`NEXT` envelopes, configured direct mentions, and the shared-bot
+  `<@Hive> actor:` form can address an actor; malformed or unroutable admitted wakes explain
+  themselves in their Slack thread.
 
 ## Development
 
@@ -27,3 +31,7 @@ pnpm build
 
 No live credential belongs in the repository. Broker and edge credentials are injected from the
 host secret store.
+
+Once configured, `hive status` is the one-shot operational view and `hive web` serves the
+loopback-only control surface. See the [operations guide](docs/operations.md#operator-surface) for
+binding, delivery inspection, reconciliation, and dashboard security details.
