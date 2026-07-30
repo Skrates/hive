@@ -1,8 +1,10 @@
 import type {
+	AttachmentUpdate,
 	BindingUpdate,
 	BrokerOperatorStatus,
 	DeliveryOperatorSummary,
 	DeliveryStatus,
+	ChannelListenerUpdate,
 	EgressPolicyUpdate,
 	OutboxReconciliation,
 	OutboxReconciliationAudit,
@@ -46,6 +48,20 @@ export class OperatorClient {
 
 	bind(actor: string, update: BindingUpdate): Promise<Subscription> {
 		return this.request(`/v1/admin/subscriptions/${encodeURIComponent(actor)}/binding`, {
+			method: "PATCH",
+			body: JSON.stringify(update),
+		});
+	}
+
+	attach(actor: string, update: AttachmentUpdate): Promise<Subscription> {
+		return this.request(`/v1/admin/subscriptions/${encodeURIComponent(actor)}/attachment`, {
+			method: "PUT",
+			body: JSON.stringify(update),
+		});
+	}
+
+	setChannelListener(actor: string, update: ChannelListenerUpdate): Promise<Subscription> {
+		return this.request(`/v1/admin/subscriptions/${encodeURIComponent(actor)}/listener`, {
 			method: "PATCH",
 			body: JSON.stringify(update),
 		});

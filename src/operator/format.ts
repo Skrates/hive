@@ -45,6 +45,11 @@ export function formatOperatorStatus(status: BrokerOperatorStatus): string {
 		lines.push(
 			`            home ${sub.homeEdge} · workspace ${sub.workspace} · wake ${sub.wakePolicy}`,
 		);
+		lines.push(
+			`            listen ${(sub.listenChannelIds ?? []).length > 0
+				? (sub.listenChannelIds ?? []).join(", ")
+				: "addressed only"}`,
+		);
 		lines.push(`            permission ${sub.permissionProfile}`);
 		if (actor.livePresence) {
 			const live = actor.livePresence;

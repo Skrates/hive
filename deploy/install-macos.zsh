@@ -8,6 +8,7 @@ DOMAIN="gui/$(id -u)"
 RUNTIME="${HOME}/.local/lib/hive"
 BIN_DIR="${HOME}/.local/bin"
 HIVE_BIN="${BIN_DIR}/hive"
+HIVE_ATTACH_BIN="${BIN_DIR}/hive-attach"
 AGENTS_DIR="${HOME}/Library/LaunchAgents"
 STATE_DIR="${HOME}/Library/Application Support/Hive"
 LOG_DIR="${HOME}/Library/Logs/Hive"
@@ -242,8 +243,6 @@ function wait_for_ariadne_live() {
           && sub?.providerVersion === "desktop-ipc-v1"
           && sub?.homeEdge === "mac"
           && typeof sub?.sessionId === "string" && sub.sessionId.length > 0
-          && sub?.bindingMode === "auto"
-          && sub?.bindingSource === "edge-discovery"
           && Number.isInteger(sub?.bindingRevision) && sub.bindingRevision > 0
           && live?.provider === sub.provider
           && live?.providerSurface === sub.providerSurface
@@ -265,22 +264,6 @@ function wait_for_ariadne_live() {
   done
   admin_token=""
   fail "Ariadne did not report an exact fresh auto-bound Desktop IPC presence through broker status."
-}
-
-function enable_ariadne_auto_binding() {
-  local admin_token
-  admin_token="$(security find-generic-password -a hive -s is.sokrates.hive.admin -w)"
-  if ! print -r -- "header = \"Authorization: Bearer ${admin_token}\"" \
-    | curl --config - --fail --silent --show-error --connect-timeout 1 --max-time 5 \
-      --request PATCH \
-      --header 'content-type: application/json' \
-      --data '{"mode":"auto"}' \
-      "http://127.0.0.1:8790/v1/admin/subscriptions/ariadne/binding-mode" \
-      >/dev/null; then
-    admin_token=""
-    fail "Hive could not enable Ariadne's restricted home-edge automatic binding mode."
-  fi
-  admin_token=""
 }
 
 function wait_for_file_release() {
@@ -495,6 +478,10 @@ function rollback() {
   if [[ -e "${BACKUP}/bin/hive" || -L "${BACKUP}/bin/hive" ]]; then
     cp -Pp "${BACKUP}/bin/hive" "$HIVE_BIN"
   fi
+  rm -f "$HIVE_ATTACH_BIN"
+  if [[ -e "${BACKUP}/bin/hive-attach" || -L "${BACKUP}/bin/hive-attach" ]]; then
+    cp -Pp "${BACKUP}/bin/hive-attach" "$HIVE_ATTACH_BIN"
+  fi
 
   secure_hive_files || true
   if (( binding_restore_ok == 1 && services_unloaded_ok == 1 )); then
@@ -545,7 +532,8 @@ cmp -s "${STAGE}/.hive-source-manifest" "${STAGE}/.hive-source-manifest.after" \
   || fail "Hive staged source changed while gates ran."
 rm -f "${STAGE}/.hive-source-manifest.after"
 "$NODE" "${STAGE}/dist/cli.js" --help >/dev/null
-zsh -n "${STAGE}/deploy/launchd/"*.zsh "${STAGE}/deploy/install-macos.zsh" \
+zsh -n "${STAGE}/deploy/attach-current-session.zsh" \
+  "${STAGE}/deploy/launchd/"*.zsh "${STAGE}/deploy/install-macos.zsh" \
   "${STAGE}/deploy/push-linux-edge.zsh"
 bash -n "${STAGE}/deploy/install-linux-edge.sh"
 
@@ -565,6 +553,9 @@ require_keychain_secret mac is.sokrates.hive.local-token token
 grep -q '"routerMentionIds":\["U0BGBUGGJ1H"\]' \
   "${STAGE}/deploy/launchd/run-broker.zsh" \
   || fail "The staged broker admission policy is missing the shared Hive router mention."
+grep -q '"originAppActors":{"A097V82EGG2":"ariadne","A0BG2QQ8WA3":"fable"}' \
+  "${STAGE}/deploy/launchd/run-broker.zsh" \
+  || fail "The staged broker admission policy is missing agent-origin loop suppression."
 
 mkdir -p "$BIN_DIR" "$AGENTS_DIR" "$STATE_DIR" "$LOG_DIR"
 chmod 700 "$STATE_DIR" "$LOG_DIR"
@@ -575,6 +566,9 @@ for local_plist in $PLISTS; do
 done
 if [[ -e "$HIVE_BIN" || -L "$HIVE_BIN" ]]; then
   cp -Pp "$HIVE_BIN" "${BACKUP}/bin/hive"
+fi
+if [[ -e "$HIVE_ATTACH_BIN" || -L "$HIVE_ATTACH_BIN" ]]; then
+  cp -Pp "$HIVE_ATTACH_BIN" "${BACKUP}/bin/hive-attach"
 fi
 local_label=""
 for local_label in $STOP_LABELS; do
@@ -619,6 +613,7 @@ mv "$STAGE" "$RUNTIME"
 SWAP_PHASE="new-runtime-installed"
 find "$RUNTIME" -type d -exec chmod 700 {} +
 chmod 700 \
+  "${RUNTIME}/deploy/attach-current-session.zsh" \
   "${RUNTIME}/deploy/launchd/run-broker.zsh" \
   "${RUNTIME}/deploy/launchd/run-edge.zsh" \
   "${RUNTIME}/deploy/launchd/run-operator.zsh" \
@@ -628,6 +623,7 @@ for local_plist in $PLISTS; do
   install -m 600 "${PREPARED_PLISTS}/${local_plist}" "${AGENTS_DIR}/${local_plist}"
 done
 ln -sfn "${RUNTIME}/deploy/launchd/run-operator.zsh" "$HIVE_BIN"
+ln -sfn "${RUNTIME}/deploy/attach-current-session.zsh" "$HIVE_ATTACH_BIN"
 secure_hive_files
 
 bootstrap_launchd is.sokrates.hive-broker \
@@ -636,7 +632,6 @@ wait_for_health "http://127.0.0.1:8790/health" "Hive broker"
 bootstrap_launchd is.sokrates.hive-edge \
   "${AGENTS_DIR}/is.sokrates.hive-edge.plist"
 wait_for_health "http://127.0.0.1:8791/health" "Hive edge"
-enable_ariadne_auto_binding
 bootstrap_launchd is.sokrates.hive-codex-supervisor \
   "${AGENTS_DIR}/is.sokrates.hive-codex-supervisor.plist"
 wait_for_launchd is.sokrates.hive-codex-supervisor

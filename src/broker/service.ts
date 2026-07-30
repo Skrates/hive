@@ -1,5 +1,7 @@
 import type {
+	AttachmentUpdate,
 	BindingUpdate,
+	ChannelListenerUpdate,
 	Delivery,
 	DeliveryResultInput,
 	DeliveryStatus,
@@ -72,6 +74,18 @@ export class BrokerService {
 		return this.store.setEgressPolicy(actor, update);
 	}
 
+	setChannelListener(actor: string, update: ChannelListenerUpdate) {
+		return this.store.setChannelListener(actor, update);
+	}
+
+	attach(actor: string, update: AttachmentUpdate) {
+		return this.store.attach(actor, update);
+	}
+
+	channelListeners(channelId: string): string[] {
+		return this.store.channelListeners(channelId);
+	}
+
 	setSlackReadinessSource(source: () => SlackReadiness): void {
 		this.slackReadinessSource = source;
 	}
@@ -124,6 +138,16 @@ export class BrokerService {
 	this.kickOutbox();
 	return result;
   }
+
+	ingestForActors(
+		event: SlackEventInput,
+		actors: readonly string[],
+		initialSnapshot: unknown | null = null,
+	) {
+		const result = this.store.ingestEventForActors(event, actors, initialSnapshot);
+		this.kickOutbox();
+		return result;
+	}
 
 	diagnoseIngress(
 		eventId: string,

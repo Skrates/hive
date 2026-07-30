@@ -15,6 +15,7 @@ import {
 
 class FakeBroker {
   readonly ingested: SlackEventInput[] = [];
+  listeners: string[] = [];
 	  readonly diagnostics: Array<{
 		eventId: string;
     channelId: string;
@@ -27,6 +28,26 @@ class FakeBroker {
   ingest(event: SlackEventInput): { created: boolean; deliveryId: number | null } {
     this.ingested.push(event);
     return this.result;
+  }
+
+  channelListeners(_channelId: string): string[] {
+    return [...this.listeners];
+  }
+
+  ingestForActors(
+    event: SlackEventInput,
+    actors: readonly string[],
+  ): {
+    created: boolean;
+    routes: Array<{ actor: string; deliveryId: number | null }>;
+  } {
+    const result = this.ingest({ ...event, actor: actors[0]! });
+    if (!result.created) return { created: false, routes: [] };
+    for (const actor of actors.slice(1)) this.ingested.push({ ...event, actor });
+    return {
+      created: true,
+      routes: actors.map((actor) => ({ actor, deliveryId: result.deliveryId })),
+    };
   }
 
 	  diagnoseIngress(
@@ -166,6 +187,104 @@ test("ordinary conversation and a mid-body mention remain inert", async () => {
   }
 });
 
+test("ordinary admitted conversation fans out to every attached channel listener", async () => {
+  const broker = new FakeBroker();
+  broker.listeners = ["ariadne", "fable"];
+  const outcome = await handleSlackIngressEvent(
+    body("The guard landed; carry on with the restack.", { thread_ts: "100.1" }),
+    "env-1",
+    "T1",
+    policy,
+    broker,
+  );
+
+  assert.deepEqual(outcome, {
+    disposition: "routed",
+    reason: "delivery_created",
+    eventId: "Ev1",
+    channelId: "C1",
+    actors: ["ariadne", "fable"],
+  });
+  assert.deepEqual(broker.ingested.map((event) => event.actor), ["ariadne", "fable"]);
+  assert.equal(broker.diagnostics.length, 0);
+});
+
+test("channel fanout suppresses the trusted originating app without suppressing peers", async () => {
+  const broker = new FakeBroker();
+  broker.listeners = ["ariadne", "fable"];
+  const originPolicy: AdmissionPolicy = {
+    ...policy,
+    originAppActors: new Map([["AARI", "ariadne"]]),
+  };
+  const outcome = await handleSlackIngressEvent(
+    body("Ari's update for Fable", { app_id: "AARI", thread_ts: "100.1" }),
+    "env-1",
+    "T1",
+    originPolicy,
+    broker,
+  );
+
+  assert.deepEqual(outcome, {
+    disposition: "routed",
+    reason: "delivery_created",
+    eventId: "Ev1",
+    channelId: "C1",
+    actor: "fable",
+  });
+  assert.deepEqual(broker.ingested.map((event) => event.actor), ["fable"]);
+});
+
+test("a channel message emitted by the only attached actor is ignored as self-origin", async () => {
+  const broker = new FakeBroker();
+  broker.listeners = ["ariadne"];
+  const originPolicy: AdmissionPolicy = {
+    ...policy,
+    originAppActors: new Map([["AARI", "ariadne"]]),
+  };
+  const outcome = await handleSlackIngressEvent(
+    body("Ari's own status", { app_id: "AARI" }),
+    "env-1",
+    "T1",
+    originPolicy,
+    broker,
+  );
+
+  assert.equal(outcome.reason, "self_origin");
+  assert.equal(broker.ingested.length, 0);
+});
+
+test("attached listeners make malformed legacy wake syntax ordinary channel traffic", async () => {
+  const broker = new FakeBroker();
+  broker.listeners = ["ariadne", "fable"];
+  const outcome = await handleSlackIngressEvent(
+    body("WAKE: | this grammar should no longer be required"),
+    "env-1",
+    "T1",
+    policy,
+    broker,
+  );
+
+  assert.equal(outcome.disposition, "routed");
+  assert.deepEqual(outcome.actors, ["ariadne", "fable"]);
+  assert.equal(broker.diagnostics.length, 0);
+});
+
+test("an explicit address remains a single-recipient override in an attached channel", async () => {
+  const broker = new FakeBroker();
+  broker.listeners = ["ariadne", "fable"];
+  const outcome = await handleSlackIngressEvent(
+    body("NEXT fable — private handoff"),
+    "env-1",
+    "T1",
+    policy,
+    broker,
+  );
+
+  assert.equal(outcome.actor, "fable");
+  assert.equal(outcome.actors, undefined);
+  assert.deepEqual(broker.ingested.map((event) => event.actor), ["fable"]);
+});
+
 test("an admitted malformed explicit wake gets an operator-visible Slack diagnostic", async () => {
   const broker = new FakeBroker();
   const outcome = await handleSlackIngressEvent(
@@ -278,6 +397,7 @@ test("Slack retries remain idempotent and do not produce a false failure diagnos
 
 test("a correlated Hive reply cannot recursively wake an actor", async () => {
   const broker = new FakeBroker();
+  broker.listeners = ["ariadne", "fable"];
   const reply = body("WAKE: ariadne | text emitted by an agent", {
     app_id: "A1",
     metadata: {
@@ -326,15 +446,16 @@ test("Socket Mode acknowledges only after durable ingress succeeds", async () =>
 	assert.equal(acknowledged, true);
 });
 
-test("an assistant completion prefix prevents recursive wake even without Slack metadata", async () => {
+test("an assistant completion prefix prevents recursive delivery even without Slack metadata", async () => {
 	const broker = new FakeBroker();
+	broker.listeners = ["ariadne", "fable"];
 	const echoed = body("Hive: ariadne completed delivery 9.\n\nWAKE: ariadne | recurse", {
 		user: "UBOTUSER",
 		app_id: "A1",
 		bot_id: "B1",
 	});
 	const outcome = await handleSlackIngressEvent(echoed, "env-loop", "T1", policy, broker);
-	assert.equal(outcome.reason, "not_addressed");
+	assert.equal(outcome.reason, "hive_reply");
 	assert.equal(broker.ingested.length, 0);
 });
 

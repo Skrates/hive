@@ -16,6 +16,25 @@ Agora credential boundary and never ships in an appliance.
 
 ## Decision
 
+### Amendment 1 — explicit channel attachments (2026-07-30)
+
+An operator may attach an actor's exact provider session to one or more admitted Slack channels.
+That durable attachment—not a phrase inside a Slack body—authorizes the broker to dispatch every
+admitted message in those channels to the actor. The attachment operation is exact-workspace,
+session-, surface-, and live-owner checked. As one atomic operator action it pins that session and
+sets the home edge's dispatch cwd to the task's verified exact cwd. It is idempotent and does not
+widen provider, home-edge, permission-profile, wake-policy, or repository authority.
+
+An admitted channel message fans out to each attached actor as independent fenced deliveries over
+one durable Slack event. Slack event ID plus actor remains the delivery deduplication key. A legacy
+`WAKE`, `NEXT`, or configured mention remains a backwards-compatible single-recipient override;
+it is no longer required in an attached channel. An unattached channel remains addressed-only.
+
+Agent-origin mappings use authenticated Slack app IDs to suppress delivery back to the originating
+actor while still delivering to attached peers. Broker completion messages are excluded by durable
+metadata, with a bounded fixed-prefix fallback for old Slack events. These exclusions prevent
+completion and collaboration loops; they do not interpret the Slack body for authority.
+
 ### Home and topology
 
 Hive lives in a standalone repository. A central broker runs on the always-on development box. A
@@ -50,8 +69,8 @@ it cannot retract a provider steer that already happened.
 ### Subscription and wake policy
 
 A subscription records actor, provider and surface version, session/thread ID, home edge, logical
-workspace, per-edge cwd/worktree mapping, wake policy, permission profile, lease/deadline, and
-coalescing/rate-limit policy.
+workspace, per-edge cwd/worktree mapping, wake policy, permission profile, lease/deadline,
+coalescing/rate-limit policy, and its exact channel-listener allowlist.
 
 - `live_only`: deliver only to a registered live ingress; otherwise `undeliverable`.
 - `resume`: prefer live, otherwise resume the mapped session on its home edge before the TTL;
@@ -91,9 +110,11 @@ broker-minted machine credential. WebSocket delivery is a later optimization.
 ### Trust and authority
 
 Admission gates Slack workspace/channel and sender user/app identity. Slack bodies are model-visible
-untrusted data. `WAKE` authorizes dispatch only. Launch permission derives from the subscription;
-repository mutation and other high-impact authority remain independently pre-registered and cannot
-be elevated by Slack content. Spawn defaults to a restricted permission profile.
+untrusted data. For attached actors, the operator-established channel attachment authorizes
+dispatch; for addressed-only actors, a legacy explicit envelope authorizes dispatch. Neither
+mechanism grants mutation authority. Launch permission derives from the subscription; repository
+mutation and other high-impact authority remain independently pre-registered and cannot be elevated
+by Slack content. Spawn defaults to a restricted permission profile.
 
 ## Acceptance
 
@@ -106,6 +127,13 @@ F. Provider acknowledgement carries the Slack event ID and delivery ID.
 G. Fencing rejects a revived stale edge; uncertain prior dispatch becomes `ambiguous`.
 H. Non-allowlisted input never dispatches; hostile allowlisted content remains untrusted.
 I. The complete wake-policy matrix terminates correctly and bursts cannot fork-storm.
+J. One ordinary admitted channel message fans out once to every attached actor.
+K. A trusted agent-origin app cannot loop a message back to its own actor or recursively route a
+   Hive completion, while attached peers still receive the message.
+L. Attachment is idempotent, preserves all non-binding authority, and is not reported ready until
+   the exact live owner confirms the binding revision.
+M. An explicit legacy envelope still selects exactly one actor, and unattached channels remain
+   inert without one.
 
 ## Consequences
 

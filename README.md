@@ -13,13 +13,17 @@ Deployment and secret-store requirements are in [the operations guide](docs/oper
 - A central broker owns Slack Socket Mode, Slack credentials, admission, replay, durable events,
   deliveries, subscriptions, and fenced actor leases.
 - A thin edge on each workstation owns provider-local session discovery, supervised live steering,
-  fenced headless resume/spawn, and the provider dispatch journal. Codex Desktop rebinding follows
-  the latest matching primary task automatically; there is no listener ritual.
+  fenced headless resume/spawn, and the provider dispatch journal.
 - Wake policies are `live_only`, `resume`, and `spawn`.
-- Slack content is always untrusted data. A wake authorizes dispatch, never mutation authority.
-- Explicit `WAKE:`/`NEXT` envelopes, configured direct mentions, and the shared-bot
-  `<@Hive> actor:` form can address an actor; malformed or unroutable admitted wakes explain
-  themselves in their Slack thread.
+- `hive-attach ariadne` is the one-step operator path: discover the current exact-cwd Codex task,
+  pin it, map the home edge to that cwd, enable exact-channel listening, and prove its live Desktop
+  owner before returning.
+- Slack content is always untrusted data. An operator-established channel attachment authorizes
+  dispatch, never mutation authority.
+- Ordinary admitted channel messages fan out to attached actors. `WAKE:`/`NEXT`, configured direct
+  mentions, and `<@Hive> actor:` remain optional single-recipient compatibility forms.
+- Authenticated agent-app origins suppress self-delivery, and correlated Hive completion messages
+  never re-enter routing.
 
 ## Development
 

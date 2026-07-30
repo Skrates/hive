@@ -128,9 +128,11 @@ test("admission configuration normalizes direct and router mention identities", 
     appIds: ["A1"],
     mentionActors: { uariadne: "Ariadne" },
     routerMentionIds: ["uhive"],
+    originAppActors: { aconnector: "Ariadne" },
   });
   assert.equal(policy.mentionActors.get("UARIADNE"), "ariadne");
   assert.equal(policy.routerMentionIds.has("UHIVE"), true);
+  assert.equal(policy.originAppActors.get("ACONNECTOR"), "ariadne");
 });
 
 test("admission gates workspace, channel, and sender identity", () => {

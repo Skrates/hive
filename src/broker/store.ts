@@ -2,8 +2,10 @@ import Database from "better-sqlite3";
 import { createHash, randomBytes } from "node:crypto";
 import type {
 	ActorOperatorStatus,
+	AttachmentUpdate,
 	BindingUpdate,
 	BrokerOperatorStatus,
+	ChannelListenerUpdate,
 	Delivery,
 	DeliveryOperatorSummary,
 	DeliveryStatus,
@@ -83,6 +85,16 @@ export interface SlackOutboxClaim {
 	recovery: boolean;
 }
 
+export interface IngestRoute {
+	actor: string;
+	deliveryId: number | null;
+}
+
+export interface IngestBatchResult {
+	created: boolean;
+	routes: IngestRoute[];
+}
+
 export class StaleLeaseError extends Error {}
 export class InvalidTransitionError extends Error {}
 export class ReconciliationError extends Error {}
@@ -131,9 +143,10 @@ export class BrokerStore {
         updated_at TEXT NOT NULL,
 		binding_mode TEXT NOT NULL DEFAULT 'pinned',
 		binding_source TEXT NOT NULL DEFAULT 'provisioned',
-		binding_revision INTEGER NOT NULL DEFAULT 1,
-		egress_policy TEXT NOT NULL DEFAULT 'receipt_only',
-		egress_channel_ids_json TEXT NOT NULL DEFAULT '[]',
+			binding_revision INTEGER NOT NULL DEFAULT 1,
+			egress_policy TEXT NOT NULL DEFAULT 'receipt_only',
+			egress_channel_ids_json TEXT NOT NULL DEFAULT '[]',
+			listen_channel_ids_json TEXT NOT NULL DEFAULT '[]',
         FOREIGN KEY(home_edge) REFERENCES edges(edge_id)
       );
 
@@ -288,6 +301,7 @@ export class BrokerStore {
 		this.ensureColumn("subscriptions", "binding_revision", "INTEGER NOT NULL DEFAULT 1");
 		this.ensureColumn("subscriptions", "egress_policy", "TEXT NOT NULL DEFAULT 'receipt_only'");
 		this.ensureColumn("subscriptions", "egress_channel_ids_json", "TEXT NOT NULL DEFAULT '[]'");
+		this.ensureColumn("subscriptions", "listen_channel_ids_json", "TEXT NOT NULL DEFAULT '[]'");
 		this.ensureColumn("live_presence", "binding_revision", "INTEGER NOT NULL DEFAULT 1");
 		this.ensureColumn("deliveries", "result_fingerprint", "TEXT");
 		this.ensureColumn("deliveries", "available_at", "TEXT");
@@ -402,6 +416,90 @@ export class BrokerStore {
 			WHERE actor=?
 		`).run(update.policy, JSON.stringify(update.channelIds), actor);
 		return this.getSubscription(actor)!;
+	}
+
+	setChannelListener(actor: string, update: ChannelListenerUpdate): Subscription {
+		const subscription = this.getSubscription(actor);
+		if (!subscription) throw new Error(`subscription ${actor} not found`);
+		if (sameStrings(subscription.listenChannelIds ?? [], update.channelIds)) return subscription;
+		this.db.prepare(`
+			UPDATE subscriptions
+			SET listen_channel_ids_json=?, updated_at=?
+			WHERE actor=?
+		`).run(JSON.stringify(update.channelIds), iso(this.clock), actor);
+		return this.getSubscription(actor)!;
+	}
+
+	attach(actor: string, update: AttachmentUpdate): Subscription {
+		this.markAmbiguousForExpiredDispatches();
+		return this.db.transaction(() => {
+			const subscription = this.getSubscription(actor);
+			if (!subscription) throw new Error(`subscription ${actor} not found`);
+			const providerSurface = update.providerSurface ?? subscription.providerSurface;
+			const providerVersion = update.providerVersion ?? subscription.providerVersion;
+			const edgeWorkspaces = subscription.edgeWorkspaces.some(
+				(workspace) => workspace.edgeId === subscription.homeEdge,
+			)
+				? subscription.edgeWorkspaces.map((workspace) =>
+					workspace.edgeId === subscription.homeEdge
+						? { ...workspace, cwd: update.cwd }
+						: workspace)
+				: [
+					...subscription.edgeWorkspaces,
+					{ edgeId: subscription.homeEdge, cwd: update.cwd, worktree: null },
+				];
+			const workspaceChanged = !sameEdgeWorkspaces(
+				subscription.edgeWorkspaces,
+				edgeWorkspaces,
+			);
+			const bindingChanged = subscription.sessionId !== update.sessionId
+				|| subscription.providerSurface !== providerSurface
+				|| subscription.providerVersion !== providerVersion
+				|| subscription.bindingMode !== "pinned"
+				|| workspaceChanged;
+			const listenerChanged = !sameStrings(subscription.listenChannelIds ?? [], update.channelIds);
+			if (!bindingChanged && !listenerChanged) return subscription;
+
+			const now = iso(this.clock);
+			if (!bindingChanged) {
+				this.db.prepare(`
+					UPDATE subscriptions
+					SET listen_channel_ids_json=?, updated_at=?
+					WHERE actor=?
+				`).run(JSON.stringify(update.channelIds), now, actor);
+				return this.getSubscription(actor)!;
+			}
+
+			this.assertBindingMutable(actor);
+			this.db.prepare(`
+				UPDATE subscriptions
+				SET session_id=?, provider_surface=?, provider_version=?,
+					edge_workspaces_json=?, listen_channel_ids_json=?, updated_at=?,
+					binding_mode='pinned', binding_source='operator',
+					binding_revision=binding_revision+1
+				WHERE actor=?
+			`).run(
+				update.sessionId,
+				providerSurface,
+				providerVersion,
+				JSON.stringify(edgeWorkspaces),
+				JSON.stringify(update.channelIds),
+				now,
+				actor,
+			);
+			this.invalidatePreDispatchBinding(actor, now);
+			return this.getSubscription(actor)!;
+		})();
+	}
+
+	channelListeners(channelId: string): string[] {
+		const normalized = channelId.toUpperCase();
+		return this.listSubscriptions()
+			.filter((subscription) =>
+				!isExpired(subscription.expiresAt, this.clock.now())
+				&& (subscription.listenChannelIds ?? []).includes(normalized))
+			.map((subscription) => subscription.actor)
+			.sort();
 	}
 
 		updateBinding(actor: string, update: BindingUpdate): Subscription {
@@ -845,31 +943,59 @@ export class BrokerStore {
 		};
 	}
 
-	  ingestEvent(event: SlackEventInput, initialSnapshot: unknown | null = null): { created: boolean; deliveryId: number | null } {
-    return this.db.transaction(() => {
-      const inserted = this.db.prepare(`
-        INSERT OR IGNORE INTO slack_events(
-          event_id, workspace_id, channel_id, thread_ts, message_ts, sender_id, sender_kind,
-          actor, text, raw_json, received_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        event.eventId,
-        event.workspaceId,
-        event.channelId,
-        event.threadTs,
-        event.messageTs,
-        event.senderId,
-        event.senderKind,
-        event.actor,
-        event.text,
-        JSON.stringify(event.raw),
-        event.receivedAt,
-      );
-      if (inserted.changes === 0) return { created: false, deliveryId: null };
+	ingestEvent(
+		event: SlackEventInput,
+		initialSnapshot: unknown | null = null,
+	): { created: boolean; deliveryId: number | null } {
+		const result = this.ingestEventForActors(event, [event.actor], initialSnapshot);
+		return {
+			created: result.created,
+			deliveryId: result.routes[0]?.deliveryId ?? null,
+		};
+	}
 
-	      const subscription = this.getSubscription(event.actor);
-	      if (!subscription || isExpired(subscription.expiresAt, this.clock.now())) {
-			const actor = safeActorLabel(event.actor);
+	ingestEventForActors(
+		event: SlackEventInput,
+		actors: readonly string[],
+		initialSnapshot: unknown | null = null,
+	): IngestBatchResult {
+		const targets = [...new Set(actors.map((actor) => actor.toLowerCase()))].sort();
+		if (targets.length === 0) throw new Error("at least one actor is required");
+		return this.db.transaction(() => {
+			const inserted = this.db.prepare(`
+				INSERT OR IGNORE INTO slack_events(
+					event_id, workspace_id, channel_id, thread_ts, message_ts, sender_id, sender_kind,
+					actor, text, raw_json, received_at
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			`).run(
+				event.eventId,
+				event.workspaceId,
+				event.channelId,
+				event.threadTs,
+				event.messageTs,
+				event.senderId,
+				event.senderKind,
+				targets[0],
+				event.text,
+				JSON.stringify(event.raw),
+				event.receivedAt,
+			);
+			if (inserted.changes === 0) return { created: false, routes: [] };
+
+			const routes = targets.map((actor) =>
+				this.createDeliveryForActor(event, actor, initialSnapshot));
+			return { created: true, routes };
+		})();
+	}
+
+	private createDeliveryForActor(
+		event: SlackEventInput,
+		actor: string,
+		initialSnapshot: unknown | null,
+	): IngestRoute {
+		const subscription = this.getSubscription(actor);
+		if (!subscription || isExpired(subscription.expiresAt, this.clock.now())) {
+			const safeActor = safeActorLabel(actor);
 			const reason = "no_active_subscription";
 			const createdAt = iso(this.clock);
 			this.db.prepare(`
@@ -877,52 +1003,61 @@ export class BrokerStore {
 				VALUES (?, ?, ?, ?, ?)
 			`).run(event.eventId, event.channelId, event.threadTs, reason, createdAt);
 			this.enqueueOutbox(
-				`ingress:${event.eventId}:${reason}`,
+				`ingress:${event.eventId}:${actor}:${reason}`,
 				"ingress_diagnostic",
 				event.channelId,
 				event.threadTs,
-				`Hive could not route this wake to \`${actor}\`: that actor has no active subscription. No agent was dispatched.`,
+				`Hive could not route this message to \`${safeActor}\`: that actor has no active subscription. No agent was dispatched.`,
 				{ ingress_reason: reason },
 				createdAt,
 			);
-	        return { created: true, deliveryId: null };
-	      }
-      const now = iso(this.clock);
-      const coalesceKey = `${event.actor}:${event.channelId}:${event.threadTs}`;
-	      const pending = this.db.prepare(`
-	        SELECT delivery_id, created_at FROM deliveries
-	        WHERE coalesce_key=? AND status='pending'
-	        ORDER BY delivery_id LIMIT 1
-	      `).get(coalesceKey) as Row | undefined;
-	      const coalesceWindowMs = Math.min(2_000, Math.max(100, Math.floor(subscription.deliveryTtlMs / 10)));
-	      if (pending && this.clock.now().getTime() - new Date(String(pending.created_at)).getTime() <= coalesceWindowMs) {
-        const deliveryId = Number(pending.delivery_id);
-        this.db.prepare(`
-          INSERT OR IGNORE INTO delivery_events(delivery_id, event_id, relation) VALUES (?, ?, 'coalesced')
-        `).run(deliveryId, event.eventId);
-        return { created: true, deliveryId };
-      }
-      const result = this.db.prepare(`
-        INSERT INTO deliveries(
-          event_id, actor, status, coalesce_key, initial_snapshot_json, snapshot_ts,
-          created_at, updated_at
-        ) VALUES (?, ?, 'pending', ?, ?, ?, ?, ?)
-      `).run(
-        event.eventId,
-        event.actor,
-        coalesceKey,
-        initialSnapshot === null ? null : JSON.stringify(initialSnapshot),
-        initialSnapshot === null ? null : now,
-        now,
-        now,
-      );
-      const deliveryId = Number(result.lastInsertRowid);
-      this.db.prepare(`
-        INSERT INTO delivery_events(delivery_id, event_id, relation) VALUES (?, ?, 'primary')
-      `).run(deliveryId, event.eventId);
-      return { created: true, deliveryId };
-    })();
-  }
+			return { actor, deliveryId: null };
+		}
+
+		const now = iso(this.clock);
+		const coalesceKey = `${actor}:${event.channelId}:${event.threadTs}`;
+		const pending = this.db.prepare(`
+			SELECT delivery_id, created_at FROM deliveries
+			WHERE coalesce_key=? AND status='pending'
+			ORDER BY delivery_id LIMIT 1
+		`).get(coalesceKey) as Row | undefined;
+		const coalesceWindowMs = Math.min(
+			2_000,
+			Math.max(100, Math.floor(subscription.deliveryTtlMs / 10)),
+		);
+		if (
+			pending
+			&& this.clock.now().getTime() - new Date(String(pending.created_at)).getTime()
+				<= coalesceWindowMs
+		) {
+			const deliveryId = Number(pending.delivery_id);
+			this.db.prepare(`
+				INSERT OR IGNORE INTO delivery_events(delivery_id, event_id, relation)
+				VALUES (?, ?, 'coalesced')
+			`).run(deliveryId, event.eventId);
+			return { actor, deliveryId };
+		}
+
+		const result = this.db.prepare(`
+			INSERT INTO deliveries(
+				event_id, actor, status, coalesce_key, initial_snapshot_json, snapshot_ts,
+				created_at, updated_at
+			) VALUES (?, ?, 'pending', ?, ?, ?, ?, ?)
+		`).run(
+			event.eventId,
+			actor,
+			coalesceKey,
+			initialSnapshot === null ? null : JSON.stringify(initialSnapshot),
+			initialSnapshot === null ? null : now,
+			now,
+			now,
+		);
+		const deliveryId = Number(result.lastInsertRowid);
+		this.db.prepare(`
+			INSERT INTO delivery_events(delivery_id, event_id, relation) VALUES (?, ?, 'primary')
+		`).run(deliveryId, event.eventId);
+		return { actor, deliveryId };
+	}
 
   claimNext(edgeId: string, after: number): Delivery | null {
     return this.db.transaction(() => {
@@ -1656,8 +1791,8 @@ export class BrokerStore {
              s.workspace, s.edge_workspaces_json, s.wake_policy, s.permission_profile,
 	             s.lease_ttl_ms, s.delivery_ttl_ms, s.home_grace_ms, s.spawn_rate_limit,
 	             s.expires_at, s.updated_at AS subscription_updated_at
-			 , s.binding_mode, s.binding_source, s.binding_revision,
-			 s.egress_policy, s.egress_channel_ids_json
+				 , s.binding_mode, s.binding_source, s.binding_revision,
+				 s.egress_policy, s.egress_channel_ids_json, s.listen_channel_ids_json
       FROM deliveries d
       JOIN slack_events e ON e.event_id=d.event_id
       JOIN subscriptions s ON s.actor=d.actor
@@ -1670,7 +1805,8 @@ export class BrokerStore {
 	  JOIN slack_events e ON e.event_id=de.event_id
 	  WHERE de.delivery_id=? ORDER BY de.rowid
 	`).all(deliveryId) as Row[];
-	const durableEvents = events.map(slackEventFromRow);
+		const durableEvents = events.map((event) =>
+			slackEventFromRow({ ...event, actor: delivery.actor }));
 	return {
 		...delivery,
 		coalescedEventIds: durableEvents.map((event) => event.eventId),
@@ -1753,9 +1889,10 @@ function subscriptionFromRow(row: Row): Subscription {
 		bindingMode: String(row.binding_mode) as Subscription["bindingMode"],
 		bindingSource: String(row.binding_source) as Subscription["bindingSource"],
 		bindingRevision: Number(row.binding_revision),
-		egressPolicy: String(row.egress_policy) as Subscription["egressPolicy"],
-		egressChannelIds: JSON.parse(String(row.egress_channel_ids_json)) as string[],
-  };
+			egressPolicy: String(row.egress_policy) as Subscription["egressPolicy"],
+			egressChannelIds: JSON.parse(String(row.egress_channel_ids_json)) as string[],
+			listenChannelIds: JSON.parse(String(row.listen_channel_ids_json)) as string[],
+	  };
 }
 
 function livePresenceFromRow(row: Row): LivePresence {
@@ -1783,7 +1920,9 @@ function deliveryFromRow(row: Row): Delivery {
   });
 	const subscription = row.subscription_snapshot_json === null
 		? currentSubscription
-		: JSON.parse(String(row.subscription_snapshot_json)) as Subscription;
+		: withListenerDefaults(
+			JSON.parse(String(row.subscription_snapshot_json)) as Subscription,
+		);
 	const event = slackEventFromRow(row);
   return {
     id: Number(row.delivery_id),
@@ -1826,6 +1965,41 @@ function slackEventFromRow(row: Row): SlackEventInput {
 
 function isExpired(value: string | null, now: Date): boolean {
   return value !== null && new Date(value).getTime() <= now.getTime();
+}
+
+function withListenerDefaults(subscription: Subscription): Subscription {
+	return {
+		...subscription,
+		listenChannelIds: Array.isArray(subscription.listenChannelIds)
+			? subscription.listenChannelIds
+			: [],
+	};
+}
+
+function sameStrings(left: readonly string[], right: readonly string[]): boolean {
+	if (left.length !== right.length) return false;
+	const normalizedLeft = [...left].sort();
+	const normalizedRight = [...right].sort();
+	return normalizedLeft.every((value, index) => value === normalizedRight[index]);
+}
+
+function sameEdgeWorkspaces(
+	left: readonly Subscription["edgeWorkspaces"][number][],
+	right: readonly Subscription["edgeWorkspaces"][number][],
+): boolean {
+	if (left.length !== right.length) return false;
+	const normalized = (
+		values: readonly Subscription["edgeWorkspaces"][number][],
+	) => [...values].sort((a, b) => a.edgeId.localeCompare(b.edgeId));
+	const normalizedLeft = normalized(left);
+	const normalizedRight = normalized(right);
+	return normalizedLeft.every((value, index) => {
+		const candidate = normalizedRight[index];
+		return candidate !== undefined
+			&& value.edgeId === candidate.edgeId
+			&& value.cwd === candidate.cwd
+			&& value.worktree === candidate.worktree;
+	});
 }
 
 function remainingDeliveryTtl(delivery: Pick<Delivery, "createdAt" | "subscription">, now: Date): number {

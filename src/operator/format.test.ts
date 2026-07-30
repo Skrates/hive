@@ -52,6 +52,7 @@ test("operator status makes binding, authority, and attention visible", () => {
 				bindingRevision: 1,
 				egressPolicy: "receipt_only",
 				egressChannelIds: [],
+				listenChannelIds: ["C00000001"],
 			},
 			livePresence: null,
 			lease: null,
@@ -90,6 +91,7 @@ test("operator status makes binding, authority, and attention visible", () => {
 	assert.match(rendered, /READY\s+mac · seen 5s ago/);
 	assert.match(rendered, /ATTENTION\s+ariadne · codex\/app-server 0\.144\.0/);
 	assert.match(rendered, /permission workspace-write/);
+	assert.match(rendered, /listen C00000001/);
 	assert.match(rendered, /ambiguous_delivery_requires_reconciliation/);
 	assert.match(rendered, /ambiguous=1/);
 	assert.match(rendered, /malformed_explicit_envelope · channel C1 · thread 100\.1/);

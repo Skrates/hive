@@ -27,16 +27,26 @@ are arrays:
     "U…": "ariadne",
     "W…": "fable"
   },
-  "routerMentionIds": ["U…"]
+  "routerMentionIds": ["U…"],
+  "originAppActors": {
+    "A11111111": "ariadne",
+    "A22222222": "fable"
+  }
 }
 ```
+
+Channel attachment is the normal route. Every admitted message in an exact channel is delivered to
+each actor attached to that channel. The Slack body remains untrusted: attachment authorizes
+dispatch only, while the actor's subscription remains the sole source of provider, workspace,
+wake-policy, and permission authority.
 
 `mentionActors` maps Slack's immutable user IDs to Hive actors. A real Slack mention such as
 `<@U…> — review this` is a wake envelope only when it begins the message (an optional leading
 `[actor=sender]` decoration is tolerated) and its ID is configured here. Plain names, `@name`
-text, unconfigured mentions, and mentions later in a message are conversation only and never
-dispatch. Like `WAKE:` and `NEXT`, a configured mention authorizes delivery only; the actor's
-subscription remains the sole source of provider, workspace, wake-policy, and permission authority.
+text, unconfigured mentions, and mentions later in a message do not explicitly address an actor.
+In an attached channel they still travel as ordinary channel traffic; in an unattached channel they
+remain inert. `WAKE:`, `NEXT`, direct mentions, and `<@Hive> actor:` remain available only as
+backwards-compatible single-recipient overrides.
 
 `routerMentionIds` lists shared Hive bot identities. A router mention must begin the message and
 name exactly one actor with a colon, for example `<@U…> ariadne:` or `<@U…> fable:`. A configured
@@ -44,11 +54,17 @@ router mention with a missing actor or colon is a malformed explicit envelope an
 thread reply. Unconfigured, quoted, and mid-body mentions stay inert. A router ID should not also be
 used as a per-actor identity in `mentionActors`; router semantics take precedence if it is.
 
-For an admitted malformed wake, Hive replies in the Slack thread with the accepted envelope forms.
-For a valid envelope with no active subscription, it replies that no agent was dispatched. Messages
-outside the admission boundary receive no routing information. Ignored and unroutable outcomes are
-also written to the broker log as credential-free structured metadata; the Slack body is never
-included.
+`originAppActors` maps the immutable Slack app ID used by an agent to that Hive actor. Ordinary
+channel fanout excludes the originating actor but still reaches attached peers. Human messages
+without an app origin reach every attached actor. Hive's own correlated completion messages are
+always excluded, preventing recursive delivery.
+
+For an admitted malformed legacy envelope in an unattached channel, Hive replies with the accepted
+directed forms. The same text in an attached channel is ordinary channel traffic; no grammar is
+required. For a valid explicit target with no active subscription, Hive replies that no agent was
+dispatched. Messages outside the admission boundary receive no routing information. Ignored and
+unroutable outcomes are also written to the broker log as credential-free structured metadata; the
+Slack body is never included.
 
 Bind the HTTP listener to loopback when broker and edge share a host. Across hosts, put it behind a
 private tunnel or mutually controlled HTTPS endpoint. The edge credential is bearer authority, so
@@ -72,9 +88,30 @@ hive status ariadne
 hive deliveries --actor ariadne --status ambiguous
 ```
 
-Session binding is a narrow operation. It may update only `sessionId`, `providerSurface`, and
-`providerVersion`; it cannot change the provider, home edge, workspace mappings, wake policy,
-permission profile, or lease state.
+The normal attachment path is one idempotent command run from the same exact cwd as the Codex task:
+
+```sh
+hive-attach ariadne
+# Equivalent explicit form:
+hive attach ariadne --cwd "$PWD" --channel C…
+hive detach ariadne
+```
+
+`hive attach` uses Codex's exact `CODEX_THREAD_ID` when invoked from a task and verifies that it is
+a primary user-owned task at the exact cwd. A manual terminal without that context falls back to the
+newest matching primary task; pass `--session <id>` to make that choice explicit. The command
+atomically pins the session, remaps the home edge to that verified exact cwd, and enables the exact
+channel listener. It then waits for the Desktop IPC owner to confirm the same binding revision. It
+fails rather than claiming success from the broker row alone.
+`hive detach` stops channel-wide delivery without changing the session binding. Codex Desktop does
+not treat a leading `!` in chat as terminal passthrough; run the command in a terminal, or ask Codex
+to run it.
+
+Low-level session binding remains a narrow operation. It may update only `sessionId`,
+`providerSurface`, and `providerVersion`; it cannot change the provider, home edge, workspace
+mappings, wake policy, permission profile, or lease state. Only the explicit atomic attachment
+operation may replace the home edge's cwd, and only after the Codex catalog proves that the selected
+primary user task owns that exact cwd.
 
 ```sh
 hive bind ariadne 019f... --surface app-server --provider-version 0.145.0
@@ -112,6 +149,8 @@ The corresponding authenticated broker endpoints are:
 
 - `GET /v1/admin/status`
 - `GET /v1/admin/deliveries`
+- `PUT /v1/admin/subscriptions/{actor}/attachment`
+- `PATCH /v1/admin/subscriptions/{actor}/listener`
 - `PATCH /v1/admin/subscriptions/{actor}/binding`
 - `POST /v1/admin/deliveries/{delivery_id}/reconcile`
 

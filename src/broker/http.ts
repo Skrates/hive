@@ -1,7 +1,9 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { URL } from "node:url";
 import {
-		BindingUpdateSchema,
+	AttachmentUpdateSchema,
+	BindingUpdateSchema,
+	ChannelListenerUpdateSchema,
 		AutoBindingUpdateSchema,
 		DeliveryResultInputSchema,
 		DeliveryStatusSchema,
@@ -87,8 +89,9 @@ export class BrokerHttpServer {
         const edgeId = requiredString(body.edgeId, "edgeId");
         return json(response, 201, { edgeId, token: this.broker.createEdge(edgeId) });
       }
-      if (request.method === "PUT" && url.pathname.startsWith("/v1/admin/subscriptions/")) {
-        const actor = decodeURIComponent(url.pathname.slice("/v1/admin/subscriptions/".length));
+      const subscriptionAdmin = /^\/v1\/admin\/subscriptions\/([^/]+)$/.exec(url.pathname);
+      if (request.method === "PUT" && subscriptionAdmin?.[1]) {
+        const actor = decodeURIComponent(subscriptionAdmin[1]);
         const body = await readJson(request);
         const input = SubscriptionInputSchema.parse({ ...body, actor });
         return json(response, 200, this.broker.upsertSubscription(input));
@@ -98,6 +101,18 @@ export class BrokerHttpServer {
 				const actor = decodeURIComponent(binding[1]);
 				const update = BindingUpdateSchema.parse(await readJson(request));
 				return json(response, 200, this.broker.updateBinding(actor, update));
+			}
+			const attachment = /^\/v1\/admin\/subscriptions\/([^/]+)\/attachment$/.exec(url.pathname);
+			if (request.method === "PUT" && attachment?.[1]) {
+				const actor = decodeURIComponent(attachment[1]);
+				const update = AttachmentUpdateSchema.parse(await readJson(request));
+				return json(response, 200, this.broker.attach(actor, update));
+			}
+			const listener = /^\/v1\/admin\/subscriptions\/([^/]+)\/listener$/.exec(url.pathname);
+			if (request.method === "PATCH" && listener?.[1]) {
+				const actor = decodeURIComponent(listener[1]);
+				const update = ChannelListenerUpdateSchema.parse(await readJson(request));
+				return json(response, 200, this.broker.setChannelListener(actor, update));
 			}
 				const bindingMode = /^\/v1\/admin\/subscriptions\/([^/]+)\/binding-mode$/.exec(url.pathname);
 			if (request.method === "PATCH" && bindingMode?.[1]) {

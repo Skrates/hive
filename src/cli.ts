@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { Command } from "commander";
 import { readFile } from "node:fs/promises";
+import { resolve } from "node:path";
 import { z } from "zod";
 import { AdmissionPolicySchema } from "./addressing.js";
 import { BrokerHttpServer } from "./broker/http.js";
@@ -8,13 +9,18 @@ import { BrokerService } from "./broker/service.js";
 import { SlackSocketIngress, SlackWebTransport } from "./broker/slack.js";
 import { BrokerStore } from "./broker/store.js";
 import {
-		BindingUpdateSchema,
+	AttachmentUpdateSchema,
+	BindingUpdateSchema,
+	ChannelListenerUpdateSchema,
 		DeliveryStatusSchema,
 		EgressPolicyUpdateSchema,
 		OutboxReconciliationSchema,
 		SlackOutboxStateSchema,
 	SubscriptionInputSchema,
+	type LivePresence,
+	type Subscription,
 } from "./domain.js";
+import { CodexThreadCatalog } from "./codex/discovery.js";
 import { BrokerClient } from "./edge/broker-client.js";
 import { EdgeHttpServer } from "./edge/http.js";
 import { LiveIngressRegistry } from "./edge/live-registry.js";
@@ -25,7 +31,7 @@ import { OperatorClient } from "./operator/client.js";
 import { OperatorDashboardServer } from "./operator/dashboard.js";
 import { formatOperatorDeliveries, formatOperatorOutbox, formatOperatorStatus } from "./operator/format.js";
 
-const program = new Command().name("hive").description("Hive broker/edge wake router");
+const program = new Command().name("hive").description("Hive broker/edge collaboration router");
 
 program.command("broker")
   .description("run the central Slack Socket Mode broker")
@@ -132,6 +138,96 @@ program.command("status")
 		const staleAfterMs = positiveNumber(options.staleAfter, "stale-after") * 1_000;
 		const status = await operatorClient().status({ ...(actor ? { actor } : {}), staleAfterMs });
 		process.stdout.write(options.json ? `${JSON.stringify(status, null, 2)}\n` : formatOperatorStatus(status));
+	});
+
+program.command("attach")
+	.argument("<actor>")
+	.option("--channel <channel-id...>", "exact Slack channel(s) to listen to")
+	.option("--cwd <path>", "exact Codex task workspace", process.cwd())
+	.option("--session <session-id>", "bind this session instead of discovering the newest primary task")
+	.option("--surface <name>", "update the provider surface metadata")
+	.option("--provider-version <version>", "update the provider version metadata")
+	.option("--no-wait", "return before the live owner confirms the attachment")
+	.option("--json", "emit machine-readable JSON")
+	.description("attach the current Codex task to admitted channel traffic")
+	.action(async (
+		actor: string,
+		options: {
+			channel?: string[];
+			cwd: string;
+			session?: string;
+			surface?: string;
+			providerVersion?: string;
+			wait: boolean;
+			json?: boolean;
+		},
+	) => {
+		const client = operatorClient();
+		const status = await client.status({ actor });
+		const current = status.actors[0]?.subscription;
+		if (!current || current.actor !== actor) throw new Error(`subscription ${actor} not found`);
+		const cwd = resolve(options.cwd);
+
+		let sessionId = options.session ?? process.env.CODEX_THREAD_ID;
+		if (current.provider === "codex") {
+			const catalog = new CodexThreadCatalog();
+			try {
+				if (sessionId) {
+					const exact = catalog.primaryUserThread(sessionId, cwd);
+					if (!exact) {
+						throw new Error(
+							`Codex task ${sessionId} is not a primary user task at ${cwd}`,
+						);
+					}
+					sessionId = exact.sessionId;
+				} else {
+					const discovered = catalog.latestPrimaryUserThread(cwd);
+					if (!discovered) throw new Error(`no primary Codex task found at ${cwd}`);
+					sessionId = discovered.sessionId;
+				}
+			} finally {
+				catalog.close();
+			}
+		} else if (!sessionId) {
+			throw new Error("--session is required when attaching a non-Codex provider");
+		}
+
+		const channelIds = options.channel
+			?? current.listenChannelIds
+			?? (process.env.HIVE_CHANNEL_ID ? [process.env.HIVE_CHANNEL_ID] : []);
+		const update = AttachmentUpdateSchema.parse({
+			sessionId,
+			cwd,
+			channelIds,
+			...(options.surface ? { providerSurface: options.surface } : {}),
+			...(options.providerVersion ? { providerVersion: options.providerVersion } : {}),
+		});
+		const subscription = await client.attach(actor, update);
+		const livePresence = options.wait
+			? await waitForAttachment(client, subscription)
+			: null;
+		if (options.json) {
+			process.stdout.write(`${JSON.stringify({ subscription, livePresence }, null, 2)}\n`);
+		} else {
+			process.stdout.write(
+				`Attached ${subscription.actor} session ${subscription.sessionId} to `
+				+ `${(subscription.listenChannelIds ?? []).join(", ")}`
+				+ `${livePresence ? `; live via ${livePresence.transport}.` : "."}\n`,
+			);
+		}
+	});
+
+program.command("detach")
+	.argument("<actor>")
+	.option("--json", "emit machine-readable JSON")
+	.description("stop channel-wide delivery without changing the actor's session binding")
+	.action(async (actor: string, options: { json?: boolean }) => {
+		const update = ChannelListenerUpdateSchema.parse({ channelIds: [] });
+		const result = await operatorClient().setChannelListener(actor, update);
+		if (options.json) process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+		else process.stdout.write(
+			`Detached ${result.actor} from channel-wide delivery; session binding is unchanged.\n`,
+		);
 	});
 
 program.command("bind")
@@ -338,6 +434,34 @@ function positiveInteger(value: string, name: string): number {
 	const parsed = positiveNumber(value, name);
 	if (!Number.isInteger(parsed)) throw new Error(`${name} must be an integer`);
 	return parsed;
+}
+
+async function waitForAttachment(
+	client: OperatorClient,
+	subscription: Subscription,
+	timeoutMs = 15_000,
+): Promise<LivePresence> {
+	const deadline = Date.now() + timeoutMs;
+	do {
+		const status = await client.status({ actor: subscription.actor, staleAfterMs: 60_000 });
+		const actor = status.actors[0];
+		const current = actor?.subscription;
+		const live = actor?.livePresence;
+		if (
+			current?.sessionId === subscription.sessionId
+			&& current.bindingRevision === subscription.bindingRevision
+			&& live?.sessionId === subscription.sessionId
+			&& live.bindingRevision === subscription.bindingRevision
+			&& live.ownerLoaded
+			&& new Date(live.expiresAt).getTime() > Date.now()
+		) return live;
+		if (Date.now() >= deadline) break;
+		await new Promise((resolveDelay) => setTimeout(resolveDelay, 250));
+	} while (true);
+	throw new Error(
+		`attachment was recorded but ${subscription.actor}'s live owner did not confirm it within `
+		+ `${timeoutMs / 1_000}s; run \`hive status ${subscription.actor}\``,
+	);
 }
 
 async function untilSignal(cleanup: () => Promise<void>): Promise<void> {

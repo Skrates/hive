@@ -6,7 +6,12 @@ export type WakePolicy = z.infer<typeof WakePolicySchema>;
 export const EgressPolicySchema = z.enum(["receipt_only", "assistant_text"]);
 export type EgressPolicy = z.infer<typeof EgressPolicySchema>;
 
-const SlackChannelIdSchema = z.string().regex(/^[CDG][A-Z0-9]{8,}$/);
+export const SlackChannelIdSchema = z.string()
+	.regex(/^[CDG][A-Z0-9]{8,}$/i)
+	.transform((value) => value.toUpperCase());
+const SlackChannelIdsSchema = z.array(SlackChannelIdSchema)
+	.max(20)
+	.transform((values) => [...new Set(values)].sort());
 export const EgressPolicyUpdateSchema = z.discriminatedUnion("policy", [
 	z.object({
 		policy: z.literal("receipt_only"),
@@ -14,10 +19,28 @@ export const EgressPolicyUpdateSchema = z.discriminatedUnion("policy", [
 	}),
 	z.object({
 		policy: z.literal("assistant_text"),
-		channelIds: z.array(SlackChannelIdSchema).min(1).max(20),
+		channelIds: SlackChannelIdsSchema.refine((values) => values.length > 0, {
+			message: "at least one channel is required",
+		}),
 	}),
 ]);
 export type EgressPolicyUpdate = z.infer<typeof EgressPolicyUpdateSchema>;
+
+export const ChannelListenerUpdateSchema = z.object({
+	channelIds: SlackChannelIdsSchema.default([]),
+});
+export type ChannelListenerUpdate = z.infer<typeof ChannelListenerUpdateSchema>;
+
+export const AttachmentUpdateSchema = z.object({
+	sessionId: z.string().min(1),
+	cwd: z.string().min(2).startsWith("/"),
+	providerSurface: z.string().min(1).optional(),
+	providerVersion: z.string().min(1).optional(),
+	channelIds: SlackChannelIdsSchema.refine((values) => values.length > 0, {
+		message: "at least one channel is required",
+	}),
+});
+export type AttachmentUpdate = z.infer<typeof AttachmentUpdateSchema>;
 
 export const ProviderSchema = z.enum(["codex", "claude"]);
 export type Provider = z.infer<typeof ProviderSchema>;
@@ -89,6 +112,7 @@ export interface Subscription extends SubscriptionInput {
 	bindingRevision: number;
 	egressPolicy: EgressPolicy;
 	egressChannelIds: string[];
+	listenChannelIds?: string[];
 }
 
 export const BindingUpdateSchema = z.object({

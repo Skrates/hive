@@ -44,7 +44,14 @@ export interface SlackWebApi {
 }
 
 interface SlackIngressBroker {
-  ingest(event: SlackEventInput): { created: boolean; deliveryId: number | null };
+	channelListeners(channelId: string): string[];
+	ingestForActors(
+		event: SlackEventInput,
+		actors: readonly string[],
+	): {
+		created: boolean;
+		routes: Array<{ actor: string; deliveryId: number | null }>;
+	};
 	diagnoseIngress(
 		eventId: string,
 		channelId: string,
@@ -66,11 +73,13 @@ export interface SlackIngressOutcome {
     | "missing_sender"
     | "not_admitted"
     | "not_addressed"
+    | "self_origin"
     | "malformed_explicit_envelope"
     | "no_active_subscription";
   eventId: string;
   channelId?: string;
   actor?: string;
+  actors?: string[];
 }
 
 export async function handleSlackIngressEvent(
@@ -87,7 +96,7 @@ export async function handleSlackIngressEvent(
   }
   // Broker replies carry this marker. Never feed our own correlated output back through
   // addressing: an agent response is untrusted text and may legitimately begin with WAKE/NEXT.
-  if (event.metadata?.event_type === "hive_delivery_reply") {
+  if (isHiveReply(event)) {
     return { disposition: "ignored", reason: "hive_reply", eventId, channelId: event.channel };
   }
   const eventWorkspaceId = body.team_id
@@ -124,9 +133,29 @@ export async function handleSlackIngressEvent(
     event.text,
     policy.mentionActors ?? new Map(),
     policy.routerMentionIds ?? new Set(),
-  );
-	  if (addressing.kind === "ignored") {
-	    if (addressing.reason === "malformed_explicit_envelope") {
+	);
+	const explicitlyAddressed = addressing.kind === "addressed";
+	const attachedActors = explicitlyAddressed ? [] : broker.channelListeners(event.channel);
+	let actors = explicitlyAddressed
+		? [addressing.wake.actor]
+		: attachedActors;
+	if (!explicitlyAddressed) {
+		const originActor = event.app_id
+			? policy.originAppActors?.get(event.app_id.toUpperCase())
+			: undefined;
+		if (originActor) actors = actors.filter((actor) => actor !== originActor);
+	}
+	if (actors.length === 0) {
+		if (!explicitlyAddressed && attachedActors.length > 0) {
+			return {
+				disposition: "ignored",
+				reason: "self_origin",
+				eventId,
+				channelId: event.channel,
+			};
+		}
+	    if (addressing.kind === "ignored"
+			&& addressing.reason === "malformed_explicit_envelope") {
 		broker.diagnoseIngress(
 			eventId,
 			event.channel,
@@ -137,7 +166,7 @@ export async function handleSlackIngressEvent(
     }
     return {
       disposition: "ignored",
-      reason: addressing.reason,
+      reason: addressing.kind === "ignored" ? addressing.reason : "not_addressed",
       eventId,
       channelId: event.channel,
     };
@@ -151,28 +180,28 @@ export async function handleSlackIngressEvent(
     messageTs: event.ts,
     senderId,
     senderKind,
-    actor: addressing.wake.actor,
+    actor: actors[0]!,
     text: event.text,
     raw: body,
     receivedAt: new Date().toISOString(),
   };
-  const result = broker.ingest(normalized);
+  const result = broker.ingestForActors(normalized, actors);
   if (!result.created) {
     return {
       disposition: "duplicate",
       reason: "duplicate_event",
       eventId,
       channelId: event.channel,
-      actor: addressing.wake.actor,
+      ...(actors.length === 1 ? { actor: actors[0]! } : { actors }),
     };
   }
-  if (result.deliveryId === null) {
+  if (result.routes.every((route) => route.deliveryId === null)) {
     return {
       disposition: "unroutable",
       reason: "no_active_subscription",
       eventId,
       channelId: event.channel,
-      actor: addressing.wake.actor,
+      ...(actors.length === 1 ? { actor: actors[0]! } : { actors }),
     };
   }
   return {
@@ -180,8 +209,17 @@ export async function handleSlackIngressEvent(
     reason: "delivery_created",
     eventId,
     channelId: event.channel,
-    actor: addressing.wake.actor,
+    ...(actors.length === 1 ? { actor: actors[0]! } : { actors }),
   };
+}
+
+function isHiveReply(event: SlackMessageEvent): boolean {
+	if (event.metadata?.event_type === "hive_delivery_reply") return true;
+	return Boolean(
+		event.bot_id
+		&& event.text
+		&& /^(?:Hive:|Hive ignored\b)/.test(event.text),
+	);
 }
 
 export class SlackWebTransport implements SlackTransport {

@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { BindingBusyError, BrokerStore, InvalidTransitionError, StaleLeaseError } from "./store.js";
 import {
+	AttachmentUpdateSchema,
 	BindingUpdateSchema,
+	ChannelListenerUpdateSchema,
 	SubscriptionInputSchema,
 	type SlackEventInput,
 	type SubscriptionInput,
@@ -98,6 +100,81 @@ test("binding updates preserve wake, permission, and workspace authority", () =>
 	assert.equal(updated.homeEdge, before.homeEdge);
 	assert.equal(updated.provider, before.provider);
 	assert.throws(() => BindingUpdateSchema.parse({ homeEdge: "unmapped" }), /at least one field/);
+	store.close();
+});
+
+test("attachment is idempotent, exact-channel scoped, and survives subscription reprovisioning", () => {
+	const { store } = fixture();
+	const first = store.attach("ariadne", AttachmentUpdateSchema.parse({
+		sessionId: "thread-2",
+		cwd: "/work/new-taxis",
+		channelIds: ["c00000001", "C00000001"],
+	}));
+	assert.equal(first.sessionId, "thread-2");
+	assert.equal(
+		first.edgeWorkspaces.find((workspace) => workspace.edgeId === first.homeEdge)?.cwd,
+		"/work/new-taxis",
+	);
+	assert.deepEqual(first.listenChannelIds, ["C00000001"]);
+	assert.deepEqual(store.channelListeners("c00000001"), ["ariadne"]);
+
+	const repeated = store.attach("ariadne", AttachmentUpdateSchema.parse({
+		sessionId: "thread-2",
+		cwd: "/work/new-taxis",
+		channelIds: ["C00000001"],
+	}));
+	assert.equal(repeated.bindingRevision, first.bindingRevision);
+
+	store.upsertSubscription(subscription({ sessionId: "thread-reprovisioned" }));
+	assert.deepEqual(store.getSubscription("ariadne")?.listenChannelIds, ["C00000001"]);
+	const detached = store.setChannelListener(
+		"ariadne",
+		ChannelListenerUpdateSchema.parse({ channelIds: [] }),
+	);
+	assert.deepEqual(detached.listenChannelIds, []);
+	assert.deepEqual(store.channelListeners("C00000001"), []);
+	store.close();
+});
+
+test("one durable Slack event fans out once per attached actor and stays idempotent", () => {
+	const { store } = fixture();
+	store.upsertSubscription(subscription({ actor: "fable", sessionId: "fable-thread" }));
+
+	const first = store.ingestEventForActors(event(), ["fable", "ariadne", "fable"]);
+	assert.equal(first.created, true);
+	assert.deepEqual(first.routes, [
+		{ actor: "ariadne", deliveryId: 1 },
+		{ actor: "fable", deliveryId: 2 },
+	]);
+	const eventCount = store.db
+		.prepare("SELECT COUNT(*) AS count FROM slack_events")
+		.get() as { count: number };
+	assert.equal(eventCount.count, 1);
+	const deliveries = store.listDeliveries();
+	assert.deepEqual(deliveries.map((delivery) => delivery.actor), ["ariadne", "fable"]);
+	assert.ok(deliveries.every((delivery) => delivery.event.actor === delivery.actor));
+
+	assert.deepEqual(store.ingestEventForActors(event(), ["ariadne", "fable"]), {
+		created: false,
+		routes: [],
+	});
+	assert.equal(store.listDeliveries().length, 2);
+	store.close();
+});
+
+test("fanout coalesces independently per actor without leaking the first route identity", () => {
+	const { store } = fixture();
+	store.upsertSubscription(subscription({ actor: "fable", sessionId: "fable-thread" }));
+	store.ingestEventForActors(event(), ["ariadne", "fable"]);
+	store.ingestEventForActors(
+		event({ eventId: "Ev2", messageTs: "100.3", text: "ordinary follow-up" }),
+		["ariadne", "fable"],
+	);
+
+	for (const delivery of store.listDeliveries()) {
+		assert.deepEqual(delivery.coalescedEventIds, ["Ev1", "Ev2"]);
+		assert.ok(delivery.durableEvents?.every((item) => item.actor === delivery.actor));
+	}
 	store.close();
 });
 

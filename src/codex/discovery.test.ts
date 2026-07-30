@@ -46,5 +46,14 @@ test("catalog selects only the latest exact-cwd primary user thread", async (t) 
     threadSource: "user",
     parentThreadId: null,
   });
+  assert.deepEqual(catalog.primaryUserThread("primary-old", "/work/hive"), {
+    sessionId: "primary-old",
+    cwd: "/work/hive",
+    updatedAtMs: 100,
+    threadSource: "user",
+    parentThreadId: null,
+  });
+  assert.equal(catalog.primaryUserThread("primary-old", "/work/other"), null);
+  assert.equal(catalog.primaryUserThread("spawn-child", "/work/hive"), null);
   assert.equal(catalog.latestPrimaryUserThread("/work/missing"), null);
 });

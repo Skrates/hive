@@ -80,6 +80,7 @@ export interface AdmissionPolicy {
   appIds: ReadonlySet<string>;
   mentionActors?: ReadonlyMap<string, string>;
   routerMentionIds?: ReadonlySet<string>;
+  originAppActors?: ReadonlyMap<string, string>;
 }
 
 export const AdmissionPolicySchema = z.object({
@@ -110,6 +111,21 @@ export const AdmissionPolicySchema = z.object({
     .array(z.string().regex(/^[UW][A-Z0-9]+$/i))
     .default([])
     .transform((values) => new Set(values.map((userId) => userId.toUpperCase()))),
+  originAppActors: z
+    .record(
+      z.string().regex(/^A[A-Z0-9]+$/i),
+      z.string().regex(/^[a-z][a-z0-9_-]*$/i),
+    )
+    .default({})
+    .transform(
+      (values) =>
+        new Map(
+          Object.entries(values).map(([appId, actor]) => [
+            appId.toUpperCase(),
+            actor.toLowerCase(),
+          ]),
+        ),
+    ),
 }).superRefine((policy, context) => {
 	if (policy.userIds.size === 0 && policy.appIds.size === 0) {
 		context.addIssue({ code: "custom", message: "at least one admitted user or app is required" });
