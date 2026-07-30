@@ -421,6 +421,7 @@ function isDefinitelyIdle(error: unknown, conversationId: string): boolean {
   const detail = error.code;
   return detail === `Conversation ${conversationId} is not being streamed.`
     || detail === `Cannot steer conversation ${conversationId} without an active turn id`
+    || detail === `Cannot steer conversation ${conversationId} because its active turn already ended`
     || detail.includes("without an active turn")
     || detail.includes("has no active turn");
 }
