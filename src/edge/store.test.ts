@@ -3,7 +3,7 @@ import test from "node:test";
 import type { Delivery } from "../domain.js";
 import { EdgeStore } from "./store.js";
 
-function delivery(generation: number): Delivery {
+function delivery(generation: number, attempts = generation): Delivery {
   return {
     id: 1,
     eventId: "Ev1",
@@ -12,7 +12,7 @@ function delivery(generation: number): Delivery {
     reasons: [],
     leaseGeneration: generation,
     claimedBy: "mac",
-    attempts: generation,
+    attempts,
     coalesceKey: "ariadne:C1:1.0",
     coalescedEventIds: ["Ev1"],
     initialSnapshot: null,
@@ -42,5 +42,18 @@ test("a reconciled requeue replaces stale local generation state", () => {
   assert.equal(refreshed.generation, 2);
   assert.equal(refreshed.status, "received");
   assert.equal(store.delivery(1)?.leaseGeneration, 2);
+  store.close();
+});
+
+test("a reconciled requeue replaces stale local provider-attempt state within one lease generation", () => {
+  const store = new EdgeStore(":memory:");
+  store.receive(delivery(1, 1), 1);
+  store.setStatus(1, 1, "ambiguous");
+
+  const refreshed = store.receive(delivery(1, 2), 1);
+
+  assert.equal(refreshed.generation, 1);
+  assert.equal(refreshed.status, "received");
+  assert.equal(store.delivery(1)?.attempts, 2);
   store.close();
 });
