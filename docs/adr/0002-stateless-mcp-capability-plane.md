@@ -79,7 +79,9 @@ sequenceDiagram
   E->>B: hive.delivery.begin_dispatch(commandId)
   B-->>E: durable MCP Task + sealed capability response headers
   E->>E: hive.binding.prepare_ack; commit verifier before exposing secret
-  E->>P: local dispatch after Task + ACK-verifier durability
+  E->>B: hive.delivery.authorize_live_injection(current fence, local command digest)
+  B-->>E: provider-start intent + sealed live-injection grant
+  E->>P: local dispatch after Task + ACK-verifier + launch-grant durability
   P-->>E: durable local acceptance / provider-start evidence
   opt provider ACK races ahead of broker transition
     P->>E: hive.binding.ack
@@ -115,7 +117,7 @@ fresh replay.
 | Delivery/control | Edge -> broker | MCP 2026-07-28 Streamable HTTP at `/mcp` | Edge machine bearer; dispatch capability on scoped calls | Broker only |
 | Operator | CLI -> broker | MCP 2026-07-28 Streamable HTTP at `/mcp` | Independent operator/admin bearer scopes | Broker only |
 | Local provider diagnostics | Operator CLI -> edge control | MCP 2026-07-28 Streamable HTTP over owner-only UDS | Independent local `provider:probe` operator credential | Local filesystem socket only |
-| Live dispatch | Edge -> provider ingress | MCP 2026-07-28 Streamable HTTP over owner-only UDS | Edge-held dispatch credential + dispatch-binding capability | Local filesystem socket only |
+| Live dispatch | Edge -> provider ingress | MCP 2026-07-28 Streamable HTTP over owner-only UDS | Edge-held dispatch credential + dispatch-binding capability + broker-fenced live-injection capability; per-attempt ACK capability when delivery can ACK | Local filesystem socket only |
 | Bootstrap registration | Provider bridge -> edge control | MCP 2026-07-28 Streamable HTTP over owner-only UDS | Verified local peer identity + single-use audience-bound registration nonce | Local filesystem socket only |
 | Binding renewal | Provider bridge -> edge control | MCP 2026-07-28 Streamable HTTP over owner-only UDS | Provider-held control credential + control-binding capability | Local filesystem socket only |
 | Binding confirmation | Provider bridge -> edge control | MCP 2026-07-28 Streamable HTTP over owner-only UDS | Pending-next control credential + capability and exact current/next revision fence | Local filesystem socket only |
@@ -218,18 +220,74 @@ evidence byte, or extend any authority. Sequence/digest conflicts and limit viol
 Evidence arrival alone never changes delivery truth; an authorized lifecycle command or explicit
 reconciliation must consume it. Revoking the edge credential lineage revokes this capability.
 
+### Live-injection capability
+
+Immediately before a live provider call, the edge invokes
+`hive.delivery.authorize_live_injection` with its current machine bearer and delivery capability.
+The broker validates the exact delivery, lease generation, provider attempt, current actor lease,
+local-deliver command ID and canonical request digest, and accept/start budget. From authoritative
+delivery, owner, plan, and Task state it derives `edgeId`, actor, provider, required live
+surface/version, and permission-profile ID/version/digest; none is caller-selectable. It also binds
+the caller-declared local binding ID/revision as non-authoritative coordinates; only provider ingress
+can validate them against its confirmed local binding. One compare-and-set transaction commits the
+unique `(deliveryId, leaseGeneration, providerAttempt, provider-start intent)` row and returns a
+broker-signed, key-ID-versioned `Hive-Live-Injection-Capability` header bound to all authoritative
+and declared values, the provider-ingress audience, issuance time, and expiry. Expiry is no later
+than both the current lease and the immutable accept/start deadline. The signed grant is independent
+of the longer-lived ACK-evidence capability:
+neither reusable local binding authority nor ACK authority can substitute for it.
+
+Exactly one launch authorization can exist for an attempt. Reissuing the same command ID and
+secret-negative request digest returns the stored byte-identical grant; every other command ID or
+digest for that attempt conflicts and mints nothing. The canonical local-deliver digest covers the
+MCP method and params, exact replay digest, and non-secret attempt/binding fences. It explicitly
+excludes every authentication and capability header, including the live-injection and ACK headers,
+which are verified as separate authentication metadata and cannot make the digest circular.
+
+Provider ingress verifies the broker issuer and a launch-signing key chained to a broker trust root
+provisioned independently of the reusable edge-dispatch channel; the confirmed binding pins the
+allowed key ID but cannot replace that root. It then verifies audience, exact attempt and binding
+fence, broker-derived edge/actor/provider and required surface/version against the confirmed binding,
+the permission-profile coordinate against the provider's local allowlist, local command ID and
+digest, and expiry before first acceptance.
+
+Normal signing-key rotation retains every launch key verify-only until every grant it signed has
+expired and every associated non-acceptance, evidence, and local-command replay hold is discharged
+or reaches its configured absolute retention ceiling, whichever is later. The root-authorized key
+set and binding state record that reference-counted retention; rotation cannot shorten it. Explicit
+emergency root revocation fails closed, leaves side effect possible, and creates a reconciliation
+obligation rather than manufacturing no-effect proof. An unknown, revoked, or out-of-window key
+otherwise fails closed. One local fsync-backed transaction
+consumes the grant and stores durable acceptance plus the exact command result before injection.
+Fresh use after expiry is rejected. Exact `hive.live.deliver` replay may return the stored acceptance
+after expiry but cannot consume the grant or inject again.
+
+Committing launch authorization makes provider effect possible. While its grant is outstanding, no
+new attempt may become eligible. Expiry plus durable, exact local evidence
+that provider ingress never accepted the grant restores side effect `impossible` and permits the
+same atomic authority-loss requeue used before launch intent. Missing, conflicting, or uncertain
+evidence produces `ambiguous`; expiry alone is never proof. A crash after `prepare_ack` alone remains
+safely pre-effect because the ACK capability cannot cross this launch gate.
+
+KRA-904 owns broker issuance and the provider-start-intent transaction; KRA-900 owns the broker
+signing root and root-authorized launch-key set; KRA-908 owns independent trust-root provisioning,
+key pinning, confirmed-binding comparison, and provider-ingress verification.
+
 ### Recoverable capability response envelopes
 
 Every remotely minted bearer that must survive a lost response has two broker records: a fixed-length
 digest used only for verification and a replay envelope used only to reproduce the original response.
-For claim and `begin_dispatch`, the broker generates the random 256-bit secret, then seals it with
+For claim, `begin_dispatch`, and `authorize_live_injection`, the broker generates the random 256-bit
+secret or signed grant, then seals it with
 AES-256-GCM under a broker-local capability-wrapping key. A random 96-bit IV is stored; AAD binds the
 capability kind, machine-credential lineage, delivery/generation/attempt coordinates, command ID,
-canonical request digest, and wrapping-key ID. The command transaction stores only
+canonical request digest, binding fence where applicable, and wrapping-key ID. The command
+transaction stores only
 ciphertext/IV/tag, verifier digest, and key ID—never plaintext.
 
-The response carries dispatch authority only in `Hive-Dispatch-Capability` and evidence authority
-only in `Hive-Evidence-Upload-Capability`. These response headers are stripped before any MCP result,
+The response carries dispatch authority only in `Hive-Dispatch-Capability`, evidence authority only
+in `Hive-Evidence-Upload-Capability`, and the single-attempt launch grant only in
+`Hive-Live-Injection-Capability`. These response headers are stripped before any MCP result,
 Task, model-visible `_meta`, log, trace, diagnostic, or provider prompt is constructed. The edge
 adapter persists them directly into its owner-only secret store before committing its local command
 receipt. An exact authorized command replay decrypts the stored envelope and reproduces the
@@ -271,13 +329,17 @@ local diagnostic operation:
 
 `operation` includes the logical phase; repeatable actions such as actor-lease renewal also include
 a monotonic ordinal. `hive.edge.report` and subscription mutations use the administrative-target
-family; delivery and Slack-outbox reconciliation use the reconciliation/outbox family. Replaying the
+family; delivery and Slack-outbox reconciliation use the reconciliation/outbox family;
+`hive.delivery.authorize_live_injection` uses the delivery-attempt family. Replaying the
 exact tuple and
 request returns the stored response. Reusing a command identity with different bytes is
 `command_conflict`. The MCP request ID and Task ID are not idempotency keys. Before claiming, the
 edge durably persists `claimCommandId` because claim mutates ownership before a delivery capability
-exists. Local deliver/cancel use the local-live family; register/renew/confirm/ACK use the local-binding
-family; provider probes use the local-diagnostic family. Registration's single-use nonce is consumed
+exists. Local `prepare_ack`/deliver/cancel use the local-live family. For `prepare_ack`, the tuple
+selects the exact boot epoch, binding revision, delivery/generation/attempt,
+`prepare_ack` operation, command ID, request digest, and stored sealed-header result.
+Provider-bridge register/renew/confirm/ACK use the local-binding family; provider probes use the
+local-diagnostic family. Registration's single-use nonce is consumed
 in the same transaction that stores the exact minted response, so a lost reply can recover the same
 binding and secret rather than register twice.
 
@@ -309,6 +371,8 @@ hive://{brokerUuid}/v1/deliveries/{deliveryId}/replay
 hive://{brokerUuid}/v1/deliveries/{deliveryId}/evidence
 hive://{brokerUuid}/v1/dispatches/{deliveryId}/{generation}/{providerAttempt}
 hive://{brokerUuid}/v1/reconciliation/pending
+hive://{brokerUuid}/v1/outbox{?cursor}
+hive://{brokerUuid}/v1/outbox/{outboxId}
 hive://{brokerUuid}/v1/subscriptions/{actor}
 hive://{brokerUuid}/v1/edges/{edgeId}
 hive://{brokerUuid}/v1/edges/{edgeId}/pending
@@ -321,7 +385,9 @@ hive://edge/v1/providers/{provider}/{providerSessionRef}
 
 The broker authority is a stable lowercase UUID from broker metadata. Positive integers use
 canonical decimal without leading zeroes. The binding epoch and revision are non-secret ABA fences,
-not authority. `providerSessionRef` is an edge-minted opaque reference and never the provider's raw
+not authority. The optional outbox `cursor` and `outboxId` are opaque non-authority values; a cursor
+is bound to the caller's authorization and filters, and a page returns an optional canonical `next`
+resource URI. `providerSessionRef` is an edge-minted opaque reference and never the provider's raw
 session ID. Task IDs and evidence IDs are opaque. Their results include related Hive handles as data.
 
 ### Resource and template catalog
@@ -339,6 +405,8 @@ owner; a prerequisite supplies a store, probe, or transport seam but does not co
 | `deliveries/{deliveryId}/evidence` | `resources/read` | owning edge metadata scope, evidence operator, or reconciler | Bounded evidence metadata and separately authorized chunks | private, 0 | KRA-903 | KRA-905 evidence |
 | `dispatches/{deliveryId}/{generation}/{providerAttempt}` | `resources/read` | matching owning edge, scoped operator, or reconciler | Attempt phase, immutable Task reference, and safe result projection | private, 0 | KRA-903 | KRA-905 Task/evidence store |
 | `reconciliation/pending` | `resources/read` | evidence operator or reconciler | Open obligation count, oldest age, delivery/attempt handles, safe reason/evidence-completeness fields; no raw bodies | private, 0 | KRA-903 | KRA-905 obligation store |
+| `outbox{?cursor}` | `resources/read` | operator or reconciler holding `outbox:read` | Bounded cursor page of authorized outbox handles, event/delivery handles, lane/outcome sequence, outcome kind, state/version, attempt count/times, evidence completeness, and remediation; optional `next` URI; no message body | private, 0 | KRA-911 | KRA-905 outbox store; KRA-903 common resource adapter |
+| `outbox/{outboxId}` | `resources/read` | operator or reconciler holding `outbox:read` and subject visibility | Exact safe subject, state and `expectedStateVersion`, lane position, send-attempt verdict/times, `evidenceSetDigest` and authorized evidence handles, uncertainty, and allowed typed reconciliation verdicts; no message body, token, credential, or raw Slack response | private, 0 | KRA-911 | KRA-905 outbox store; KRA-903 common resource adapter |
 | `subscriptions/{actor}` | `resources/read` | subscription admin, scoped operator, or edge currently leasing that actor | Versioned subscription projection with no credential | private, 0 | KRA-903 | KRA-898 adapter |
 | `edges/{edgeId}` | `resources/read` | that edge or scoped operator | Safe identity, compatibility, and health projection | private, 0 | KRA-903 | KRA-898 first resource |
 | `edges/{edgeId}/pending` | `resources/read`; optional `subscriptions/listen` resource-update doorbell | that edge only | Queue revision and `hasWork`; never delivery content | private, 0 | KRA-903 | KRA-899 doorbell/claim transport |
@@ -353,6 +421,11 @@ and zero-TTL serving. KRA-904 is its consumer: it owns the requirement to perfor
 immediately before provider action and pass the exact returned bytes onward. Consumption timing does
 not make KRA-904 a co-owner or prerequisite of the resource surface.
 
+`outbox:read` and `outbox:reconcile` are separate scopes. An outbox handle, cursor, state version,
+or evidence digest never grants mutation authority. Unauthorized and cross-subject reads use
+`hive_not_found_or_hidden`; reconciliation repeats authorization and the reconciliation-family
+state/evidence compare-and-set.
+
 ### Broker tool catalog
 
 | Tool | Caller | Effect |
@@ -361,6 +434,7 @@ not make KRA-904 a co-owner or prerequisite of the resource surface.
 | `hive.delivery.accept` | owning edge | Record durable local acceptance |
 | `hive.delivery.renew_lease` | owning edge | Renew the actor-generation lease through one serialized ordinal |
 | `hive.delivery.begin_dispatch` | owning edge | Validate plan and create the durable dispatch Task before provider start |
+| `hive.delivery.authorize_live_injection` | owning edge | Validate current lifecycle authority, bind the declared local binding/command coordinates, atomically record the unique provider-start intent, and return its replayable exact-attempt live-injection grant |
 | `hive.delivery.record_phase` | owning edge | Append a fenced phase/evidence reference |
 | `hive.delivery.mark_dispatched` | owning edge | Atomically record provider acceptance/start evidence, transition `dispatching -> dispatched`, and start the adapter-specific attempt deadline |
 | `hive.delivery.reserve_spawn` | owning edge | Acquire the single fenced spawn reservation |
@@ -373,7 +447,7 @@ not make KRA-904 a co-owner or prerequisite of the resource surface.
 | `hive.subscription.validate` | subscription admin | Validate without mutation |
 | `hive.dispatch.plan` | operator | Compute a read-only dispatch plan without claim/probe mutation |
 | `hive.delivery.reconcile` | reconciler | Atomically append the safe verdict, apply the delivery/Task result, close its obligation, insert the outcome-revision Slack-outbox intent, and store the replayable result |
-| `hive.outbox.reconcile` | reconciler | Append a separate Slack-outbox verdict |
+| `hive.outbox.reconcile` | reconciler holding `outbox:reconcile` | CAS `expectedStateVersion` and `evidenceSetDigest`, then append and replay the separate idempotent Slack-outbox verdict; never rewrite the delivery verdict |
 
 The claim tool replaces the current mutating `GET /v1/deliveries`. Lifecycle routes are not
 mistaken for resources merely because the old transport used HTTP verbs. Replay is a fresh private
@@ -417,16 +491,16 @@ The two local directions have separate catalogs and credentials:
 | Server / tool | Caller | Required input and durable result |
 | --- | --- | --- |
 | provider ingress / `hive.live.describe` | edge executor | Binding ID/revision and boot epoch; returns supported surface/version and opaque `providerSessionRef` |
-| provider ingress / `hive.live.deliver` | edge executor | Delivery/generation/attempt, binding fence, exact replay, per-attempt live-ACK capability in the dedicated authentication header, and command ID; stores and returns durable local acceptance before provider injection can be repeated |
+| provider ingress / `hive.live.deliver` | edge executor | Delivery/generation/attempt, broker-derived edge/actor/provider/surface/profile coordinates, binding fence, exact replay, broker-fenced live-injection capability, per-attempt live-ACK capability in its dedicated authentication header, and command ID; compares semantic coordinates to the confirmed binding/local profile allowlist, then atomically consumes the grant and stores durable local acceptance before provider injection can be repeated |
 | provider ingress / `hive.live.cancel` | edge executor | Delivery/generation/attempt, binding fence, reason, and command ID; stores and returns cooperative cancellation acknowledgement |
-| edge control / `hive.binding.register` | provider bridge | Actor, provider, surface/version, allowed operations, boot epoch, one-time registration nonce, and command ID; atomically stores a pending binding and recoverable provider-facing directional envelope |
-| edge control / `hive.binding.renew` | matching provider bridge | Binding ID, current revision, boot epoch, and command ID; exact CAS stages a next revision while current remains active and returns one stored encrypted renew envelope |
+| edge control / `hive.binding.register` | provider bridge | Actor, provider, surface/version, allowed operations, boot epoch, one-time registration nonce, command ID, and root-authorized broker launch-key IDs; atomically stores a pending binding and recoverable provider-facing directional envelope without replacing the provider's trust root |
+| edge control / `hive.binding.renew` | matching provider bridge | Binding ID, current revision, boot epoch, command ID, and any root-authorized launch-key-set update; exact CAS stages a next revision while current remains active and returns one stored encrypted renew envelope |
 | edge control / `hive.binding.confirm` | matching provider bridge | Current/next revision fence, originating register/renew command ID, and new command ID authenticated by pending-next control authority; atomically promotes next and returns stored confirmation |
 | edge control / `hive.binding.prepare_ack` | edge executor with current delivery authority | Binding fence, delivery/generation/attempt, broker-authenticated `begin_dispatch` result reference, and command ID; derives the bounded ACK expiry, durably stores the verifier and sealed header replay, then emits the secret only in the dedicated authentication response header |
 | edge control / `hive.binding.ack` | matching provider bridge | Binding fence, delivery/generation/attempt, ACK kind, bounded receipt reference, and command ID; appends one fenced immutable local-journal result without lifecycle effect, quarantined until `mark_dispatched` is durable |
 | edge control / `hive.provider.probe` | local operator with `provider:probe` | Provider, probe kind, hard deadline, and command ID; returns one immediate supervised typed result and creates no delivery Task |
 
-Before `hive.live.deliver` can expose a live-ACK secret to provider ingress, the edge executor calls
+Before `hive.live.deliver` can carry a live-ACK secret to provider ingress, the edge executor calls
 `hive.binding.prepare_ack`. Its request names the exact broker-authenticated `begin_dispatch` result
 already committed in the edge journal; callers never supply an expiry. Edge control verifies the
 delivery/generation/attempt and result digest, then derives `ackEvidenceExpiresAt` from the immutable
@@ -443,13 +517,21 @@ header. The deliver call fails closed if the prepared verifier is not durable. P
 persists the header in its owner-only secret store with durable local acceptance and strips it before
 provider injection; if either write fails, injection MUST NOT begin.
 
-A crash after preparation but before provider injection leaves an unused bounded capability and
-cannot create provider effect. A synchronous ACK can therefore be verified and journaled rather
-than racing verifier creation. Plaintext never enters a command row, replay body, Task, DTO,
+A crash after ACK preparation but before broker live-injection authorization leaves an unused
+bounded ACK capability and cannot create provider effect. A synchronous ACK can therefore be
+verified and journaled rather than racing verifier creation. Plaintext never enters a command row,
+replay body, Task, DTO,
 provider prompt, log, trace, or diagnostic. Exact preparation replay opens the stored ciphertext
 only through the owner-only edge-local wrapping key and re-emits the same header bytes over the
 authenticated UDS; the body remains secret-negative and the durable command row contains only
 ciphertext/IV/tag and fixed-length digests.
+
+Preparation is evidence setup, not launch authority. After it succeeds, the edge calls
+`hive.delivery.authorize_live_injection` and persists and strips that response header through the
+same owner-only transport seam. Provider ingress requires both separate headers, verifies the
+broker-signed launch grant as specified above, and atomically consumes it with acceptance. Exact
+`prepare_ack` replay may recover the byte-identical ACK header after lifecycle expiry, but it cannot
+satisfy, mint, refresh, or bypass the live-injection gate.
 
 Registration authenticates both the local peer identity and a single-use, audience-bound bootstrap
 credential delivered outside Slack and outside the discoverable catalog. In the same durable
@@ -458,6 +540,11 @@ transaction that consumes the nonce and stores the replay result, the edge mints
 
 - a dispatch credential plus dispatch-binding capability for edge -> provider-ingress calls; and
 - a control credential plus control-binding capability for provider -> edge-control renew/ACK calls.
+
+The provider bridge's broker trust root is provisioned outside both bundles. Registration or renewal
+may carry only launch-signing key IDs and key sets that validate under that root; confirmation pins
+the accepted set to the binding revision. No edge-supplied value can replace the root or authorize an
+unrooted launch key.
 
 Each bundle has its own credential/capability lineage, audience, allowed operations, and expiry. The
 sender stores secret material in its owner-only local secret store; the receiving verifier stores
@@ -556,7 +643,7 @@ defines no non-delivery Task kind: provider/version probes are bounded immediate
 | Operation | Initial result | Terminal Task projection |
 | --- | --- | --- |
 | Discovery, lists, reads, validation, plan | Immediate | None |
-| Claim, accept, renew, mark-dispatched, spawn reservation | Immediate durable result | None |
+| Claim, accept, renew, live-injection authorization, mark-dispatched, spawn reservation | Immediate durable result | None |
 | Dispatch begin | Immediate durable Task handle; evidence authority only in a sealed response header | See delivery projection below |
 | Local live-deliver injection | Immediate local acceptance | Broker Task remains `working` for explicit `hive_ack` |
 | Headless resume/spawn | Broker Task `working` | `completed` domain result or `cancelled` with no-effect proof |
@@ -623,12 +710,16 @@ window.
 
 A Task cannot terminalize independently of delivery truth. When operator cancellation is proven
 before any provider effect, the broker atomically records delivery `undeliverable` with
-`operator_cancelled` and Task `cancelled`. When actor-lease authority is lost before launch intent
-and no effect is proved, it atomically closes that attempt's Task as `cancelled` and requeues the
-delivery to `pending`; the next claim receives a higher lease generation and provider attempt. Once
-provider effect is possible, cancellation cannot produce Task `cancelled`: evidence instead yields
-the appropriate `processed`, `undeliverable`, or `ambiguous` domain terminal. No terminal Task may
-leave its delivery stranded in `dispatching` or `dispatched`.
+`operator_cancelled` and Task `cancelled`. When actor-lease authority is lost before launch intent,
+or after the unique live launch grant expires and exact durable non-acceptance
+evidence restores side effect `impossible`, or after headless process creation is durably proved
+absent, the broker atomically closes that attempt's Task as `cancelled` and requeues the delivery to
+`pending`; the next claim receives a higher lease generation and provider attempt. While a launch
+grant is live, or whenever acceptance/process evidence is missing or uncertain, requeue is forbidden
+and the attempt becomes `ambiguous`. Once provider effect remains possible, cancellation cannot
+produce Task `cancelled`: evidence instead yields the appropriate
+`processed`, `undeliverable`, or `ambiguous` domain terminal. No terminal Task may leave its delivery
+stranded in `dispatching` or `dispatched`.
 
 ## Error, disposition, and retry contract
 
@@ -681,7 +772,7 @@ deployed idempotency proof.
 | Before validation completes | Stop; operator cancellation records `undeliverable/operator_cancelled`; lease loss releases for fenced reclaim |
 | Claimed/accepted, before durable dispatch Task | Lease loss requeues `pending` for a higher generation; operator cancellation records `undeliverable/operator_cancelled` |
 | Task durable, before provider-start intent | With no-effect proof, atomically cancel Task and record operator `undeliverable` or authority-loss requeue |
-| Start intent recorded, process not created and absence proved | Stop; deterministic terminal result |
+| Start intent recorded; live grant expired with durable non-acceptance proof, or headless process creation durably proved absent | Operator cancellation records deterministic `undeliverable/operator_cancelled`; authority loss atomically cancels the Task and requeues under a higher generation/attempt |
 | Provider starting/running or start outcome unknown | Attempt cleanup; `ambiguous` unless provider proves no effect |
 | Provider completed, result not durably recorded | `ambiguous` unless durable provider evidence proves result |
 | Result durably recorded | Return stored terminal result; cancellation cannot rewrite history |
@@ -720,6 +811,7 @@ compatibility peer and never makes Hive's own response conformant.
 | Exact Slack replay | private | 0 | One authorized delivery/thread; exact raw untrusted bytes |
 | Subscription, edge, provider, workspace health | private | 0 | Scope-filtered operational state |
 | Evidence and reconciliation preconditions | private | 0 | Explicit evidence/reconciler authority |
+| Slack-outbox inspection and reconciliation preconditions | private | 0 | Explicit `outbox:read`; safe metadata and authorized evidence handles only |
 | Human/JSON CLI views | private | 0 | Same resource authorization as underlying data |
 
 Every `tasks/get`, `tasks/update`, and `tasks/cancel` repeats authentication and authorization; Task
@@ -761,8 +853,10 @@ order. The edge retains an idempotent evidence outbox until the broker acknowled
 Lease loss does not discard it: the original edge may drain only its immutable bound records through
 the attempt evidence-upload capability, and reconciliation/lifecycle authority remains separate.
 Command dedup, Task creation, and the `dispatching` transition commit in one broker transaction.
-Provider launch intent commits locally before spawn/injection; provider acknowledgement evidence
-commits before broker terminalization.
+For live dispatch, broker provider-start intent commits before local acceptance or injection, and
+provider ingress durably consumes that grant before injection. For headless dispatch, provider
+launch intent commits locally before spawn. Provider acknowledgement evidence commits before broker
+terminalization.
 
 Every transaction that first commits or appends a sender-visible outcome revision atomically inserts
 one idempotent Slack-outbox intent keyed by event/delivery plus outcome revision. This includes
@@ -835,15 +929,51 @@ removal gate, the broker commits a durable `legacyDraining` manifest revision. E
 registers an in-flight request against the manifest revision and broker boot epoch it observed
 before route logic,
 including claim, delivery transitions, edge mint/rotation, subscription writes, reconciliation, and
-stored-response or secret-bearing reads. After `legacyDraining` commits, no new request is admitted
-except the exact bounded tombstone/replay reads required to discharge already-recorded obligations;
-those reads remain revision-fenced and counted as in flight. Every legacy mutation rechecks and
-compares the same manifest revision in its final write transaction. A handler that began before
-draining either commits before the revision changes—making its result visible to the drain—or rolls
-back on the revision conflict; it cannot serialize a credential, subscription, reconciliation, or
-delivery mutation after the zero check. The in-flight registration is released only after a read
-response completes or a mutation aborts or commits its result and replay obligation into legacy
-drain accounting.
+stored-response or secret-bearing reads. After `legacyDraining` commits, legacy admission becomes a
+closed, subject-bound drain allowlist. The broker rejects new claims; `accept`, `begin_dispatch`, and
+`reserve_spawn`; creation of any new Task, provider attempt, or provider-start intent; progress
+enqueue; adapter or authority retargeting; credential, enrollment, subscription, and unrelated
+administrative mutations; and reconciliation not tied either to an obligation already durable
+before the draining revision or to one atomically descended under that same drain revision from an
+admitted pre-drain pinned subject.
+
+The broker admits only: exact bounded tombstone/stored-result/replay reads; atomic cancellation or
+evidence-proved no-effect requeue of any exact pre-drain pinned attempt with no provider-start
+intent, explicitly including a durable Task in `dispatching`; lease renewal, monotonic completion
+phase/evidence append, `mark_dispatched`, and terminal result for the exact `legacyV1` attempt
+already pinned before the draining revision and whose provider acceptance/start durably predates it;
+attempt-bound evidence upload through its separate evidence capability after lease loss; and delivery/outbox reconciliation
+or Slack delivery for an obligation or outbox intent already recorded before draining or atomically
+descended under the same drain revision from an admitted completion, cancellation, or send for that
+pre-drain subject. Renewal cannot extend the attempt's absolute deadline. No admitted phase may
+create a post-drain provider-start intent. A reconciliation-produced requeue may remain pending for
+the modern adapter after cutover, but cannot be claimed or create another legacy attempt while
+draining. Operator cancellation of a proved pre-effect attempt atomically records
+`undeliverable/operator_cancelled` and cancels any durable Task. An authority-loss requeue likewise
+cancels that attempt's Task and may target only the modern adapter after cutover; it never begins
+provider work under quiescence.
+
+Every admitted call remains counted in flight and revalidates the same manifest revision, broker
+boot epoch, closed operation allowlist, and class-specific subject fence in its final transaction.
+Attempt lifecycle requires the `legacyV1` adapter pin, exact delivery/generation/provider-attempt,
+and current lifecycle capability plus lease/ordinal authority. Evidence-only append requires the
+exact attempt/evidence-stream fence and evidence-upload capability and cannot alter lifecycle truth.
+Slack-outbox send or reconciliation requires the outbox ID, lane/outcome sequence, expected state
+version, and its send or `outbox:reconcile` authority; reconciliation additionally compares the
+evidence-set digest. Delivery reconciliation requires its obligation subject, separate scope,
+`expectedStateVersion`, and `evidenceSetDigest`. Operator cancellation requires its separate scope
+and exact subject/version compare-and-set. Stored-result/replay requires the original principal or
+credential lineage plus immutable command tuple and request digest and can execute no application
+logic. The final `legacyDisabled` compare-and-set conflicts with every such completion. A handler
+registered under the pre-drain revision either commits wholly before that revision changes or rolls
+back on the revision conflict; it never continues across revisions in place. If its logical
+operation is drain-allowlisted, the caller retries with the same command identity and a fresh
+in-flight registration under the draining revision. That retry returns an already committed stored
+result or re-runs the closed allowlist and class-specific fence before any new write or external
+effect. No unenumerated credential, subscription, reconciliation, or delivery mutation can
+serialize after the zero check. The in-flight registration is released only after a read response
+completes or a mutation aborts or commits its result and replay obligation into legacy drain
+accounting.
 
 The in-flight registry is crash-recoverable rather than an immortal row or a wall-clock guess. On
 startup, before serving traffic, one transaction advances the broker boot epoch and thereby fences
@@ -862,13 +992,23 @@ and exact replay remain served until their bounded window expires unless the gat
 Restart recovery plus all due lease/deadline sweeps run while admission remains quiesced. One
 serializable compare-and-set transaction then verifies the same manifest revision, zero registered
 in-flight legacy requests, zero active or uncertain legacy-pinned work, zero open reconciliation
-obligations, and zero unacknowledged legacy evidence/outbox/replay records before committing
-`legacyDisabled` with a removal epoch. Any new or changed record conflicts and restarts the gate.
+obligations, zero unacknowledged legacy evidence/outbox records, zero unexpired legacy command
+tombstones or stored-response replay windows, and zero legacy secret-bearing replay envelopes before
+committing `legacyDisabled` with a removal epoch. A completed HTTP response is not a durable client receipt and
+cannot discharge that replay window. Any new or changed record conflicts and restarts the gate.
 Admission registration and this final CAS contend on the same manifest fence: a request commits
 wholly before draining and enters drain accounting, commits as an explicitly allowed drain under the
 same revision, or fails `hive_legacy_disabled`. Physical `/v1` code removal follows a successful
 disabled-state restart/rollback rehearsal; it never races an in-flight request or attempt that could
 create a lost response or become ambiguous after the zero check.
+
+Cutover conformance MUST prove that a pre-drain dispatched or ACK-waiting attempt can renew and
+finish without manufactured ambiguity; post-drain claim, begin-dispatch, provider-start, progress,
+and administrative calls fail; a stale lease, wrong attempt, wrong adapter, or unrelated obligation
+fails; evidence upload after lease loss cannot change lifecycle truth; and every allowed completion
+racing the zero check conflicts with and restarts the final compare-and-set. It also races that gate
+with both an in-flight exact replay and an unexpired but idle command tombstone; neither permits
+legacy disablement.
 
 | Edge selection | Broker surface | Result |
 | --- | --- | --- |
@@ -1010,9 +1150,13 @@ implementation owner.
 - **Candidates:** machine token alone; signed self-contained token; server-stored opaque capability.
 - **Invariant/uncertainty:** stateless transport must not mean ambient or replayable application power.
 - **Smallest falsifier:** cross-generation/attempt/audience/operation replay with lost responses.
-- **Ruling:** server-stored opaque capability plus durable command identity including providerAttempt.
-- **Rejected:** handles or Task IDs as authority; token-only or request-ID-only deduplication.
-- **Owner/acceptance:** KRA-900, KRA-901, KRA-909; exact retry returns stored result, conflict fails.
+- **Ruling:** server-stored opaque lifecycle capability plus durable command identity including
+  providerAttempt. The final local injection additionally requires one short-lived broker-signed
+  grant backed by an atomically committed provider-start intent and bound to the exact local command.
+- **Rejected:** handles or Task IDs as authority; token-only or request-ID-only deduplication; a
+  self-contained launch token with no broker-side intent/fence.
+- **Owner/acceptance:** KRA-900, KRA-901, KRA-904, KRA-908, KRA-909; exact retry returns stored
+  result, conflict fails, and stale launch authority never reaches provider injection.
 
 ### D6 — Hive handle grammar
 
@@ -1032,7 +1176,7 @@ implementation owner.
 - **Ruling:** the resource/template and tool catalogs above; reads are resources, mutations tools,
   execution remains edge-local, and both directions of local registration/delivery have named tools.
 - **Rejected:** HTTP-verb mirroring, missing admin surface, and reverse provider invocation.
-- **Owner/acceptance:** KRA-898/903/904/907/908/910; every current and target operation has one owner.
+- **Owner/acceptance:** KRA-898/903/904/907/908/910/911; every current and target operation has one owner.
 
 ### D8 — immediate result versus Task
 
@@ -1071,7 +1215,8 @@ implementation owner.
 - **Invariant/uncertainty:** no arbitrary network authority, shared credential, or ABA registration.
 - **Smallest falsifier:** forged/stale/cross-target/redirect/socket-owner matrix for both providers.
 - **Ruling:** fenced capability handles resolved only by the edge to owner-only UDS MCP servers
-  using Streamable HTTP request/response framing and its real authentication headers.
+  using Streamable HTTP request/response framing and its real authentication headers. Live delivery
+  requires both the reusable binding authority and the exact broker-fenced injection grant.
 - **Rejected:** callback URLs and shared `HIVE_EDGE_LOCAL_TOKEN`; stdio alone is not reconnectable.
 - **Owner/acceptance:** KRA-908; Codex and Claude replacement with explicit ACK and current revision.
 
