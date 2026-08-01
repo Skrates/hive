@@ -4,8 +4,9 @@
 - Decision: D-HIVE-HOME v3
 - Ratified: 2026-07-12 by Hákon Freyr Gunnarsson
 - Durable ledger: [KRA-717](https://linear.app/krates-ehf/issue/KRA-717/hive-ears-v03-brokeredge-architecture)
-- v0.4 note: the broker/edge wire and replay-bootstrap details are superseded by
-  [ADR-0002](./0002-stateless-mcp-capability-plane.md); all other locked invariants remain accepted
+- v0.4 note: the broker/edge wire, replay bootstrap, and one evidence-proved no-effect requeue edge
+  are superseded/refined by [ADR-0002](./0002-stateless-mcp-capability-plane.md); all other locked
+  invariants remain accepted
 
 ## Context
 
@@ -38,6 +39,15 @@ pending -> claimed -> accepted_local -> dispatching -> dispatched
 
 Terminal dispositions are `processed`, `undeliverable`, `ambiguous`, and `dead_letter`, each with a
 typed reason set. JSONL is an audit/export format only.
+
+ADR-0002 adds exactly one backward transition for v0.4: authority loss may move `claimed`,
+`accepted_local`, or `dispatching` **before provider-start intent** back to `pending` only when
+durable evidence proves provider effect impossible. If a dispatch Task already exists, Task
+`cancelled`, the no-effect evidence, and the requeue commit atomically; the next claim uses a higher
+lease generation and provider attempt. After start intent, even proved process absence produces the
+typed deterministic terminal result from ADR-0002 rather than this requeue. Operator cancellation
+instead terminalizes `undeliverable/operator_cancelled`, and any possible provider effect forbids
+the backward edge.
 
 ### Crash honesty
 
