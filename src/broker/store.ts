@@ -278,14 +278,16 @@ export class BrokerStore {
     })();
   }
 
-  claimNext(edgeId: string, after: number): Delivery | null {
+  claimNext(edgeId: string, _after: number): Delivery | null {
     return this.db.transaction(() => {
+      // `after` remains a v1 compatibility hint only: broker-side eligibility
+      // can change over time, so every pending delivery must remain visible.
       const rows = this.db.prepare(`
         SELECT d.delivery_id, d.actor, d.created_at
         FROM deliveries d
-        WHERE d.delivery_id > ? AND d.status = 'pending'
+        WHERE d.status = 'pending'
         ORDER BY d.delivery_id
-      `).all(after) as Row[];
+      `).all() as Row[];
 
       for (const row of rows) {
         const actor = String(row.actor);

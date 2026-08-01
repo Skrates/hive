@@ -51,6 +51,11 @@ export class EdgeStore {
         delivery_json=excluded.delivery_json,
         updated_at=excluded.updated_at
       WHERE excluded.generation > local_deliveries.generation
+         OR (
+           excluded.generation = local_deliveries.generation
+           AND CAST(json_extract(excluded.delivery_json, '$.attempts') AS INTEGER)
+             > CAST(json_extract(local_deliveries.delivery_json, '$.attempts') AS INTEGER)
+         )
     `).run(delivery.id, generation, JSON.stringify(delivery), now);
     return this.get(delivery.id)!;
   }

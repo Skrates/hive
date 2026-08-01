@@ -7,9 +7,27 @@ export interface ProviderDispatch {
   processed: boolean;
 }
 
+export type ProviderPreDispatchErrorCode =
+  | "live_ingress_rejected"
+  | "provider_permission_profile_invalid";
+
+/** A deterministic rejection that proves no provider turn was started. */
+export class ProviderPreDispatchError extends Error {
+  constructor(readonly code: ProviderPreDispatchErrorCode) {
+    super(code);
+    this.name = "ProviderPreDispatchError";
+  }
+}
+
 export interface ProviderAdapter {
   provider: Provider;
-  deliverLive(ingress: LiveIngress, delivery: Delivery, framed: string): Promise<ProviderDispatch>;
+  preflight?(subscription: Subscription): void;
+  deliverLive(
+    ingress: LiveIngress,
+    delivery: Delivery,
+    framed: string,
+    ackCapability: string,
+  ): Promise<ProviderDispatch>;
   resume(subscription: Subscription, cwd: string, framed: string): Promise<ProviderDispatch>;
   spawn(subscription: Subscription, cwd: string, framed: string): Promise<ProviderDispatch>;
 }
@@ -19,15 +37,34 @@ export class CodexProvider implements ProviderAdapter {
 
   constructor(private readonly localToken: string) {}
 
-  async deliverLive(ingress: LiveIngress, delivery: Delivery, framed: string): Promise<ProviderDispatch> {
+  preflight(subscription: Subscription): void {
+    codexPermissionArgs(subscription.permissionProfile);
+  }
+
+  async deliverLive(
+    ingress: LiveIngress,
+    delivery: Delivery,
+    framed: string,
+    ackCapability: string,
+  ): Promise<ProviderDispatch> {
     const response = await fetch(ingress.callbackUrl, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${this.localToken}` },
-      body: JSON.stringify({ delivery, framed }),
+      body: JSON.stringify({
+        delivery,
+        framed,
+        ackCapability,
+        binding: {
+          bindingId: ingress.bindingId,
+          bindingRevision: ingress.bindingRevision,
+        },
+      }),
     });
-    if (!response.ok) throw new Error(`Codex live ingress ${response.status}: ${await response.text()}`);
-    const result = await response.json() as { receipt: string };
-    return { receipt: result.receipt, processed: false };
+    assertLiveIngressAccepted(response, "Codex");
+    return {
+      receipt: await safeLiveReceipt(response, "Codex", ackCapability, this.localToken),
+      processed: false,
+    };
   }
 
   resume(subscription: Subscription, cwd: string, framed: string): Promise<ProviderDispatch> {
@@ -55,15 +92,34 @@ export class ClaudeProvider implements ProviderAdapter {
 
   constructor(private readonly localToken: string) {}
 
-  async deliverLive(ingress: LiveIngress, delivery: Delivery, framed: string): Promise<ProviderDispatch> {
+  preflight(subscription: Subscription): void {
+    claudePermissionArgs(subscription.permissionProfile);
+  }
+
+  async deliverLive(
+    ingress: LiveIngress,
+    delivery: Delivery,
+    framed: string,
+    ackCapability: string,
+  ): Promise<ProviderDispatch> {
     const response = await fetch(ingress.callbackUrl, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${this.localToken}` },
-      body: JSON.stringify({ delivery, framed }),
+      body: JSON.stringify({
+        delivery,
+        framed,
+        ackCapability,
+        binding: {
+          bindingId: ingress.bindingId,
+          bindingRevision: ingress.bindingRevision,
+        },
+      }),
     });
-    if (!response.ok) throw new Error(`Claude live ingress ${response.status}: ${await response.text()}`);
-    const result = await response.json() as { receipt: string };
-    return { receipt: result.receipt, processed: false };
+    assertLiveIngressAccepted(response, "Claude");
+    return {
+      receipt: await safeLiveReceipt(response, "Claude", ackCapability, this.localToken),
+      processed: false,
+    };
   }
 
   resume(subscription: Subscription, cwd: string, framed: string): Promise<ProviderDispatch> {
@@ -84,6 +140,41 @@ export class ClaudeProvider implements ProviderAdapter {
       null,
     );
   }
+}
+
+function assertLiveIngressAccepted(response: Response, provider: "Codex" | "Claude"): void {
+  if (response.ok) return;
+  if (response.status >= 400 && response.status < 500) {
+    throw new ProviderPreDispatchError("live_ingress_rejected");
+  }
+  throw new Error(`${provider} live ingress ${response.status}`);
+}
+
+async function safeLiveReceipt(
+  response: Response,
+  provider: "Codex" | "Claude",
+  ackCapability: string,
+  localToken: string,
+): Promise<string> {
+  let value: unknown;
+  try {
+    value = await response.json();
+  } catch {
+    throw new Error(`${provider} live ingress invalid response`);
+  }
+  const receipt = value && typeof value === "object"
+    ? (value as { receipt?: unknown }).receipt
+    : null;
+  if (
+    typeof receipt !== "string"
+    || receipt.length === 0
+    || receipt.length > 1_000
+    || receipt.includes(ackCapability)
+    || receipt.includes(localToken)
+  ) {
+    throw new Error(`${provider} live ingress invalid response`);
+  }
+  return receipt;
 }
 
 async function runHeadless(command: string, args: string[], cwd: string, stdin: string | null): Promise<ProviderDispatch> {
@@ -107,7 +198,7 @@ function codexPermissionArgs(profile: string): string[] {
     case "read-only": return ["--sandbox", "read-only"];
     case "workspace-write": return ["--sandbox", "workspace-write"];
     case "danger-full-access": return ["--dangerously-bypass-approvals-and-sandbox"];
-    default: throw new Error(`unsupported Codex permission profile: ${profile}`);
+    default: throw new ProviderPreDispatchError("provider_permission_profile_invalid");
   }
 }
 
@@ -116,6 +207,6 @@ function claudePermissionArgs(profile: string): string[] {
     case "read-only": return ["--permission-mode", "plan"];
     case "workspace-write": return ["--permission-mode", "acceptEdits"];
     case "danger-full-access": return ["--permission-mode", "bypassPermissions"];
-    default: throw new Error(`unsupported Claude permission profile: ${profile}`);
+    default: throw new ProviderPreDispatchError("provider_permission_profile_invalid");
   }
 }
