@@ -110,6 +110,34 @@ test("spawn waits for home grace before a foreign mapped edge may claim", () => 
   store.close();
 });
 
+test("claim cursor cannot hide older work skipped during home grace", () => {
+  const { store, clock } = fixture();
+  store.upsertSubscription(subscription({
+    actor: "fable",
+    homeEdge: "dev",
+    sessionId: "thread-2",
+  }));
+
+  assert.equal(store.ingestEvent(event()).deliveryId, 1);
+  assert.equal(store.ingestEvent(event({
+    eventId: "Ev2",
+    actor: "fable",
+    threadTs: "101.1",
+    messageTs: "101.2",
+    text: "WAKE: fable | test",
+  })).deliveryId, 2);
+
+  const newer = store.claimNext("dev", 0);
+  assert.equal(newer?.id, 2);
+  assert.equal(store.getDelivery(1).status, "pending");
+
+  clock.advance(2_001);
+  const older = store.claimNext("dev", newer!.id);
+  assert.equal(older?.id, 1);
+  assert.equal(older?.claimedBy, "dev");
+  store.close();
+});
+
 test("resume never escalates to a foreign edge", () => {
   const { store, clock } = fixture({ wakePolicy: "resume" });
   store.ingestEvent(event());
