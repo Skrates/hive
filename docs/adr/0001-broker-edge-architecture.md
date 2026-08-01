@@ -4,8 +4,9 @@
 - Decision: D-HIVE-HOME v3
 - Ratified: 2026-07-12 by Hákon Freyr Gunnarsson
 - Durable ledger: [KRA-717](https://linear.app/krates-ehf/issue/KRA-717/hive-ears-v03-brokeredge-architecture)
-- v0.4 note: the broker/edge wire, replay bootstrap, and one evidence-proved no-effect requeue edge
-  are superseded/refined by [ADR-0002](./0002-stateless-mcp-capability-plane.md); all other locked
+- v0.4 note: the broker/edge wire, replay bootstrap, live-provider adapter/local-ingress details that
+  mandate loopback callbacks or `claude/channel`, and one evidence-proved no-effect requeue edge are
+  superseded/refined by [ADR-0002](./0002-stateless-mcp-capability-plane.md); all other locked
   invariants remain accepted
 
 ## Context
@@ -75,6 +76,9 @@ coalescing/rate-limit policy.
 Foreign edges never resume machine-local sessions. Hive never opens a desktop UI to satisfy a wake.
 
 ### Provider adapters
+
+The v0.4 live-provider transport details in this section are superseded by ADR-0002's fenced local
+MCP catalogs. The headless acknowledgement and `resume`/`spawn` semantics below remain authoritative.
 
 - Live Codex uses app-server `turn/steer`, queues when non-steerable, and uses `turn/start` when idle.
 - Live Claude Code uses a `claude/channel` MCP notification.

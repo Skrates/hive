@@ -4,8 +4,9 @@
 - Decision: D-HIVE-MCP v1
 - Ratified: 2026-08-01 under [KRA-897](https://linear.app/krates-ehf/issue/KRA-897)
 - Parent overhaul: [KRA-896](https://linear.app/krates-ehf/issue/KRA-896)
-- Supersedes: the v0.3 broker/edge wire contract and the narrowly defined no-effect requeue
-  transition in ADR-0001; all other ADR-0001 invariants remain authoritative
+- Supersedes: the v0.3 broker/edge wire contract; the live-provider adapter/local-ingress details
+  that mandate loopback callbacks or `claude/channel`; and the narrowly defined no-effect requeue
+  transition in ADR-0001. All other ADR-0001 invariants remain authoritative
 - Does not authorize: production cutover or removal of `/v1`; that remains an explicit KRA-912 gate
 
 ## Context and authority
@@ -76,12 +77,20 @@ sequenceDiagram
   B-->>E: delivery + generation + providerAttempt + scoped capability
   E->>B: resources/read fresh replay (private, ttlMs=0)
   E->>B: hive.delivery.begin_dispatch(commandId)
-  B-->>E: durable MCP Task handle
+  B-->>E: durable MCP Task + sealed capability response headers
   E->>P: local dispatch after Task durability
+  P-->>E: durable local acceptance / provider-start evidence
+  opt provider ACK races ahead of broker transition
+    P->>E: hive.binding.ack
+    E-->>P: ACK evidence durably quarantined
+  end
+  E->>B: hive.delivery.mark_dispatched(commandId, evidenceRef)
+  B-->>E: dispatched + Task working + adapter-specific deadline
+  E->>E: activate lifecycle consumption of any quarantined ACK
   E->>B: phase/evidence append commands
   alt explicit provider acknowledgement
     E->>B: hive.delivery.finish(processed, receiptRef)
-    B-->>E: same terminal Task on retry
+    B-->>E: terminal delivery + Task + Slack-outbox intent atomically
   else deterministic pre-provider failure
     E->>B: hive.delivery.finish(undeliverable, typedReason)
   else provider effect possible but unproved
@@ -104,6 +113,7 @@ fresh replay.
 | Slack ingress | Slack -> broker | Socket Mode | Slack app credentials | Broker only |
 | Delivery/control | Edge -> broker | MCP 2026-07-28 Streamable HTTP at `/mcp` | Edge machine bearer; dispatch capability on scoped calls | Broker only |
 | Operator | CLI -> broker | MCP 2026-07-28 Streamable HTTP at `/mcp` | Independent operator/admin bearer scopes | Broker only |
+| Local provider diagnostics | Operator CLI -> edge control | MCP 2026-07-28 over UDS with newline-delimited stdio framing | Independent local `provider:probe` operator credential | Local filesystem socket only |
 | Live dispatch | Edge -> provider ingress | MCP 2026-07-28 over UDS with newline-delimited stdio framing | Edge-held dispatch credential + dispatch-binding capability | Local filesystem socket only |
 | Bootstrap registration | Provider bridge -> edge control | MCP 2026-07-28 over UDS with newline-delimited stdio framing | Verified local peer identity + single-use audience-bound registration nonce | Local filesystem socket only |
 | Binding renewal | Provider bridge -> edge control | MCP 2026-07-28 over UDS with newline-delimited stdio framing | Provider-held control credential + control-binding capability | Local filesystem socket only |
@@ -163,9 +173,56 @@ authorizes only the bound delivery operations. Both are required. The latter tra
 in a URI, query string, resource body, Task result, diagnostic, trace, error, or provider prompt.
 Expiry cannot extend the lease. A stale generation, attempt, edge, audience, or operation fails
 closed even if the secret itself is valid. A successful serialized actor-lease renewal atomically
-extends the expiry records of every still-active capability under that actor/generation, never
-beyond the renewed lease; it does not expose a new secret. Exact command replay observes the same
-renewal result. Loss or unresolved renewal never extends capability life.
+extends every still-active **delivery-lifecycle** capability under that actor/generation, never
+beyond the renewed lease; it does not expose a new secret. This rule excludes the evidence-upload
+and local ACK-evidence capabilities, which authorize no lifecycle mutation and use their separate
+bounded evidence-window expiries. Exact command replay observes the same renewal result. Loss or
+unresolved renewal never extends lifecycle capability life.
+
+### Attempt evidence-upload capability
+
+`hive.delivery.begin_dispatch` also mints a separate opaque evidence-upload capability in the same
+transaction as the Task. Its digest record binds the original edge and machine-credential lineage,
+delivery, lease generation, provider attempt, evidence-stream ID, append-only operation, sequence
+floor, audience, size/count limits, and an initial expiry no earlier than the bounded
+provider-accept/start deadline plus the reconciliation-retention window. `mark_dispatched`
+atomically extends that same server-side authority, without minting or returning a new secret, to
+at least the adapter-specific attempt deadline plus reconciliation retention, subject to the
+absolute attempt-retention ceiling.
+
+Before creating the Task, `begin_dispatch` validates that the configured absolute ceiling is no
+earlier than the greatest allowed provider accept/start or adapter attempt deadline plus
+reconciliation retention. An invalid configuration fails deterministically before Task creation or
+provider effect; the ceiling can never truncate the promised evidence window.
+
+This capability deliberately survives actor-lease loss and revocation of lifecycle authority so a
+restarted original edge can drain provider acknowledgement or crash evidence already committed to
+its local outbox. It requires a current machine bearer from the original edge/credential lineage and
+authorizes only idempotent immutable append for the bound attempt. It cannot claim, renew, dispatch,
+cancel, terminalize a Task/delivery, enqueue Slack output, create a new attempt, change an existing
+evidence byte, or extend any authority. Sequence/digest conflicts and limit violations fail closed.
+Evidence arrival alone never changes delivery truth; an authorized lifecycle command or explicit
+reconciliation must consume it. Revoking the edge credential lineage revokes this capability.
+
+### Recoverable capability response envelopes
+
+Every remotely minted bearer that must survive a lost response has two broker records: a fixed-length
+digest used only for verification and a replay envelope used only to reproduce the original response.
+For claim and `begin_dispatch`, the broker generates the random 256-bit secret, then seals it with
+AES-256-GCM under a broker-local capability-wrapping key. A random 96-bit IV is stored; AAD binds the
+capability kind, machine-credential lineage, delivery/generation/attempt coordinates, command ID,
+canonical request digest, and wrapping-key ID. The command transaction stores only
+ciphertext/IV/tag, verifier digest, and key ID—never plaintext.
+
+The response carries dispatch authority only in `Hive-Dispatch-Capability` and evidence authority
+only in `Hive-Evidence-Upload-Capability`. These response headers are stripped before any MCP result,
+Task, model-visible `_meta`, log, trace, diagnostic, or provider prompt is constructed. The edge
+adapter persists them directly into its owner-only secret store before committing its local command
+receipt. An exact authorized command replay decrypts the stored envelope and reproduces the
+byte-identical header; it does not mint or extend authority. Wrapping-key rotation transactionally
+rewraps live envelopes and retains the prior key decrypt-only until every command tombstone it
+protects expires. Missing keys or failed authentication fail closed. Ciphertext is not a bearer and
+never participates in capability verification.
 
 ### Durable command identity
 
@@ -193,6 +250,9 @@ local live operation:
 local binding operation:
   (providerPrincipalId, edgeBootEpoch, registrationNonceOrBindingId,
    expectedBindingRevision, operation, commandId, canonicalRequestDigest, storedResult)
+local diagnostic operation:
+  (operatorPrincipalId, edgeBootEpoch, provider, probeKind,
+   commandId, canonicalRequestDigest, storedResult)
 ```
 
 `operation` includes the logical phase; repeatable actions such as actor-lease renewal also include
@@ -203,8 +263,9 @@ request returns the stored response. Reusing a command identity with different b
 `command_conflict`. The MCP request ID and Task ID are not idempotency keys. Before claiming, the
 edge durably persists `claimCommandId` because claim mutates ownership before a delivery capability
 exists. Local deliver/cancel use the local-live family; register/renew/confirm/ACK use the local-binding
-family. Registration's single-use nonce is consumed in the same transaction that stores the exact
-minted response, so a lost reply can recover the same binding and secret rather than register twice.
+family; provider probes use the local-diagnostic family. Registration's single-use nonce is consumed
+in the same transaction that stores the exact minted response, so a lost reply can recover the same
+binding and secret rather than register twice.
 
 Fresh mutation and exact committed-command replay have distinct authorization decisions. A current
 authenticated principal in the original credential lineage may present the complete immutable tuple
@@ -233,6 +294,7 @@ hive://{brokerUuid}/v1/deliveries/{deliveryId}/transitions
 hive://{brokerUuid}/v1/deliveries/{deliveryId}/replay
 hive://{brokerUuid}/v1/deliveries/{deliveryId}/evidence
 hive://{brokerUuid}/v1/dispatches/{deliveryId}/{generation}/{providerAttempt}
+hive://{brokerUuid}/v1/reconciliation/pending
 hive://{brokerUuid}/v1/subscriptions/{actor}
 hive://{brokerUuid}/v1/edges/{edgeId}
 hive://{brokerUuid}/v1/edges/{edgeId}/pending
@@ -262,6 +324,7 @@ owner; a prerequisite supplies a store, probe, or transport seam but does not co
 | `deliveries/{deliveryId}/replay` | `resources/read` | current owning edge with `replay:read`, or separately audited raw-replay operator scope | Fresh exact thread replay for that delivery only | private, 0 | KRA-903 | KRA-898 adapter |
 | `deliveries/{deliveryId}/evidence` | `resources/read` | owning edge metadata scope, evidence operator, or reconciler | Bounded evidence metadata and separately authorized chunks | private, 0 | KRA-903 | KRA-905 evidence |
 | `dispatches/{deliveryId}/{generation}/{providerAttempt}` | `resources/read` | matching owning edge, scoped operator, or reconciler | Attempt phase, immutable Task reference, and safe result projection | private, 0 | KRA-903 | KRA-905 Task/evidence store |
+| `reconciliation/pending` | `resources/read` | evidence operator or reconciler | Open obligation count, oldest age, delivery/attempt handles, safe reason/evidence-completeness fields; no raw bodies | private, 0 | KRA-903 | KRA-905 obligation store |
 | `subscriptions/{actor}` | `resources/read` | subscription admin, scoped operator, or edge currently leasing that actor | Versioned subscription projection with no credential | private, 0 | KRA-903 | KRA-898 adapter |
 | `edges/{edgeId}` | `resources/read` | that edge or scoped operator | Safe identity, compatibility, and health projection | private, 0 | KRA-903 | KRA-898 first resource |
 | `edges/{edgeId}/pending` | `resources/read`; optional `subscriptions/listen` resource-update doorbell | that edge only | Queue revision and `hasWork`; never delivery content | private, 0 | KRA-903 | KRA-899 doorbell/claim transport |
@@ -285,16 +348,17 @@ not make KRA-904 a co-owner or prerequisite of the resource surface.
 | `hive.delivery.renew_lease` | owning edge | Renew the actor-generation lease through one serialized ordinal |
 | `hive.delivery.begin_dispatch` | owning edge | Validate plan and create the durable dispatch Task before provider start |
 | `hive.delivery.record_phase` | owning edge | Append a fenced phase/evidence reference |
+| `hive.delivery.mark_dispatched` | owning edge | Atomically record provider acceptance/start evidence, transition `dispatching -> dispatched`, and start the adapter-specific attempt deadline |
 | `hive.delivery.reserve_spawn` | owning edge | Acquire the single fenced spawn reservation |
-| `hive.delivery.finish` | owning edge | Record a typed terminal result and terminalize the Task |
+| `hive.delivery.finish` | owning edge | Atomically record a typed terminal result, terminalize the Task, and insert the versioned terminal Slack-outbox intent |
 | `hive.delivery.cancel` | owning edge with matching delivery capability, or separately scoped operator | Request cooperative cancellation under separate authority |
-| `hive.delivery.append_evidence` | owning edge | Idempotently append bounded evidence metadata/chunks |
-| `hive.reply.enqueue` | owning edge | Durably enqueue sender-visible Slack output |
+| `hive.delivery.append_evidence` | owning edge, or original edge lineage with the attempt evidence-upload capability after lease loss | Idempotently append bounded immutable attempt evidence without lifecycle authority |
+| `hive.reply.enqueue` | owning edge | Durably enqueue explicitly nonterminal progress output; terminal outcomes are forbidden here |
 | `hive.edge.report` | edge | Report safe last-seen, workspace, and provider observations |
 | `hive.subscription.upsert` | subscription admin | Validate and write one subscription |
 | `hive.subscription.validate` | subscription admin | Validate without mutation |
 | `hive.dispatch.plan` | operator | Compute a read-only dispatch plan without claim/probe mutation |
-| `hive.delivery.reconcile` | reconciler | Append a safe explicit delivery verdict |
+| `hive.delivery.reconcile` | reconciler | Append a safe explicit delivery verdict and, when terminal, atomically insert its versioned Slack-outbox intent |
 | `hive.outbox.reconcile` | reconciler | Append a separate Slack-outbox verdict |
 
 The claim tool replaces the current mutating `GET /v1/deliveries`. Lifecycle routes are not
@@ -304,6 +368,22 @@ Claim has no client cursor capable of excluding older eligible work: the broker 
 pending deliveries fairly. The current `/v1/admin/*` edge-mint, subscription, and reconciliation
 surfaces are explicitly owned by the local enrollment, subscription-admin, and reconciliation
 planes above rather than disappearing from the replacement inventory.
+
+`hive.delivery.mark_dispatched` is the sole authoritative transition from `dispatching` to
+`dispatched`. It requires the current delivery capability and durable local-acceptance or
+provider-start evidence for the same attempt, commits the transition and adapter-specific deadline
+atomically, and leaves the Task `working`. For a live attempt it starts `liveAckDeadline`; for a
+headless attempt it records the already bounded supervised-process deadline and never creates a
+human live-ACK clock. Headless completion follows process-exit evidence. Failure before this point
+remains a deterministic pre-provider outcome when no effect is proved.
+
+A live provider MUST durably accept the attempt before `mark_dispatched`, but a correctly fenced
+provider ACK may race before or after that broker transition. `hive.binding.ack` always appends such
+an ACK as immutable local evidence; it never directly mutates broker delivery, Task, or Slack truth.
+Before the exact `mark_dispatched` result is durable locally, the edge quarantines that evidence.
+Afterward, current lifecycle authority may consume it through `finish`; if authority is lost first,
+the edge drains it with the attempt evidence-upload capability for explicit reconciliation. Fast,
+synchronous, and post-lease ACK evidence is therefore never rejected merely for timing.
 
 `server/discover` returns only `2026-07-28` and an authentication-filtered catalog. It advertises the
 pinned Tasks profile only when implemented and explicitly negotiated by the caller, and advertises
@@ -328,7 +408,8 @@ The two local directions have separate catalogs and credentials:
 | edge control / `hive.binding.register` | provider bridge | Actor, provider, surface/version, allowed operations, boot epoch, one-time registration nonce, and command ID; atomically stores a pending binding and recoverable provider-facing directional envelope |
 | edge control / `hive.binding.renew` | matching provider bridge | Binding ID, current revision, boot epoch, and command ID; exact CAS stages a next revision while current remains active and returns one stored encrypted renew envelope |
 | edge control / `hive.binding.confirm` | matching provider bridge | Current/next revision fence, originating register/renew command ID, and new command ID authenticated by pending-next control authority; atomically promotes next and returns stored confirmation |
-| edge control / `hive.binding.ack` | matching provider bridge | Binding fence, delivery/generation/attempt, ACK kind, bounded receipt reference, and command ID; appends one fenced local-journal result |
+| edge control / `hive.binding.ack` | matching provider bridge | Binding fence, delivery/generation/attempt, ACK kind, bounded receipt reference, and command ID; appends one fenced immutable local-journal result without lifecycle effect, quarantined until `mark_dispatched` is durable |
+| edge control / `hive.provider.probe` | local operator with `provider:probe` | Provider, probe kind, hard deadline, and command ID; returns one immediate supervised typed result and creates no delivery Task |
 
 Registration authenticates both the local peer identity and a single-use, audience-bound bootstrap
 credential delivered outside Slack and outside the discoverable catalog. In the same durable
@@ -376,15 +457,30 @@ Registration and renewal use explicit pending/current states:
    provider accepts current and next dispatch verifiers during staging, so neither loss strands the
    edge.
 4. After promotion, the previous bundle has a bounded overlap only for already-bound in-flight
-   attempts and exact stored-response replay. New work uses current; expiry removes previous.
+   attempts and exact stored-response replay. Its verifier retention lasts through the greatest
+   still-bound attempt ACK-evidence expiry (within the absolute retention ceiling), so rotation
+   cannot discard a late immutable ACK; previous authority cannot renew or accept new work. New work
+   uses current; expiry removes previous.
 
 Before initial confirmation the binding cannot dispatch. ACK requires current control authority (or
 bounded previous authority for an attempt already bound to that revision) plus the distinct
-per-attempt live-ACK capability. The edge derives and validates socket identity from the owner-only
-runtime directory; the caller never supplies an arbitrary URL or broker/admin target. Registration
-binds actor, provider, edge, opaque provider-session reference, binding ID and revision, edge boot
+per-attempt live-ACK capability. That capability authenticates only immutable evidence for its exact
+attempt, remains valid through the bounded attempt-plus-reconciliation window despite actor-lease
+loss, and cannot authorize lifecycle completion. Edge control durably journals a valid early ACK and
+quarantines it until the broker's `hive.delivery.mark_dispatched` result is local; after lease loss it
+remains evidence for upload/reconciliation only. The edge derives and validates socket identity from
+the owner-only runtime directory; the caller never supplies an arbitrary URL or broker/admin target.
+Registration binds actor, provider, edge, opaque provider-session reference, binding ID and revision,
+edge boot
 epoch, surface/version, allowed operations, expiry, and both credential lineages. Redirects, TCP
 targets, cross-actor use, expired registrations, and stale revisions fail closed.
+
+`hive.provider.probe` is deliberately local: the broker cannot invoke an outward-only edge. The
+operator CLI must run on the selected workstation and call its owner-only edge-control UDS with a
+separate `provider:probe` credential, or fail `local_edge_required`. KRA-910 supplies the supervised
+version/capability probe with an environment allowlist and hard deadline. The result is immediate and
+creates no delivery Task. Persisting a new broker observation is a separate explicit, idempotent
+`hive.edge.report` mutation; a read/plan command never triggers a probe implicitly.
 
 The current Claude SDK-v1 experimental notification is a migration input, not a valid v0.4
 capability. KRA-908 owns its replacement and the Codex/Claude live conformance seam.
@@ -403,8 +499,10 @@ while stable core `2026-07-28` assigns `MissingRequiredClientCapability` to `-32
 code wins in Hive's profile. KRA-898 records this upstream extension delta as a raw-wire fixture;
 Hive never allocates either value to a custom error.
 
-`hive.delivery.begin_dispatch` durably creates one immutable Task per provider attempt before
-returning its handle. It never asks the
+`hive.delivery.begin_dispatch` durably creates one immutable Task and the separate evidence-upload
+capability per provider attempt before returning the Task handle. The secret travels only in the
+sealed `Hive-Evidence-Upload-Capability` response header and is reproduced byte-identically from the
+stored envelope on exact replay. It never asks the
 client to perform the provider side effect through `tasks/update`; edge phase/evidence tools remain
 the application protocol. `tasks/update` carries only responses to outstanding `inputRequests`.
 `tasks/cancel` is cooperative. Polling via `tasks/get` is the baseline; task notifications over
@@ -414,12 +512,12 @@ defines no non-delivery Task kind: provider/version probes are bounded immediate
 | Operation | Initial result | Terminal Task projection |
 | --- | --- | --- |
 | Discovery, lists, reads, validation, plan | Immediate | None |
-| Claim, accept, renew, spawn reservation | Immediate durable result | None |
-| Dispatch begin | Immediate durable Task handle | See delivery projection below |
+| Claim, accept, renew, mark-dispatched, spawn reservation | Immediate durable result | None |
+| Dispatch begin | Immediate durable Task handle; evidence authority only in a sealed response header | See delivery projection below |
 | Local live-deliver injection | Immediate local acceptance | Broker Task remains `working` for explicit `hive_ack` |
 | Headless resume/spawn | Broker Task `working` | `completed` domain result or `cancelled` with no-effect proof |
 | Provider/version probe | Immediate bounded result or typed timeout | None |
-| Reconciliation after validated preconditions | Immediate durable result | None |
+| Reconciliation after validated preconditions | Immediate durable result | Creates no Task; may terminalize the existing `working` attempt Task, never rewrites a terminal Task |
 
 | Hive truth | Task truth |
 | --- | --- |
@@ -430,11 +528,25 @@ defines no non-delivery Task kind: provider/version probes are bounded immediate
 | `dead_letter` | `completed` with `CallToolResult.isError=true` and terminal reason set |
 | JSON-RPC execution failed without a Hive domain outcome | `failed` |
 
+The first transition of an attempt to `ambiguous` atomically inserts one durable reconciliation
+obligation keyed by delivery, provider attempt, and outcome revision. The completed Task result
+contains the obligation handle, and the authorized `reconciliation/pending` resource lists it until
+an explicit safe verdict appends a closure. Creating another attempt for that delivery is forbidden
+while the obligation is open. Hive v0.4 performs no automatic reconciliation and never treats Task
+completion as discharge of the obligation; unrelated deliveries may continue.
+
+The baseline ambiguity budget is zero open obligations: the first open item makes reconciliation
+health degraded and emits one bounded operator alert, but does not make the broker unavailable.
+KRA-906 exposes only aggregate open-count and oldest-age signals; KRA-911 owns the actionable queue
+and verdict. Cutover progression and legacy removal in KRA-912 require zero open obligations. Every
+transition/restart/sweep path uses the same idempotent obligation insert, so repeated recovery cannot
+inflate the backlog.
+
 Four clocks remain independent:
 
 1. The lease controls delivery authority.
-2. The live-ACK deadline controls how long unacknowledged possible provider work may remain
-   `dispatched` before becoming `ambiguous`.
+2. The live-ACK deadline controls how long an unacknowledged live attempt may remain `dispatched`
+   before becoming `ambiguous`; it does not exist for headless attempts.
 3. Task `ttlMs` controls Task retrieval retention only.
 4. Task `pollIntervalMs` is client pacing only.
 
@@ -444,6 +556,13 @@ extension requires. Task expiry or a missed poll never changes delivery state. D
 outlive Task payload retention. A live-ACK deadline or lease loss after provider start may create
 ambiguity; a Task clock cannot. Requeue creates a new provider attempt and a new immutable Task; a
 later reconciliation never rewrites a historical terminal Task.
+
+Provider accept/start and supervised-process hard deadlines are bounded adapter-operation budgets
+owned by KRA-910, not additional Task clocks. They never choose a disposition without durable phase
+and side-effect evidence. The evidence-upload authority initially covers the accept/start budget and
+is extended at `mark_dispatched` through the live-ACK deadline for live work or the supervised-process
+deadline for headless work, plus reconciliation retention. `begin_dispatch` rejects configuration
+whose absolute attempt-retention ceiling cannot cover the maximum of those windows.
 
 A Task cannot terminalize independently of delivery truth. When operator cancellation is proven
 before any provider effect, the broker atomically records delivery `undeliverable` with
@@ -519,8 +638,11 @@ remains active until every associated attempt is terminal or no longer provider-
 including the human-latency live-ACK window. The first loss or uncertain renewal is sticky, revokes
 every associated delivery capability, and later success cannot clear it. Authority loss attempts
 provider cancellation/process-group cleanup, but cleanup success is not evidence that earlier side
-effects did not occur. A revived stale edge cannot dispatch, acknowledge, reply, append evidence, or
-record a result.
+effects did not occur. A revived stale edge cannot dispatch, turn acknowledgement evidence into a
+result, reply, or record lifecycle truth. Its only post-lease broker mutation is immutable,
+attempt-bound outbox drain through the separate evidence-upload capability; that append cannot alter
+lifecycle truth. The edge-control server may still journal a correctly fenced provider ACK as local
+immutable evidence during its bounded evidence window.
 
 ## Resource privacy and cache matrix
 
@@ -569,7 +691,7 @@ the replay body.
 KRA-905 introduces the target append-only evidence plane. This ADR does not pretend the current
 broker already has a Slack outbox or provider-evidence store. The target stores are:
 
-- broker event/delivery/lease/command/Task/transition/outbox/reconciliation evidence;
+- broker event/delivery/lease/command/Task/transition/outbox/reconciliation-obligation evidence;
 - edge local dispatch journal, provider probe/process/phase/output-reference evidence;
 - idempotent evidence transfer keyed by evidence ID and canonical digest;
 - bounded chunks with size, count, retention, and total-delivery limits;
@@ -578,9 +700,26 @@ broker already has a Slack outbox or provider-evidence store. The target stores 
 Broker and edge each assign a durable per-ledger sequence. Cross-ledger causality uses evidence,
 command, Task, and correlation links; wall clocks are diagnostic and never manufacture a total
 order. The edge retains an idempotent evidence outbox until the broker acknowledges its sequence.
+Lease loss does not discard it: the original edge may drain only its immutable bound records through
+the attempt evidence-upload capability, and reconciliation/lifecycle authority remains separate.
 Command dedup, Task creation, and the `dispatching` transition commit in one broker transaction.
 Provider launch intent commits locally before spawn/injection; provider acknowledgement evidence
 commits before broker terminalization.
+
+Every transaction that first commits or appends a sender-visible outcome revision atomically inserts
+one idempotent Slack-outbox intent keyed by event/delivery plus outcome revision. This includes
+ingress rejection or `unroutable`, operator cancellation, `finish`, live-deadline/lease sweeps,
+`dead_letter`, and reconciliation—not only ordinary edge commands. A terminal transition also
+terminalizes a still-`working` Task in that transaction. If reconciliation follows an already
+terminal historical Task such as `ambiguous`, it appends the delivery verdict and outbox revision
+without changing that immutable Task.
+
+The outbox worker may deliver at least once and records provider evidence separately, but a crash or
+authority loss cannot erase the sender-visible outcome intent. `hive.reply.enqueue` is reserved for
+explicitly nonterminal progress. Every progress intent carries the same per-event/delivery outcome
+sequence; once a terminal revision exists, the worker suppresses any older unsent progress row and
+delivers no progress after terminal. `hive.outbox.reconcile` resolves uncertain Slack delivery
+without rewriting the delivery verdict.
 
 Each event records schema version, delivery, generation, provider attempt, command, actor/edge,
 binding revision where relevant, monotonic phase, wall time, and safe structured detail. Output is
@@ -600,7 +739,8 @@ values are bounded and raw bodies are never span attributes.
 Required spans cover discovery, header validation, authentication, authorization, claim, replay,
 dispatch begin, Task get/update/cancel, provider probe/start/result, lease renewal, transition,
 outbox reply, and reconciliation. Health distinguishes liveness, broker readiness, provider
-availability, subscription eligibility, workspace mapping, authority, and protocol compatibility.
+availability, subscription eligibility, workspace mapping, authority, protocol compatibility, and
+aggregate reconciliation backlog health.
 Credential-shaped and prompt-shaped negative fixtures must prove absence from logs, spans, metrics,
 errors, evidence metadata, and CLI output.
 
@@ -621,6 +761,19 @@ most seven calendar days. Its manifest records exact `compatibilityStartedAt` an
 an extension requires a fresh explicit Hákon ruling. `/v1` may be re-enabled during that window only by the named rollback owner and
 only for a new provider attempt whose evidence proves no duplicate side effect. KRA-912 prepares the
 cutover, but production selection and `/v1` removal require explicit Hákon approval.
+
+Zero open reconciliation obligations is necessary but not sufficient for legacy removal. Before the
+removal gate, the broker first disables admission of new `legacyV1` claims under a durable manifest
+revision, then drains or explicitly reconciles every legacy-pinned claim, provider attempt, Task,
+evidence upload, Slack-outbox item, and stored-response replay obligation. Legacy command tombstones
+and exact replay remain served until their bounded window expires unless the gate proves none remain.
+Restart recovery plus all due lease/deadline sweeps run while admission remains quiesced. One
+serializable compare-and-set transaction then verifies the same manifest revision, zero active or
+uncertain legacy-pinned work, zero open reconciliation obligations, and zero unacknowledged legacy
+evidence/outbox/replay records before committing `legacyDisabled` with a removal epoch. Any new or
+changed record conflicts and restarts the gate. Physical `/v1` code removal follows a successful
+disabled-state restart/rollback rehearsal; it never races an in-flight attempt that could become
+ambiguous after the zero check.
 
 | Edge selection | Broker surface | Result |
 | --- | --- | --- |
@@ -674,6 +827,11 @@ Human and `--json` outputs share typed schemas. Exit codes are stable: `0` succe
 conflict/stale state, `8` transient transport, `9` ambiguity/operator action, and `10` internal
 failed-closed. No routine workflow requires SQLite or handcrafted HTTP.
 
+`hive providers probe` is an explicit local diagnostic action, not a broker-routed read. It requires
+the target edge's owner-only UDS and `provider:probe` scope; remote use fails `local_edge_required`.
+It returns the immediate KRA-910 probe result. Persisting that observation requires an explicit
+separate report action.
+
 `create-edge` and `put-subscription` remain compatibility aliases only during the bounded legacy
 window. Read commands are mechanically side-effect-free: `dispatch plan` cannot claim, reserve,
 spawn a probe, or mutate.
@@ -691,15 +849,19 @@ spawn a probe, or mutate.
 3. **Authority:** a valid `WAKE` authorizes Hive to route untrusted material to the registered actor.
    It grants no downstream mutation or permission. Those actions require the actor's already
    attached user/task authority and permission profile.
-4. **Sender outcome envelope:** every accepted Slack envelope obtains a versioned durable outcome:
+4. **Sender outcome envelope:** every stable-identity Slack envelope admitted for evaluation obtains
+   a versioned durable outcome, including routing/admission refusal:
    `queued`, `dispatched`, `assessed_only`, `unroutable`, `undeliverable`, `processed`, `ambiguous`,
    or `dead_letter`, with
-   event/delivery IDs and a safe reason code. Transport receipt is distinct from task completion.
+   event/delivery IDs and a safe reason code. The first transaction for each sender-visible revision
+   also inserts its outcome-revision-keyed Slack-outbox intent. Transport receipt is distinct from task completion.
    An unbound event defaults to `assessed_only`; a pre-existing task binding may authorize more, but
    message text itself never does.
 5. **Home:** KRA-894 implementation is folded into the v0.4 children named below. The KRA-717
-   tracker remains historical/closed-deferred while ADR-0001 remains accepted; this ADR supersedes
-   only ADR-0001's v0.3 wire section.
+   tracker remains historical/closed-deferred while ADR-0001 remains accepted. This ADR supersedes
+   exactly ADR-0001's v0.3 broker/edge wire, the live-provider adapter/local-ingress details that
+   mandate loopback callbacks or `claude/channel`, and the narrowly defined evidence-proved
+   no-effect requeue transition; every other ADR-0001 invariant remains authoritative.
 
 ## D1-D20 decision register
 
@@ -773,7 +935,7 @@ implementation owner.
 - **Ruling:** the resource/template and tool catalogs above; reads are resources, mutations tools,
   execution remains edge-local, and both directions of local registration/delivery have named tools.
 - **Rejected:** HTTP-verb mirroring, missing admin surface, and reverse provider invocation.
-- **Owner/acceptance:** KRA-898/903/904/907/908; every current and target operation has one owner.
+- **Owner/acceptance:** KRA-898/903/904/907/908/910; every current and target operation has one owner.
 
 ### D8 — immediate result versus Task
 
@@ -790,7 +952,9 @@ implementation owner.
 - **Invariant/uncertainty:** uncertainty must remain visible and must never invite automatic retry.
 - **Smallest falsifier:** crash after each provider-start boundary with no receipt.
 - **Ruling:** delivery `ambiguous`; Task `completed` with `isError=true`, side effect possible, and
-  retry forbidden. Task `failed` is reserved for JSON-RPC execution failure without a domain result.
+  retry forbidden; the same transaction creates a durable reconciliation obligation. The zero-open
+  baseline budget degrades health and alerts without blocking unrelated work. Task `failed` is
+  reserved for JSON-RPC execution failure without a domain result.
 - **Rejected:** successful completion fictionalizes success; cancelled/timeout fictionalizes
   non-execution; generic failed invites unsafe retry.
 - **Owner/acceptance:** KRA-901/905/909/911; projection and reconciliation fixtures.
@@ -865,7 +1029,9 @@ implementation owner.
 - **Invariant/uncertainty:** prove semantic equality or safety without duplicate provider execution.
 - **Smallest falsifier:** one recording service and hostile provider matrix through both adapters.
 - **Ruling:** deterministic semantic preorder plus a controlled staged rollout, one explicit edge
-  assignment at a time.
+  assignment at a time. Legacy removal additionally requires admission quiescence, full legacy-work
+  drain/reconciliation, and a serializable zero-active/zero-obligation `legacyDisabled` fence before
+  physical code deletion.
 - **Rejected:** real dual execution and ceremony unsupported by fleet size.
 - **Owner/acceptance:** KRA-902/KRA-912; Hákon is cutover owner and explicit approval is mandatory.
 
@@ -947,7 +1113,7 @@ KRA-913 -> KRA-898, KRA-912
 KRA-897 -> KRA-894, KRA-898, KRA-899, KRA-900, KRA-901, KRA-902
 KRA-901 -> KRA-905
 KRA-900 + KRA-901 -> KRA-909
-KRA-905 -> KRA-910
+KRA-898 + KRA-905 -> KRA-910
 KRA-898 + KRA-899 + KRA-900 + KRA-901 -> KRA-906
 KRA-898 + KRA-899 + KRA-900 + KRA-901 + KRA-905 + KRA-910 -> KRA-903
 KRA-894 + KRA-898 + KRA-899 + KRA-900 + KRA-901 + KRA-909 + KRA-910 -> KRA-904
@@ -960,7 +1126,8 @@ KRA-912 preparation -> explicit Hákon cutover approval
 
 Independent ready nodes may run in parallel; arrows are prerequisites, not a ceremonial total
 order. KRA-909 and KRA-910 semantics must exist before KRA-904 may claim provider-affecting
-acceptance. KRA-905 precedes evidence-consuming resources, supervision, and reconciliation.
+acceptance. KRA-898 and KRA-905 precede the MCP-backed supervised probe in KRA-910; KRA-905 also
+precedes evidence-consuming resources and reconciliation.
 KRA-906 can lay instrumentation in parallel with the other post-A foundations. KRA-907 need not wait
 for KRA-904 or KRA-908. KRA-911 alone owns reconciliation and its CLI. KRA-902 develops from the
 start and remains the final hostile/conformance gate into KRA-912.
