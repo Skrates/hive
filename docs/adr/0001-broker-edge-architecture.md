@@ -4,6 +4,8 @@
 - Decision: D-HIVE-HOME v3
 - Ratified: 2026-07-12 by Hákon Freyr Gunnarsson
 - Durable ledger: [KRA-717](https://linear.app/krates-ehf/issue/KRA-717/hive-ears-v03-brokeredge-architecture)
+- v0.4 note: the broker/edge wire and replay-bootstrap details are superseded by
+  [ADR-0002](./0002-stateless-mcp-capability-plane.md); all other locked invariants remain accepted
 
 ## Context
 
@@ -78,15 +80,18 @@ Provider versions and capabilities are recorded and proven by deployed acceptanc
 
 ### Replay
 
-Deliveries contain an initial broker-assembled thread snapshot and cursor. Immediately before
-acting, the edge requests a fresh replay. The broker calls Slack `conversations.replies` and returns
-bytes plus envelope metadata. It may assemble but never summarize, redact, prioritize, or interpret.
+In v0.3 a delivery may contain an initial broker-assembled thread snapshot and cursor. Immediately
+before acting, the edge requests a fresh replay. The broker calls Slack `conversations.replies` and
+returns bytes plus envelope metadata. It may assemble but never summarize, redact, prioritize, or
+interpret. ADR-0002 makes the durable normalized event plus mandatory just-in-time full replay the
+v0.4 safety contract; an ingest-time snapshot is optional evidence, not an ACK prerequisite.
 
 ### Broker/edge protocol
 
 v0.3 uses long-poll HTTP semantics: deliveries after a durable offset, explicit accept/dispatch/result
 transitions carrying delivery ID and lease generation, and callable thread replay. Each edge has a
-broker-minted machine credential. WebSocket delivery is a later optimization.
+broker-minted machine credential. WebSocket delivery is a later optimization. ADR-0002 replaces this
+wire contract for v0.4 with the stateless MCP `2026-07-28` capability plane.
 
 ### Trust and authority
 
