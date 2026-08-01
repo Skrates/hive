@@ -114,12 +114,12 @@ fresh replay.
 | Slack ingress | Slack -> broker | Socket Mode | Slack app credentials | Broker only |
 | Delivery/control | Edge -> broker | MCP 2026-07-28 Streamable HTTP at `/mcp` | Edge machine bearer; dispatch capability on scoped calls | Broker only |
 | Operator | CLI -> broker | MCP 2026-07-28 Streamable HTTP at `/mcp` | Independent operator/admin bearer scopes | Broker only |
-| Local provider diagnostics | Operator CLI -> edge control | MCP 2026-07-28 over UDS with newline-delimited stdio framing | Independent local `provider:probe` operator credential | Local filesystem socket only |
-| Live dispatch | Edge -> provider ingress | MCP 2026-07-28 over UDS with newline-delimited stdio framing | Edge-held dispatch credential + dispatch-binding capability | Local filesystem socket only |
-| Bootstrap registration | Provider bridge -> edge control | MCP 2026-07-28 over UDS with newline-delimited stdio framing | Verified local peer identity + single-use audience-bound registration nonce | Local filesystem socket only |
-| Binding renewal | Provider bridge -> edge control | MCP 2026-07-28 over UDS with newline-delimited stdio framing | Provider-held control credential + control-binding capability | Local filesystem socket only |
-| Binding confirmation | Provider bridge -> edge control | MCP 2026-07-28 over UDS with newline-delimited stdio framing | Pending-next control credential + capability and exact current/next revision fence | Local filesystem socket only |
-| Live ACK | Provider bridge -> edge control | MCP 2026-07-28 over UDS with newline-delimited stdio framing | Provider-held control credential + control-binding capability + distinct per-attempt ACK capability | Local filesystem socket only |
+| Local provider diagnostics | Operator CLI -> edge control | MCP 2026-07-28 Streamable HTTP over owner-only UDS | Independent local `provider:probe` operator credential | Local filesystem socket only |
+| Live dispatch | Edge -> provider ingress | MCP 2026-07-28 Streamable HTTP over owner-only UDS | Edge-held dispatch credential + dispatch-binding capability | Local filesystem socket only |
+| Bootstrap registration | Provider bridge -> edge control | MCP 2026-07-28 Streamable HTTP over owner-only UDS | Verified local peer identity + single-use audience-bound registration nonce | Local filesystem socket only |
+| Binding renewal | Provider bridge -> edge control | MCP 2026-07-28 Streamable HTTP over owner-only UDS | Provider-held control credential + control-binding capability | Local filesystem socket only |
+| Binding confirmation | Provider bridge -> edge control | MCP 2026-07-28 Streamable HTTP over owner-only UDS | Pending-next control credential + capability and exact current/next revision fence | Local filesystem socket only |
+| Live ACK | Provider bridge -> edge control | MCP 2026-07-28 Streamable HTTP over owner-only UDS | Provider-held control credential + control-binding capability + distinct per-attempt ACK capability | Local filesystem socket only |
 | Headless provider | Edge -> provider process | Supervised process adapter, not an MCP hop | Permission profile + environment allowlist | None |
 
 The broker endpoint accepts one JSON-RPC message per POST and returns JSON or request-scoped SSE.
@@ -129,9 +129,14 @@ metadata, and implements no `Last-Event-ID` resume. Every request carries protoc
 identity, and capabilities in `_meta`; `server/discover` is implemented. Closing a request stream is
 transport cancellation, not proof that application work stopped.
 
-UDS endpoints live in an owner-only runtime directory, are created mode `0600`, reject symlinks and
-unexpected owners, and use explicit binding revisions. They preserve the MCP JSON-RPC and
-per-request metadata model. No callback URL or TCP port is stored as execution authority.
+Local MCP uses HTTP/1.1 Streamable HTTP request/response framing over a Unix-domain socket, including
+real request and response headers; it is not newline-delimited stdio or a custom JSON framing. The
+listener never binds TCP. UDS endpoints live in an owner-only runtime directory, are created mode
+`0600`, reject symlinks and unexpected owners, verify local peer identity, and use explicit binding
+revisions. They preserve the same one-request-per-POST MCP JSON-RPC, modern metadata, header/body
+equality, cancellation, and no-session model as the broker endpoint. This gives capability headers a
+real authentication-metadata channel without storing any callback URL or network endpoint as
+execution authority.
 
 ## Identity and authority model
 
@@ -412,30 +417,39 @@ The two local directions have separate catalogs and credentials:
 | Server / tool | Caller | Required input and durable result |
 | --- | --- | --- |
 | provider ingress / `hive.live.describe` | edge executor | Binding ID/revision and boot epoch; returns supported surface/version and opaque `providerSessionRef` |
-| provider ingress / `hive.live.deliver` | edge executor | Delivery/generation/attempt, binding fence, exact replay, per-attempt live-ACK capability, and command ID; stores and returns durable local acceptance before provider injection can be repeated |
+| provider ingress / `hive.live.deliver` | edge executor | Delivery/generation/attempt, binding fence, exact replay, per-attempt live-ACK capability in the dedicated authentication header, and command ID; stores and returns durable local acceptance before provider injection can be repeated |
 | provider ingress / `hive.live.cancel` | edge executor | Delivery/generation/attempt, binding fence, reason, and command ID; stores and returns cooperative cancellation acknowledgement |
 | edge control / `hive.binding.register` | provider bridge | Actor, provider, surface/version, allowed operations, boot epoch, one-time registration nonce, and command ID; atomically stores a pending binding and recoverable provider-facing directional envelope |
 | edge control / `hive.binding.renew` | matching provider bridge | Binding ID, current revision, boot epoch, and command ID; exact CAS stages a next revision while current remains active and returns one stored encrypted renew envelope |
 | edge control / `hive.binding.confirm` | matching provider bridge | Current/next revision fence, originating register/renew command ID, and new command ID authenticated by pending-next control authority; atomically promotes next and returns stored confirmation |
-| edge control / `hive.binding.prepare_ack` | edge executor with current delivery authority | Binding fence, delivery/generation/attempt, ACK expiry, and command ID; durably stores the attempt verifier and a recoverable sealed response before returning the per-attempt live-ACK secret |
+| edge control / `hive.binding.prepare_ack` | edge executor with current delivery authority | Binding fence, delivery/generation/attempt, broker-authenticated `begin_dispatch` result reference, and command ID; derives the bounded ACK expiry, durably stores the verifier and sealed header replay, then emits the secret only in the dedicated authentication response header |
 | edge control / `hive.binding.ack` | matching provider bridge | Binding fence, delivery/generation/attempt, ACK kind, bounded receipt reference, and command ID; appends one fenced immutable local-journal result without lifecycle effect, quarantined until `mark_dispatched` is durable |
 | edge control / `hive.provider.probe` | local operator with `provider:probe` | Provider, probe kind, hard deadline, and command ID; returns one immediate supervised typed result and creates no delivery Task |
 
 Before `hive.live.deliver` can expose a live-ACK secret to provider ingress, the edge executor calls
-`hive.binding.prepare_ack`. One fsync-backed local transaction stores the verifier digest, exact
-delivery/generation/attempt and binding-revision fence, expiry, command identity, and sealed replay
-response, and the attempt-scoped verification hold on the bound control bundle. Only after that
-commit may the secret leave edge control and be passed to
-`hive.live.deliver`. The deliver call fails closed if the matching prepared verifier is not already
-durable. A crash after preparation but before provider injection leaves an unused bounded
-capability; it cannot create provider effect. A synchronous ACK from inside provider injection can
-therefore always be verified and journaled rather than racing verifier creation. Provider ingress
-stores the sender secret in its owner-only secret store as part of the durable local acceptance
-committed before injection; if that write fails, injection MUST NOT begin. Plaintext never enters a
-command row, replay body, provider prompt, log, trace, or diagnostic. Exact preparation replay opens
-the stored ciphertext only through the owner-only edge-local wrapping key and returns it solely over
-the authenticated UDS; the durable command row contains only ciphertext/IV/tag and fixed-length
-digests.
+`hive.binding.prepare_ack`. Its request names the exact broker-authenticated `begin_dispatch` result
+already committed in the edge journal; callers never supply an expiry. Edge control verifies the
+delivery/generation/attempt and result digest, then derives `ackEvidenceExpiresAt` from the immutable
+broker-bound attempt-retention ceiling. It rejects any missing/mismatched result and can neither
+extend that ceiling nor select a later time.
+
+One fsync-backed local transaction stores the verifier digest, exact attempt and binding-revision
+fence, derived expiry, command identity, sealed header replay, and the attempt-scoped verification
+hold on the bound control bundle. Only after commit may edge control emit plaintext in the dedicated
+`Hive-Live-Ack-Capability` authentication response header. The edge transport persists that header
+in its owner-only secret store and strips it before any DTO/application/logging layer sees the
+response; it passes the secret to `hive.live.deliver` only as the matching authentication request
+header. The deliver call fails closed if the prepared verifier is not durable. Provider ingress
+persists the header in its owner-only secret store with durable local acceptance and strips it before
+provider injection; if either write fails, injection MUST NOT begin.
+
+A crash after preparation but before provider injection leaves an unused bounded capability and
+cannot create provider effect. A synchronous ACK can therefore be verified and journaled rather
+than racing verifier creation. Plaintext never enters a command row, replay body, Task, DTO,
+provider prompt, log, trace, or diagnostic. Exact preparation replay opens the stored ciphertext
+only through the owner-only edge-local wrapping key and re-emits the same header bytes over the
+authenticated UDS; the body remains secret-negative and the durable command row contains only
+ciphertext/IV/tag and fixed-length digests.
 
 Registration authenticates both the local peer identity and a single-use, audience-bound bootstrap
 credential delivered outside Slack and outside the discoverable catalog. In the same durable
@@ -818,7 +832,8 @@ cutover, but production selection and `/v1` removal require explicit Hákon appr
 
 Zero open reconciliation obligations is necessary but not sufficient for legacy removal. Before the
 removal gate, the broker commits a durable `legacyDraining` manifest revision. Every `/v1` entrypoint
-registers an in-flight request against the manifest revision it observed before route logic,
+registers an in-flight request against the manifest revision and broker boot epoch it observed
+before route logic,
 including claim, delivery transitions, edge mint/rotation, subscription writes, reconciliation, and
 stored-response or secret-bearing reads. After `legacyDraining` commits, no new request is admitted
 except the exact bounded tombstone/replay reads required to discharge already-recorded obligations;
@@ -829,6 +844,17 @@ back on the revision conflict; it cannot serialize a credential, subscription, r
 delivery mutation after the zero check. The in-flight registration is released only after a read
 response completes or a mutation aborts or commits its result and replay obligation into legacy
 drain accounting.
+
+The in-flight registry is crash-recoverable rather than an immortal row or a wall-clock guess. On
+startup, before serving traffic, one transaction advances the broker boot epoch and thereby fences
+all handlers from the prior epoch; every legacy mutation's final transaction compares both its
+registered epoch and manifest revision. Recovery then resolves each prior-epoch registration from
+authoritative records: a committed command/domain result and replay obligation is marked completed
+and remains in drain accounting; absence of that atomic result proves the mutation did not commit
+and marks the registration aborted; any uncertain provider/Slack effect remains an explicit attempt,
+outbox, or reconciliation obligation and is not cleared as a request. Only after this reconciliation
+may the old registration be released. A registration never expires merely because time passed while
+its boot epoch could still commit.
 
 The broker then drains or explicitly reconciles every legacy-pinned claim, provider attempt, Task,
 evidence upload, Slack-outbox item, and stored-response replay obligation. Legacy command tombstones
@@ -950,10 +976,11 @@ implementation owner.
 
 ### D2 — concrete transport
 
-- **Candidates:** Streamable HTTP, stdio, UDS custom framing, WebSocket/custom tunnel.
+- **Candidates:** Streamable HTTP over TCP/TLS or UDS, stdio, UDS custom framing, WebSocket/custom tunnel.
 - **Invariant/uncertainty:** final-standard semantics on every hop with the least exposed surface.
 - **Smallest falsifier:** official transport conformance plus restart/cancellation/Origin tests.
-- **Ruling:** HTTPS Streamable HTTP off-box; newline-delimited MCP over owner-only UDS locally.
+- **Ruling:** HTTPS Streamable HTTP off-box; HTTP/1.1 Streamable HTTP over owner-only UDS locally,
+  retaining real headers without a TCP listener.
 - **Rejected:** WebSocket/tunnel has no benefit; local TCP preserves avoidable endpoint risk.
 - **Owner/acceptance:** KRA-899 and KRA-908; pass final header, metadata, framing, and negative tests.
 
@@ -1043,7 +1070,8 @@ implementation owner.
 - **Candidates:** arbitrary callback URL; loopback HTTP; stdio; owner-only UDS MCP.
 - **Invariant/uncertainty:** no arbitrary network authority, shared credential, or ABA registration.
 - **Smallest falsifier:** forged/stale/cross-target/redirect/socket-owner matrix for both providers.
-- **Ruling:** fenced capability handles resolved only by the edge to owner-only UDS MCP servers.
+- **Ruling:** fenced capability handles resolved only by the edge to owner-only UDS MCP servers
+  using Streamable HTTP request/response framing and its real authentication headers.
 - **Rejected:** callback URLs and shared `HIVE_EDGE_LOCAL_TOKEN`; stdio alone is not reconnectable.
 - **Owner/acceptance:** KRA-908; Codex and Claude replacement with explicit ACK and current revision.
 
