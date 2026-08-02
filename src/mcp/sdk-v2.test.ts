@@ -342,6 +342,18 @@ test("Host and Origin rejection precede authentication; authentication failures 
       id: null,
     });
     assert.equal(authenticationCalls, 0, collidingBearer);
+
+    const rejectedHiveCollision = await adapter.fetch(modernRequest("server/discover", {}, {
+      headers: { "Hive-Expired-Live-Injection-Capability": collidingBearer },
+    }));
+    assert.equal(rejectedHiveCollision.status, 500, collidingBearer);
+    assert.equal(rejectedHiveCollision.headers.get("content-type"), "application/json");
+    assert.deepEqual(await jsonResponse(rejectedHiveCollision), {
+      jsonrpc: "2.0",
+      error: { code: -32_603, message: "Internal error." },
+      id: null,
+    });
+    assert.equal(authenticationCalls, 0, collidingBearer);
   }
 
   const unauthenticated = await adapter.fetch(modernRequest("server/discover"));

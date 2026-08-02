@@ -65,6 +65,14 @@ interface ManifestEntry {
   readonly resultVariants: readonly string[];
 }
 
+interface ResultRouteEntry {
+  readonly server: string;
+  readonly method: string;
+  readonly alternateMethods?: readonly string[];
+  readonly resultVariants: readonly string[];
+  readonly canonicalResult: unknown;
+}
+
 export class AuthenticationHeaderError extends Error {
   constructor() {
     super("invalid_authentication_response_header");
@@ -148,8 +156,30 @@ export class AuthenticationResponseStager {
       const headerRequired = toolEntries.some((entry) =>
           actualResultVariant !== null
           && entry.resultVariants.includes(actualResultVariant));
+      const secretFreeEntry = requestToolName !== null
+        && actualResultVariant !== null
+        ? matchingSecretFreeResult(
+          this.server,
+          requestToolName,
+          actualResultVariant,
+        )
+        : null;
       if (!context.staged) {
-        if (headerRequired) rejectAuthenticationResponse(response);
+        if (
+          successfulResult
+          && toolEntries.length > 0
+          && (
+            headerRequired
+            || !secretFreeEntry
+            || !isSuccessfulCallToolResult(successfulResult.result)
+            || !jsonValuesEqual(successfulResult.result, secretFreeEntry.canonicalResult)
+            || responseLeaksSecrets(
+              response,
+              successfulResult.serializedBody,
+              context.requestSecrets,
+            )
+          )
+        ) rejectAuthenticationResponse(response);
         return response;
       }
       if (actualResultVariant !== context.staged.resultVariant) {
@@ -312,10 +342,17 @@ async function interceptAuthenticationResponse(
     && (entry.method === route.method || entry.alternateMethods?.includes(route.method))
     && entry.resultVariants.includes(resultVariant));
   if (variantEntries.length === 0) {
+    const secretFreeEntry = matchingSecretFreeResult(
+      route.server,
+      route.method,
+      resultVariant,
+    );
     if (
-      found.length !== 0
+      !secretFreeEntry
+      || found.length !== 0
       || successfulResult.id !== route.requestId
       || !isSuccessfulCallToolResult(successfulResult.result)
+      || !jsonValuesEqual(successfulResult.result, secretFreeEntry.canonicalResult)
       || responseLeaksSecrets(
         response,
         successfulResult.serializedBody,
@@ -393,6 +430,45 @@ function matchingManifestEntry(
 
 function responseManifest(): readonly ManifestEntry[] {
   return AUTHENTICATION_HEADER_MANIFEST.responseHeaders as readonly ManifestEntry[];
+}
+
+function secretFreeResultManifest(): readonly ResultRouteEntry[] {
+  return AUTHENTICATION_HEADER_MANIFEST.secretFreeResults as readonly ResultRouteEntry[];
+}
+
+function matchingSecretFreeResult(
+  server: string,
+  method: string,
+  resultVariant: string,
+): ResultRouteEntry | null {
+  return secretFreeResultManifest().find((entry) =>
+    entry.server === server
+    && (entry.method === method || entry.alternateMethods?.includes(method) === true)
+    && entry.resultVariants.includes(resultVariant)) ?? null;
+}
+
+function jsonValuesEqual(left: unknown, right: unknown): boolean {
+  if (left === right) return true;
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return Array.isArray(left)
+      && Array.isArray(right)
+      && left.length === right.length
+      && left.every((value, index) => jsonValuesEqual(value, right[index]));
+  }
+  if (
+    left === null
+    || right === null
+    || typeof left !== "object"
+    || typeof right !== "object"
+  ) return false;
+  const leftRecord = left as Record<string, unknown>;
+  const rightRecord = right as Record<string, unknown>;
+  const leftKeys = Object.keys(leftRecord);
+  const rightKeys = Object.keys(rightRecord);
+  return leftKeys.length === rightKeys.length
+    && leftKeys.every((key) =>
+      Object.prototype.hasOwnProperty.call(rightRecord, key)
+      && jsonValuesEqual(leftRecord[key], rightRecord[key]));
 }
 
 interface SuccessfulJsonRpcResultInspection {

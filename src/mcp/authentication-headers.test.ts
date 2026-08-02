@@ -23,6 +23,16 @@ test("generated manifest is the exact closed eight-header response set", () => {
     AUTHENTICATION_HEADER_MANIFEST.requestOnlyHeaders.map((entry) => entry.name),
     ["Hive-Expired-Live-Injection-Capability"],
   );
+  assert.deepEqual(AUTHENTICATION_HEADER_MANIFEST.secretFreeResults, [{
+    server: "broker",
+    method: "hive.delivery.claim",
+    resultVariants: ["no_claimable_delivery"],
+    canonicalResult: {
+      content: [],
+      resultType: "complete",
+      structuredContent: { resultVariant: "no_claimable_delivery" },
+    },
+  }]);
   assert.equal(manifestPaths().length, 11);
 });
 
@@ -282,7 +292,7 @@ test("bound interception permits validated secret-free outcomes and still blocks
     methodRequest(route.method),
     { responseKey: "claim:empty" },
   );
-  const passed = await pending.intercept(successfulResponse(secretFreeVariant));
+  const passed = await pending.intercept(secretFreeClaimResponse());
   const passedBody = await passed.json() as ResultBody;
   assert.equal(passed.status, 200);
   assert.equal(passed.headers.has(entry.name), false);
@@ -295,12 +305,89 @@ test("bound interception permits validated secret-free outcomes and still blocks
     { responseKey: "claim:empty-with-authority" },
   );
   await assert.rejects(
-    () => unexpected.intercept(successfulResponse(secretFreeVariant, {
+    () => unexpected.intercept(secretFreeClaimResponse({
       [entry.name]: "unexpected-empty-queue-authority",
     })),
     AuthenticationHeaderError,
   );
   assert.equal(unexpectedSink.records.length, 0);
+
+  const otherEntry = AUTHENTICATION_HEADER_MANIFEST.responseHeaders.find((candidate) =>
+    candidate.name === "Hive-Edge-Credential")!;
+  const crossRouteSink = new RecordingSink();
+  const crossRoute = await new AuthenticationResponseInterceptor(route.server, crossRouteSink).bind(
+    methodRequest(route.method),
+    { responseKey: "claim:cross-route-secret-variant" },
+  );
+  await assert.rejects(
+    () => crossRoute.intercept(successfulResponse(otherEntry.resultVariants[0]!, {}, {
+      credential: "must-not-release-cross-route-credential",
+    })),
+    AuthenticationHeaderError,
+  );
+  assert.equal(crossRouteSink.records.length, 0);
+
+  const unknownVariantSink = new RecordingSink();
+  const unknownVariant = await new AuthenticationResponseInterceptor(
+    route.server,
+    unknownVariantSink,
+  ).bind(
+    methodRequest(route.method),
+    { responseKey: "claim:unknown-secret-free-variant" },
+  );
+  await assert.rejects(
+    () => unknownVariant.intercept(successfulResponse(
+      "credential_committed_unregistered",
+      {},
+      { credential: "must-not-release-unregistered-credential" },
+    )),
+    AuthenticationHeaderError,
+  );
+  assert.equal(unknownVariantSink.records.length, 0);
+
+  const allowlistedPayloadSink = new RecordingSink();
+  const allowlistedPayload = await new AuthenticationResponseInterceptor(
+    route.server,
+    allowlistedPayloadSink,
+  ).bind(
+    methodRequest(route.method),
+    { responseKey: "claim:allowlisted-label-secret-payload" },
+  );
+  await assert.rejects(
+    () => allowlistedPayload.intercept(secretFreeClaimResponse({}, {
+      credential: "must-not-release-under-allowlisted-label",
+    })),
+    AuthenticationHeaderError,
+  );
+  assert.equal(allowlistedPayloadSink.records.length, 0);
+
+  const serverStager = new AuthenticationResponseStager(route.server);
+  const serverSecretFree = await serverStager.run(
+    methodRequest(route.method),
+    async () => secretFreeClaimResponse(),
+  );
+  assert.equal(
+    (await serverSecretFree.json() as ResultBody).result.structuredContent.resultVariant,
+    secretFreeVariant,
+  );
+  await assert.rejects(
+    () => serverStager.run(
+      methodRequest(route.method),
+      async () => successfulResponse("credential_committed_unregistered", {}, {
+        credential: "must-not-release-server-unregistered-credential",
+      }),
+    ),
+    AuthenticationHeaderError,
+  );
+  await assert.rejects(
+    () => serverStager.run(
+      methodRequest(route.method),
+      async () => secretFreeClaimResponse({}, {
+        credential: "must-not-release-server-allowlisted-payload",
+      }),
+    ),
+    AuthenticationHeaderError,
+  );
 
   const requestSecret = "empty-queue-request-secret";
   const reflectedSink = new RecordingSink();
@@ -309,7 +396,7 @@ test("bound interception permits validated secret-free outcomes and still blocks
     { responseKey: "claim:empty-reflection" },
   );
   await assert.rejects(
-    () => reflected.intercept(successfulResponse(secretFreeVariant, {}, {
+    () => reflected.intercept(secretFreeClaimResponse({}, {
       echoed: requestSecret,
     })),
     AuthenticationHeaderError,
@@ -1429,6 +1516,27 @@ function successfulResponse(
       },
     },
     { status, headers },
+  );
+}
+
+function secretFreeClaimResponse(
+  headers: Headers | Readonly<Record<string, string>> = {},
+  structuredContent: Readonly<Record<string, unknown>> = {},
+): Response {
+  return Response.json(
+    {
+      jsonrpc: "2.0",
+      id: 1,
+      result: {
+        content: [],
+        resultType: "complete",
+        structuredContent: {
+          resultVariant: "no_claimable_delivery",
+          ...structuredContent,
+        },
+      },
+    },
+    { headers },
   );
 }
 

@@ -152,6 +152,11 @@ class HiveMcpAdapterImplementation implements HiveMcpAdapter {
     const authenticationHeaders = new Headers(requestHeaders);
     authenticationHeaders.delete("mcp-session-id");
     authenticationHeaders.delete("last-event-id");
+    const protectedRequestSecrets = protectedSecretCandidatesFromHeaders(authenticationHeaders);
+    if (hasCanonicalCredentialNegativeCollision(protectedRequestSecrets)) {
+      cancelRequestBody(request);
+      return canonicalCredentialNegativeResponse();
+    }
     // This broker adapter accepts no Hive-* request header. The sole canonical
     // request-only header belongs to the future provider-ingress adapter and
     // must be verified and stripped there before domain dispatch (KRA-908).
@@ -160,12 +165,6 @@ class HiveMcpAdapterImplementation implements HiveMcpAdapter {
       return invalidHiveRequestHeaderResponse();
     }
     if (hasAmbiguousProtectedCredentialHeaders(authenticationHeaders)) {
-      cancelRequestBody(request);
-      return invalidHiveRequestHeaderResponse();
-    }
-    if (hasCanonicalCredentialNegativeCollision(
-      protectedSecretCandidatesFromHeaders(authenticationHeaders),
-    )) {
       cancelRequestBody(request);
       return invalidHiveRequestHeaderResponse();
     }

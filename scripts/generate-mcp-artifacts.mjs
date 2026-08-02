@@ -206,6 +206,23 @@ async function validate(schemaDocuments, value) {
   const names = responseHeaders.map((entry) => entry.name);
   if (new Set(names).size !== names.length) fail("authentication response header names must be unique");
   if (names.some((name) => !/^Hive-[A-Za-z-]+$/.test(name))) fail("invalid authentication response header name");
+  const secretFreeResults = value.authenticationHeaders.secretFreeResults;
+  if (!Array.isArray(secretFreeResults) || secretFreeResults.length !== 1) {
+    fail("authentication response manifest must contain exactly one secret-free result route");
+  }
+  const authenticationVariants = new Set(
+    responseHeaders.flatMap((entry) => entry.resultVariants),
+  );
+  if (secretFreeResults.some((entry) =>
+    entry.resultVariants.some((variant) => authenticationVariants.has(variant)))) {
+    fail("secret-free result variants cannot overlap authentication-bearing variants");
+  }
+  for (const entry of secretFreeResults) {
+    const canonicalVariant = entry.canonicalResult?.structuredContent?.resultVariant;
+    if (entry.resultVariants.length !== 1 || entry.resultVariants[0] !== canonicalVariant) {
+      fail("secret-free result route must name exactly its canonical result variant");
+    }
+  }
   const requestOnly = value.authenticationHeaders.requestOnlyHeaders;
   if (!Array.isArray(requestOnly) || requestOnly.length !== 1) fail("exactly one request-only header is required");
   if (names.includes(requestOnly[0].name)) fail("request-only header cannot be response-capable");
@@ -445,6 +462,14 @@ function validatePotentialCapabilityCatalog(catalog, handles, authenticationHead
       const tool = tools.get(method);
       if (!tool || tool.server !== entry.server) {
         fail(`authentication header route is absent from potential catalog: ${method}`);
+      }
+    }
+  }
+  for (const entry of authenticationHeaders.secretFreeResults) {
+    for (const method of [entry.method, ...(entry.alternateMethods ?? [])]) {
+      const tool = tools.get(method);
+      if (!tool || tool.server !== entry.server) {
+        fail(`secret-free result route is absent from potential catalog: ${method}`);
       }
     }
   }

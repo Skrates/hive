@@ -18,7 +18,7 @@ export const MCP_SCHEMA_PROVENANCE = deepFreeze({
   "authenticationHeaders": {
     "path": "schemas/mcp/authentication-response-headers.v1.json",
     "$id": "urn:skrates:hive:mcp:authentication-response-headers:v1",
-    "sha256": "29e7abb827546cad55ca35c5ae46bea161b8a16072560dcd89337fdf0b13c687"
+    "sha256": "5b7957f23475ae21dd8f615d430f03a53dd3bc0ab06cc28bc396b080ab743cc0"
   },
   "handleKinds": {
     "path": "schemas/mcp/hive-handle-kinds.v1.json",
@@ -185,6 +185,22 @@ export const AUTHENTICATION_HEADER_MANIFEST = deepFreeze({
       "resultVariants": [
         "verifier_and_sealed_replay_committed"
       ]
+    }
+  ],
+  "secretFreeResults": [
+    {
+      "server": "broker",
+      "method": "hive.delivery.claim",
+      "resultVariants": [
+        "no_claimable_delivery"
+      ],
+      "canonicalResult": {
+        "content": [],
+        "resultType": "complete",
+        "structuredContent": {
+          "resultVariant": "no_claimable_delivery"
+        }
+      }
     }
   ],
   "requestOnlyHeaders": [

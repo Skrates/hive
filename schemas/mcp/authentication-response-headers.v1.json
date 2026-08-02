@@ -35,6 +35,45 @@
       },
       "required": ["name", "authorizing", "method"],
       "additionalProperties": false
+    },
+    "secretFreeResult": {
+      "type": "object",
+      "properties": {
+        "server": { "enum": ["broker", "edge-control"] },
+        "method": { "type": "string", "pattern": "^hive\\.[a-z0-9_.]+$" },
+        "alternateMethods": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^hive\\.[a-z0-9_.]+$" }
+        },
+        "resultVariants": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" }
+        },
+        "canonicalResult": { "$ref": "#/$defs/noClaimableDeliveryResult" }
+      },
+      "required": ["server", "method", "resultVariants", "canonicalResult"],
+      "additionalProperties": false
+    },
+    "noClaimableDeliveryResult": {
+      "type": "object",
+      "properties": {
+        "content": { "type": "array", "maxItems": 0 },
+        "resultType": { "const": "complete" },
+        "structuredContent": {
+          "type": "object",
+          "properties": {
+            "resultVariant": { "const": "no_claimable_delivery" }
+          },
+          "required": ["resultVariant"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["content", "resultType", "structuredContent"],
+      "additionalProperties": false
     }
   },
   "properties": {
@@ -45,6 +84,12 @@
       "maxItems": 8,
       "items": { "$ref": "#/$defs/responseHeader" }
     },
+    "secretFreeResults": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1,
+      "items": { "$ref": "#/$defs/secretFreeResult" }
+    },
     "requestOnlyHeaders": {
       "type": "array",
       "minItems": 1,
@@ -52,7 +97,7 @@
       "items": { "$ref": "#/$defs/requestOnlyHeader" }
     }
   },
-  "required": ["schemaVersion", "responseHeaders", "requestOnlyHeaders"],
+  "required": ["schemaVersion", "responseHeaders", "secretFreeResults", "requestOnlyHeaders"],
   "additionalProperties": false,
   "examples": [
     {
@@ -106,6 +151,20 @@
           "server": "edge-control",
           "method": "hive.binding.prepare_ack",
           "resultVariants": ["verifier_and_sealed_replay_committed"]
+        }
+      ],
+      "secretFreeResults": [
+        {
+          "server": "broker",
+          "method": "hive.delivery.claim",
+          "resultVariants": ["no_claimable_delivery"],
+          "canonicalResult": {
+            "content": [],
+            "resultType": "complete",
+            "structuredContent": {
+              "resultVariant": "no_claimable_delivery"
+            }
+          }
         }
       ],
       "requestOnlyHeaders": [
