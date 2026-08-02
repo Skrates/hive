@@ -125,7 +125,7 @@ fresh replay.
 | Live dispatch | Edge -> provider ingress | MCP 2026-07-28 Streamable HTTP over owner-only UDS | Edge-held dispatch credential + dispatch-binding capability + broker-fenced live-injection capability; per-attempt ACK capability when delivery can ACK | Local filesystem socket only |
 | Bootstrap registration | Provider bridge -> edge control | MCP 2026-07-28 Streamable HTTP over owner-only UDS | Verified local peer identity + single-use audience-bound registration nonce | Local filesystem socket only |
 | Binding renewal | Provider bridge -> edge control | MCP 2026-07-28 Streamable HTTP over owner-only UDS | Provider-held control credential + control-binding capability | Local filesystem socket only |
-| Binding confirmation | Provider bridge -> edge control | MCP 2026-07-28 Streamable HTTP over owner-only UDS | Pending-next control credential + capability and exact current/next revision fence | Local filesystem socket only |
+| Binding confirmation | Provider bridge -> edge control | MCP 2026-07-28 Streamable HTTP over owner-only UDS | Pending-initial or pending-next control credential + capability and exact expected-absent/pending-initial or current/pending-next revision fence | Local filesystem socket only |
 | Live ACK | Provider bridge -> edge control | MCP 2026-07-28 Streamable HTTP over owner-only UDS | Provider-held control credential + control-binding capability + distinct per-attempt ACK capability | Local filesystem socket only |
 | Headless provider | Edge -> isolated launch supervisor -> provider process | Local supervised process adapter after broker phase authorization; not an MCP hop | Separately rooted supervisor identity + broker-signed bounded headless-launch capability + permission profile/environment allowlist | None |
 
@@ -322,37 +322,67 @@ current confirmed-binding registry before the provider-start-intent CAS. Binding
 serializes with the local journal and cannot erase the row.
 
 After local promotion, the edge invokes `hive.edge.confirm_binding` before any fresh launch on the
-new revision. Its exact command includes the provider-authenticated local confirmation receipt,
-previous/current binding and boot fences, expected broker binding-registry revision, a sealed digest
-and complete list of journaled prior-revision authorization command identities/digests/deadlines,
-and a new command ID. One broker transaction locks the binding registry and the same unique
-attempt/command/start-intent keys used by authorization. Under those locks the broker enumerates
-every stored grant and provider-start intent for the exact old edge, binding, boot epoch, and covered
-attempts, and compares that authoritative set with the supplied sealed list. It rejects omissions,
-duplicates, entries with the wrong edge/binding/boot/attempt/deadline coordinates, and any digest or
-receipt mismatch. Extra listed entries are accepted only when they are valid rows from the sealed
-old-revision edge journal and their exact broker keys are genuinely absent. For each validated listed
-command the transaction returns an existing-grant reference or writes a permanent
-`no_grant_committed` tombstone, then promotes the registry and stores the canonical complete result
-set. A racing authorization therefore either commits first and is enumerated/returned as existing,
-or observes the tombstone/new binding and can never mint. Lookup absence alone is never authoritative
-no-record proof: only the committed tombstone under this complete-set CAS is. Existing-grant results
-expose the safe signed expiry so sender/verifier holds extend through effective expiry plus
-post-expiry evidence/replay retention; secret recovery still uses the original exact command replay.
-The tombstone permanently excludes provider-start intent for that command and, when joined to the
-sealed edge authorization row and promotion fence, is ADR-0001 case-1 no-effect evidence. It is not
+new revision. The command has exactly two canonical **broker-slot** precondition forms, selected from
+durable broker state independently of whether the provider-authenticated local receipt came from
+`register` or `renew`. Slot seeding carries the receipt for the local pending candidate's promotion
+to current, the exact current binding and boot fence, `previousBinding: { state: "absent" }`,
+`expectedBindingRegistry: { state: "absent" }`, a sealed digest of the canonical empty
+prior-authorization list, and a new command ID. Slot replacement carries the local confirmation
+receipt, exact broker-previous and local-current binding/boot fences, the expected broker
+binding-registry revision, a sealed digest and complete list of journaled prior-binding authorization
+command identities/digests/deadlines, and a new command ID. The current binding may be the next
+revision of the same binding or a newly registered binding ID/boot replacing a durable broker slot
+that survived provider expiry or restart.
+
+One broker transaction locks the broker-derived `(edgeId, actor, provider)` registry slot and the same unique
+attempt/command/start-intent keys used by authorization. In the initial branch it verifies that the
+registry slot is absent, the receipt proves the exact staged local candidate and promotion, the
+supplied sealed set is canonically empty, and no grant, provider-start intent, or
+no-grant tombstone exists for that never-confirmed binding. It then inserts the current registry row
+and stores the canonical empty result set plus `resultingBindingRegistryRevision` and the exact
+current binding/boot fence. It creates no no-grant tombstone and no promoted-away
+sender/verifier hold. Because live authorization requires that current registry
+row, a binding in the expected-absent state could never legally have minted a grant. A competing
+initial confirmation serializes on the same slot; exact command replay returns the stored insert,
+while any changed receipt, binding, or request bytes conflict. This branch seeds authority only and
+never treats database absence as no-effect proof for a previously launchable revision.
+
+In the slot-replacement branch, under the same locks, the broker enumerates every stored grant and
+provider-start intent for the exact broker-previous edge, binding, boot epoch, and covered attempts, and compares
+that authoritative set with the supplied sealed list. It rejects omissions, duplicates, entries with
+the wrong edge/binding/boot/attempt/deadline coordinates, and any digest or receipt mismatch. Extra
+listed entries are accepted only when they are valid rows from the sealed prior-binding edge journal
+and their exact broker keys are genuinely absent. For each validated listed command the transaction
+returns an existing-grant reference or writes a permanent `no_grant_committed` tombstone, then
+promotes the registry and stores the canonical complete result set,
+`resultingBindingRegistryRevision`, and exact current binding/boot fence. A racing authorization therefore
+either commits first and is enumerated/returned as existing, or observes the tombstone/new binding
+and can never mint. Lookup absence alone is never authoritative no-record proof for a launchable
+revision: only the committed tombstone under this complete-set CAS is. Existing-grant results expose
+the safe signed expiry so sender/verifier holds extend through effective expiry plus post-expiry
+evidence/replay retention; secret recovery still uses the original exact command replay. The
+tombstone permanently excludes provider-start intent for that command and, when joined to the sealed
+edge authorization row and promotion fence, is ADR-0001 case-1 no-effect evidence. It is not
 provider-ingress `expired_unaccepted` evidence because no grant existed.
 
+If a slot-present replacement came from a fresh local registration and the exact old sender/verifier
+snapshot is unavailable, an existing-grant result remains an explicit ambiguity obligation; it can
+never be rewritten as no-grant merely because the replacement process lacks old local state. The
+replacement may serve unrelated future deliveries after the broker CAS, but every affected delivery
+remains fenced from another attempt until its obligation is reconciled. The edge persists the
+replayed resulting registry revision/current fence before it can form any later slot replacement.
+
 A pre-send stall, delayed network request, or process restart cannot bypass this gate: after broker
-promotion every old-revision request is stale, and after an `unresolved_at_ceiling` outcome the edge
-must complete this broker fencing transaction before any new-revision provider work. If the broker
+promotion every prior-binding request is stale, and after an `unresolved_at_ceiling` outcome the edge
+must complete this broker fencing transaction before any replacement-binding provider work. If the broker
 is unreachable, the binding remains non-launchable and the local ambiguity obligation stays open.
 A lost committed grant response is resolved by exact broker stored-result replay. Every
-confirmation also conservatively retains the promoted-away dispatch verifier, binding revision,
+slot-present replacement for which that exact old local state remains available also conservatively
+retains the promoted-away dispatch verifier, binding revision,
 boot epoch, and immutable semantic snapshot (edge/actor/provider/surface/version/profile coordinate
 and digest plus provider-attestation key ID/digest) in a bounded `launch-acceptance-only` hold. Measured only on the provider's injected
 local clock, the hold ends no earlier than confirmation plus `maxAuthorizeRpcMs + maxGrantTtlMs +
-(2 * maxGrantClockSkewMs) + postExpiryEvidenceRetentionMs`, and never before each registered old-revision
+(2 * maxGrantClockSkewMs) + postExpiryEvidenceRetentionMs`, and never before each registered prior-binding
 authorization is resolved to a stored grant, authoritative no-record result, or an explicit
 `unresolved_at_ceiling` ambiguity obligation. At that ceiling the latter resolution atomically
 forbids later acceptance and permits bounded verifier retirement only after its audit/replay hold;
@@ -474,13 +504,36 @@ and wrapping-key ID. One transaction generates the bearer, stores its fixed-leng
 seals the plaintext and safe result/envelope reference, and commits the full command tuple before a
 response may emit `Hive-Edge-Credential`. No delivery-shaped coordinate is invented for initial mint.
 
-The response carries dispatch authority only in `Hive-Dispatch-Capability`, evidence authority only
-in `Hive-Evidence-Upload-Capability`, a live single-attempt launch grant only in
+Broker responses carry dispatch authority only in `Hive-Dispatch-Capability`, evidence authority
+only in `Hive-Evidence-Upload-Capability`, a live single-attempt launch grant only in
 `Hive-Live-Injection-Capability`, and a headless single-slot launch grant only in
 `Hive-Headless-Launch-Capability`. The signed secret-negative headless result travels only in
 `Hive-Headless-No-Reservation`; every signed headless phase allow/deny/no-process-anchor response
-travels only in `Hive-Headless-Authority-Status`. Broker machine-credential mint and rotation carry the new bearer
-only in `Hive-Edge-Credential`. These closed-set response headers are stripped before any MCP result,
+travels only in `Hive-Headless-Authority-Status`. Broker machine-credential mint and rotation carry
+the new bearer only in `Hive-Edge-Credential`. The edge-control `hive.binding.prepare_ack` response
+carries its per-attempt evidence bearer only in `Hive-Live-Ack-Capability`, sealed and replayed under
+the edge-local wrapping-key contract below. These eight names form the complete direction-aware
+authentication response-header manifest; an unlisted name or a listed header emitted on an
+unregistered response path fails conformance.
+
+| Response header | Sole server / method / result variant allowed to emit it |
+| --- | --- |
+| `Hive-Dispatch-Capability` | broker / `hive.delivery.claim` / claimed delivery |
+| `Hive-Evidence-Upload-Capability` | broker / `hive.delivery.begin_dispatch` / Task created |
+| `Hive-Live-Injection-Capability` | broker / `hive.delivery.authorize_live_injection` / launch authorized |
+| `Hive-Headless-Launch-Capability` | broker / `hive.delivery.reserve_spawn` / reservation committed |
+| `Hive-Headless-No-Reservation` | broker / `hive.delivery.reserve_spawn` / permanent no-reservation result |
+| `Hive-Headless-Authority-Status` | broker / `hive.supervisor.authorize_headless_phase` / signed allow, deny, or committed no-process-anchor result |
+| `Hive-Edge-Credential` | broker / `hive.edge_credential.mint` or `hive.edge_credential.rotate` / new bearer committed |
+| `Hive-Live-Ack-Capability` | edge control / `hive.binding.prepare_ack` / verifier and sealed replay committed |
+
+Each row is singleton and request-scoped; duplicate or comma-joined values fail closed. A method or
+result variant may not emit another row's header. Registered request-side authentication uses are
+separate manifest entries and never authorize response emission. In particular,
+`Hive-Expired-Live-Injection-Capability` is request-only, non-authorizing evidence metadata and can
+never appear in a response.
+
+These closed-set response headers are stripped before any MCP result,
 Task, model-visible `_meta`, log, trace, diagnostic, or provider prompt is constructed. The edge
 transport, isolated supervisor client, or credential-admin adapter persists them directly into its owner-only secret store before
 committing its local command receipt. An exact authorized command replay decrypts the stored envelope
@@ -525,9 +578,9 @@ headless authority status:
   request/result: (capabilityDigest, policyAndProfileDigests, expectedDenialRevisions,
    terminalRecordDigestOrNone, canonicalRequestDigest, signedStoredResult)
 broker binding confirmation identity:
-  (stableEdgeId, machineCredentialLineageId, edgeBootEpoch,
-   previousBindingHandle, currentBindingHandle, operation, commandId)
-  request/result: (expectedBindingRegistryRevision, localConfirmationReceiptDigest,
+  (stableEdgeId, machineCredentialLineageId, operation, commandId)
+  request/result: (edgeBootEpoch, previousBindingHandleOrAbsent, currentBindingHandle,
+   expectedBindingRegistryRevisionOrAbsent, localConfirmationReceiptDigest,
    priorAuthorizationSetDigest, canonicalRequestDigest, storedResult)
 delivery reconciliation identity:
   (stableReconcilerPrincipalId, canonicalObligationHandle, operation, commandId)
@@ -546,8 +599,8 @@ local live operation:
   (edgeBootEpoch, bindingId, bindingRevision, deliveryId, leaseGeneration,
    providerAttempt, operation, commandId, canonicalRequestDigest, storedResult)
 local binding operation:
-  (providerPrincipalId, edgeBootEpoch, registrationNonceOrBindingId,
-   expectedBindingRevision, operation, commandId, canonicalRequestDigest, storedResult)
+  (providerPrincipalId, edgeBootEpoch, registrationNonceOrBindingId, operation, commandId)
+  request/result: (expectedBindingRevisionOrAbsent, canonicalRequestDigest, storedResult)
 local diagnostic operation:
   (operatorPrincipalId, edgeBootEpoch, provider, probeKind,
    commandId, canonicalRequestDigest, storedResult)
@@ -581,10 +634,11 @@ revision, evidence digest, verdict, evidence reference, audit detail, or any oth
 that identity is `hive_command_conflict`, never a new command. Replay requires the same stable
 reconciler principal and current method scope and never reattributes a verdict, acknowledgement, or
 resolution.
-The broker-binding-confirmation identity is likewise unique independently of expected registry
-revision, receipt/list digest, or other request bytes. Exact replay requires the same stable edge and
+The broker-binding-confirmation identity is likewise unique independently of boot/binding fences,
+expected registry revision, receipt/list digest, or other request bytes. Exact replay requires the same stable edge and
 current machine-credential lineage/method scope, looks up the stored result before fresh registry
-validation, and returns it after promotion; changed bytes conflict.
+validation, and returns it after promotion—including an initial expected-absent result after its row
+is now present; changed bytes conflict.
 
 Fresh mutation and exact committed-command replay have distinct authorization decisions. For a
 credential-secret response, ordering is principal authentication, current method-scope
@@ -833,7 +887,7 @@ reconciliation-family state/evidence compare-and-set.
 | `hive.delivery.seal_evidence` | original edge lineage with the attempt evidence-upload capability | Append one final sequence/digest seal for a required attempt evidence stream after all prior records are durable; exact replay only, no lifecycle authority |
 | `hive.reply.enqueue` | owning edge | Durably enqueue explicitly nonterminal progress output; terminal outcomes are forbidden here |
 | `hive.edge.report` | edge transport for ordinary observations; separately enrolled supervisor identity for supervisor-key registration | Report safe last-seen/workspace/provider observations and transport a supervisor-rooted, revision-fenced boot-key registration; the general edge bearer cannot originate or replace supervisor trust |
-| `hive.edge.confirm_binding` | edge under current machine lineage | CAS the broker binding registry to one locally confirmed binding and atomically resolve every journaled prior-revision authorization as an existing grant or permanent no-grant tombstone before fresh work uses the new revision |
+| `hive.edge.confirm_binding` | edge under current machine lineage | On an absent broker slot, CAS the canonical empty prior-authorization set to the locally confirmed binding; on a present slot, CAS the exact broker-previous binding/revision to the locally confirmed current binding—even after re-registration with a new binding ID/boot—and atomically resolve every journaled prior-binding authorization as an existing grant or permanent no-grant tombstone; both branches return the resulting registry revision and current binding/boot fence before fresh work uses it |
 | `hive.edge_credential.mint` | operator holding `edge-credential:mint` | Given edge handle, exact expected `credentialControl={state:"absent"}`, and `commandId`, atomically create exactly one lineage and active key; return safe edge/lineage/key handles, revision/validity, and the replayable secret only in `Hive-Edge-Credential` |
 | `hive.edge_credential.rotate` | operator holding `edge-credential:rotate` | Given lineage handle, `expectedLineageRevision`, and `commandId`, CAS-stage exactly one pending-next key with `confirmBy` no later than ten minutes and strictly inside both current and next key validity; return safe current/next handles, resulting revision/`confirmBy`/`nextValidUntil`, and the replayable next secret only in `Hive-Edge-Credential` |
 | `hive.edge_credential.confirm` | pending-next credential with confirm-only audience before the deadline; its exact expired-next verifier may only finalize expiry, and the original bearer has command-bound result-replay-only authority after either branch | Given lineage/current/next handles, expected staged revision, originating rotate command, and a new `commandId`, prove possession and atomically promote next/revoke old before the deadline or commit expiry; return a secret-negative replayable result including resulting revision/current handle/`validUntil` or the expiry disposition |
@@ -1375,7 +1429,7 @@ The two local directions have separate catalogs and credentials:
 | provider ingress / `hive.live.cancel` | edge executor using current binding or exact attempt-cancel hold | Delivery/generation/attempt, binding fence, reason, and command ID; stores and returns cooperative cancellation acknowledgement |
 | edge control / `hive.binding.register` | provider bridge | Actor, provider, surface/version, allowed operations, boot epoch, one-time registration nonce, command ID, root-authorized broker launch-key IDs, and Ed25519 nonacceptance-attestation key ID/public key plus proof of possession; atomically stores a pending binding and recoverable provider-facing directional envelope without replacing the provider's trust root |
 | edge control / `hive.binding.renew` | matching provider bridge | Binding ID, current revision, boot epoch, command ID, any root-authorized launch-key-set update, and current or next attestation key proof; exact CAS stages a next revision while current remains active and returns one stored encrypted renew envelope |
-| edge control / `hive.binding.confirm` | matching provider bridge | Current/next revision fence, originating register/renew command ID, and new command ID authenticated by pending-next control authority; atomically promotes next and returns stored confirmation |
+| edge control / `hive.binding.confirm` | matching provider bridge | For initial registration, expected-current `absent`, pending-initial fence, originating register command, and new command ID authenticated by pending-initial control authority; for renewal, exact current/pending-next fence and originating renew command authenticated by pending-next authority; atomically promotes exactly one pending candidate and returns stored confirmation |
 | edge control / `hive.binding.prepare_ack` | edge executor with current delivery authority | Binding fence, delivery/generation/attempt, broker-authenticated `begin_dispatch` result reference, and command ID; derives the bounded ACK expiry, durably stores the verifier and sealed header replay, then emits the secret only in the dedicated authentication response header |
 | edge control / `hive.binding.ack` | matching provider bridge | Binding fence, delivery/generation/attempt, ACK kind, bounded receipt reference, and command ID; appends one fenced immutable local-journal result without lifecycle effect, quarantined until `mark_dispatched` is durable |
 | edge control / `hive.provider.probe` | local operator with `provider:probe` | Provider, probe kind, hard deadline, and command ID; returns one immediate supervised typed result and creates no delivery Task |
@@ -1464,14 +1518,22 @@ from both factors and opens the next control secrets/dispatch verifiers.
 
 Registration and renewal use explicit pending/current states:
 
-1. Register stages the initial bundle as `pending`; renew authenticates with `current`, stages exactly
-   one `next` revision, and leaves current sender/verifier pairs active.
-2. The provider installs the next dispatch verifier in accept-next state and its next control sender
-   secret, then invokes `hive.binding.confirm` using that next control authority.
-3. Confirm atomically promotes both directional bundles. A lost renew response replays through the
-   still-current bundle; a lost confirm response replays through the now-current next bundle. The
-   provider accepts current and next dispatch verifiers during staging, so neither loss strands the
-   edge.
+1. Register stages one `pending-initial` bundle with expected-current `absent`; renew authenticates
+   with `current`, stages exactly one `pending-next` revision, and leaves current sender/verifier
+   pairs active. Both are a pending candidate, but their confirmation preconditions are distinct.
+2. The provider installs the pending candidate's dispatch verifier in accept-pending state and its
+   control sender secret, then invokes `hive.binding.confirm` using that pending control authority.
+3. Confirm atomically promotes both directional bundles and stores the provider-authenticated local
+   confirmation receipt. Locally, registration requires expected-current `absent`; renewal requires
+   the exact current/pending-next fence. The edge then durably completes
+   `hive.edge.confirm_binding`, choosing expected-absent seed or expected-present replacement solely
+   from the durable broker slot—not from whether the local receipt says register or renew. It
+   persists the returned `resultingBindingRegistryRevision` and current binding/boot fence before
+   launch. The locally current bundle remains non-launchable through the broker until that CAS is
+   stored. A lost renew response replays through the still-current bundle; a lost local confirm
+   response replays through the now-current promoted bundle; and a lost broker-confirmation response
+   replays its exact stored registry result. The provider accepts current and the one pending
+   candidate during staging, so none of those losses strands the edge.
 4. Binding an attempt atomically creates an attempt-scoped `ack-verification-only` hold for the
    exact control credential/capability digests through that attempt's ACK-evidence expiry. Nominal
    expiry or promotion of a bundle cannot remove such a hold, whether the bundle is still `current`
@@ -1480,16 +1542,21 @@ Registration and renewal use explicit pending/current states:
    accept new work. New work uses a non-expired current bundle. The verifier is removed only after
    its last hold expires or is durably discharged. Explicit binding or control-lineage revocation
    overrides retention and fails closed.
-5. Confirmation also places the promoted-away dispatch verifier/revision in the conservative
-   `launch-acceptance-only` hold defined above through the maximum possible grant lifetime,
+5. A local confirmation places the promoted-away dispatch verifier/revision in the conservative
+   `launch-acceptance-only` hold only when the edge journal already contains a durable prior
+   broker-confirmed slot fence that exactly matches that retained binding. This covers renewal or
+   re-registration replacement of broker-confirmed authority, but excludes a first-ever confirmation
+   and any local renewals that occur while the broker slot is still absent. The hold lasts through
+   the maximum possible grant lifetime,
    post-expiry attestation/evidence horizon, and exact-result replay hold. Any still-valid
    broker-signed grant bound to that exact retained snapshot may be consumed exactly once; the full
    expired grant may be tombstoned/attested afterward. A different binding fence or any other
    operation fails closed. Deliver, attestation, rotation, and exact replay race through one local
    store transaction, so promotion cannot create a gap or turn a negative observation into proof.
-6. In the same confirmation transaction, the edge retains its promoted-away dispatch sender
+6. In that same broker-fence-matched superseding-confirmation transaction, the edge retains its
+   promoted-away dispatch sender
    credential/capability in a matching owner-only `launch-send-only` hold for every registered
-   old-revision authorization/grant. It may authenticate only the exact already-registered
+   prior-binding authorization/grant. It may authenticate only the exact already-registered
    deliver, post-effective-expiry attestation, and their stored replays; it cannot authorize a new
    grant, describe, renew, bind, or target another attempt. When that grant is accepted, the edge
    retains only an `attempt-cancel-send-only` hold matching provider ingress's
@@ -1497,9 +1564,10 @@ Registration and renewal use explicit pending/current states:
    evidence/reconciliation/replay reference counts and fail-closed revocation rules. Losing either
    half makes unresolved work ambiguous; promotion never silently deletes one side first.
 
-Before initial confirmation the binding cannot dispatch. A pre-promotion live grant may use only
-the exact held dispatch verifier described in step 5; all fresh work uses the confirmed current
-revision. ACK requires the control bundle that was
+Before the broker confirms the locally current binding the binding cannot dispatch. For any
+superseding slot replacement, a pre-replacement live grant may use only the exact held dispatch
+verifier described in step 5; all
+fresh work uses the broker-confirmed current revision. ACK requires the control bundle that was
 bound to the attempt—active current authority or its attempt-scoped verification hold—plus the
 distinct per-attempt live-ACK capability. The pair authenticates only immutable evidence for that
 exact attempt, remains verifiable through the bounded attempt-plus-reconciliation window despite
@@ -2527,6 +2595,18 @@ These fixtures are part of the owning issues' acceptance, not optional integrati
   cannot discover/read raw replay; the owning edge's delivery-scoped `replay:read` remains a distinct
   operation and never grants operator authority.
 
+**Authentication response-header manifest (KRA-898):**
+
+- Generate the direction/method/result-variant manifest from one canonical source and plant a unique
+  canary in each of all eight response headers. Each canary appears byte-identically only on its
+  registered response path, reaches the correct injected owner-only sink before local success, and
+  is absent from bodies, Tasks, `_meta`, DTOs, errors, logs, traces, diagnostics, provider prompts,
+  child environments, and every other sink. Exact command replay returns the same singleton value.
+- On every method/result fixture, attempt the other seven known response names, the request-only
+  `Hive-Expired-Live-Injection-Capability`, an unknown `Hive-*` name, duplicate lines, and a
+  comma-joined value. Each fails closed before the SDK/domain result is acknowledged. Race parallel
+  requests with distinct canaries and prove no request-scoped header staging leaks across responses.
+
 **Machine credentials (KRA-900, with KRA-898 transport and KRA-907 target-local sink):**
 
 - Commit then drop/replay mint and rotate responses across restart: exactly one lineage/key or
@@ -2572,6 +2652,33 @@ These fixtures are part of the owning issues' acceptance, not optional integrati
 
 **Local launch CAS/holds (KRA-908):**
 
+- On fresh local state, register `pending-initial` and race two local confirmation command IDs plus
+  changed expected-current/pending/receipt bytes. Exactly one expected-current-absent confirmation
+  promotes and stores its receipt; exact lost-response replay succeeds after promotion, while changed
+  bytes conflict. It creates no previous-revision sender/verifier hold. Before the broker CAS, every
+  `authorize_live_injection` call fails without a provider-start intent.
+- Before any broker seed, locally renew that current-but-never-broker-confirmed binding and promote
+  its pending-next candidate. Because no durable prior broker-confirmed slot fence exists, the renewal
+  creates no promoted-away sender/verifier hold; the broker slot remains eligible only for the
+  canonical empty expected-absent seed of the locally current revision.
+- On a fresh broker slot, race two locally confirmed candidates with distinct binding IDs and boot
+  epochs for the same broker-derived `(edgeId, actor, provider)` slot. Confirmation with
+  `previousBinding: absent`, `expectedBindingRegistry: absent`, and the canonical empty sealed
+  prior-authorization set inserts exactly one row. A non-empty set, prior grant/start/tombstone row,
+  changed receipt/current fence, or losing command fails without another absent insert; the loser may
+  proceed only through expected-present replacement. The winning exact replay returns the byte-identical
+  `resultingBindingRegistryRevision` and current binding/boot after restart even though the row is now
+  present; the edge persists those values and uses that revision in the next CAS. The seed creates no
+  no-grant tombstone or promoted-away hold. After it, one authorized launch under that exact current
+  binding can proceed.
+- Preserve broker slot N, then expire/restart the provider and locally `register` M under a distinct
+  binding ID/boot. Broker selection is expected-present N->M, not expected-absent: it fences a delayed
+  N authorization/confirmation, reconciles the sealed complete N set, returns the next registry
+  revision/current M fence, and exact-replays after restart. With N's exact old sender/verifier
+  snapshot retained, an existing N grant remains consumable/replayable exactly once through the
+  superseding holds. Repeat without that snapshot: the affected attempt remains an explicit
+  ambiguity obligation and is never converted to no-grant because local replacement state is
+  missing.
 - Mint a grant under binding revision N, promote N+1, then deliver N exactly once. Repeat with
   `authorize_live_injection` in flight across confirmation and with its committed response lost then
   recovered after promotion. Stall after the local in-flight fsync but before send, promote/report
@@ -2594,6 +2701,12 @@ These fixtures are part of the owning issues' acceptance, not optional integrati
   stored acceptance, migrates the edge `launch-send-only` hold to `attempt-cancel-send-only`, and an
   exact cancel reaches the retained provider `attempt-cancel-only` verifier once. No replay may inject
   again or strand cancellation behind N+1.
+- Inject failure immediately before the acceptance transaction, during its rollback, immediately
+  after its durable commit but before provider injection, and after provider return. Injection never
+  begins before the acceptance/result commit. Once that commit exists, every retry returns the
+  stored acceptance and cannot inject a second time; a crash before the first provider call remains
+  side-effect `possible` and cannot produce nonacceptance proof merely because no provider result is
+  present.
 - Before acceptance, held N cannot describe, renew, cancel, authorize unrelated/new work, or accept
   the wrong issuer, boot epoch, revision, semantic snapshot, grant digest, local command ID, or
   canonical digest. After N is accepted, only its exact attempt-cancel hold can cancel that attempt.
