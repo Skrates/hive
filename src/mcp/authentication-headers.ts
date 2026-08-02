@@ -12,7 +12,11 @@ import {
   hasAmbiguousProtectedCredentialHeaders,
   protectedSecretCandidatesFromHeaders,
 } from "./credential-secrets.js";
-import { decodeJsonBytes, parseCredentialNegativeJson } from "./json-security.js";
+import {
+  decodeJsonBytes,
+  parseCredentialNegativeJson,
+  parseUniqueMemberJson,
+} from "./json-security.js";
 import { parseHttpMediaTypeEssence } from "./http-media-type.js";
 
 export type AuthenticationHeaderServer = "broker" | "edge-control";
@@ -53,7 +57,13 @@ interface StageContext {
   readonly requestId: string | number | null;
   readonly requestSecrets: readonly string[];
   staged: StagedAuthenticationHeader | null;
-  invalid: boolean;
+  state:
+    | "ready"
+    | "validating"
+    | "staged"
+    | "sealed-ready"
+    | "sealed-staged"
+    | "invalid";
 }
 
 const RESULT_VARIANT_FIELD = "resultVariant";
@@ -118,17 +128,21 @@ export class AuthenticationResponseStager {
       requestId: requestContext?.requestId ?? null,
       requestSecrets,
       staged: null,
-      invalid: false,
+      state: "ready",
     };
     return this.storage.run(context, async () => {
       let response: Response;
       try {
         response = await next(capturedRequest.request);
       } catch (error) {
-        if (context.staged || context.invalid) throw new AuthenticationHeaderError();
+        if (context.state !== "ready") throw new AuthenticationHeaderError();
         throw error;
       }
-      if (context.invalid) rejectAuthenticationResponse(response);
+      if (context.state === "invalid" || context.state === "validating") {
+        rejectAuthenticationResponse(response);
+      }
+      const sealedState = context.state === "staged" ? "sealed-staged" : "sealed-ready";
+      context.state = sealedState;
       const responseMetadata = snapshotResponseMetadata(response);
       if (
         hasUnstagedHiveHeaders(responseMetadata.headers)
@@ -138,6 +152,7 @@ export class AuthenticationResponseStager {
       }
       const captured = await captureSuccessfulJsonRpcResult(response, responseMetadata);
       response = captured.response;
+      if (context.state !== sealedState) rejectAuthenticationResponse(response);
       const successfulResult = captured.successfulResult;
       const actualResultVariant = successfulResult?.resultVariant ?? null;
       const requestToolName = context.requestToolName;
@@ -169,6 +184,10 @@ export class AuthenticationResponseStager {
         )
         : null;
       if (!context.staged) {
+        if (context.state !== "sealed-ready") rejectAuthenticationResponse(response);
+        if (toolEntries.length > 0 && responseMetadata.status === 200 && !successfulResult) {
+          rejectAuthenticationResponse(response);
+        }
         if (
           successfulResult
           && toolEntries.length > 0
@@ -176,7 +195,11 @@ export class AuthenticationResponseStager {
             headerRequired
             || !secretFreeEntry
             || !isSuccessfulCallToolResult(successfulResult.result)
-            || !jsonValuesEqual(successfulResult.result, secretFreeEntry.canonicalResult)
+            || !isCanonicalSecretFreeEnvelope(
+              successfulResult.envelope,
+              context.requestId,
+              secretFreeEntry.canonicalResult,
+            )
             || !responseHeadersEqual(
               responseMetadata.headers,
               secretFreeEntry.canonicalResponseHeaders,
@@ -194,7 +217,8 @@ export class AuthenticationResponseStager {
         rejectAuthenticationResponse(response);
       }
       if (
-        !successfulResult
+        context.state !== "sealed-staged"
+        || !successfulResult
         || !isSuccessfulCallToolResult(successfulResult.result)
         || responseLeaksSecrets(
           response,
@@ -204,6 +228,7 @@ export class AuthenticationResponseStager {
       ) {
         rejectAuthenticationResponse(response);
       }
+      if (context.state !== "sealed-staged") rejectAuthenticationResponse(response);
       const headers = new Headers(response.headers);
       headers.set(context.staged.headerName, context.staged.value);
       return new Response(response.body, {
@@ -223,29 +248,49 @@ export class AuthenticationResponseStager {
     if (!context) {
       throw new AuthenticationHeaderError();
     }
-    if (
-      context.invalid
-      || context.staged
-      || context.requestToolName !== route.method
-      || route.server !== this.server
-    ) {
-      context.invalid = true;
+    if (context.state !== "ready" || context.staged) {
+      context.state = "invalid";
       throw new AuthenticationHeaderError();
     }
-    // Poison before inspecting caller-supplied stage data. Only a completely
-    // validated, installed stage clears the poison, so a caught runtime or
-    // validation failure cannot leave this request eligible to emit output.
-    context.invalid = true;
-    const canonical = matchingManifestEntry(headerName, route);
-    if (
-      !canonical
-      || !isSingletonHeaderValue(value)
-      || hasSuccessfulResponseMetadataCollision([value])
-    ) {
+    // Enter a non-recoverable validating state before touching caller data.
+    // A reentrant stage poisons the state, and the outer attempt may not clear
+    // that poison even if a caller-controlled getter catches the inner error.
+    context.state = "validating";
+    try {
+      const server = route.server;
+      const method = route.method;
+      const resultVariant = route.resultVariant;
+      if (
+        context.state !== "validating"
+        || typeof headerName !== "string"
+        || typeof server !== "string"
+        || typeof method !== "string"
+        || typeof resultVariant !== "string"
+        || typeof value !== "string"
+        || context.requestToolName !== method
+        || server !== this.server
+      ) {
+        throw new AuthenticationHeaderError();
+      }
+      const candidateRoute = { server, method, resultVariant };
+      const canonical = matchingManifestEntry(headerName, candidateRoute);
+      if (
+        context.state !== "validating"
+        || !canonical
+        || !isSingletonHeaderValue(value)
+        || hasSuccessfulResponseMetadataCollision([value])
+      ) throw new AuthenticationHeaderError();
+      context.staged = {
+        ...candidateRoute,
+        headerName: canonical.name as AuthenticationResponseHeaderName,
+        value,
+      };
+      if (context.state !== "validating") throw new AuthenticationHeaderError();
+      context.state = "staged";
+    } catch {
+      context.state = "invalid";
       throw new AuthenticationHeaderError();
     }
-    context.staged = { ...route, headerName: canonical.name as AuthenticationResponseHeaderName, value };
-    context.invalid = false;
   }
 }
 
@@ -371,7 +416,11 @@ async function interceptAuthenticationResponse(
       || found.length !== 0
       || successfulResult.id !== route.requestId
       || !isSuccessfulCallToolResult(successfulResult.result)
-      || !jsonValuesEqual(successfulResult.result, secretFreeEntry.canonicalResult)
+      || !isCanonicalSecretFreeEnvelope(
+        successfulResult.envelope,
+        route.requestId,
+        secretFreeEntry.canonicalResult,
+      )
       || !responseHeadersEqual(
         responseMetadata.headers,
         secretFreeEntry.canonicalResponseHeaders,
@@ -494,6 +543,19 @@ function jsonValuesEqual(left: unknown, right: unknown): boolean {
       && jsonValuesEqual(leftRecord[key], rightRecord[key]));
 }
 
+function isCanonicalSecretFreeEnvelope(
+  actual: unknown,
+  requestId: string | number | null,
+  canonicalResult: unknown,
+): boolean {
+  if (requestId === null) return false;
+  return jsonValuesEqual(actual, {
+    jsonrpc: "2.0",
+    id: requestId,
+    result: canonicalResult,
+  });
+}
+
 function responseHeadersEqual(
   actual: Headers,
   expected: Readonly<Record<string, string>>,
@@ -506,6 +568,7 @@ function responseHeadersEqual(
 
 interface SuccessfulJsonRpcResultInspection {
   readonly id: string | number;
+  readonly envelope: Readonly<Record<string, unknown>>;
   readonly result: unknown;
   readonly resultVariant: string | null;
   readonly serializedBody: string;
@@ -556,7 +619,7 @@ async function captureSuccessfulJsonRpcResult(
     rejectAuthenticationResponse(response);
   }
   try {
-    const body = JSON.parse(serializedBody) as Record<string, unknown>;
+    const body = parseUniqueMemberJson(serializedBody) as Record<string, unknown>;
     if (
       body === null
       || typeof body !== "object"
@@ -572,14 +635,14 @@ async function captureSuccessfulJsonRpcResult(
     if (!result || typeof result !== "object") {
       return {
         response: capturedResponse,
-        successfulResult: { id, result, resultVariant: null, serializedBody },
+        successfulResult: { id, envelope: body, result, resultVariant: null, serializedBody },
       };
     }
     const structuredContent = (result as Record<string, unknown>).structuredContent;
     if (!structuredContent || typeof structuredContent !== "object") {
       return {
         response: capturedResponse,
-        successfulResult: { id, result, resultVariant: null, serializedBody },
+        successfulResult: { id, envelope: body, result, resultVariant: null, serializedBody },
       };
     }
     const variant = (structuredContent as Record<string, unknown>)[RESULT_VARIANT_FIELD];
@@ -587,6 +650,7 @@ async function captureSuccessfulJsonRpcResult(
       response: capturedResponse,
       successfulResult: {
         id,
+        envelope: body,
         result,
         resultVariant: typeof variant === "string" ? variant : null,
         serializedBody,

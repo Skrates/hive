@@ -198,6 +198,108 @@ test("a caught rejected staging attempt terminally poisons the request", async (
       return true;
     },
   );
+
+  for (const malformedRoute of [
+    null,
+    {
+      get server(): AuthenticationHeaderRoute["server"] {
+        throw new Error("caller-controlled server getter");
+      },
+      method: route.method,
+      resultVariant: route.resultVariant,
+    },
+    {
+      server: route.server,
+      get method(): string {
+        try {
+          stager.stage(entry.name, route, "reentrant-stage-secret");
+        } catch {
+          // A caller-controlled getter may catch the nested failure, but it
+          // must not restore the outer request to a releasable state.
+        }
+        return route.method;
+      },
+      resultVariant: route.resultVariant,
+    },
+  ]) {
+    await assert.rejects(
+      () => stager.run(methodRequest(route.method), async () => {
+        assert.throws(
+          () => stager.stage(entry.name, malformedRoute as AuthenticationHeaderRoute, "outer"),
+        );
+        return secretFreeClaimResponse();
+      }),
+      AuthenticationHeaderError,
+    );
+  }
+
+  const reentrantValue = {
+    get length(): number {
+      try {
+        stager.stage(entry.name, route, "nested-value-stage-secret");
+      } catch {
+        // The outer validation must remain terminally poisoned even if this
+        // runtime impostor catches the nested staging rejection.
+      }
+      return 4;
+    },
+    trim() {
+      return this;
+    },
+    includes() {
+      return false;
+    },
+  };
+  await assert.rejects(
+    () => stager.run(methodRequest(route.method), async () => {
+      assert.throws(
+        () => stager.stage(
+          entry.name,
+          route,
+          reentrantValue as unknown as string,
+        ),
+        AuthenticationHeaderError,
+      );
+      return secretFreeClaimResponse();
+    }),
+    AuthenticationHeaderError,
+  );
+});
+
+test("a delayed body pull cannot stage after the handler returns", async () => {
+  const entry = AUTHENTICATION_HEADER_MANIFEST.responseHeaders[0]!;
+  const route = routeFor(entry);
+  const stager = new AuthenticationResponseStager(route.server);
+  const body = new TextEncoder().encode(JSON.stringify({
+    jsonrpc: "2.0",
+    id: 1,
+    result: {
+      content: [],
+      resultType: "complete",
+      structuredContent: { resultVariant: route.resultVariant, safe: true },
+    },
+  }));
+  let delayedAttempted = false;
+  await assert.rejects(
+    () => stager.run(methodRequest(route.method), async () => {
+      stager.stage(entry.name, route, "outer-delayed-stage-secret");
+      const delayed = new ReadableStream<Uint8Array>({
+        async pull(controller) {
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          delayedAttempted = true;
+          assert.throws(
+            () => stager.stage(entry.name, route, "inner-delayed-stage-secret"),
+            AuthenticationHeaderError,
+          );
+          controller.enqueue(body);
+          controller.close();
+        },
+      }, { highWaterMark: 0 });
+      return new Response(delayed, { headers: { "content-type": "application/json" } });
+    }),
+    AuthenticationHeaderError,
+  );
+  assert.equal(delayedAttempted, true);
 });
 
 test("server staging binds edge credential mint and rotate to the actual request", async () => {
@@ -322,6 +424,44 @@ test("bound interception permits validated secret-free outcomes and still blocks
   assert.equal(passedBody.result.structuredContent.resultVariant, secretFreeVariant);
   assert.equal(sink.records.length, 0);
 
+  const extraEnvelopeMemberSink = new RecordingSink();
+  const extraEnvelopeMember = await new AuthenticationResponseInterceptor(
+    route.server,
+    extraEnvelopeMemberSink,
+  ).bind(
+    methodRequest(route.method),
+    { responseKey: "claim:extra-envelope-member" },
+  );
+  await assert.rejects(
+    () => extraEnvelopeMember.intercept(Response.json({
+      jsonrpc: "2.0",
+      id: 1,
+      result: {
+        content: [],
+        resultType: "complete",
+        structuredContent: { resultVariant: secretFreeVariant },
+      },
+      unexpected: { released: true },
+    })),
+    AuthenticationHeaderError,
+  );
+  assert.equal(extraEnvelopeMemberSink.records.length, 0);
+
+  for (const [index, duplicateBody] of duplicateSecretFreeClaimBodies().entries()) {
+    const duplicateSink = new RecordingSink();
+    const duplicate = await new AuthenticationResponseInterceptor(route.server, duplicateSink).bind(
+      methodRequest(route.method),
+      { responseKey: `claim:duplicate-member:${index}` },
+    );
+    await assert.rejects(
+      () => duplicate.intercept(new Response(duplicateBody, {
+        headers: { "content-type": "application/json" },
+      })),
+      AuthenticationHeaderError,
+    );
+    assert.equal(duplicateSink.records.length, 0);
+  }
+
   const unexpectedSink = new RecordingSink();
   const unexpected = await new AuthenticationResponseInterceptor(route.server, unexpectedSink).bind(
     methodRequest(route.method),
@@ -410,6 +550,51 @@ test("bound interception permits validated secret-free outcomes and still blocks
   assert.equal(
     (await serverSecretFree.json() as ResultBody).result.structuredContent.resultVariant,
     secretFreeVariant,
+  );
+  const missingContentType = secretFreeClaimResponse();
+  missingContentType.headers.delete("content-type");
+  const duplicateContentType = new Headers();
+  duplicateContentType.append("content-type", "application/json");
+  duplicateContentType.append("content-type", "application/json");
+  for (const malformedResponse of [
+    missingContentType,
+    secretFreeClaimResponse(duplicateContentType),
+    secretFreeClaimResponse({ "content-type": "text/plain" }),
+  ]) {
+    await assert.rejects(
+      () => serverStager.run(
+        methodRequest(route.method),
+        async () => malformedResponse,
+      ),
+      AuthenticationHeaderError,
+    );
+  }
+  for (const duplicateBody of duplicateSecretFreeClaimBodies()) {
+    await assert.rejects(
+      () => serverStager.run(
+        methodRequest(route.method),
+        async () => new Response(duplicateBody, {
+          headers: { "content-type": "application/json" },
+        }),
+      ),
+      AuthenticationHeaderError,
+    );
+  }
+  await assert.rejects(
+    () => serverStager.run(
+      methodRequest(route.method),
+      async () => Response.json({
+        jsonrpc: "2.0",
+        id: 1,
+        result: {
+          content: [],
+          resultType: "complete",
+          structuredContent: { resultVariant: secretFreeVariant },
+        },
+        unexpected: { released: true },
+      }),
+    ),
+    AuthenticationHeaderError,
   );
   await assert.rejects(
     () => serverStager.run(
@@ -1006,7 +1191,6 @@ test("server staging snapshots non-authorizing response metadata before delayed 
   for (const fixture of [
     { status: 202, contentType: "application/json" },
     { status: 500, contentType: "application/json" },
-    { status: 200, contentType: "text/plain" },
   ] as const) {
     const lateSecret = `late-unstaged-${fixture.status}-${fixture.contentType}`;
     let sourceResponse!: Response;
@@ -1588,6 +1772,17 @@ function secretFreeClaimResponse(
     },
     { headers },
   );
+}
+
+function duplicateSecretFreeClaimBodies(): readonly string[] {
+  const canonicalResult = '"result":{"content":[],"resultType":"complete","structuredContent":{"resultVariant":"no_claimable_delivery"}}';
+  return [
+    `{"jsonrpc":"2.0","id":1,"result":{"credential":"hidden"},${canonicalResult}}`,
+    `{"jsonrpc":"1.0","jsonrpc":"2.0","id":1,${canonicalResult}}`,
+    `{"jsonrpc":"2.0","id":2,"id":1,${canonicalResult}}`,
+    '{"jsonrpc":"2.0","id":1,"result":{"content":[],"resultType":"complete","structuredContent":{"resultVariant":"other","resultVariant":"no_claimable_delivery"}}}',
+    '{"jsonrpc":"2.0","id":1,"result":{"content":[],"resultType":"complete","structuredContent":{"resultVariant":"other","\\u0072esultVariant":"no_claimable_delivery"}}}',
+  ];
 }
 
 function errorResponse(headers: Readonly<Record<string, string>> = {}): Response {

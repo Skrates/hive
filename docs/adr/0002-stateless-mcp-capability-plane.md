@@ -547,6 +547,12 @@ label, or response variant. The interceptor then requires an unambiguous HTTP
 consulting the closed manifest. HTTP `202` is notification-only in the Hive profile and can never
 authorize a secret-bearing response.
 
+Authority-managed JSON responses reject duplicate object member names, including escape-equivalent
+names, at every nesting depth before parsed route/result validation or release of the captured bytes.
+The registered secret-free `no_claimable_delivery` path additionally requires the complete canonical
+JSON-RPC envelope, result, and response-header map; no unknown envelope member, result member, or
+response header is released.
+
 These closed-set response headers are persisted to the registered direction- and consumer-specific
 owner-only sink before they are stripped and before any MCP result,
 Task, model-visible `_meta`, log, trace, diagnostic, or provider prompt is constructed. The edge
