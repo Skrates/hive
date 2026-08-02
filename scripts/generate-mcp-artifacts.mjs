@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdir, readFile, readdir, realpath, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, realpath, stat, writeFile } from "node:fs/promises";
 import { dirname, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Ajv2020 } from "ajv/dist/2020.js";
@@ -516,6 +516,11 @@ async function verifyFixtureCorpus(corpus, fixtureManifest) {
     || JSON.stringify(actualPaths) !== JSON.stringify(expectedPaths)
   ) fail("stable core corpus file set drift");
 
+  const treeObjectId = await gitTreeObjectId(corpusRoot);
+  if (treeObjectId !== corpus.tree) {
+    fail(`stable core corpus git tree drift: expected ${corpus.tree}, got ${treeObjectId}`);
+  }
+
   const digest = createHash("sha256");
   for (let index = 0; index < files.length; index += 1) {
     const bytes = await readFile(files[index]);
@@ -526,6 +531,40 @@ async function verifyFixtureCorpus(corpus, fixtureManifest) {
     digest.update("\0");
   }
   if (digest.digest("hex") !== corpus.sha256) fail("stable core corpus sha256 drift");
+}
+
+async function gitTreeObjectId(directory) {
+  const entries = await Promise.all((await readdir(directory, { withFileTypes: true })).map(async (entry) => {
+    const path = resolve(directory, entry.name);
+    if (entry.isDirectory()) {
+      return { name: entry.name, mode: "40000", objectId: await gitTreeObjectId(path), directory: true };
+    }
+    if (entry.isFile()) {
+      const metadata = await stat(path);
+      if ((metadata.mode & 0o111) !== 0) {
+        fail(`executable fixture corpus entry cannot match pinned 100644 tree mode: ${path}`);
+      }
+      const bytes = await readFile(path);
+      const objectId = createHash("sha1")
+        .update(`blob ${bytes.byteLength}\0`)
+        .update(bytes)
+        .digest("hex");
+      return { name: entry.name, mode: "100644", objectId, directory: false };
+    }
+    fail(`unsupported fixture corpus entry: ${path}`);
+  }));
+  entries.sort((left, right) => Buffer.compare(
+    Buffer.from(`${left.name}${left.directory ? "/" : ""}`, "utf8"),
+    Buffer.from(`${right.name}${right.directory ? "/" : ""}`, "utf8"),
+  ));
+  const body = Buffer.concat(entries.flatMap((entry) => [
+    Buffer.from(`${entry.mode} ${entry.name}\0`, "utf8"),
+    Buffer.from(entry.objectId, "hex"),
+  ]));
+  return createHash("sha1")
+    .update(`tree ${body.byteLength}\0`)
+    .update(body)
+    .digest("hex");
 }
 
 async function resolveVendoredPath(vendoredPath) {

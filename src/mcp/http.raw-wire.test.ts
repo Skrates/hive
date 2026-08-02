@@ -67,6 +67,18 @@ test("raw modern wire enforces the final envelope and HTTP profile before factor
       secretCanary: "raw-bearer-host-canary",
     },
     {
+      name: "rejected Host cannot reflect a request-only Hive capability",
+      request: modernRequest("server/discover", {}, {
+        headers: {
+          host: "expired-grant-host-canary",
+          "Hive-Expired-Live-Injection-Capability": "expired-grant-host-canary",
+        },
+      }),
+      status: 403,
+      code: -32_000,
+      secretCanary: "expired-grant-host-canary",
+    },
+    {
       name: "rejected Origin cannot reflect the raw bearer",
       request: modernRequest("server/discover", {}, {
         headers: {
@@ -213,6 +225,44 @@ test("raw modern wire enforces the final envelope and HTTP profile before factor
       code: -32_000,
     },
     {
+      name: "wrong content type precedes missing protocol metadata",
+      request: deleteHeader(modernRequest("server/discover", {}, {
+        headers: { "content-type": "text/plain" },
+      }), "mcp-protocol-version"),
+      status: 415,
+      code: -32_000,
+    },
+    {
+      name: "wrong content type precedes unacceptable response media",
+      request: modernRequest("server/discover", {}, {
+        headers: { accept: "application/json", "content-type": "text/plain" },
+      }),
+      status: 415,
+      code: -32_000,
+    },
+    {
+      name: "wrong content type precedes malformed JSON",
+      request: rawRequest("{", {
+        ...modernHeaders("server/discover"),
+        "content-type": "text/plain",
+      }),
+      status: 415,
+      code: -32_000,
+    },
+    ...[
+      "application/json;charset=utf-8;charset=ascii",
+      "application/json;bad",
+      "application/json;=x",
+      'application/json;profile="unterminated',
+    ].map((contentType) => ({
+      name: `malformed content type ${contentType}`,
+      request: modernRequest("server/discover", {}, {
+        headers: { "content-type": contentType },
+      }),
+      status: 415,
+      code: -32_000,
+    })),
+    {
       name: "Accept omits SSE",
       request: modernRequest("server/discover", {}, {
         headers: { accept: "application/json" },
@@ -221,9 +271,33 @@ test("raw modern wire enforces the final envelope and HTTP profile before factor
       code: -32_000,
     },
     {
+      name: "unacceptable response media precedes missing protocol metadata",
+      request: deleteHeader(modernRequest("server/discover", {}, {
+        headers: { accept: "application/json" },
+      }), "mcp-protocol-version"),
+      status: 406,
+      code: -32_000,
+    },
+    {
       name: "Accept omits JSON",
       request: modernRequest("server/discover", {}, {
         headers: { accept: "text/event-stream" },
+      }),
+      status: 406,
+      code: -32_000,
+    },
+    {
+      name: "Accept rejects duplicate quality parameters",
+      request: modernRequest("server/discover", {}, {
+        headers: { accept: "application/json;q=1;q=0, text/event-stream" },
+      }),
+      status: 406,
+      code: -32_000,
+    },
+    {
+      name: "Accept rejects noncanonical quality syntax",
+      request: modernRequest("server/discover", {}, {
+        headers: { accept: "application/json;q=.5, text/event-stream" },
       }),
       status: 406,
       code: -32_000,
@@ -259,8 +333,12 @@ test("raw modern wire enforces the final envelope and HTTP profile before factor
 
   for (const fixture of cases) {
     const response = await adapter.fetch(fixture.request);
-    const raw = await response.text();
     assert.equal(response.status, fixture.status, fixture.name);
+    const raw = await response.text().catch((error: unknown) => {
+      throw new Error(`${fixture.name}: unexpected credential-firewall stream failure`, {
+        cause: error,
+      });
+    });
     const parsed = JSON.parse(raw) as Record<string, unknown>;
     assert.equal(
       jsonRpcErrorCode(parsed),

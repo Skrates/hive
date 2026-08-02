@@ -13,12 +13,23 @@ import {
   AuthenticationHeaderError,
   AuthenticationResponseStager,
 } from "./authentication-headers.js";
+import { captureBoundedRequest, readBoundedBody } from "./bounded-body.js";
 import {
   validateHivePrincipal,
   type HivePrincipal,
   type RequestingEdgeHealth,
 } from "./catalog.js";
+import {
+  hasAmbiguousProtectedCredentialHeaders,
+  protectedSecretCandidatesFromHeaders,
+  protectedSecretCandidatesFromRequest,
+} from "./credential-secrets.js";
 import { formatBrokerHandle, normalizeBrokerUuid } from "./handles.js";
+import {
+  acceptsMcpJsonAndSse,
+  parseHttpMediaTypeEssence,
+} from "./http-media-type.js";
+import { decodeJsonBytes, parseCredentialNegativeJson } from "./json-security.js";
 import { MCP_CONFORMANCE_MANIFEST } from "./schemas.js";
 
 const SERVER_IDENTITY = Object.freeze({ name: "hive", version: "0.4.0" });
@@ -104,34 +115,84 @@ class HiveMcpAdapterImplementation implements HiveMcpAdapter {
   }
 
   async fetch(request: Request): Promise<Response> {
-    const response = await this.fetchBeforeCredentialFirewall(request);
-    return await enforceAuthorizationCredentialNegativeResponse(
+    // Snapshot credential-shaped metadata before the first await. Neither an
+    // application-controlled body pull nor a caller retaining the source
+    // Request may erase a value that authentication or dispatch observed.
+    const requestHeaders = new Headers(request.headers);
+    const requestSecrets = protectedSecretCandidatesFromHeaders(requestHeaders);
+    const response = await this.fetchBeforeCredentialFirewall(request, requestHeaders);
+    return await enforceCredentialNegativeResponse(
       response,
-      request.headers.get("authorization"),
+      requestSecrets,
     );
   }
 
-  private async fetchBeforeCredentialFirewall(request: Request): Promise<Response> {
-    const hostRejected = hostHeaderValidationResponse(request, this.allowedHostnames);
-    if (hostRejected) return hostRejected;
-    const originRejected = originValidationResponse(request, this.allowedOriginHostnames);
-    if (originRejected) return originRejected;
-
-    if (
-      request.method === "POST"
-      && !request.headers.get("mcp-protocol-version")
-      && !await isLegacyRequest(request)
-    ) {
-      return await missingProtocolVersionResponse(request);
+  private async fetchBeforeCredentialFirewall(
+    request: Request,
+    requestHeaders: Headers,
+  ): Promise<Response> {
+    const metadataRequest = new Request(request.url, {
+      method: request.method,
+      headers: requestHeaders,
+    });
+    const hostRejected = hostHeaderValidationResponse(metadataRequest, this.allowedHostnames);
+    if (hostRejected) {
+      cancelRequestBody(request);
+      return hostRejected;
+    }
+    const originRejected = originValidationResponse(metadataRequest, this.allowedOriginHostnames);
+    if (originRejected) {
+      cancelRequestBody(request);
+      return originRejected;
     }
 
     // Final 2026-07-28 stateless transport ignores these removed mechanisms.
     // Strip them before authentication and SDK dispatch so no downstream
     // component can accidentally interpret or echo them.
-    const authenticationRequest = withoutHeaders(request, [
-      "mcp-session-id",
-      "last-event-id",
-    ]);
+    const authenticationHeaders = new Headers(requestHeaders);
+    authenticationHeaders.delete("mcp-session-id");
+    authenticationHeaders.delete("last-event-id");
+    // This broker adapter accepts no Hive-* request header. The sole canonical
+    // request-only header belongs to the future provider-ingress adapter and
+    // must be verified and stripped there before domain dispatch (KRA-908).
+    if (hasHiveRequestHeader(authenticationHeaders)) {
+      cancelRequestBody(request);
+      return invalidHiveRequestHeaderResponse();
+    }
+    if (hasAmbiguousProtectedCredentialHeaders(authenticationHeaders)) {
+      cancelRequestBody(request);
+      return invalidHiveRequestHeaderResponse();
+    }
+    if (hasCanonicalCredentialNegativeCollision(
+      protectedSecretCandidatesFromHeaders(authenticationHeaders),
+    )) {
+      cancelRequestBody(request);
+      return invalidHiveRequestHeaderResponse();
+    }
+    if (request.method !== "POST") {
+      cancelRequestBody(request);
+      return methodNotAllowedResponse();
+    }
+    if (
+      parseHttpMediaTypeEssence(authenticationHeaders.get("content-type"))
+        !== "application/json"
+    ) {
+      cancelRequestBody(request);
+      return unsupportedMediaTypeResponse();
+    }
+    if (
+      !acceptsMcpJsonAndSse(authenticationHeaders.get("accept"))
+    ) {
+      cancelRequestBody(request);
+      return notAcceptableResponse();
+    }
+    let capturedRequest: Awaited<ReturnType<typeof captureBoundedRequest>>;
+    try {
+      capturedRequest = await captureBoundedRequest(request, authenticationHeaders);
+    } catch {
+      return invalidRequestBodyResponse();
+    }
+    const authenticationRequest = capturedRequest.request;
     // Authentication may inspect the complete body. Give it an independent
     // branch so a body-consuming authenticator cannot disturb SDK dispatch.
     const principal = await authenticateSafely(
@@ -141,9 +202,13 @@ class HiveMcpAdapterImplementation implements HiveMcpAdapter {
     if (!principal) return unauthenticatedResponse();
     if (
       request.method === "POST"
-      && !acceptsModernMcpResponses(authenticationRequest.headers.get("accept"))
+      && !authenticationRequest.headers.get("mcp-protocol-version")
+      && !await isLegacyRequest(authenticationRequest)
     ) {
-      return notAcceptableResponse();
+      return await missingProtocolVersionResponse(authenticationRequest);
+    }
+    if (request.method === "POST" && !isValidJsonBody(capturedRequest.body)) {
+      return parseErrorResponse();
     }
 
     // The raw bearer terminates at the authentication seam. The SDK receives
@@ -250,10 +315,26 @@ function principalFromAuthInfo(authInfo: AuthInfo | undefined): HivePrincipal {
   return validateHivePrincipal(principal as HivePrincipal);
 }
 
+function cancelRequestBody(request: Request): void {
+  try {
+    const cancellation = request.body?.cancel();
+    void cancellation?.catch(() => {});
+  } catch {
+    // A caller-controlled upload cannot delay or replace the fixed rejection.
+  }
+}
+
 function withoutHeaders(request: Request, names: readonly string[]): Request {
   const headers = new Headers(request.headers);
   for (const name of names) headers.delete(name);
   return new Request(request, { headers });
+}
+
+function hasHiveRequestHeader(headers: Headers): boolean {
+  for (const [name] of headers.entries()) {
+    if (name.toLowerCase().startsWith("hive-")) return true;
+  }
+  return false;
 }
 
 function validateRequestingEdgeHealth(
@@ -291,12 +372,45 @@ function secretHeaderFailureResponse(): Response {
   return jsonRpcErrorResponse(500, -32_603, "Internal error.");
 }
 
+function invalidHiveRequestHeaderResponse(): Response {
+  return jsonRpcErrorResponse(400, -32_600, "Invalid Request: unsupported authentication metadata.");
+}
+
+function invalidRequestBodyResponse(): Response {
+  return jsonRpcErrorResponse(400, -32_600, "Invalid Request: malformed or unbounded body.");
+}
+
+function parseErrorResponse(): Response {
+  return jsonRpcErrorResponse(400, -32_700, "Parse error.");
+}
+
+function isValidJsonBody(body: Uint8Array): boolean {
+  try {
+    JSON.parse(decodeJsonBytes(body));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function unsupportedMediaTypeResponse(): Response {
+  return jsonRpcErrorResponse(
+    415,
+    -32_000,
+    "Unsupported Media Type: Content-Type must be application/json",
+  );
+}
+
 function notAcceptableResponse(): Response {
   return jsonRpcErrorResponse(
     406,
     -32_000,
     "Not Acceptable: Accept must list application/json and text/event-stream.",
   );
+}
+
+function methodNotAllowedResponse(): Response {
+  return jsonRpcErrorResponse(405, -32_000, "Method not allowed.");
 }
 
 async function missingProtocolVersionResponse(request: Request): Promise<Response> {
@@ -320,22 +434,16 @@ async function missingProtocolVersionResponse(request: Request): Promise<Respons
   );
 }
 
-function secretCandidatesFromAuthorization(value: string | null): readonly string[] {
-  if (!value) return [];
-  const candidates = new Set<string>();
-  candidates.add(value);
-  const bearer = /^Bearer\s+(.+)$/i.exec(value)?.[1];
-  if (bearer) candidates.add(bearer);
-  return [...candidates];
-}
-
 export async function enforceAuthorizationCredentialNegativeResponse(
   response: Response,
   authorization: string | null,
 ): Promise<Response> {
+  const request = new Request("http://localhost/mcp", {
+    headers: authorization ? { authorization } : {},
+  });
   return await enforceCredentialNegativeResponse(
     response,
-    secretCandidatesFromAuthorization(authorization),
+    protectedSecretCandidatesFromRequest(request),
   );
 }
 
@@ -344,31 +452,125 @@ async function enforceCredentialNegativeResponse(
   secrets: readonly string[],
 ): Promise<Response> {
   if (secrets.length === 0) return response;
-  const metadataLeak = responseMetadataLeaksSecret(response, secrets);
-  const mediaType = responseMediaType(response);
-  if (mediaType !== "application/json") {
-    if (metadataLeak) return sanitizeCredentialReflectingResponse(response, null, secrets);
-    if (!response.body) return response;
-    const protectedBody = mediaType === "text/event-stream"
-      ? secretNegativeSseStream(response.body, secrets)
-      : secretNegativeStream(response.body, secrets);
-    return new Response(protectedBody, {
-      status: response.status,
-      statusText: response.statusText,
-      headers: response.headers,
-    });
+  const metadata = snapshotResponseMetadata(response);
+  const metadataLeak = responseMetadataLeaksSecret(metadata, secrets);
+  if (metadataLeak || !hasScannableContentEncoding(metadata.headers.get("content-encoding"))) {
+    return sanitizeCredentialReflectingResponse(response, null, secrets);
   }
-
-  const serializedBody = await response.clone().text();
-  const bodyLeak = secrets.some((secret) =>
-    serializedBody.includes(secret)
-    || semanticJsonContainsSecret(parseJson(serializedBody), secret));
-  if (!metadataLeak && !bodyLeak) return response;
-  return sanitizeCredentialReflectingResponse(response, serializedBody, secrets);
+  if (!response.body) {
+    return new Response(null, metadata);
+  }
+  const contentType = metadata.headers.get("content-type");
+  if (isJsonLikeContentType(contentType)) {
+    return await preflightCredentialNegativeJsonResponse(response, metadata, secrets);
+  }
+  if (!isEventStreamContentType(contentType)) {
+    return sanitizeCredentialReflectingResponse(response, null, secrets);
+  }
+  const protectedSource = collapseCredentialStreamErrors(response.body);
+  const protectedBody = secretNegativeSseStream(protectedSource, secrets);
+  return new Response(protectedBody, {
+    status: metadata.status,
+    statusText: metadata.statusText,
+    headers: metadata.headers,
+  });
 }
 
-function responseMetadataLeaksSecret(response: Response, secrets: readonly string[]): boolean {
+interface ResponseMetadataSnapshot {
+  readonly status: number;
+  readonly statusText: string;
+  readonly headers: Headers;
+}
+
+function snapshotResponseMetadata(response: Response): ResponseMetadataSnapshot {
+  return {
+    status: response.status,
+    statusText: response.statusText,
+    headers: new Headers(response.headers),
+  };
+}
+
+async function preflightCredentialNegativeJsonResponse(
+  response: Response,
+  metadata: ResponseMetadataSnapshot,
+  secrets: readonly string[],
+): Promise<Response> {
+  let bytes: Uint8Array;
+  let serialized: string;
+  try {
+    bytes = await readBoundedBody(response.body);
+    serialized = decodeJsonBytes(bytes);
+    if (secrets.some((secret) => serialized.includes(secret))) {
+      return sanitizeCredentialReflectingResponse(response, serialized, secrets);
+    }
+    parseCredentialNegativeJson(serialized, secrets);
+  } catch {
+    return sanitizeCredentialReflectingResponse(response, null, secrets);
+  }
+  return new Response(bytes, {
+    status: metadata.status,
+    statusText: metadata.statusText,
+    headers: metadata.headers,
+  });
+}
+
+const CREDENTIAL_FIREWALL_SOURCE_FAILURE = "credential_firewall_source_failure";
+
+/**
+ * A response body is application-controlled and its stream error reason may
+ * itself contain an authorization value or an owner-private path. Proxy it
+ * one chunk per pull so backpressure survives, while replacing every source
+ * failure and cancellation failure with a fixed secret-negative boundary.
+ */
+function collapseCredentialStreamErrors(
+  stream: ReadableStream<Uint8Array>,
+): ReadableStream<Uint8Array> {
+  let reader: ReadableStreamDefaultReader<Uint8Array>;
+  try {
+    reader = stream.getReader();
+  } catch {
+    return new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.error(new Error(CREDENTIAL_FIREWALL_SOURCE_FAILURE));
+      },
+    });
+  }
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const next = await reader.read();
+        if (next.done) {
+          controller.close();
+          return;
+        }
+        controller.enqueue(next.value);
+      } catch {
+        controller.error(new Error(CREDENTIAL_FIREWALL_SOURCE_FAILURE));
+        cancelStreamReader(reader);
+      }
+    },
+    cancel() {
+      cancelStreamReader(reader);
+    },
+  });
+}
+
+function cancelStreamReader(reader: ReadableStreamDefaultReader<Uint8Array>): void {
+  try {
+    const cancellation = reader.cancel();
+    void cancellation.catch(() => {});
+  } catch {
+    // Application-controlled cancellation cannot delay or replace the public
+    // stream outcome.
+  }
+}
+
+function responseMetadataLeaksSecret(
+  response: ResponseMetadataSnapshot,
+  secrets: readonly string[],
+): boolean {
   return secrets.some((secret) => {
+    if (String(response.status).includes(secret)) return true;
     if (response.statusText.includes(secret)) return true;
     const lowerSecret = secret.toLowerCase();
     for (const [name, value] of response.headers.entries()) {
@@ -383,7 +585,6 @@ async function sanitizeCredentialReflectingResponse(
   serializedBody: string | null,
   secrets: readonly string[],
 ): Promise<Response> {
-
   let id: string | number | null = null;
   let code = -32_603;
   if (serializedBody !== null) {
@@ -398,12 +599,17 @@ async function sanitizeCredentialReflectingResponse(
         typeof candidateId === "string"
         && !secrets.some((secret) => candidateId.includes(secret))
       ) id = candidateId;
-      if (typeof body.error?.code === "number") code = body.error.code;
+      const errorCode = body.error?.code;
+      if (typeof errorCode === "number" && Number.isSafeInteger(errorCode)) code = errorCode;
     } catch {
       // A credential-reflecting malformed response becomes a constant failure.
     }
   }
   const status = response.status >= 400 ? response.status : 500;
+  // The replacement severs the caller from the original response. Cancel its
+  // body first so an open SSE handler, keepalive, or transport cannot survive
+  // behind the constant-shape error with no remaining cancellation path.
+  cancelResponseBody(response);
   const replacement = jsonRpcErrorResponse(
     status,
     code,
@@ -412,64 +618,72 @@ async function sanitizeCredentialReflectingResponse(
     id,
   );
   const replacementBytes = await replacement.clone().text();
-  if (secrets.some((secret) => replacementBytes.includes(secret))) {
-    return new Response(null, {
-      status: 500,
-      headers: { "cache-control": "no-store" },
-    });
+  const replacementMetadata = snapshotResponseMetadata(replacement);
+  if (
+    secrets.some((secret) => replacementBytes.includes(secret))
+    || responseMetadataLeaksSecret(replacementMetadata, secrets)
+  ) {
+    // If request text collides with the immutable JSON-RPC grammar itself,
+    // byte-level absence is impossible (for example a bearer named `id`).
+    // Admission rejects those values before authentication or dispatch; this
+    // fixed scaffold then contains no application-controlled response bytes.
+    return canonicalCredentialNegativeResponse();
   }
   return replacement;
 }
 
-function responseMediaType(response: Response): string | null {
-  const value = response.headers.get("content-type");
-  return value?.split(";", 1)[0]?.trim().toLowerCase() || null;
+const CANONICAL_CREDENTIAL_NEGATIVE_BODY =
+  '{"jsonrpc":"2.0","error":{"code":-32603,"message":"Internal error."},"id":null}';
+const CANONICAL_CREDENTIAL_NEGATIVE_HEADER_NAMES = Object.freeze([
+  "cache-control",
+  "content-type",
+]);
+const CANONICAL_CREDENTIAL_NEGATIVE_METADATA_VALUES = Object.freeze([
+  "500",
+  "no-store",
+  "application/json",
+]);
+
+function hasCanonicalCredentialNegativeCollision(secrets: readonly string[]): boolean {
+  return secrets.some((secret) =>
+    CANONICAL_CREDENTIAL_NEGATIVE_BODY.includes(secret)
+    || CANONICAL_CREDENTIAL_NEGATIVE_HEADER_NAMES.some((name) =>
+      name.includes(secret.toLowerCase()))
+    || CANONICAL_CREDENTIAL_NEGATIVE_METADATA_VALUES.some((value) => value.includes(secret)));
 }
 
-function parseJson(value: string): unknown {
+function canonicalCredentialNegativeResponse(): Response {
+  return new Response(CANONICAL_CREDENTIAL_NEGATIVE_BODY, {
+    status: 500,
+    headers: {
+      "cache-control": "no-store",
+      "content-type": "application/json",
+    },
+  });
+}
+
+function cancelResponseBody(response: Response): void {
   try {
-    return JSON.parse(value) as unknown;
+    const cancellation = response.body?.cancel();
+    void cancellation?.catch(() => {});
   } catch {
-    return null;
+    // Cancellation is best-effort and its application-controlled failure is
+    // never allowed to replace or delay the constant safe response.
   }
 }
 
-function semanticJsonContainsSecret(value: unknown, secret: string): boolean {
-  if (typeof value === "string") return value.includes(secret);
-  if (Array.isArray(value)) return value.some((item) => semanticJsonContainsSecret(item, secret));
-  if (value && typeof value === "object") {
-    return Object.entries(value).some(([key, item]) =>
-      key.includes(secret) || semanticJsonContainsSecret(item, secret));
-  }
-  return false;
+function hasScannableContentEncoding(value: string | null): boolean {
+  return value === null || value.trim().toLowerCase() === "identity";
 }
 
-function secretNegativeStream(
-  stream: ReadableStream<Uint8Array>,
-  secrets: readonly string[],
-): ReadableStream<Uint8Array> {
-  const needles = secrets.map((secret) => new TextEncoder().encode(secret));
-  const retainedBytes = Math.max(...needles.map((needle) => needle.byteLength)) - 1;
-  let pending: Uint8Array<ArrayBufferLike> = new Uint8Array();
-  return stream.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
-    transform(chunk, controller) {
-      const combined = concatenateBytes(pending, chunk);
-      if (needles.some((needle) => containsBytes(combined, needle))) {
-        controller.error(new Error("credential_reflection"));
-        return;
-      }
-      const emitLength = Math.max(0, combined.byteLength - retainedBytes);
-      if (emitLength > 0) controller.enqueue(combined.slice(0, emitLength));
-      pending = combined.slice(emitLength);
-    },
-    flush(controller) {
-      if (needles.some((needle) => containsBytes(pending, needle))) {
-        controller.error(new Error("credential_reflection"));
-        return;
-      }
-      if (pending.byteLength > 0) controller.enqueue(pending);
-    },
-  }));
+function isJsonLikeContentType(value: string | null): boolean {
+  const mediaType = parseHttpMediaTypeEssence(value);
+  return mediaType === "application/json"
+    || (mediaType?.startsWith("application/") === true && mediaType.endsWith("+json"));
+}
+
+function isEventStreamContentType(value: string | null): boolean {
+  return parseHttpMediaTypeEssence(value) === "text/event-stream";
 }
 
 const MAX_SSE_EVENT_BYTES = 1_048_576;
@@ -478,70 +692,147 @@ function secretNegativeSseStream(
   stream: ReadableStream<Uint8Array>,
   secrets: readonly string[],
 ): ReadableStream<Uint8Array> {
-  const needles = secrets.map((secret) => new TextEncoder().encode(secret));
-  let pending: Uint8Array<ArrayBufferLike> = new Uint8Array();
-  return stream.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
-    transform(chunk, controller) {
-      pending = concatenateBytes(pending, chunk);
-      let eventEnd = findSseEventEnd(pending);
-      while (eventEnd !== -1) {
-        const event = pending.slice(0, eventEnd);
-        assertCredentialNegativeSseEvent(event, secrets, needles, false);
-        controller.enqueue(event);
-        pending = pending.slice(eventEnd);
-        eventEnd = findSseEventEnd(pending);
-      }
-      if (pending.byteLength > MAX_SSE_EVENT_BYTES) {
-        controller.error(new Error("credential_firewall_sse_event_too_large"));
-      }
-    },
-    flush(controller) {
-      let eventEnd = findSseEventEnd(pending, true);
-      while (eventEnd !== -1) {
-        const event = pending.slice(0, eventEnd);
-        assertCredentialNegativeSseEvent(event, secrets, needles, false);
-        controller.enqueue(event);
-        pending = pending.slice(eventEnd);
-        eventEnd = findSseEventEnd(pending, true);
-      }
-      if (pending.byteLength === 0) return;
-      assertCredentialNegativeSseEvent(pending, secrets, needles, true);
-      controller.enqueue(pending);
-    },
-  }));
-}
-
-function findSseEventEnd(bytes: Uint8Array, eof = false): number {
-  for (let index = 0; index < bytes.byteLength; index += 1) {
-    const firstLength = sseLineEndingLength(bytes, index, eof);
-    if (firstLength === 0) continue;
-    const secondStart = index + firstLength;
-    const secondLength = sseLineEndingLength(bytes, secondStart, eof);
-    if (secondLength > 0) return secondStart + secondLength;
-    index += firstLength - 1;
+  const eventBuffer = new Uint8Array(MAX_SSE_EVENT_BYTES);
+  let eventBytes = 0;
+  let previousLineEnding = false;
+  let previousWasCr = false;
+  let leadingLfContinuesEmittedCr = false;
+  let currentChunk: Uint8Array | null = null;
+  let currentOffset = 0;
+  let sourceDone = false;
+  let emptyChunks = 0;
+  let reader: ReadableStreamDefaultReader<Uint8Array>;
+  try {
+    reader = stream.getReader();
+  } catch {
+    return new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.error(new Error(CREDENTIAL_FIREWALL_SOURCE_FAILURE));
+      },
+    });
   }
-  return -1;
-}
 
-function sseLineEndingLength(bytes: Uint8Array, index: number, eof: boolean): number {
-  const byte = bytes[index];
-  if (byte === 0x0a) return 1;
-  if (byte !== 0x0d) return 0;
-  if (index + 1 >= bytes.byteLength) return eof ? 1 : 0;
-  return bytes[index + 1] === 0x0a ? 2 : 1;
+  async function hasInput(): Promise<boolean> {
+    while (currentChunk === null || currentOffset >= currentChunk.byteLength) {
+      if (sourceDone) return false;
+      let done: boolean;
+      let value: Uint8Array | undefined;
+      try {
+        const next = await reader.read();
+        done = next.done;
+        value = next.value;
+      } catch {
+        throw new Error(CREDENTIAL_FIREWALL_SOURCE_FAILURE);
+      }
+      if (done) {
+        sourceDone = true;
+        currentChunk = null;
+        return false;
+      }
+      if (value === undefined) throw new Error(CREDENTIAL_FIREWALL_SOURCE_FAILURE);
+      if (value.byteLength === 0) {
+        emptyChunks += 1;
+        if (emptyChunks > 1_024) throw new Error(CREDENTIAL_FIREWALL_SOURCE_FAILURE);
+        continue;
+      }
+      emptyChunks = 0;
+      currentChunk = value;
+      currentOffset = 0;
+    }
+    return true;
+  }
+
+  function appendByte(byte: number): void {
+    if (eventBytes >= eventBuffer.byteLength) {
+      throw new Error("credential_firewall_sse_event_too_large");
+    }
+    eventBuffer[eventBytes] = byte;
+    eventBytes += 1;
+  }
+
+  function emitEvent(controller: ReadableStreamDefaultController<Uint8Array>): void {
+    const event = eventBuffer.slice(0, eventBytes);
+    assertCredentialNegativeSseEvent(event, secrets, false);
+    controller.enqueue(event);
+    eventBytes = 0;
+    previousLineEnding = false;
+    previousWasCr = false;
+  }
+
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        // A CR delimiter is emitted promptly instead of waiting indefinitely
+        // to discover whether a later LF completes CRLF. Preserve that LF as
+        // one bounded continuation chunk on the next downstream pull.
+        if (leadingLfContinuesEmittedCr) {
+          leadingLfContinuesEmittedCr = false;
+          if (await hasInput() && currentChunk![currentOffset] === 0x0a) {
+            currentOffset += 1;
+            controller.enqueue(Uint8Array.of(0x0a));
+            return;
+          }
+        }
+
+        for (;;) {
+          if (!await hasInput()) {
+            if (eventBytes === 0) {
+              controller.close();
+              return;
+            }
+            const event = eventBuffer.slice(0, eventBytes);
+            assertCredentialNegativeSseEvent(event, secrets, true);
+            controller.enqueue(event);
+            eventBytes = 0;
+            return;
+          }
+
+          const byte = currentChunk![currentOffset]!;
+          if (previousWasCr) {
+            previousWasCr = false;
+            if (byte === 0x0a) {
+              appendByte(byte);
+              currentOffset += 1;
+              continue;
+            }
+          }
+
+          appendByte(byte);
+          currentOffset += 1;
+          if (byte !== 0x0d && byte !== 0x0a) {
+            previousLineEnding = false;
+            continue;
+          }
+          if (!previousLineEnding) {
+            previousLineEnding = true;
+            previousWasCr = byte === 0x0d;
+            continue;
+          }
+
+          emitEvent(controller);
+          leadingLfContinuesEmittedCr = byte === 0x0d;
+          return;
+        }
+      } catch (error) {
+        cancelStreamReader(reader);
+        controller.error(error instanceof Error
+          ? error
+          : new Error(CREDENTIAL_FIREWALL_SOURCE_FAILURE));
+      }
+    },
+    cancel() {
+      cancelStreamReader(reader);
+    },
+  });
 }
 
 function assertCredentialNegativeSseEvent(
   bytes: Uint8Array,
   secrets: readonly string[],
-  needles: readonly Uint8Array[],
   unterminated: boolean,
 ): void {
   if (bytes.byteLength > MAX_SSE_EVENT_BYTES) {
     throw new Error("credential_firewall_sse_event_too_large");
-  }
-  if (needles.some((needle) => containsBytes(bytes, needle))) {
-    throw new Error("credential_reflection");
   }
   let eventText: string;
   try {
@@ -549,13 +840,20 @@ function assertCredentialNegativeSseEvent(
   } catch {
     throw new Error("credential_firewall_invalid_sse_utf8");
   }
+  // Fatal decoding makes the decoded string a lossless view of valid UTF-8.
+  // Delegate substring search to the runtime's linear-time string engine
+  // instead of multiplying event size by credential length in userland.
+  if (secrets.some((secret) => eventText.includes(secret))) {
+    throw new Error("credential_reflection");
+  }
   const data = sseDataPayload(eventText);
   if (data === null) return;
   if (unterminated) throw new Error("credential_firewall_unterminated_sse_event");
-  const parsed = parseJson(data);
-  if (parsed === null) throw new Error("credential_firewall_invalid_sse_json");
-  if (secrets.some((secret) => semanticJsonContainsSecret(parsed, secret))) {
-    throw new Error("credential_reflection");
+  try {
+    parseCredentialNegativeJson(data, secrets);
+  } catch (error) {
+    if (error instanceof Error && error.message === "credential_reflection") throw error;
+    throw new Error("credential_firewall_invalid_sse_json");
   }
 }
 
@@ -569,24 +867,6 @@ function sseDataPayload(eventText: string): string | null {
   return values.length === 0 ? null : values.join("\n");
 }
 
-function concatenateBytes(first: Uint8Array, second: Uint8Array): Uint8Array {
-  const combined = new Uint8Array(first.byteLength + second.byteLength);
-  combined.set(first, 0);
-  combined.set(second, first.byteLength);
-  return combined;
-}
-
-function containsBytes(haystack: Uint8Array, needle: Uint8Array): boolean {
-  if (needle.byteLength === 0 || needle.byteLength > haystack.byteLength) return false;
-  outer: for (let start = 0; start <= haystack.byteLength - needle.byteLength; start += 1) {
-    for (let offset = 0; offset < needle.byteLength; offset += 1) {
-      if (haystack[start + offset] !== needle[offset]) continue outer;
-    }
-    return true;
-  }
-  return false;
-}
-
 function constantCredentialNegativeMessage(status: number, code: number): string {
   if (code === -32_020) return "Bad Request: request metadata mismatch.";
   if (code === -32_022) return "Unsupported protocol version.";
@@ -594,23 +874,6 @@ function constantCredentialNegativeMessage(status: number, code: number): string
   if (status === 406) return "Not Acceptable.";
   if (status >= 400 && status < 500) return "Request rejected.";
   return "Internal error.";
-}
-
-function acceptsModernMcpResponses(value: string | null): boolean {
-  if (!value) return false;
-  const accepted = new Set<string>();
-  for (const item of value.split(",")) {
-    const parts = item.split(";").map((part) => part.trim().toLowerCase());
-    const mediaType = parts[0];
-    if (!mediaType) continue;
-    const quality = parts.find((part) => part.startsWith("q="));
-    if (quality !== undefined) {
-      const parsed = Number(quality.slice(2));
-      if (!Number.isFinite(parsed) || parsed <= 0 || parsed > 1) continue;
-    }
-    accepted.add(mediaType);
-  }
-  return accepted.has("application/json") && accepted.has("text/event-stream");
 }
 
 function jsonRpcErrorResponse(

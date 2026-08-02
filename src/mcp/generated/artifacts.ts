@@ -13,7 +13,7 @@ export const MCP_SCHEMA_PROVENANCE = deepFreeze({
   "conformance": {
     "path": "schemas/mcp/conformance-manifest.v1.json",
     "$id": "urn:skrates:hive:mcp:conformance-manifest:v1",
-    "sha256": "ac5a83984491eac83d3d65318ee1a77caf37ee92495c232749f3b7492b55d729"
+    "sha256": "bc9a253238c2602a214e59e954fbe584ae740b033be071603a49619048a66ce1"
   },
   "authenticationHeaders": {
     "path": "schemas/mcp/authentication-response-headers.v1.json",
@@ -57,7 +57,7 @@ export const MCP_CONFORMANCE_MANIFEST = deepFreeze({
         "vendoredPath": "schemas/upstream/core-2026-07-28-fixtures",
         "fileCount": 128,
         "hashAlgorithm": "sha256-v1(relative-path NUL bytes NUL)",
-        "sha256": "0443419da59bedb062111a1527fb7996c0d7c5348d1e58aa1c82658c33b61109"
+        "sha256": "bae6de868193aed37ce379fbb1de2455599b0eede87cec1d7b44ba5c29e49ae5"
       }
     },
     "schemaTwin": {

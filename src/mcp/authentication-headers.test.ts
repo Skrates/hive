@@ -9,7 +9,10 @@ import {
   type AuthenticationSecretRecord,
   type AuthenticationSecretSink,
 } from "./authentication-headers.js";
-import { AUTHENTICATION_HEADER_MANIFEST } from "./schemas.js";
+import {
+  AUTHENTICATION_HEADER_MANIFEST,
+  MCP_CONFORMANCE_MANIFEST,
+} from "./schemas.js";
 
 type ResponseEntry = (typeof AUTHENTICATION_HEADER_MANIFEST.responseHeaders)[number];
 
@@ -268,6 +271,32 @@ test("client interception persists then strips all eleven registered paths", asy
   }
 });
 
+test("client interception rejects ambiguous or malformed JSON content type before persistence", async () => {
+  const entry = AUTHENTICATION_HEADER_MANIFEST.responseHeaders[0]!;
+  for (const [index, contentType] of [
+    "application/json; charset=utf-8, text/plain",
+    "application/json;charset=utf-8;charset=ascii",
+    "application/json;bad",
+    "application/json;=x",
+    'application/json;profile="unterminated',
+  ].entries()) {
+    const route = { ...routeFor(entry), responseKey: `malformed-content-type:${index}` };
+    const sink = new RecordingSink();
+    await assert.rejects(
+      () => interceptAuthenticationResponse(
+        successfulResponse(route.resultVariant, {
+          [entry.name]: "malformed-content-type-canary",
+          "content-type": contentType,
+        }),
+        route,
+        sink,
+      ),
+      AuthenticationHeaderError,
+    );
+    assert.equal(sink.records.length, 0, contentType);
+  }
+});
+
 test("client interception blocks delivery until the registered owner-only sink commits", async () => {
   const entry = AUTHENTICATION_HEADER_MANIFEST.responseHeaders[0]!;
   const route = { ...routeFor(entry), responseKey: "barrier:1" };
@@ -466,10 +495,90 @@ test("client binding captures one tools/call request and is one-shot", async () 
     () => interceptor.bind(methodRequest(entry.method), { responseKey: " invalid" }),
     AuthenticationHeaderError,
   );
+  const missingProtocolHeader = methodRequest(entry.method);
+  missingProtocolHeader.headers.delete("mcp-protocol-version");
+  for (const request of [
+    methodRequest(entry.method, { headers: { "content-type": "text/plain" } }),
+    methodRequest(entry.method, {
+      headers: { "content-type": "application/json; charset=utf-8, text/plain" },
+    }),
+    methodRequest(entry.method, {
+      headers: { "content-type": "application/json;charset=utf-8;charset=ascii" },
+    }),
+    methodRequest(entry.method, { headers: { "content-type": "application/json;bad" } }),
+    methodRequest(entry.method, {
+      headers: { "content-type": 'application/json;profile="unterminated' },
+    }),
+    methodRequest(entry.method, { headers: { accept: "application/json" } }),
+    methodRequest(entry.method, {
+      headers: { accept: "application/json;q=1;q=0, text/event-stream" },
+    }),
+    methodRequest(entry.method, {
+      headers: { accept: "application/json;q=.5, text/event-stream" },
+    }),
+    methodRequest(entry.method, { headers: { "mcp-method": "resources/read" } }),
+    methodRequest(entry.method, { headers: { "mcp-name": "hive.edge_credential.rotate" } }),
+    missingProtocolHeader,
+    methodRequest(entry.method, { headers: { "mcp-protocol-version": "2025-11-25" } }),
+    methodRequest(entry.method, {
+      headers: { authorization: "Bearer duplicate-alpha, Bearer duplicate-beta" },
+    }),
+    methodRequest(entry.method, {
+      headers: { "Hive-Expired-Live-Injection-Capability": "duplicate-alpha, duplicate-beta" },
+    }),
+    methodRequest(entry.method, {
+      body: {
+        jsonrpc: "1.0",
+        id: 1,
+        method: "tools/call",
+        params: {
+          name: entry.method,
+          arguments: {},
+          _meta: finalEnvelope(),
+        },
+      },
+    }),
+    methodRequest(entry.method, {
+      body: {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: {
+          name: entry.method,
+          arguments: [],
+          _meta: finalEnvelope(),
+        },
+      },
+    }),
+    methodRequest(entry.method, {
+      body: {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: {
+          name: entry.method,
+          arguments: {},
+          _meta: {
+            "io.modelcontextprotocol/protocolVersion":
+              MCP_CONFORMANCE_MANIFEST.stableCore.protocolVersion,
+          },
+        },
+      },
+    }),
+  ]) {
+    await assert.rejects(
+      () => interceptor.bind(request, { responseKey: "binding:invalid-wire" }),
+      AuthenticationHeaderError,
+    );
+  }
 
   const sink = new RecordingSink();
   const pending = await new AuthenticationResponseInterceptor("broker", sink).bind(
-    methodRequest("hive.edge_credential.rotate"),
+    methodRequest("hive.edge_credential.rotate", {
+      headers: {
+        "mcp-name": `=?base64?${Buffer.from("hive.edge_credential.rotate").toString("base64")}?=`,
+      },
+    }),
     { responseKey: "binding:rotate" },
   );
   const response = successfulResponse("new_bearer_committed", {
@@ -484,6 +593,400 @@ test("client binding captures one tools/call request and is one-shot", async () 
     AuthenticationHeaderError,
   );
   assert.equal(sink.records.length, 1);
+});
+
+test("client binding returns the exact bounded request snapshot it authorizes", async () => {
+  const entry = AUTHENTICATION_HEADER_MANIFEST.responseHeaders[0]!;
+  const route = routeFor(entry);
+  const template = methodRequest(route.method, {
+    headers: { authorization: "Bearer pre-bind-secret-canary" },
+  });
+  const serialized = await template.text();
+  const sourceBytes = new TextEncoder().encode(serialized);
+  const source = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(sourceBytes);
+      controller.close();
+    },
+  });
+  const sourceRequest = new Request(template.url, {
+    method: "POST",
+    headers: template.headers,
+    body: source,
+    duplex: "half",
+  } as RequestInit & { duplex: "half" });
+  const sink = new RecordingSink();
+  const bound = await new AuthenticationResponseInterceptor(route.server, sink).bind(
+    sourceRequest,
+    { responseKey: "bounded-request:1" },
+  );
+  sourceRequest.headers.set("authorization", "Bearer post-bind-secret-canary");
+  sourceBytes.fill(0x78);
+
+  assert.equal(sourceRequest.bodyUsed, true);
+  assert.equal(bound.request.headers.get("authorization"), "Bearer pre-bind-secret-canary");
+  assert.equal(await bound.request.clone().text(), serialized);
+  await assert.rejects(
+    () => bound.intercept(successfulResponse(
+      route.resultVariant,
+      { [entry.name]: "bounded-response-secret" },
+      { echoed: "pre-bind-secret-canary" },
+    )),
+    AuthenticationHeaderError,
+  );
+  assert.equal(sink.records.length, 0);
+
+  let sourceCancelled = false;
+  const openSource = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(serialized.slice(0, 32)));
+    },
+    cancel() {
+      sourceCancelled = true;
+    },
+  });
+  const openRequest = new Request(template.url, {
+    method: "POST",
+    headers: template.headers,
+    body: openSource,
+    duplex: "half",
+  } as RequestInit & { duplex: "half" });
+  await rejectsWithin(
+    new AuthenticationResponseInterceptor(route.server, new RecordingSink()).bind(
+      openRequest,
+      { responseKey: "bounded-request:open" },
+    ),
+    1_500,
+    AuthenticationHeaderError,
+  );
+  assert.equal(sourceCancelled, true);
+});
+
+test("authority-bearing responses reject every non-identity content encoding", async () => {
+  const entry = AUTHENTICATION_HEADER_MANIFEST.responseHeaders[0]!;
+  const route = routeFor(entry);
+  for (const [index, contentEncoding] of [
+    "gzip",
+    "identity, gzip",
+    "identity;level=0",
+  ].entries()) {
+    const sink = new RecordingSink();
+    const pending = await new AuthenticationResponseInterceptor(route.server, sink).bind(
+      methodRequest(route.method),
+      { responseKey: `encoded-response:${index}` },
+    );
+    await assert.rejects(
+      () => pending.intercept(successfulResponse(route.resultVariant, {
+        [entry.name]: "encoded-response-secret",
+        "content-encoding": contentEncoding,
+      })),
+      AuthenticationHeaderError,
+    );
+    assert.equal(sink.records.length, 0, contentEncoding);
+
+    const stager = new AuthenticationResponseStager(route.server);
+    await assert.rejects(
+      () => stager.run(methodRequest(route.method), async () => {
+        stager.stage(entry.name, route, "encoded-staged-secret");
+        return successfulResponse(route.resultVariant, { "content-encoding": contentEncoding });
+      }),
+      AuthenticationHeaderError,
+    );
+  }
+});
+
+test("client and server authority seams reject invalid UTF-8 request bytes", async () => {
+  const entry = AUTHENTICATION_HEADER_MANIFEST.responseHeaders[0]!;
+  const route = routeFor(entry);
+  await assert.rejects(
+    () => new AuthenticationResponseInterceptor(route.server, new RecordingSink()).bind(
+      invalidUtf8MethodRequest(route.method),
+      { responseKey: "invalid-utf8-request:client" },
+    ),
+    AuthenticationHeaderError,
+  );
+
+  let handlerCalled = false;
+  const stager = new AuthenticationResponseStager(route.server);
+  await assert.rejects(
+    () => stager.run(invalidUtf8MethodRequest(route.method), async () => {
+      handlerCalled = true;
+      return successfulResponse(route.resultVariant);
+    }),
+    AuthenticationHeaderError,
+  );
+  assert.equal(handlerCalled, false);
+});
+
+test("client binding protects every request credential and removed session metadata", async () => {
+  const entry = AUTHENTICATION_HEADER_MANIFEST.responseHeaders.find((candidate) =>
+    candidate.name === "Hive-Edge-Credential")!;
+  const route = routeFor(entry);
+  for (const [headerName, headerValue] of [
+    ["authorization", "Bearer outbound-request-secret"],
+    ["Hive-Expired-Live-Injection-Capability", "outbound-expired-grant-secret"],
+  ] as const) {
+    const sink = new RecordingSink();
+    const pending = await new AuthenticationResponseInterceptor(route.server, sink).bind(
+      methodRequest(route.method, { headers: { [headerName]: headerValue } }),
+      { responseKey: `request-secret:${headerName}` },
+    );
+    const reflected = headerName === "authorization"
+      ? "outbound-request-secret"
+      : headerValue;
+    await assert.rejects(
+      () => pending.intercept(successfulResponse(
+        route.resultVariant,
+        { [entry.name]: "new-response-secret" },
+        { echoed: reflected },
+      )),
+      AuthenticationHeaderError,
+    );
+    assert.equal(sink.records.length, 0, headerName);
+  }
+
+  for (const removedHeader of ["Mcp-Session-Id", "Last-Event-ID"]) {
+    const sink = new RecordingSink();
+    const pending = await new AuthenticationResponseInterceptor(route.server, sink).bind(
+      methodRequest(route.method),
+      { responseKey: `removed-session:${removedHeader}` },
+    );
+    await assert.rejects(
+      () => pending.intercept(successfulResponse(route.resultVariant, {
+        [entry.name]: "new-response-secret",
+        [removedHeader]: "legacy-session-canary",
+      })),
+      AuthenticationHeaderError,
+    );
+    assert.equal(sink.records.length, 0, removedHeader);
+  }
+
+  const nestedRequestSecret = "nested-outbound-request-secret";
+  const nestedSink = new RecordingSink();
+  const nestedPending = await new AuthenticationResponseInterceptor(route.server, nestedSink).bind(
+    methodRequest(route.method, {
+      headers: { authorization: `Bearer ${nestedRequestSecret}` },
+    }),
+    { responseKey: "request-secret:nested-response-header" },
+  );
+  await assert.rejects(
+    () => nestedPending.intercept(successfulResponse(route.resultVariant, {
+      [entry.name]: `prefix-${nestedRequestSecret}-suffix`,
+    })),
+    AuthenticationHeaderError,
+  );
+  assert.equal(nestedSink.records.length, 0);
+
+  const statusCollisionSink = new RecordingSink();
+  await assert.rejects(
+    () => new AuthenticationResponseInterceptor(route.server, statusCollisionSink).bind(
+      methodRequest(route.method, { headers: { authorization: "Bearer 200" } }),
+      { responseKey: "request-secret:status-collision" },
+    ),
+    AuthenticationHeaderError,
+  );
+  assert.equal(statusCollisionSink.records.length, 0);
+
+  let statusCollisionHandlerCalled = false;
+  await assert.rejects(
+    () => new AuthenticationResponseStager(route.server).run(
+      methodRequest(route.method, { headers: { authorization: "Bearer 200" } }),
+      async () => {
+        statusCollisionHandlerCalled = true;
+        return successfulResponse(route.resultVariant);
+      },
+    ),
+    AuthenticationHeaderError,
+  );
+  assert.equal(statusCollisionHandlerCalled, false);
+
+  const responseStatusSink = new RecordingSink();
+  const responseStatusPending = await new AuthenticationResponseInterceptor(
+    route.server,
+    responseStatusSink,
+  ).bind(methodRequest(route.method), { responseKey: "response-secret:status-collision" });
+  await assert.rejects(
+    () => responseStatusPending.intercept(successfulResponse(
+      route.resultVariant,
+      { [entry.name]: "200" },
+    )),
+    AuthenticationHeaderError,
+  );
+  assert.equal(responseStatusSink.records.length, 0);
+});
+
+test("server staging snapshots non-authorizing response metadata before delayed body pulls", async () => {
+  const entry = AUTHENTICATION_HEADER_MANIFEST.responseHeaders[0]!;
+  const route = routeFor(entry);
+  const encoder = new TextEncoder();
+
+  for (const fixture of [
+    { status: 202, contentType: "application/json" },
+    { status: 500, contentType: "application/json" },
+    { status: 200, contentType: "text/plain" },
+  ] as const) {
+    const lateSecret = `late-unstaged-${fixture.status}-${fixture.contentType}`;
+    let sourceResponse!: Response;
+    const source = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        sourceResponse.headers.set(entry.name, lateSecret);
+        controller.enqueue(encoder.encode("non-authorizing response"));
+        controller.close();
+      },
+    }, { highWaterMark: 0 });
+    sourceResponse = new Response(source, {
+      status: fixture.status,
+      headers: { "content-type": fixture.contentType },
+    });
+
+    const returned = await new AuthenticationResponseStager(route.server).run(
+      methodRequest(route.method),
+      async () => sourceResponse,
+    );
+    assert.equal(returned.headers.get(entry.name), null);
+    assert.equal(await returned.text(), "non-authorizing response");
+    assert.equal(sourceResponse.headers.get(entry.name), lateSecret);
+    assert.equal(returned.headers.get(entry.name), null);
+  }
+});
+
+test("authority inspection is bounded and scans duplicate members before persistence", async () => {
+  const entry = AUTHENTICATION_HEADER_MANIFEST.responseHeaders[0]!;
+  const route = routeFor(entry);
+
+  const duplicateSecret = "duplicate-auth-canary";
+  const duplicateBody = `{"jsonrpc":"2.0","id":1,"result":{"content":[],"resultType":"complete","structuredContent":{"resultVariant":${JSON.stringify(route.resultVariant)},"echoed":"\\u0064uplicate-auth-canary","echoed":"safe"}}}`;
+  const duplicateSink = new RecordingSink();
+  const duplicatePending = await new AuthenticationResponseInterceptor(route.server, duplicateSink)
+    .bind(methodRequest(route.method), { responseKey: "duplicate-member:1" });
+  await assert.rejects(
+    () => duplicatePending.intercept(new Response(duplicateBody, {
+      headers: { "content-type": "application/json", [entry.name]: duplicateSecret },
+    })),
+    AuthenticationHeaderError,
+  );
+  assert.equal(duplicateSink.records.length, 0);
+
+  let sourceCancelled = false;
+  const open = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode('{"jsonrpc":"2.0","id":1,"result":'));
+    },
+    cancel() {
+      sourceCancelled = true;
+    },
+  });
+  const openSink = new RecordingSink();
+  const openPending = await new AuthenticationResponseInterceptor(route.server, openSink).bind(
+    methodRequest(route.method),
+    { responseKey: "open-body:1" },
+  );
+  await rejectsWithin(
+    openPending.intercept(new Response(open, {
+      headers: { "content-type": "application/json", [entry.name]: "open-secret" },
+    })),
+    1_500,
+    AuthenticationHeaderError,
+  );
+  assert.equal(sourceCancelled, true);
+  assert.equal(openSink.records.length, 0);
+
+  const oversized = successfulResponse(
+    route.resultVariant,
+    { [entry.name]: "oversized-secret" },
+    { padding: "x".repeat(1_048_576) },
+  );
+  const oversizedSink = new RecordingSink();
+  const oversizedPending = await new AuthenticationResponseInterceptor(route.server, oversizedSink)
+    .bind(methodRequest(route.method), { responseKey: "oversized-body:1" });
+  await assert.rejects(
+    () => oversizedPending.intercept(oversized),
+    AuthenticationHeaderError,
+  );
+  assert.equal(oversizedSink.records.length, 0);
+});
+
+test("authority validation and emission use one immutable body snapshot", async () => {
+  const entry = AUTHENTICATION_HEADER_MANIFEST.responseHeaders[0]!;
+  const route = routeFor(entry);
+  const encoder = new TextEncoder();
+
+  const clientSecret = "client-mutable-wire-canary";
+  const clientPlaceholder = "x".repeat(clientSecret.length);
+  const clientSerialized = JSON.stringify({
+    jsonrpc: "2.0",
+    id: 1,
+    result: {
+      content: [],
+      resultType: "complete",
+      structuredContent: {
+        resultVariant: route.resultVariant,
+        echoed: clientPlaceholder,
+      },
+    },
+  });
+  const clientBytes = encoder.encode(clientSerialized);
+  const clientOffset = clientSerialized.indexOf(clientPlaceholder);
+  assert.notEqual(clientOffset, -1);
+  const clientSource = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(clientBytes);
+      controller.close();
+    },
+  });
+  const mutatingSink: AuthenticationSecretSink = {
+    async persist() {
+      clientBytes.set(encoder.encode(clientSecret), clientOffset);
+    },
+  };
+  const pending = await new AuthenticationResponseInterceptor(route.server, mutatingSink).bind(
+    methodRequest(route.method),
+    { responseKey: "immutable-client:1" },
+  );
+  const intercepted = await pending.intercept(new Response(clientSource, {
+    headers: {
+      "content-type": "application/json",
+      [entry.name]: clientSecret,
+    },
+  }));
+  const clientWire = await intercepted.text();
+  assert.equal(intercepted.headers.has(entry.name), false);
+  assert.equal(clientWire.includes(clientSecret), false);
+  assert.equal(clientWire.includes(clientPlaceholder), true);
+
+  const serverSecret = "server-mutable-wire-canary";
+  const serverPlaceholder = "y".repeat(serverSecret.length);
+  const serverSerialized = JSON.stringify({
+    jsonrpc: "2.0",
+    id: 1,
+    result: {
+      content: [],
+      resultType: "complete",
+      structuredContent: {
+        resultVariant: route.resultVariant,
+        echoed: serverPlaceholder,
+      },
+    },
+  });
+  const serverBytes = encoder.encode(serverSerialized);
+  const serverOffset = serverSerialized.indexOf(serverPlaceholder);
+  assert.notEqual(serverOffset, -1);
+  const serverSource = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(serverBytes);
+      controller.close();
+    },
+  });
+  const stager = new AuthenticationResponseStager(route.server);
+  const staged = await stager.run(methodRequest(route.method), async () => {
+    stager.stage(entry.name, route, serverSecret);
+    return new Response(serverSource, { headers: { "content-type": "application/json" } });
+  });
+  serverBytes.set(encoder.encode(serverSecret), serverOffset);
+  const serverWire = await staged.text();
+  assert.equal(staged.headers.get(entry.name), serverSecret);
+  assert.equal(serverWire.includes(serverSecret), false);
+  assert.equal(serverWire.includes(serverPlaceholder), true);
 });
 
 test("malformed results, response-id mismatch, and reflected canaries fail before emission or persistence", async () => {
@@ -517,6 +1020,13 @@ test("malformed results, response-id mismatch, and reflected canaries fail befor
     () => stager.run(methodRequest(route.method), async () => {
       stager.stage(entry.name, route, canary);
       return escapedSecretResponse(route.resultVariant, canary);
+    }),
+    AuthenticationHeaderError,
+  );
+  await assert.rejects(
+    () => stager.run(methodRequest(route.method), async () => {
+      stager.stage(entry.name, route, canary);
+      return escapedSecretResponse(route.resultVariant, canary, {}, "key");
     }),
     AuthenticationHeaderError,
   );
@@ -612,6 +1122,7 @@ test("malformed results, response-id mismatch, and reflected canaries fail befor
       },
     }, { headers: { [entry.name]: canary } }),
     escapedSecretResponse(route.resultVariant, canary, { [entry.name]: canary }),
+    escapedSecretResponse(route.resultVariant, canary, { [entry.name]: canary }, "key"),
     statusTextSecretResponse(route.resultVariant, canary, { [entry.name]: canary }),
     new Response(JSON.stringify({
       result: { structuredContent: { resultVariant: route.resultVariant } },
@@ -663,9 +1174,80 @@ test("sink idempotency gives exact replay one record and changed replay a confli
       route,
       sink,
     ),
-    /secret_replay_conflict/,
+    AuthenticationHeaderError,
   );
-  assert.equal(sink.records.get(route.responseKey), "stable-canary");
+  assert.equal(sink.records.get(route.responseKey)?.value, "stable-canary");
+
+  const differentEntry = AUTHENTICATION_HEADER_MANIFEST.responseHeaders[1]!;
+  const differentRoute = { ...routeFor(differentEntry), responseKey: route.responseKey };
+  await assert.rejects(
+    () => interceptAuthenticationResponse(
+      successfulResponse(differentRoute.resultVariant, {
+        [differentEntry.name]: "stable-canary",
+      }),
+      differentRoute,
+      sink,
+    ),
+    AuthenticationHeaderError,
+  );
+});
+
+test("sink failure consumes the binding and fresh exact replay can retry", async () => {
+  const entry = AUTHENTICATION_HEADER_MANIFEST.responseHeaders[0]!;
+  const route = { ...routeFor(entry), responseKey: "replay:after-sink-failure" };
+  const sink = new FailOnceIdempotentSink();
+  const interceptor = new AuthenticationResponseInterceptor(route.server, sink);
+  const first = await interceptor.bind(methodRequest(route.method), {
+    responseKey: route.responseKey,
+  });
+  const response = () => successfulResponse(route.resultVariant, {
+    [entry.name]: "retry-canary",
+  });
+  await assert.rejects(
+    () => first.intercept(response()),
+    (error: unknown) => {
+      assert.ok(error instanceof AuthenticationHeaderError);
+      assert.equal(error.message, "invalid_authentication_response_header");
+      assert.equal(String(error).includes("retry-canary"), false);
+      assert.equal("cause" in error, false);
+      return true;
+    },
+  );
+  await assert.rejects(() => first.intercept(response()), AuthenticationHeaderError);
+  assert.equal(sink.records.size, 0);
+
+  const second = await interceptor.bind(methodRequest(route.method), {
+    responseKey: route.responseKey,
+  });
+  const stripped = await second.intercept(response());
+  assert.equal(stripped.headers.has(entry.name), false);
+  assert.equal(sink.records.get(route.responseKey)?.value, "retry-canary");
+
+  const exactReplay = await interceptor.bind(methodRequest(route.method), {
+    responseKey: route.responseKey,
+  });
+  await exactReplay.intercept(response());
+  assert.equal(sink.records.size, 1);
+});
+
+test("server staging collapses a post-staging handler exception", async () => {
+  const entry = AUTHENTICATION_HEADER_MANIFEST.responseHeaders[0]!;
+  const route = routeFor(entry);
+  const secret = "staged-handler-throw-canary";
+  const stager = new AuthenticationResponseStager(route.server);
+  await assert.rejects(
+    () => stager.run(methodRequest(route.method), async () => {
+      stager.stage(entry.name, route, secret);
+      throw new Error(`handler failed with ${secret} at /owner/private/store`);
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof AuthenticationHeaderError);
+      assert.equal(error.message, "invalid_authentication_response_header");
+      assert.equal(String(error).includes(secret), false);
+      assert.equal("cause" in error, false);
+      return true;
+    },
+  );
 });
 
 function routeFor(entry: ResponseEntry): AuthenticationHeaderRoute {
@@ -702,13 +1284,67 @@ async function interceptAuthenticationResponse(
   return pending.intercept(response);
 }
 
-function methodRequest(method: string): Request {
-  return jsonRpcRequest({
+function methodRequest(
+  method: string,
+  options: {
+    readonly body?: unknown;
+    readonly headers?: Readonly<Record<string, string>>;
+  } = {},
+): Request {
+  const body = options.body ?? {
     jsonrpc: "2.0",
     id: 1,
     method: "tools/call",
-    params: { name: method, arguments: {} },
+    params: {
+      name: method,
+      arguments: {},
+      _meta: finalEnvelope(),
+    },
+  };
+  return new Request("http://localhost/mcp", {
+    method: "POST",
+    headers: {
+      accept: "application/json, text/event-stream",
+      "content-type": "application/json",
+      "mcp-protocol-version": MCP_CONFORMANCE_MANIFEST.stableCore.protocolVersion,
+      "mcp-method": "tools/call",
+      "mcp-name": method,
+      ...options.headers,
+    },
+    body: JSON.stringify(body),
   });
+}
+
+function invalidUtf8MethodRequest(method: string): Request {
+  const marker = "invalid-utf8-note";
+  const body = JSON.stringify({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "tools/call",
+    params: {
+      name: method,
+      arguments: { note: marker },
+      _meta: finalEnvelope(),
+    },
+  });
+  const bytes = new TextEncoder().encode(body);
+  const markerOffset = body.indexOf(marker);
+  assert.notEqual(markerOffset, -1);
+  bytes[markerOffset] = 0xff;
+  const template = methodRequest(method);
+  return new Request(template.url, {
+    method: "POST",
+    headers: template.headers,
+    body: bytes,
+  });
+}
+
+function finalEnvelope(): Record<string, unknown> {
+  return {
+    "io.modelcontextprotocol/protocolVersion":
+      MCP_CONFORMANCE_MANIFEST.stableCore.protocolVersion,
+    "io.modelcontextprotocol/clientCapabilities": {},
+  };
 }
 
 function jsonRpcRequest(body: unknown): Request {
@@ -761,11 +1397,15 @@ function escapedSecretResponse(
   resultVariant: string,
   secret: string,
   headers: Readonly<Record<string, string>> = {},
+  placement: "key" | "value" = "value",
 ): Response {
   const first = secret.codePointAt(0);
   assert.notEqual(first, undefined);
   const escaped = `\\u${first!.toString(16).padStart(4, "0")}${secret.slice(1)}`;
-  const body = `{"jsonrpc":"2.0","id":1,"result":{"structuredContent":{"resultVariant":${JSON.stringify(resultVariant)},"echoed":"${escaped}"}}}`;
+  const reflected = placement === "key"
+    ? `"${escaped}":"safe"`
+    : `"echoed":"${escaped}"`;
+  const body = `{"jsonrpc":"2.0","id":1,"result":{"content":[],"resultType":"complete","structuredContent":{"resultVariant":${JSON.stringify(resultVariant)},${reflected}}}}`;
   assert.equal(body.includes(secret), false);
   return new Response(body, {
     headers: { "content-type": "application/json", ...headers },
@@ -792,6 +1432,27 @@ function statusTextSecretResponse(
   });
 }
 
+async function rejectsWithin(
+  promise: Promise<unknown>,
+  timeoutMs: number,
+  expected: new (...args: never[]) => Error,
+): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await assert.rejects(
+      Promise.race([
+        promise,
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error("timed_out_waiting_for_rejection")), timeoutMs);
+        }),
+      ]),
+      expected,
+    );
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 class RecordingSink implements AuthenticationSecretSink {
   readonly records: AuthenticationSecretRecord[] = [];
 
@@ -801,15 +1462,39 @@ class RecordingSink implements AuthenticationSecretSink {
 }
 
 class IdempotentSink implements AuthenticationSecretSink {
-  readonly records = new Map<string, string>();
+  readonly records = new Map<string, AuthenticationSecretRecord>();
 
   async persist(record: AuthenticationSecretRecord): Promise<void> {
     const existing = this.records.get(record.responseKey);
-    if (existing !== undefined && existing !== record.value) {
+    if (existing !== undefined && !recordsEqual(existing, record)) {
       throw new Error("secret_replay_conflict");
     }
-    this.records.set(record.responseKey, record.value);
+    this.records.set(record.responseKey, Object.freeze({ ...record }));
   }
+}
+
+class FailOnceIdempotentSink extends IdempotentSink {
+  private failed = false;
+
+  override async persist(record: AuthenticationSecretRecord): Promise<void> {
+    if (!this.failed) {
+      this.failed = true;
+      throw new Error(`injected_sink_failure:${record.value}:/owner/private/store`);
+    }
+    await super.persist(record);
+  }
+}
+
+function recordsEqual(
+  left: AuthenticationSecretRecord,
+  right: AuthenticationSecretRecord,
+): boolean {
+  return left.server === right.server
+    && left.method === right.method
+    && left.resultVariant === right.resultVariant
+    && left.responseKey === right.responseKey
+    && left.headerName === right.headerName
+    && left.value === right.value;
 }
 
 function deferred<T>(): {

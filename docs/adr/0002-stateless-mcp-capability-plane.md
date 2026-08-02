@@ -536,10 +536,13 @@ separate manifest entries and never authorize response emission. In particular,
 `Hive-Expired-Live-Injection-Capability` is request-only, non-authorizing evidence metadata and can
 never appear in a response.
 
-For a call that can emit one of these headers, the client binds the original `tools/call` request
-before transport and receives a one-shot interceptor. The binding captures the JSON-RPC method and
-ID itself; callers cannot supply a method label, result label, or response variant. The interceptor
-then requires an exact HTTP `200 application/json` response, validates a complete non-error
+For a call that can emit one of these headers, the client binding consumes the source `tools/call`
+into a one-MiB, one-second, fatal-UTF-8 snapshot and returns the exact captured `Request` that must be
+transported beside a one-shot interceptor. The server seam likewise passes its captured request to
+the handler. Method, ID, headers, protected request values, body classification, transport, and later
+response validation therefore derive from one snapshot; callers cannot supply a method label, result
+label, or response variant. The interceptor then requires an unambiguous HTTP
+`200 application/json` response, rejects non-identity content encodings, validates a complete non-error
 `CallToolResult` with the same ID, and derives the actual result variant from that result before
 consulting the closed manifest. HTTP `202` is notification-only in the Hive profile and can never
 authorize a secret-bearing response.
@@ -556,13 +559,28 @@ rewraps live envelopes and retains the prior key decrypt-only until every comman
 protects expires. Missing keys or failed authentication fail closed. Ciphertext is not a bearer and
 never participates in capability verification.
 
-The adapter firewall rejects a response if a protected secret occurs in raw response bytes, decoded
-JSON keys or values, response headers, status metadata, or an SSE event's decoded JSON payload. It
-buffers at most one bounded SSE event, validates that event before releasing it, and otherwise
-preserves streaming and backpressure; it never buffers an entire response stream. KRA-898 proves
-this request-bound interception and an injected owner-only sink seam, including idempotent duplicate
+The adapter firewall rejects a response if any protected request or response secret occurs in raw
+response bytes, any decoded JSON string token, response headers, status metadata, or an SSE event's
+decoded JSON payload. Protected request values include the complete Authorization value, its bearer,
+and every `Hive-*` value and comma-canonicalized component; ambiguous comma-joined credentials fail
+before authentication or dispatch. Encoded response bodies fail closed before media-specific
+scanning. JSON and `application/*+json` responses are completely preflighted before release with a
+one-MiB and one-second bound, fatal UTF-8 decoding, every string token scanned before duplicate-member
+collapse, and a constant valid JSON-RPC replacement on failure. SSE alone remains streaming: one
+fixed one-MiB event accumulator validates fatal-UTF-8 event text and every decoded JSON string in
+linear time before releasing each event. Its pull-driven parser releases at most one event or CRLF
+continuation per downstream pull, so one large source chunk cannot amplify into an unbounded output
+queue. A body-bearing response with any other or ambiguous media type fails closed.
+Candidate text that is itself a substring of the immutable JSON-RPC rejection scaffold (for example
+`id`, `jsonrpc`, or `2.0`) is a protocol-grammar collision, not evidence that application output
+reflected the credential. Such a credential is rejected before authentication or dispatch, its
+original response is discarded, and only the fixed valid JSON-RPC rejection scaffold is emitted;
+no application-controlled response byte or metadata survives that path. These paths preserve SSE
+backpressure and never buffer an unbounded response. KRA-898 proves this
+request-bound interception and an injected owner-only sink seam, including idempotent duplicate
 interception. The durable encrypted replay envelopes and crash-boundary persistence for each
-consumer remain the explicitly assigned work of KRA-900, KRA-904, and KRA-908.
+consumer remain the explicitly
+assigned work of KRA-900, KRA-904, and KRA-908.
 
 ### Durable command identity
 

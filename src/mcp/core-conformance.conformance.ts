@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { access, readFile } from "node:fs/promises";
+import { access, chmod, readFile, stat } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -99,6 +100,30 @@ test("all 128 official final-core examples satisfy their named pinned schema", a
   }
   assert.equal(parsed, manifest.fileCount);
   assert.equal(parsed, 128);
+});
+
+test("fixture provenance rejects executable-bit tree drift", async () => {
+  const fixture = resolve(
+    ROOT,
+    MCP_CONFORMANCE_MANIFEST.stableCore.fixtures.corpus.vendoredPath,
+    "DiscoverRequest/server-discover-request.json",
+  );
+  const originalMode = (await stat(fixture)).mode;
+  try {
+    await chmod(fixture, originalMode | 0o100);
+    const probe = spawnSync(
+      process.execPath,
+      [resolve(ROOT, "scripts/generate-mcp-artifacts.mjs"), "--check"],
+      { cwd: ROOT, encoding: "utf8" },
+    );
+    assert.notEqual(probe.status, 0);
+    assert.match(
+      `${probe.stdout}${probe.stderr}`,
+      /executable fixture corpus entry cannot match pinned 100644 tree mode/,
+    );
+  } finally {
+    await chmod(fixture, originalMode);
+  }
 });
 
 test("generated security manifests are recursively immutable at runtime", () => {
