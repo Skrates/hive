@@ -32,6 +32,7 @@ test("generated manifest is the exact closed eight-header response set", () => {
       resultType: "complete",
       structuredContent: { resultVariant: "no_claimable_delivery" },
     },
+    canonicalResponseHeaders: { "content-type": "application/json" },
   }]);
   assert.equal(manifestPaths().length, 11);
 });
@@ -175,6 +176,28 @@ test("server staging rejects preexisting, duplicate, comma-joined, and cross-rou
       AuthenticationHeaderError,
     );
   }
+});
+
+test("a caught rejected staging attempt terminally poisons the request", async () => {
+  const entry = AUTHENTICATION_HEADER_MANIFEST.responseHeaders[0]!;
+  const route = routeFor(entry);
+  const stager = new AuthenticationResponseStager(route.server);
+  const rejectedSecret = "caught-second-stage-secret";
+  await assert.rejects(
+    () => stager.run(methodRequest(route.method), async () => {
+      stager.stage(entry.name, route, "first-stage-secret");
+      assert.throws(
+        () => stager.stage(entry.name, route, rejectedSecret),
+        AuthenticationHeaderError,
+      );
+      return successfulResponse(route.resultVariant, {}, { credential: rejectedSecret });
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof AuthenticationHeaderError);
+      assert.equal(String(error).includes(rejectedSecret), false);
+      return true;
+    },
+  );
 });
 
 test("server staging binds edge credential mint and rotate to the actual request", async () => {
@@ -361,6 +384,24 @@ test("bound interception permits validated secret-free outcomes and still blocks
   );
   assert.equal(allowlistedPayloadSink.records.length, 0);
 
+  for (const responseHeader of ["authorization", "x-generated-credential"]) {
+    const freshHeaderSink = new RecordingSink();
+    const freshHeader = await new AuthenticationResponseInterceptor(
+      route.server,
+      freshHeaderSink,
+    ).bind(
+      methodRequest(route.method),
+      { responseKey: `claim:fresh-header:${responseHeader}` },
+    );
+    await assert.rejects(
+      () => freshHeader.intercept(secretFreeClaimResponse({
+        [responseHeader]: "fresh-unregistered-response-secret",
+      })),
+      AuthenticationHeaderError,
+    );
+    assert.equal(freshHeaderSink.records.length, 0);
+  }
+
   const serverStager = new AuthenticationResponseStager(route.server);
   const serverSecretFree = await serverStager.run(
     methodRequest(route.method),
@@ -375,6 +416,15 @@ test("bound interception permits validated secret-free outcomes and still blocks
       methodRequest(route.method),
       async () => successfulResponse("credential_committed_unregistered", {}, {
         credential: "must-not-release-server-unregistered-credential",
+      }),
+    ),
+    AuthenticationHeaderError,
+  );
+  await assert.rejects(
+    () => serverStager.run(
+      methodRequest(route.method),
+      async () => secretFreeClaimResponse({
+        authorization: "Bearer fresh-server-response-secret",
       }),
     ),
     AuthenticationHeaderError,

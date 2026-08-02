@@ -53,9 +53,18 @@
           "uniqueItems": true,
           "items": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" }
         },
-        "canonicalResult": { "$ref": "#/$defs/noClaimableDeliveryResult" }
+        "canonicalResult": { "$ref": "#/$defs/noClaimableDeliveryResult" },
+        "canonicalResponseHeaders": { "$ref": "#/$defs/noClaimableDeliveryHeaders" }
       },
-      "required": ["server", "method", "resultVariants", "canonicalResult"],
+      "required": ["server", "method", "resultVariants", "canonicalResult", "canonicalResponseHeaders"],
+      "additionalProperties": false
+    },
+    "noClaimableDeliveryHeaders": {
+      "type": "object",
+      "properties": {
+        "content-type": { "const": "application/json" }
+      },
+      "required": ["content-type"],
       "additionalProperties": false
     },
     "noClaimableDeliveryResult": {
@@ -164,6 +173,9 @@
             "structuredContent": {
               "resultVariant": "no_claimable_delivery"
             }
+          },
+          "canonicalResponseHeaders": {
+            "content-type": "application/json"
           }
         }
       ],

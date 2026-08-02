@@ -53,6 +53,7 @@ interface StageContext {
   readonly requestId: string | number | null;
   readonly requestSecrets: readonly string[];
   staged: StagedAuthenticationHeader | null;
+  invalid: boolean;
 }
 
 const RESULT_VARIANT_FIELD = "resultVariant";
@@ -71,6 +72,7 @@ interface ResultRouteEntry {
   readonly alternateMethods?: readonly string[];
   readonly resultVariants: readonly string[];
   readonly canonicalResult: unknown;
+  readonly canonicalResponseHeaders: Readonly<Record<string, string>>;
 }
 
 export class AuthenticationHeaderError extends Error {
@@ -116,15 +118,17 @@ export class AuthenticationResponseStager {
       requestId: requestContext?.requestId ?? null,
       requestSecrets,
       staged: null,
+      invalid: false,
     };
     return this.storage.run(context, async () => {
       let response: Response;
       try {
         response = await next(capturedRequest.request);
       } catch (error) {
-        if (context.staged) throw new AuthenticationHeaderError();
+        if (context.staged || context.invalid) throw new AuthenticationHeaderError();
         throw error;
       }
+      if (context.invalid) rejectAuthenticationResponse(response);
       const responseMetadata = snapshotResponseMetadata(response);
       if (
         hasUnstagedHiveHeaders(responseMetadata.headers)
@@ -173,6 +177,10 @@ export class AuthenticationResponseStager {
             || !secretFreeEntry
             || !isSuccessfulCallToolResult(successfulResult.result)
             || !jsonValuesEqual(successfulResult.result, secretFreeEntry.canonicalResult)
+            || !responseHeadersEqual(
+              responseMetadata.headers,
+              secretFreeEntry.canonicalResponseHeaders,
+            )
             || responseLeaksSecrets(
               response,
               successfulResult.serializedBody,
@@ -212,21 +220,32 @@ export class AuthenticationResponseStager {
     value: string,
   ): void {
     const context = this.storage.getStore();
+    if (!context) {
+      throw new AuthenticationHeaderError();
+    }
     if (
-      !context
+      context.invalid
       || context.staged
       || context.requestToolName !== route.method
       || route.server !== this.server
     ) {
+      context.invalid = true;
       throw new AuthenticationHeaderError();
     }
+    // Poison before inspecting caller-supplied stage data. Only a completely
+    // validated, installed stage clears the poison, so a caught runtime or
+    // validation failure cannot leave this request eligible to emit output.
+    context.invalid = true;
     const canonical = matchingManifestEntry(headerName, route);
     if (
       !canonical
       || !isSingletonHeaderValue(value)
       || hasSuccessfulResponseMetadataCollision([value])
-    ) throw new AuthenticationHeaderError();
+    ) {
+      throw new AuthenticationHeaderError();
+    }
     context.staged = { ...route, headerName: canonical.name as AuthenticationResponseHeaderName, value };
+    context.invalid = false;
   }
 }
 
@@ -353,6 +372,10 @@ async function interceptAuthenticationResponse(
       || successfulResult.id !== route.requestId
       || !isSuccessfulCallToolResult(successfulResult.result)
       || !jsonValuesEqual(successfulResult.result, secretFreeEntry.canonicalResult)
+      || !responseHeadersEqual(
+        responseMetadata.headers,
+        secretFreeEntry.canonicalResponseHeaders,
+      )
       || responseLeaksSecrets(
         response,
         successfulResult.serializedBody,
@@ -469,6 +492,16 @@ function jsonValuesEqual(left: unknown, right: unknown): boolean {
     && leftKeys.every((key) =>
       Object.prototype.hasOwnProperty.call(rightRecord, key)
       && jsonValuesEqual(leftRecord[key], rightRecord[key]));
+}
+
+function responseHeadersEqual(
+  actual: Headers,
+  expected: Readonly<Record<string, string>>,
+): boolean {
+  const actualEntries = [...actual.entries()];
+  const expectedEntries = Object.entries(expected);
+  return actualEntries.length === expectedEntries.length
+    && actualEntries.every(([name, value]) => expected[name] === value);
 }
 
 interface SuccessfulJsonRpcResultInspection {
