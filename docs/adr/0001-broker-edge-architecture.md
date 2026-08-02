@@ -5,7 +5,7 @@
 - Ratified: 2026-07-12 by Hákon Freyr Gunnarsson
 - Durable ledger: [KRA-717](https://linear.app/krates-ehf/issue/KRA-717/hive-ears-v03-brokeredge-architecture)
 - v0.4 note: the broker/edge wire, replay bootstrap, live-provider adapter/local-ingress details that
-  mandate loopback callbacks or `claude/channel`, and one evidence-proved no-effect requeue edge are
+  mandate loopback callbacks or `claude/channel`, and the evidence-proved no-effect requeue rules are
   superseded/refined by [ADR-0002](./0002-stateless-mcp-capability-plane.md); all other locked
   invariants remain accepted
 
@@ -41,20 +41,42 @@ pending -> claimed -> accepted_local -> dispatching -> dispatched
 Terminal dispositions are `processed`, `undeliverable`, `ambiguous`, and `dead_letter`, each with a
 typed reason set. JSONL is an audit/export format only.
 
-ADR-0002 adds exactly one backward transition for v0.4: authority loss may move `claimed`,
-`accepted_local`, or `dispatching` **before provider-start intent** back to `pending` only when
-durable evidence proves provider effect impossible. If a dispatch Task already exists, Task
-`cancelled`, the no-effect evidence, and the requeue commit atomically; the next claim uses a higher
-lease generation and provider attempt. After start intent, even proved process absence produces the
-typed deterministic terminal result from ADR-0002 rather than this requeue. Operator cancellation
-instead terminalizes `undeliverable/operator_cancelled`, and any possible provider effect forbids
-the backward edge.
+`ambiguous` is terminal truth for that provider attempt and its Task, not permission to rewrite its
+history. Explicit reconciliation may append a verdict that permanently closes the delivery or,
+only with ADR-0002's complete no-effect proof, makes a higher-generation/higher-attempt delivery
+eligible at `pending`; the historical terminal Task and attempt remain immutable.
+
+ADR-0002 defines the only v0.4 authority-loss backward edges. A `claimed`, `accepted_local`, or
+`dispatching` delivery may return to `pending` only when durable evidence establishes one of:
+
+1. no provider-start intent was committed and provider effect is impossible;
+2. a live provider-start intent exists, but its unique launch grant reached ADR-0002's effective
+   expiry and provider ingress
+   atomically committed exact `expired_unaccepted` proof for that grant; or
+3. a headless spawn reservation exists, but ADR-0002's exact
+   reservation/attempt/retry-ordinal-keyed supervisor state machine atomically committed one signed
+   closed no-process terminal—`spawn_forbidden_no_process`, `expired_unbound_no_process`, or the
+   root-denial-receipted `denied_unbound_no_process`—before any `process_created` transition, every
+   delayed/restarted bind or spawn path is permanently fenced by that terminal, the independently
+   rooted broker phase ledger anchored that exact terminal digest while proving no process-phase
+   receipt committed, and the supervisor evidence source is sealed after that anchor.
+
+If the attempt has a still-`working` Task, the no-effect proof, Task cancellation, and requeue commit
+atomically; a historical terminal Task is immutable. The next claim uses a higher lease generation
+and provider attempt. Operator cancellation instead records `undeliverable/operator_cancelled`.
+Grant expiry alone, observed row
+absence, cleanup success, process disappearance after creation, or any missing, conflicting, or
+uncertain/unsigned supervisor evidence cannot authorize the backward edge; possible provider effect remains
+`ambiguous`.
 
 ### Crash honesty
 
 Broker and edge deduplicate independently. A crash between provider injection and recording the
-dispatch is intrinsically ambiguous. The edge retries only when that exact deployed provider path
-has proven idempotency; otherwise the broker records `ambiguous` and requires reconciliation.
+dispatch is intrinsically ambiguous. A deployed provider-idempotency proof permits only replay of
+the same logical provider operation under the same delivery, generation, provider attempt, Task,
+and durable provider idempotency key with a higher retry ordinal—never requeue or a new attempt.
+Once `ambiguous` and its obligation commit, no automatic provider call is permitted. Without that
+exact proof, the broker records `ambiguous` and requires reconciliation.
 
 In v0.3 reconciliation posts an operator-visible Hive alert. A human inspects the provider session
 transcript and records `processed` or `requeue`. Fencing rejects stale claims and acknowledgements;
