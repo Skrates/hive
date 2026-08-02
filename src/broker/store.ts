@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import type {
   Delivery,
   DeliveryStatus,
@@ -22,18 +22,26 @@ const TERMINAL = new Set<DeliveryStatus>([
   "dead_letter",
 ]);
 
+const BROKER_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
 export class StaleLeaseError extends Error {}
 export class InvalidTransitionError extends Error {}
 export class ReconciliationError extends Error {}
 
 export class BrokerStore {
   readonly db: Database.Database;
+  readonly brokerUuid: string;
 
   constructor(path: string, private readonly clock: Clock = systemClock) {
     this.db = new Database(path);
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("foreign_keys = ON");
+    // SQLite implements INSERT OR REPLACE as a delete followed by an insert.
+    // Recursive triggers must be enabled for the immutable singleton's DELETE
+    // guard to fire on that replacement path.
+    this.db.pragma("recursive_triggers = ON");
     this.migrate();
+    this.brokerUuid = this.loadOrCreateBrokerUuid();
   }
 
   close(): void {
@@ -42,6 +50,24 @@ export class BrokerStore {
 
   private migrate(): void {
     this.db.exec(`
+      CREATE TABLE IF NOT EXISTS broker_metadata (
+        singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+        broker_uuid TEXT NOT NULL UNIQUE CHECK(length(broker_uuid) = 36),
+        created_at TEXT NOT NULL
+      );
+
+      CREATE TRIGGER IF NOT EXISTS broker_metadata_immutable_update
+      BEFORE UPDATE ON broker_metadata
+      BEGIN
+        SELECT RAISE(ABORT, 'broker_metadata_immutable');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS broker_metadata_immutable_delete
+      BEFORE DELETE ON broker_metadata
+      BEGIN
+        SELECT RAISE(ABORT, 'broker_metadata_immutable');
+      END;
+
       CREATE TABLE IF NOT EXISTS edges (
         edge_id TEXT PRIMARY KEY,
         token_hash TEXT NOT NULL,
@@ -144,6 +170,23 @@ export class BrokerStore {
         FOREIGN KEY(delivery_id) REFERENCES deliveries(delivery_id)
       );
     `);
+  }
+
+  private loadOrCreateBrokerUuid(): string {
+    return this.db.transaction(() => {
+      this.db.prepare(`
+        INSERT OR IGNORE INTO broker_metadata(singleton, broker_uuid, created_at)
+        VALUES (1, ?, ?)
+      `).run(randomUUID(), iso(this.clock));
+      const row = this.db.prepare(`
+        SELECT broker_uuid FROM broker_metadata WHERE singleton = 1
+      `).get() as Row | undefined;
+      const value = row?.broker_uuid;
+      if (typeof value !== "string" || !BROKER_UUID_PATTERN.test(value)) {
+        throw new Error("invalid_broker_uuid_metadata");
+      }
+      return value;
+    })();
   }
 
   createEdge(edgeId: string): string {

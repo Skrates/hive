@@ -1,0 +1,120 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:skrates:hive:mcp:authentication-response-headers:v1",
+  "title": "Hive MCP authentication response-header manifest",
+  "type": "object",
+  "$defs": {
+    "responseHeader": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string", "pattern": "^Hive-[A-Za-z-]+$" },
+        "server": { "enum": ["broker", "edge-control"] },
+        "method": { "type": "string", "pattern": "^hive\\.[a-z0-9_.]+$" },
+        "alternateMethods": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^hive\\.[a-z0-9_.]+$" }
+        },
+        "resultVariants": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" }
+        }
+      },
+      "required": ["name", "server", "method", "resultVariants"],
+      "additionalProperties": false
+    },
+    "requestOnlyHeader": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string", "pattern": "^Hive-[A-Za-z-]+$" },
+        "authorizing": { "const": false },
+        "method": { "type": "string", "pattern": "^hive\\.[a-z0-9_.]+$" }
+      },
+      "required": ["name", "authorizing", "method"],
+      "additionalProperties": false
+    }
+  },
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "responseHeaders": {
+      "type": "array",
+      "minItems": 8,
+      "maxItems": 8,
+      "items": { "$ref": "#/$defs/responseHeader" }
+    },
+    "requestOnlyHeaders": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1,
+      "items": { "$ref": "#/$defs/requestOnlyHeader" }
+    }
+  },
+  "required": ["schemaVersion", "responseHeaders", "requestOnlyHeaders"],
+  "additionalProperties": false,
+  "examples": [
+    {
+      "schemaVersion": 1,
+      "responseHeaders": [
+        {
+          "name": "Hive-Dispatch-Capability",
+          "server": "broker",
+          "method": "hive.delivery.claim",
+          "resultVariants": ["claimed_delivery"]
+        },
+        {
+          "name": "Hive-Evidence-Upload-Capability",
+          "server": "broker",
+          "method": "hive.delivery.begin_dispatch",
+          "resultVariants": ["task_created"]
+        },
+        {
+          "name": "Hive-Live-Injection-Capability",
+          "server": "broker",
+          "method": "hive.delivery.authorize_live_injection",
+          "resultVariants": ["launch_authorized"]
+        },
+        {
+          "name": "Hive-Headless-Launch-Capability",
+          "server": "broker",
+          "method": "hive.delivery.reserve_spawn",
+          "resultVariants": ["reservation_committed"]
+        },
+        {
+          "name": "Hive-Headless-No-Reservation",
+          "server": "broker",
+          "method": "hive.delivery.reserve_spawn",
+          "resultVariants": ["permanent_no_reservation"]
+        },
+        {
+          "name": "Hive-Headless-Authority-Status",
+          "server": "broker",
+          "method": "hive.supervisor.authorize_headless_phase",
+          "resultVariants": ["allow", "deny", "committed_no_process_anchor"]
+        },
+        {
+          "name": "Hive-Edge-Credential",
+          "server": "broker",
+          "method": "hive.edge_credential.mint",
+          "alternateMethods": ["hive.edge_credential.rotate"],
+          "resultVariants": ["new_bearer_committed"]
+        },
+        {
+          "name": "Hive-Live-Ack-Capability",
+          "server": "edge-control",
+          "method": "hive.binding.prepare_ack",
+          "resultVariants": ["verifier_and_sealed_replay_committed"]
+        }
+      ],
+      "requestOnlyHeaders": [
+        {
+          "name": "Hive-Expired-Live-Injection-Capability",
+          "authorizing": false,
+          "method": "hive.live.attest_nonacceptance"
+        }
+      ]
+    }
+  ]
+}

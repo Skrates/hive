@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:skrates:hive:mcp:hive-handle-kinds:v1",
+  "title": "Hive MCP canonical handle-kind manifest",
+  "type": "object",
+  "$defs": {
+    "coordinateName": {
+      "type": "string",
+      "pattern": "^[a-z][A-Za-z0-9]*$"
+    },
+    "definition": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "pattern": "^[a-z][A-Za-z0-9]*$"
+        },
+        "path": {
+          "type": "string",
+          "pattern": "^(?:[a-z0-9]+(?:-[a-z0-9]+)*|\\{[a-z][A-Za-z0-9]*\\})(?:/(?:[a-z0-9]+(?:-[a-z0-9]+)*|\\{[a-z][A-Za-z0-9]*\\}))*$"
+        },
+        "positiveIntegers": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/coordinateName" }
+        },
+        "optionalQuery": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/coordinateName" }
+        },
+        "requiredQuery": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/coordinateName" }
+        }
+      },
+      "required": ["kind", "path"],
+      "not": {
+        "type": "object",
+        "properties": {
+          "optionalQuery": true,
+          "requiredQuery": true
+        },
+        "required": ["optionalQuery", "requiredQuery"]
+      },
+      "additionalProperties": false
+    }
+  },
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "broker": {
+      "type": "array",
+      "minItems": 25,
+      "maxItems": 25,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/definition" }
+    },
+    "edge": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/definition" }
+    }
+  },
+  "required": ["schemaVersion", "broker", "edge"],
+  "additionalProperties": false,
+  "examples": [
+    {
+      "schemaVersion": 1,
+      "broker": [
+        { "kind": "event", "path": "events/{eventId}" },
+        { "kind": "deliveries", "path": "deliveries", "optionalQuery": ["cursor"] },
+        { "kind": "delivery", "path": "deliveries/{deliveryId}", "positiveIntegers": ["deliveryId"] },
+        { "kind": "deliveryTransitions", "path": "deliveries/{deliveryId}/transitions", "positiveIntegers": ["deliveryId"] },
+        { "kind": "deliveryReplay", "path": "deliveries/{deliveryId}/replay", "positiveIntegers": ["deliveryId"] },
+        { "kind": "deliveryEvidence", "path": "deliveries/{deliveryId}/evidence", "positiveIntegers": ["deliveryId"], "optionalQuery": ["cursor"] },
+        { "kind": "deliveryEvidenceItem", "path": "deliveries/{deliveryId}/evidence/{evidenceId}", "positiveIntegers": ["deliveryId"] },
+        { "kind": "dispatch", "path": "dispatches/{deliveryId}/{generation}/{providerAttempt}", "positiveIntegers": ["deliveryId", "generation", "providerAttempt"] },
+        { "kind": "dispatchEvidence", "path": "dispatches/{deliveryId}/{generation}/{providerAttempt}/evidence", "positiveIntegers": ["deliveryId", "generation", "providerAttempt"], "optionalQuery": ["cursor"] },
+        { "kind": "reconciliationPending", "path": "reconciliation/pending", "optionalQuery": ["cursor"] },
+        { "kind": "reconciliationObligation", "path": "reconciliation/obligations/{obligationId}" },
+        { "kind": "integrityAlerts", "path": "reconciliation/integrity-alerts", "optionalQuery": ["cursor"] },
+        { "kind": "integrityAlert", "path": "reconciliation/integrity-alerts/{alertId}" },
+        { "kind": "outbox", "path": "outbox", "optionalQuery": ["cursor"] },
+        { "kind": "outboxItem", "path": "outbox/{outboxId}" },
+        { "kind": "subscriptions", "path": "subscriptions", "optionalQuery": ["cursor"] },
+        { "kind": "subscription", "path": "subscriptions/{actor}" },
+        { "kind": "edges", "path": "edges", "optionalQuery": ["cursor"] },
+        { "kind": "edge", "path": "edges/{edgeId}" },
+        { "kind": "credentialLineage", "path": "edges/{edgeId}/credential-lineages/{lineageId}" },
+        { "kind": "credentialKey", "path": "edges/{edgeId}/credential-lineages/{lineageId}/keys/{keyId}" },
+        { "kind": "edgePending", "path": "edges/{edgeId}/pending" },
+        { "kind": "provider", "path": "providers/{edgeId}/{provider}" },
+        { "kind": "workspace", "path": "workspaces/{workspaceId}" },
+        { "kind": "reasonCodes", "path": "reason-codes" }
+      ],
+      "edge": [
+        { "kind": "localBinding", "path": "bindings/{bindingId}", "requiredQuery": ["epoch", "revision"], "positiveIntegers": ["epoch", "revision"] },
+        { "kind": "localProvider", "path": "providers/{provider}/{providerSessionRef}" }
+      ]
+    }
+  ]
+}
