@@ -494,6 +494,7 @@ async function verifyFixtureCorpus(corpus, fixtureManifest) {
     path: "schema/draft/examples",
     fileCount: 128,
     hashAlgorithm: "sha256-v1(relative-path NUL bytes NUL)",
+    sha256: "bae6de868193aed37ce379fbb1de2455599b0eede87cec1d7b44ba5c29e49ae5",
   };
   for (const [field, expectedValue] of Object.entries(expected)) {
     if (corpus?.[field] !== expectedValue) fail(`stable core corpus ${field} drift`);

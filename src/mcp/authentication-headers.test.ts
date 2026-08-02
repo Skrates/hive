@@ -271,6 +271,52 @@ test("client interception persists then strips all eleven registered paths", asy
   }
 });
 
+test("bound interception permits validated secret-free outcomes and still blocks authority leaks", async () => {
+  const entry = AUTHENTICATION_HEADER_MANIFEST.responseHeaders.find((candidate) =>
+    candidate.name === "Hive-Dispatch-Capability")!;
+  const route = routeFor(entry);
+  const secretFreeVariant = "no_claimable_delivery";
+
+  const sink = new RecordingSink();
+  const pending = await new AuthenticationResponseInterceptor(route.server, sink).bind(
+    methodRequest(route.method),
+    { responseKey: "claim:empty" },
+  );
+  const passed = await pending.intercept(successfulResponse(secretFreeVariant));
+  const passedBody = await passed.json() as ResultBody;
+  assert.equal(passed.status, 200);
+  assert.equal(passed.headers.has(entry.name), false);
+  assert.equal(passedBody.result.structuredContent.resultVariant, secretFreeVariant);
+  assert.equal(sink.records.length, 0);
+
+  const unexpectedSink = new RecordingSink();
+  const unexpected = await new AuthenticationResponseInterceptor(route.server, unexpectedSink).bind(
+    methodRequest(route.method),
+    { responseKey: "claim:empty-with-authority" },
+  );
+  await assert.rejects(
+    () => unexpected.intercept(successfulResponse(secretFreeVariant, {
+      [entry.name]: "unexpected-empty-queue-authority",
+    })),
+    AuthenticationHeaderError,
+  );
+  assert.equal(unexpectedSink.records.length, 0);
+
+  const requestSecret = "empty-queue-request-secret";
+  const reflectedSink = new RecordingSink();
+  const reflected = await new AuthenticationResponseInterceptor(route.server, reflectedSink).bind(
+    methodRequest(route.method, { headers: { authorization: `Bearer ${requestSecret}` } }),
+    { responseKey: "claim:empty-reflection" },
+  );
+  await assert.rejects(
+    () => reflected.intercept(successfulResponse(secretFreeVariant, {}, {
+      echoed: requestSecret,
+    })),
+    AuthenticationHeaderError,
+  );
+  assert.equal(reflectedSink.records.length, 0);
+});
+
 test("client interception rejects ambiguous or malformed JSON content type before persistence", async () => {
   const entry = AUTHENTICATION_HEADER_MANIFEST.responseHeaders[0]!;
   for (const [index, contentType] of [

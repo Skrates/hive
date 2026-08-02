@@ -30,6 +30,10 @@ test("stable-core fixture provenance is exact, vendored, and final-2026", async 
   assert.equal(core.fixtures.commit, "cc4b41617ce3601b1290d67216ea0b194a3cd9ac");
   assert.equal(core.fixtures.tree, "76fe303cf95eb4cbdf7f78b750ffa4a4b3eb51cc");
   assert.equal(core.fixtures.gitBlob, "eeeae659cd3eaae264d88bee1134eaad50656e1b");
+  assert.equal(
+    core.fixtures.corpus.sha256,
+    "bae6de868193aed37ce379fbb1de2455599b0eede87cec1d7b44ba5c29e49ae5",
+  );
 
   const bytes = await readFile(resolve(ROOT, core.fixtures.vendoredPath));
   assert.equal(bytes.byteLength, core.fixtures.size);

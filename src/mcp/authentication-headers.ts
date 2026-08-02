@@ -297,11 +297,7 @@ async function interceptAuthenticationResponse(
     if (!entry || !isSingletonHeaderValue(value)) rejectAuthenticationResponse(response);
     found.push({ entry, value });
   }
-  if (found.length !== 1 || hasRemovedSessionHeaders(responseMetadata.headers)) {
-    rejectAuthenticationResponse(response);
-  }
-  const secret = found[0]!;
-  if (route.requestSecrets.some((requestSecret) => secret.value.includes(requestSecret))) {
+  if (found.length > 1 || hasRemovedSessionHeaders(responseMetadata.headers)) {
     rejectAuthenticationResponse(response);
   }
   const captured = await captureSuccessfulJsonRpcResult(response, responseMetadata);
@@ -311,6 +307,32 @@ async function interceptAuthenticationResponse(
     rejectAuthenticationResponse(response);
   }
   const resultVariant = successfulResult.resultVariant;
+  const variantEntries = responseManifest().filter((entry) =>
+    entry.server === route.server
+    && (entry.method === route.method || entry.alternateMethods?.includes(route.method))
+    && entry.resultVariants.includes(resultVariant));
+  if (variantEntries.length === 0) {
+    if (
+      found.length !== 0
+      || successfulResult.id !== route.requestId
+      || !isSuccessfulCallToolResult(successfulResult.result)
+      || responseLeaksSecrets(
+        response,
+        successfulResult.serializedBody,
+        route.requestSecrets,
+      )
+    ) {
+      rejectAuthenticationResponse(response);
+    }
+    return response;
+  }
+  if (variantEntries.length !== 1 || found.length !== 1) {
+    rejectAuthenticationResponse(response);
+  }
+  const secret = found[0]!;
+  if (route.requestSecrets.some((requestSecret) => secret.value.includes(requestSecret))) {
+    rejectAuthenticationResponse(response);
+  }
   const canonical = matchingManifestEntry(secret.entry.name, { ...route, resultVariant });
   if (!canonical) rejectAuthenticationResponse(response);
   if (
