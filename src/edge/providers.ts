@@ -144,7 +144,7 @@ export class ClaudeProvider implements ProviderAdapter {
     if (!subscription.sessionId) throw new Error("resume target missing");
     return runHeadless(
       process.env.HIVE_CLAUDE_COMMAND ?? "claude",
-      ["-p", "--resume", subscription.sessionId, "--output-format", "stream-json", ...claudePermissionArgs(subscription.permissionProfile), framed],
+      ["-p", "--resume", subscription.sessionId, "--output-format", "stream-json", "--verbose", ...claudePermissionArgs(subscription.permissionProfile), framed],
       cwd,
       null,
       { CLAUDE_CONFIG_DIR: requireAccountProfile(subscription) },
@@ -154,7 +154,7 @@ export class ClaudeProvider implements ProviderAdapter {
   spawn(subscription: Subscription, cwd: string, framed: string): Promise<ProviderDispatch> {
     return runHeadless(
       process.env.HIVE_CLAUDE_COMMAND ?? "claude",
-      ["-p", "--output-format", "stream-json", ...claudePermissionArgs(subscription.permissionProfile), framed],
+      ["-p", "--output-format", "stream-json", "--verbose", ...claudePermissionArgs(subscription.permissionProfile), framed],
       cwd,
       null,
       { CLAUDE_CONFIG_DIR: requireAccountProfile(subscription) },
