@@ -1,11 +1,12 @@
 # Edge: cx53 (dedicated Hetzner VM) — seat claude-2 (Claude Team, rationallyprime@gmail.com)
 
-Provision a **cx53** (16 shared vCPU / 32 GB / 320 GB, fsn1, ~€29/mo) — a *dedicated* agent VM,
-deliberately **not** the Coolify box: the demo kernels and bd stack must never contend with agent
-builds, and a runaway disk-fill must not be able to touch them. If CPU steal ever measurably drags
-CI, rescale to ccx33 — without growing the disk, so the move stays reversible.
-
-Create it: `hcloud server create --type cx53 --image ubuntu-24.04 --location fsn1 --name agent-cx53`.
+**Provisioned 2026-08-03:** `agent-cx53` (16 shared vCPU / 32 GB / 320 GB, ~€29/mo) at
+**hel1 / 62.238.51.63** (fsn1 and nbg1 had no cx53 stock), firewall `agent-cx53-fw` (inbound
+ssh only), users `hive` + `ci-runner` created, tailscale + docker installed (`tailscale up` =
+Hákon's step). A *dedicated* agent VM, deliberately **not** the Coolify box: the demo kernels and
+bd stack must never contend with agent builds, and a runaway disk-fill must not be able to touch
+them. If CPU steal ever measurably drags CI, rescale to ccx33 — without growing the disk, so the
+move stays reversible.
 
 Under ADR-0003 R-2 the ONLY ceiling on what a wake can cause is this agent's harness
 configuration — Hive gates nothing — so the edge still runs caged:
@@ -22,7 +23,7 @@ configuration — Hive gates nothing — so the edge still runs caged:
 ## Second role: self-hosted CI runner
 
 This VM also hosts the GitHub Actions runner for the private repos (sokrates, hive) — saves
-Actions minutes and keeps persistent uv/pnpm/docker-layer caches warm, which is what actually gets
+Actions minutes and keeps persistent uv/bun/docker-layer caches warm, which is what actually gets
 PR feedback under five minutes. Run the runner as its **own** non-sudo user (`ci-runner`), never
 as `hive`: CI executes repo-authored code and must not share the agent's home, profile, or hive
 socket. Keep `runs-on: ubuntu-latest` as the documented fallback for when the box is down;

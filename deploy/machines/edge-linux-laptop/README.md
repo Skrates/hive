@@ -1,6 +1,6 @@
 # Edge: linux laptop — seat claude-1 (Claude Max, rationallyprime@gmail.com)
 
-1. `pnpm install && pnpm build` in the hive checkout; symlink `dist/cli.js` targets via the
+1. `bun install && bun run build` in the hive checkout; symlink `dist/cli.js` targets via the
    systemd unit (`deploy/systemd/hive-edge.service`, a user unit: `systemctl --user enable --now hive-edge`).
 2. Pinned profile (R-5): create `~/.hive/profiles/claude-1` and log in once —
    `CLAUDE_CONFIG_DIR=~/.hive/profiles/claude-1 claude login` (interactive; Hákon's step).

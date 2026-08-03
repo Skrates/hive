@@ -3,15 +3,22 @@
 # Built in CI, pushed to ghcr.io/skrates/hive-edge-runpod. RunPod pods cannot
 # build images (no docker daemon inside a pod), so this is the only build path.
 
+# Build on the SAME Debian release as the runtime stage: better-sqlite3 compiles
+# from source here (prebuild-install skips bun runtimes) and must link the
+# runtime's glibc. The bun binary rides in from the official image.
 FROM node:22-bookworm-slim AS build
+COPY --from=oven/bun:1.3 /usr/local/bin/bun /usr/local/bin/bun
 WORKDIR /app
-RUN corepack enable && corepack prepare pnpm@11.7.0 --activate
-COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
-RUN pnpm install --frozen-lockfile
+RUN apt-get update && apt-get install -y --no-install-recommends python3 make g++ \
+    && rm -rf /var/lib/apt/lists/*
+COPY package.json bun.lock ./
+RUN bun install --frozen-lockfile
 COPY tsconfig.json ./
 COPY scripts/ scripts/
 COPY src/ src/
-RUN pnpm build && pnpm prune --prod
+RUN bun run build \
+    && rm -rf node_modules \
+    && bun install --frozen-lockfile --production
 
 FROM node:22-bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \

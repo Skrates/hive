@@ -26,6 +26,6 @@ invariants.
 ## Gate
 
 ```sh
-pnpm check
-pnpm build
+bun run check
+bun run build
 ```
