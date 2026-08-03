@@ -13,7 +13,14 @@ configuration — Hive gates nothing — so the edge still runs caged:
 
 - Dedicated non-sudo user `hive`; no docker-group membership unless a workload demands it.
 - `HIVE_HOME=/home/hive/.hive`; profile `/home/hive/.hive/profiles/gnomon`
-  (interactive login: Hákon's step).
+  (interactive login: Hákon's step —
+  `CLAUDE_CONFIG_DIR=/home/hive/.hive/profiles/gnomon claude login`).
+- **An unpinned `claude` on this box is a seat violation.** A bare invocation
+  mints a shadow profile at `~/.claude` — same account, no `HIVE_ACTOR`, no
+  hooks, invisible to the live registry (R-5 constrains only the dispatch
+  path). `/home/hive/.profile` exports `CLAUDE_CONFIG_DIR` so login shells
+  (`su - hive`, ssh) land in the pinned seat; do not bypass it with `env -i`
+  or non-login shells.
 - Subscription `deploy/subscriptions/gnomon.json` pins `permissionProfile: workspace-write`
   and a workspace cwd inside `/home/hive/work`.
 - Tailscale joined; `HIVE_BROKER_URL` = broker tailnet address. Outbound only, no inbound port.
