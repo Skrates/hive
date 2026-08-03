@@ -7,8 +7,8 @@ Ratified topology, 2026-08-02/03. One broker, four edges, all links outbound-onl
 | dev box (`192.168.1.238`) | broker | — | joins the tailnet; edges dial in over it |
 | linux laptop | edge `laptop` | `claude-1` (Claude Max, rationallyprime@gmail.com) | sleep = dark agent; failures stay thread-visible |
 | macbook | edge `mac` | `codex-1` (ChatGPT Max) | app-server socket must be same-machine for mid-turn steering |
-| cx43 (Coolify) | edge `cx43` | `claude-2` (Claude Team, rationallyprime@gmail.com) | shares the box with the kernel demo stack — tight harness ceiling (see its README) |
-| runpod | edge `runpod` | `claude-3` (Claude Team, hakon@sokrates.is) | the hive's actuator: Sovereign dev, capability-registry model tests, LoRA runs; everything durable lives on the persistent volume |
+| cx53 (dedicated Hetzner VM, to provision) | edge `cx53` | `claude-2` (Claude Team, rationallyprime@gmail.com) | dedicated agent VM + self-hosted CI runner — deliberately NOT the Coolify demo box (see its README) |
+| runpod (EUR-IS-1) | edge `runpod` | `claude-3` (Claude Team, hakon@sokrates.is) | the hive's actuator: Sovereign dev, capability-registry model tests, LoRA runs; seat = custom-image CPU pod spawning sibling GPU pods; durable state on network volume `w65u1o4qbn` (100 GB) |
 
 Seat-to-machine assignment is a subscription-time decision; the mapping above is the ratified
 default and the example subscriptions in `../subscriptions/` encode it.
@@ -16,8 +16,8 @@ default and the example subscriptions in `../subscriptions/` encode it.
 ## Network prerequisite (the only plumbing)
 
 The broker sits behind home NAT. Slack Socket Mode dials out, so the broker needs no public
-ingress — but cx43 and runpod need a path to the broker's HTTP listener. Install Tailscale on the
-dev box, cx43, and the runpod pod; set each edge's `HIVE_BROKER_URL` to the broker's tailnet
+ingress — but the cx53 VM and runpod need a path to the broker's HTTP listener. Install Tailscale
+on the dev box, the cx53 VM, and the runpod pod; set each edge's `HIVE_BROKER_URL` to the tailnet
 address. Plain off-box HTTP is forbidden (the edge token is bearer authority) — the tailnet
 (WireGuard) or a mutually controlled HTTPS tunnel is the transport.
 
