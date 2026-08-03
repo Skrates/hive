@@ -8,6 +8,12 @@
   that mandate loopback callbacks or `claude/channel`; and the narrowly defined no-effect requeue
   rules in ADR-0001. All other ADR-0001 invariants remain authoritative
 - Does not authorize: production cutover or removal of `/v1`; that remains an explicit KRA-912 gate
+- v0.5 note: largely superseded by [ADR-0003](./0003-sender-attributed-trust.md). The
+  delivery-authority capability (`authorize_live_injection` and the launch-grant/key-rotation/
+  clock-skew stratum), no-effect proofs, supervisor phase ledgers, `ambiguous` reconciliation
+  obligations, `legacyDraining` fences, operator scope partition, and pagination-snapshot ceremony
+  are removed. Retained: D1–D8, the sender-visible Slack outbox, the operator CLI skeleton, and
+  D15 observability. This document remains as the historical record of the superseded contract
 
 ## Context and authority
 

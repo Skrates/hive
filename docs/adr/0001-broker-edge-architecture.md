@@ -8,6 +8,11 @@
   mandate loopback callbacks or `claude/channel`, and the evidence-proved no-effect requeue rules are
   superseded/refined by [ADR-0002](./0002-stateless-mcp-capability-plane.md); all other locked
   invariants remain accepted
+- v0.5 note: invariant 6 ("Slack bodies are untrusted; WAKE permits routing only") and the
+  crash-honesty reconciliation apparatus are superseded by
+  [ADR-0003](./0003-sender-attributed-trust.md) — trust is sender-attributed, messages from the
+  closed trust set are instructions, and uncertainty retries instead of reconciling. Broker-only
+  Slack custody, outbound-only edges, and `resume` never escalating to `spawn` remain accepted
 
 ## Context
 
