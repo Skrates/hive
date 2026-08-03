@@ -14,6 +14,7 @@ interface SlackMessageEvent {
   app_id?: string;
   bot_id?: string;
   subtype?: string;
+  metadata?: { event_type?: string };
 }
 
 interface SlackEnvelopeBody {
@@ -87,6 +88,13 @@ export async function handleSlackEnvelope(
 
   const event = asSlackMessageEvent(body.event);
   if (!event?.text) {
+    await ack();
+    return;
+  }
+  // Hive's own outbox posts (receipts, outcomes, notices) carry hive_* message
+  // metadata. They are never re-ingested as wakes: an agent outcome that quotes
+  // a `WAKE:` line must not recursively mint a fresh trusted delivery.
+  if (event.metadata?.event_type?.startsWith("hive_")) {
     await ack();
     return;
   }

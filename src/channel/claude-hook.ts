@@ -25,6 +25,18 @@ import { udsRequestJson } from "../local/uds.js";
 
 const REGISTRATION_TTL_MS = 180_000;
 
+/**
+ * The heartbeat promises "a future boundary will drain the inbox". A Stop with
+ * an empty inbox makes no such promise — the session is ending — so the hook
+ * DEREGISTERS instead, and the edge's resume/spawn ladder owns the next wake.
+ * A Stop WITH messages blocks the stop (the session continues); any other
+ * boundary implies the session is still running: both renew the heartbeat.
+ */
+export function shouldMaintainHeartbeat(eventName: string, pendingMessages: number): boolean {
+  const terminalBoundary = eventName === "Stop" || eventName === "SubagentStop";
+  return !terminalBoundary || pendingMessages > 0;
+}
+
 interface HookInput {
   hook_event_name?: string;
   session_id?: string;
@@ -101,21 +113,30 @@ async function main(): Promise<void> {
     // A malformed hook payload still gets a heartbeat and an inbox check.
   }
 
+  const eventName = input.hook_event_name ?? "Stop";
+  const messages = drainInbox(inboxDirectory);
+
   try {
-    await udsRequestJson(edgeSocket, "POST", "/live/register", {
-      actor,
-      provider: "claude",
-      socketPath: inboxDirectory,
-      sessionId: input.session_id ?? null,
-      surfaceVersion: "claude-hook",
-      ttlMs: REGISTRATION_TTL_MS,
-    });
+    if (shouldMaintainHeartbeat(eventName, messages.length)) {
+      await udsRequestJson(edgeSocket, "POST", "/live/register", {
+        actor,
+        provider: "claude",
+        socketPath: inboxDirectory,
+        sessionId: input.session_id ?? null,
+        surfaceVersion: "claude-hook",
+        ttlMs: REGISTRATION_TTL_MS,
+      });
+    } else {
+      await udsRequestJson(edgeSocket, "POST", "/live/deregister", {
+        actor,
+        provider: "claude",
+      });
+    }
   } catch {
     // The edge being down never blocks the session; resume-wake covers delivery.
   }
 
-  const messages = drainInbox(inboxDirectory);
-  const output = hookOutput(input.hook_event_name ?? "Stop", messages.map((message) => message.framed));
+  const output = hookOutput(eventName, messages.map((message) => message.framed));
   if (output !== null) process.stdout.write(output);
   consumeInboxFiles(inboxDirectory, messages);
 }

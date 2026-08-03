@@ -271,3 +271,32 @@ test("malformed untrusted message fields are refused and acknowledged without in
   assert.equal(acked, true);
   assert.equal(ingested, false);
 });
+
+test("Hive's own outbox posts are never re-ingested as wakes — no recursion (ADR-0003)", async () => {
+  const { store, broker } = fixture();
+  let acked = 0;
+  await handleSlackEnvelope({
+    body: {
+      event_id: "Ev-self",
+      envelope_id: "env-self",
+      event: {
+        type: "message",
+        channel: "C1",
+        // An agent outcome quoting the instruction it handled — parseable as
+        // an addressed wake, from an admitted sender. The metadata stamp is
+        // what keeps it out of the ingest lane.
+        text: "WAKE: ariadne | quoted instruction inside an outcome post",
+        ts: "100.9",
+        thread_ts: "100.1",
+        user: "U1",
+        metadata: { event_type: "hive_delivery_reply" },
+      },
+    },
+    async ack() {
+      acked += 1;
+    },
+  }, { workspaceId: WORKSPACE_ID, policy, broker });
+  assert.equal(acked, 1);
+  assert.equal(store.listDeliveries().length, 0);
+  store.close();
+});

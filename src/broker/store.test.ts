@@ -4,8 +4,14 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { BrokerStore, InvalidTransitionError, StaleLeaseError } from "./store.js";
-import { retryBackoffMs, type SlackEventInput, type SubscriptionInput } from "../domain.js";
+import {
+  BrokerStore,
+  DISPATCHED_OUTCOME_GRACE_MS,
+  InvalidTransitionError,
+  LegacyDatabaseError,
+  StaleLeaseError,
+} from "./store.js";
+import { frameWakeInstruction, retryBackoffMs, SubscriptionInputSchema, type SlackEventInput, type SubscriptionInput } from "../domain.js";
 import type { Clock } from "../time.js";
 
 class FakeClock implements Clock {
@@ -269,7 +275,27 @@ test("an expired lease requeues the delivery for redelivery behind backoff (ADR-
   store.close();
 });
 
-test("a dispatched delivery whose lease expires is redelivered, not quarantined", () => {
+test("a dispatched delivery waits out the outcome grace, then is redelivered, not quarantined", () => {
+  const { store, clock } = fixture();
+  store.ingestEvent(event());
+  const claimed = store.claimNext("mac", 0)!;
+  store.transition(claimed.id, "mac", 1, "claimed", "accepted_local");
+  store.transition(claimed.id, "mac", 1, "accepted_local", "dispatching");
+  store.transition(claimed.id, "mac", 1, "dispatching", "dispatched");
+  // Inside the grace the delivery stays open for the agent's outcome report —
+  // an expired lease alone must NOT requeue a durably dispatched wake.
+  clock.advance(1_001);
+  assert.equal(store.requeueExpiredLeases(), 0);
+  assert.equal(store.getDelivery(claimed.id).status, "dispatched");
+  // An outcome arriving during the grace closes the loop without redelivery.
+  // (Separate delivery below proves the requeue side.)
+  clock.advance(DISPATCHED_OUTCOME_GRACE_MS + 1);
+  assert.equal(store.requeueExpiredLeases(), 1);
+  assert.equal(store.getDelivery(claimed.id).status, "pending");
+  store.close();
+});
+
+test("an outcome report during the dispatched grace closes the delivery without redelivery", () => {
   const { store, clock } = fixture();
   store.ingestEvent(event());
   const claimed = store.claimNext("mac", 0)!;
@@ -277,8 +303,10 @@ test("a dispatched delivery whose lease expires is redelivered, not quarantined"
   store.transition(claimed.id, "mac", 1, "accepted_local", "dispatching");
   store.transition(claimed.id, "mac", 1, "dispatching", "dispatched");
   clock.advance(1_001);
-  assert.equal(store.requeueExpiredLeases(), 1);
-  assert.equal(store.getDelivery(claimed.id).status, "pending");
+  store.recordOutcome(claimed.id, "done");
+  clock.advance(DISPATCHED_OUTCOME_GRACE_MS + 1);
+  assert.equal(store.requeueExpiredLeases(), 0);
+  assert.equal(store.getDelivery(claimed.id).status, "processed");
   store.close();
 });
 
@@ -372,16 +400,52 @@ test("an agent outcome report closes the loop without a lease fence (ADR-0003 R-
   store.close();
 });
 
-test("outbox rows drain once and survive send failure", () => {
-  const { store } = fixture();
+test("outbox rows drain once, back off after failure, and survive to retry", () => {
+  const { store, clock } = fixture();
   store.enqueueThreadNotice("C1", "100.1", "⛔ dropped sender notice");
   const unsent = store.listUnsentOutbox();
   assert.equal(unsent.length, 1);
   store.markOutboxAttempt(unsent[0]!.outboxId);
+  // A failed row backs off — it must not immediately reoccupy the page.
+  assert.equal(store.listUnsentOutbox().length, 0);
+  clock.advance(retryBackoffMs(1) + 1);
   assert.equal(store.listUnsentOutbox().length, 1);
   store.markOutboxSent(unsent[0]!.outboxId);
+  clock.advance(retryBackoffMs(2) + 1);
   assert.equal(store.listUnsentOutbox().length, 0);
   store.close();
+});
+
+test("a poisoned outbox row cannot starve later rows and is finally abandoned", () => {
+  const { store, clock } = fixture();
+  store.enqueueThreadNotice("C-archived", "100.1", "poisoned row");
+  store.enqueueThreadNotice("C-healthy", "100.2", "healthy row");
+  // The poisoned row fails forever; the healthy row must still surface.
+  const first = store.listUnsentOutbox();
+  assert.equal(first.length, 2);
+  store.markOutboxAttempt(first[0]!.outboxId);
+  const during = store.listUnsentOutbox();
+  assert.deepEqual(during.map((entry) => entry.channelId), ["C-healthy"]);
+  // Exhaust the poisoned row's attempts entirely: it leaves the page for good.
+  for (let i = 0; i < 60; i += 1) {
+    clock.advance(11 * 60_000);
+    for (const entry of store.listUnsentOutbox()) {
+      if (entry.channelId === "C-archived") store.markOutboxAttempt(entry.outboxId);
+    }
+  }
+  clock.advance(11 * 60_000);
+  assert.ok(store.listUnsentOutbox().every((entry) => entry.channelId !== "C-archived"));
+  store.close();
+});
+
+test("a pre-v0.5 broker database is refused loudly, never migrated in place", () => {
+  const dir = mkdtempSync(join(tmpdir(), "hive-legacy-"));
+  const path = join(dir, "broker.sqlite");
+  const legacy = new Database(path);
+  legacy.exec("CREATE TABLE deliveries (delivery_id INTEGER PRIMARY KEY, status TEXT)");
+  legacy.close();
+  assert.throws(() => new BrokerStore(path), LegacyDatabaseError);
+  rmSync(dir, { recursive: true, force: true });
 });
 
 test("terminal and out-of-order transitions fail closed", () => {
@@ -400,4 +464,34 @@ test("terminal and out-of-order transitions fail closed", () => {
     InvalidTransitionError,
   );
   store.close();
+});
+
+test("a coalesced second instruction is delivered imperatively, not demoted to data", () => {
+  const { store } = fixture();
+  store.ingestEvent(event());
+  const second = store.ingestEvent(event({
+    eventId: "Ev2",
+    messageTs: "100.3",
+    text: "WAKE: ariadne | also do the second thing",
+  }));
+  assert.equal(second.deliveryId, 1);
+  const claimed = store.claimNext("mac", 0)!;
+  assert.equal(claimed.coalescedMessages.length, 1);
+  assert.equal(claimed.coalescedMessages[0]!.text, "WAKE: ariadne | also do the second thing");
+  const framed = frameWakeInstruction(claimed, null);
+  // Both trusted instructions ride in the imperative section.
+  assert.match(framed, /Additional message from U1 in the same thread/);
+  assert.match(framed, /also do the second thing/);
+  assert.match(framed, /Act on these messages/);
+  // And neither is exiled to the data-only replay block.
+  assert.doesNotMatch(framed, /<thread_replay/);
+  store.close();
+});
+
+test("a relative accountProfile is rejected at the schema boundary (R-5)", () => {
+  assert.throws(() => SubscriptionInputSchema.parse({
+    ...subscription(),
+    accountProfile: "profiles/claude-1",
+  }));
+  assert.doesNotThrow(() => SubscriptionInputSchema.parse(subscription()));
 });

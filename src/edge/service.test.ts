@@ -62,6 +62,7 @@ function delivery(id: number, overrides: Partial<Delivery> = {}): Delivery {
     nextAttemptAt: null,
     coalesceKey: `ariadne:C1:100.1`,
     coalescedEventIds: [`Ev${id}`],
+    coalescedMessages: [],
     initialSnapshot: null,
     snapshotTs: null,
     createdAt: "2026-08-01T00:00:00.000Z",
@@ -188,13 +189,16 @@ test("a headless resume dispatch completes, posts its outcome, and finishes proc
   assert.match(adapter.resumes[0]!, /hive reply 1/);
   assert.doesNotMatch(adapter.resumes[0]!, /untrusted/i);
   assert.equal(broker.markCount, 1);
-  assert.deepEqual(broker.replies, [{ deliveryId: 1, text: "resumed" }]);
+  // The outcome rides INSIDE the terminal transition (one durable broker
+  // commit), never as a separate inline Slack post.
+  assert.deepEqual(broker.replies, []);
   assert.equal(broker.finishes[0]?.result.status, "processed");
+  assert.equal(broker.finishes[0]?.result.outcome, "resumed");
   assert.equal(store.get(1)?.status, "processed");
   store.close();
 });
 
-test("a registered live ingress receives the injection and the delivery finishes processed", async () => {
+test("a live injection leaves the delivery dispatched until the agent's outcome closes it", async () => {
   const broker = new FakeBroker([delivery(2, { subscription: subscription({ wakePolicy: "live_only" }) })]);
   const store = new EdgeStore(":memory:");
   const adapter = new StubAdapter();
@@ -211,10 +215,14 @@ test("a registered live ingress receives the injection and the delivery finishes
   assert.equal(await edge.processOne(), true);
   assert.deepEqual(adapter.liveDeliveries, [2]);
   assert.equal(broker.markCount, 1);
-  // Live injection produces no synthetic reply — the agent's own hive-reply
-  // outcome is the second thread event.
+  // Live injection produces no synthetic reply and NO terminal transition:
+  // the receipt only proves durable dispatch, so the delivery stays
+  // `dispatched` until the agent's own hive-reply outcome closes it (R-6).
+  // A vanished outcome becomes a broker-side requeue after the dispatched
+  // grace — never a silent `processed` with no answer.
   assert.deepEqual(broker.replies, []);
-  assert.equal(broker.finishes[0]?.result.status, "processed");
+  assert.deepEqual(broker.finishes, []);
+  assert.equal(store.get(2)?.status, "dispatched");
   store.close();
 });
 

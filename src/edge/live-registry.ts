@@ -54,6 +54,15 @@ export class LiveIngressRegistry {
     }
     return entry;
   }
+
+  /**
+   * A surface that knows it is going away withdraws its claim immediately —
+   * a terminal Claude Stop must not leave a heartbeat promising a boundary
+   * that will never come. Idempotent: deregistering an absent binding is fine.
+   */
+  deregister(actor: string, provider: Provider): void {
+    this.entries.delete(key(actor, provider));
+  }
 }
 
 function key(actor: string, provider: Provider): string {

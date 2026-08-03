@@ -1,6 +1,7 @@
 import Database from "better-sqlite3";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import type {
+  CoalescedMessage,
   Delivery,
   DeliveryStatus,
   EdgeWorkspace,
@@ -24,8 +25,29 @@ const TERMINAL = new Set<DeliveryStatus>([
 
 const BROKER_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
+/**
+ * ADR-0003 R-8: there is no schema migration path across the v0.5 cutover — a
+ * pre-v0.5 broker database is moved aside, never mutated in place. The stamp
+ * turns a reused legacy file into a loud boot refusal instead of a
+ * `no such column` crash on the first subscription upsert.
+ */
+const BROKER_SCHEMA_VERSION = 5;
+
+/**
+ * A `dispatched` delivery is waiting on its agent's outcome report (R-6). The
+ * sweep leaves it open for this grace before treating the missing outcome as
+ * ordinary uncertainty and requeueing — long enough for a live session to
+ * drain its inbox and reply, short enough that a wake written to an inbox
+ * nobody will ever drain becomes a visible retry instead of silent loss.
+ */
+export const DISPATCHED_OUTCOME_GRACE_MS = 15 * 60_000;
+
+/** An outbox row that keeps failing is retried with backoff and finally abandoned (visibly logged). */
+export const OUTBOX_MAX_ATTEMPTS = 50;
+
 export class StaleLeaseError extends Error {}
 export class InvalidTransitionError extends Error {}
+export class LegacyDatabaseError extends Error {}
 
 export interface OutboxEntry {
   outboxId: number;
@@ -50,8 +72,24 @@ export class BrokerStore {
     // Recursive triggers must be enabled for the immutable singleton's DELETE
     // guard to fire on that replacement path.
     this.db.pragma("recursive_triggers = ON");
+    this.assertSchemaGeneration(path);
     this.migrate();
+    this.db.pragma(`user_version = ${BROKER_SCHEMA_VERSION}`);
     this.brokerUuid = this.loadOrCreateBrokerUuid();
+  }
+
+  /** Refuse to boot on a pre-v0.5 database: no migration path, move it aside. */
+  private assertSchemaGeneration(path: string): void {
+    const hasTables = this.db.prepare(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name='deliveries'",
+    ).get() !== undefined;
+    const version = Number((this.db.pragma("user_version", { simple: true }) as number | bigint | undefined) ?? 0);
+    if (hasTables && version < BROKER_SCHEMA_VERSION) {
+      throw new LegacyDatabaseError(
+        `broker database at ${path} predates hive v0.5 (schema generation ${version} < ${BROKER_SCHEMA_VERSION}); `
+        + "there is no migration path across the ADR-0003 cutover — move the file aside and restart with a fresh store",
+      );
+    }
   }
 
   close(): void {
@@ -191,7 +229,9 @@ export class BrokerStore {
         text TEXT NOT NULL,
         created_at TEXT NOT NULL,
         sent_at TEXT,
-        attempts INTEGER NOT NULL DEFAULT 0
+        attempts INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at TEXT,
+        abandoned_at TEXT
       );
 
       CREATE INDEX IF NOT EXISTS outbox_unsent_idx
@@ -525,12 +565,29 @@ export class BrokerStore {
     return this.getDelivery(deliveryId);
   }
 
+  /**
+   * The dispatched transition and its sender-visible delivery receipt commit
+   * in ONE transaction: a broker crash between them could otherwise leave a
+   * delivery whose thread never shows it was delivered.
+   */
+  markDispatched(deliveryId: number, edgeId: string, generation: number): Delivery {
+    return this.db.transaction(() => {
+      const delivery = this.transition(deliveryId, edgeId, generation, "dispatching", "dispatched");
+      this.enqueueOutbox(
+        delivery,
+        `→ delivered to ${delivery.actor} (delivery ${delivery.id}, attempt ${delivery.attempts}/${delivery.subscription.maxAttempts})`,
+      );
+      return delivery;
+    })();
+  }
+
   finish(
     deliveryId: number,
     edgeId: string,
     generation: number,
     status: TerminalDeliveryStatus,
     reasons: Reason[],
+    outcomeText: string | null = null,
   ): Delivery {
     return this.db.transaction(() => {
       this.assertLease(deliveryId, edgeId, generation);
@@ -542,6 +599,10 @@ export class BrokerStore {
       `).run(status, JSON.stringify(reasons), now, now, deliveryId);
       if (status !== "processed") {
         this.enqueueOutbox(current, failureNotice(current, status, reasons));
+      } else if (outcomeText !== null) {
+        // R-6: a headless outcome commits with the terminal transition so a
+        // Slack outage can neither lose it nor rerun the trusted instruction.
+        this.enqueueOutbox(current, outcomePost(current, outcomeText));
       }
       return this.getDelivery(deliveryId);
     })();
@@ -570,17 +631,28 @@ export class BrokerStore {
    * were mid-dispatch. The worst case this permits is a duplicate instruction
    * to a trusted agent, which ADR-0003 accepts by design; the dedupe key makes
    * the duplicate self-identifying.
+   *
+   * A `dispatched` delivery is different: dispatch was durably confirmed and
+   * the agent's outcome report (R-6) is the expected closer, so it gets
+   * DISPATCHED_OUTCOME_GRACE_MS beyond its dispatch stamp before the missing
+   * outcome is treated as uncertainty and requeued. Exhausted attempts still
+   * terminalize as `failed` with a thread notice — delivered-but-never-
+   * answered is visible loss, never silence.
    */
   requeueExpiredLeases(): number {
     return this.db.transaction(() => {
       const now = iso(this.clock);
+      const dispatchedDeadline = new Date(this.clock.now().getTime() - DISPATCHED_OUTCOME_GRACE_MS).toISOString();
       const rows = this.db.prepare(`
         SELECT d.delivery_id
         FROM deliveries d
         JOIN actor_leases l ON l.actor=d.actor
-        WHERE d.status IN ('claimed', 'accepted_local', 'dispatching', 'dispatched')
-          AND l.expires_at<=?
-      `).all(now) as Row[];
+        WHERE l.expires_at<=?
+          AND (
+            d.status IN ('claimed', 'accepted_local', 'dispatching')
+            OR (d.status='dispatched' AND d.dispatched_at<=?)
+          )
+      `).all(now, dispatchedDeadline) as Row[];
       for (const row of rows) {
         const delivery = this.getDelivery(Number(row.delivery_id));
         this.requeueOrFail(delivery, {
@@ -632,7 +704,7 @@ export class BrokerStore {
           WHERE delivery_id=?
         `).run(JSON.stringify([{ code: "agent_outcome_reported", detail: "the agent reported its outcome" }]), now, now, deliveryId);
       }
-      this.enqueueOutbox(current, `${text}\n\n[delivery ${current.id} · dedupe ${current.event.messageTs}:${current.id} · ${current.actor}]`);
+      this.enqueueOutbox(current, outcomePost(current, text));
       return this.getDelivery(deliveryId);
     })();
   }
@@ -651,10 +723,20 @@ export class BrokerStore {
     `).run(delivery.id, delivery.event.channelId, delivery.event.threadTs, text, iso(this.clock));
   }
 
+  /**
+   * Rows failing repeatedly retry behind per-row exponential backoff so a
+   * poisoned page (e.g. an archived channel) cannot starve later receipts and
+   * outcomes; a row past OUTBOX_MAX_ATTEMPTS is abandoned, visibly logged, and
+   * never occupies the page again.
+   */
   listUnsentOutbox(limit = 32): OutboxEntry[] {
+    const now = iso(this.clock);
     const rows = this.db.prepare(`
-      SELECT * FROM outbox WHERE sent_at IS NULL ORDER BY outbox_id LIMIT ?
-    `).all(limit) as Row[];
+      SELECT * FROM outbox
+      WHERE sent_at IS NULL AND abandoned_at IS NULL
+        AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+      ORDER BY outbox_id LIMIT ?
+    `).all(now, limit) as Row[];
     return rows.map(outboxFromRow);
   }
 
@@ -664,7 +746,18 @@ export class BrokerStore {
   }
 
   markOutboxAttempt(outboxId: number): void {
-    this.db.prepare("UPDATE outbox SET attempts=attempts+1 WHERE outbox_id=?").run(outboxId);
+    const row = this.db.prepare("SELECT attempts FROM outbox WHERE outbox_id=?").get(outboxId) as Row | undefined;
+    if (!row) return;
+    const attempts = Number(row.attempts) + 1;
+    if (attempts >= OUTBOX_MAX_ATTEMPTS) {
+      this.db.prepare("UPDATE outbox SET attempts=?, abandoned_at=? WHERE outbox_id=?")
+        .run(attempts, iso(this.clock), outboxId);
+      console.error("hive outbox row abandoned after max attempts", outboxId);
+      return;
+    }
+    const nextAttemptAt = new Date(this.clock.now().getTime() + retryBackoffMs(attempts)).toISOString();
+    this.db.prepare("UPDATE outbox SET attempts=?, next_attempt_at=? WHERE outbox_id=?")
+      .run(attempts, nextAttemptAt, outboxId);
   }
 
   getDelivery(deliveryId: number): Delivery {
@@ -683,9 +776,22 @@ export class BrokerStore {
     if (!row) throw new Error(`delivery ${deliveryId} not found`);
     const delivery = deliveryFromRow(row);
     const events = this.db.prepare(`
-      SELECT event_id FROM delivery_events WHERE delivery_id=? ORDER BY rowid
+      SELECT de.event_id, de.relation, e.sender_id, e.message_ts, e.text
+      FROM delivery_events de JOIN slack_events e ON e.event_id=de.event_id
+      WHERE de.delivery_id=? ORDER BY de.rowid
     `).all(deliveryId) as Row[];
-    return { ...delivery, coalescedEventIds: events.map((event) => String(event.event_id)) };
+    const coalescedMessages: CoalescedMessage[] = events
+      .filter((event) => String(event.relation) === "coalesced")
+      .map((event) => ({
+        senderId: String(event.sender_id),
+        messageTs: String(event.message_ts),
+        text: String(event.text),
+      }));
+    return {
+      ...delivery,
+      coalescedEventIds: events.map((event) => String(event.event_id)),
+      coalescedMessages,
+    };
   }
 
   listDeliveries(): Delivery[] {
@@ -723,6 +829,11 @@ export class BrokerStore {
       this.enqueueOutbox(delivery, failureNotice(delivery, status, reasons));
     }
   }
+}
+
+/** ADR-0003 R-6: the thread-visible outcome format — self-identifying via delivery id, dedupe key, and actor. */
+function outcomePost(delivery: Delivery, text: string): string {
+  return `${text}\n\n[delivery ${delivery.id} · dedupe ${delivery.event.messageTs}:${delivery.id} · ${delivery.actor}]`;
 }
 
 function failureNotice(delivery: Delivery, status: "failed" | "undeliverable", reasons: Reason[]): string {
@@ -791,6 +902,7 @@ function deliveryFromRow(row: Row): Delivery {
     nextAttemptAt: row.next_attempt_at === null ? null : String(row.next_attempt_at),
     coalesceKey: String(row.coalesce_key),
     coalescedEventIds: [],
+    coalescedMessages: [],
     initialSnapshot: row.initial_snapshot_json === null ? null : JSON.parse(String(row.initial_snapshot_json)),
     snapshotTs: row.snapshot_ts === null ? null : String(row.snapshot_ts),
     createdAt: String(row.created_at),

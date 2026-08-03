@@ -45,16 +45,11 @@ export class BrokerService {
   }
 
   /**
-   * ADR-0003 R-6: the thread shows delivery. The dispatched transition
-   * enqueues the sender-visible delivery receipt in the same durable step.
+   * ADR-0003 R-6: the thread shows delivery. The dispatched transition and the
+   * sender-visible delivery receipt commit in one store transaction.
    */
   markDispatched(deliveryId: number, edgeId: string, generation: number): Delivery {
-    const delivery = this.store.transition(deliveryId, edgeId, generation, "dispatching", "dispatched");
-    this.store.enqueueOutbox(
-      delivery,
-      `→ delivered to ${delivery.actor} (delivery ${delivery.id}, attempt ${delivery.attempts}/${delivery.subscription.maxAttempts})`,
-    );
-    return delivery;
+    return this.store.markDispatched(deliveryId, edgeId, generation);
   }
 
   renew(deliveryId: number, edgeId: string, generation: number): Delivery {
@@ -66,7 +61,7 @@ export class BrokerService {
   }
 
   finish(deliveryId: number, edgeId: string, result: DeliveryResultInput): Delivery {
-    return this.store.finish(deliveryId, edgeId, result.generation, result.status, result.reasons);
+    return this.store.finish(deliveryId, edgeId, result.generation, result.status, result.reasons, result.outcome);
   }
 
   /** ADR-0003 R-3: uncertainty releases the delivery for redelivery instead of declaring an outcome. */

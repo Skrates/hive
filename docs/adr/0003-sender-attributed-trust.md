@@ -130,7 +130,16 @@ that are acted on when they arrive.
   terminals `processed | undeliverable | failed`. Uncertainty releases the delivery
   (`release` from the edge, or the broker's lease-expiry sweep) back to `pending` behind
   `retryBackoffMs`; exhaustion terminalizes as `failed`. All failure/retry/receipt/outcome
-  posts flow through the durable `outbox` table, drained by the broker.
+  posts flow through the durable `outbox` table, drained by the broker with per-row backoff
+  (a permanently failing row is finally abandoned and can never starve the page).
+* A **live** delivery (Codex steer accepted, Claude inbox written) stays `dispatched` until
+  the agent's outcome closes it: the receipt proves durable dispatch, not completion. The
+  sweep grants `DISPATCHED_OUTCOME_GRACE_MS` for the outcome before treating its absence as
+  uncertainty and requeueing — delivered-but-never-answered becomes a visible retry and
+  ultimately a visible `failed`, never a silent `processed`. A **headless** run's outcome
+  travels inside the terminal transition (`finish` with `outcome`), committing `processed`
+  and the thread post in one broker transaction, so a Slack outage after provider
+  completion can neither lose the outcome nor rerun the instruction.
 * The machine-local plane is owner-only UDS: the edge control socket (`~/.hive/edge.sock`)
   serves live-registration heartbeats and `hive reply` outcome relay; the Codex live
   surface serves `/deliver` on its own socket; Claude delivery is an owner-only ingress

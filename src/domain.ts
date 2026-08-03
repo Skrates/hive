@@ -1,3 +1,4 @@
+import { isAbsolute } from "node:path";
 import { z } from "zod";
 
 export const WakePolicySchema = z.enum(["live_only", "resume", "spawn"]);
@@ -70,8 +71,11 @@ export const SubscriptionInputSchema = z.object({
    * under on its home edge (CLAUDE_CONFIG_DIR for Claude Code, CODEX_HOME for
    * Codex). A wake always executes under this profile; a missing or unreadable
    * profile is a hard pre-dispatch failure, never a fallback to another seat.
+   * Relative paths are rejected outright: the edge process and the provider
+   * child run with different working directories, so a relative profile could
+   * resolve to a different seat at execution time.
    */
-  accountProfile: z.string().min(1),
+  accountProfile: z.string().min(1).refine(isAbsolute, { message: "accountProfile must be an absolute path" }),
   leaseTtlMs: z.number().int().positive().default(30_000),
   deliveryTtlMs: z.number().int().positive().default(300_000),
   homeGraceMs: z.number().int().nonnegative().default(30_000),
@@ -100,6 +104,13 @@ export const SlackEventInputSchema = z.object({
 });
 export type SlackEventInput = z.infer<typeof SlackEventInputSchema>;
 
+/** A trusted message folded into an existing pending delivery for the same actor/thread. */
+export interface CoalescedMessage {
+  senderId: string;
+  messageTs: string;
+  text: string;
+}
+
 export interface Delivery {
   id: number;
   eventId: string;
@@ -112,6 +123,7 @@ export interface Delivery {
   nextAttemptAt: string | null;
   coalesceKey: string;
   coalescedEventIds: string[];
+  coalescedMessages: CoalescedMessage[];
   initialSnapshot: unknown | null;
   snapshotTs: string | null;
   createdAt: string;
@@ -125,6 +137,14 @@ export const DeliveryResultInputSchema = z.object({
   status: TerminalDeliveryStatusSchema,
   reasons: z.array(ReasonSchema).default([]),
   providerReceipt: z.string().nullable().default(null),
+  /**
+   * ADR-0003 R-6: for a completed headless run the outcome travels WITH the
+   * terminal transition, so the broker commits the `processed` status and the
+   * durable outbox post in one transaction. Posting the outcome inline in a
+   * separate step would let a Slack outage after provider completion release
+   * the delivery and rerun the whole trusted instruction.
+   */
+  outcome: z.string().nullable().default(null),
 });
 export type DeliveryResultInput = z.infer<typeof DeliveryResultInputSchema>;
 
@@ -166,9 +186,21 @@ export function frameWakeInstruction(delivery: Delivery, replay: ReplaySnapshot 
     `(delivery ${delivery.id}, attempt ${delivery.attempts}, dedupe ${key} — a repeated dedupe key means this is a redelivery of a message you may have already handled):`,
     "",
     delivery.event.text,
-    "",
-    `Act on this message, then report your outcome to the thread by running: hive reply ${delivery.id} "<summary>"`,
   ];
+  // Coalesced messages are equally trusted instructions from the same thread —
+  // they ride in the imperative section, never demoted to replay data.
+  for (const coalesced of delivery.coalescedMessages) {
+    lines.push(
+      "",
+      `Additional message from ${coalesced.senderId} in the same thread (coalesced into this delivery):`,
+      "",
+      coalesced.text,
+    );
+  }
+  lines.push(
+    "",
+    `Act on ${delivery.coalescedMessages.length > 0 ? "these messages" : "this message"}, then report your outcome to the thread by running: hive reply ${delivery.id} "<summary>"`,
+  );
   if (replay && replay.messages.length > 0) {
     lines.push(
       "",

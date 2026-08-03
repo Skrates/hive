@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { consumeInboxFiles, drainInbox, hookOutput } from "./claude-hook.js";
+import { consumeInboxFiles, drainInbox, hookOutput, shouldMaintainHeartbeat } from "./claude-hook.js";
 
 function inboxFixture(): string {
   const root = mkdtempSync(join(tmpdir(), "hive-hook-"));
@@ -66,4 +66,15 @@ test("an unreadable inbox entry is left in place for inspection", (t) => {
   writeFileSync(join(inbox, "delivery-1-attempt-1.json"), "{not json");
   assert.deepEqual(drainInbox(inbox), []);
   assert.deepEqual(readdirSync(inbox), ["delivery-1-attempt-1.json"]);
+});
+
+test("heartbeat policy: a terminal Stop with an empty inbox withdraws liveness; everything else renews", () => {
+  // Session ending, nothing pending: no future boundary is promised — deregister.
+  assert.equal(shouldMaintainHeartbeat("Stop", 0), false);
+  assert.equal(shouldMaintainHeartbeat("SubagentStop", 0), false);
+  // Pending messages block the stop, so the session continues.
+  assert.equal(shouldMaintainHeartbeat("Stop", 2), true);
+  // Mid-session boundaries always renew.
+  assert.equal(shouldMaintainHeartbeat("PostToolUse", 0), true);
+  assert.equal(shouldMaintainHeartbeat("UserPromptSubmit", 0), true);
 });

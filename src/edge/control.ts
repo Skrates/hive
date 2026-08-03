@@ -74,6 +74,15 @@ export class EdgeControlServer {
       return json(response, 200, ingress);
     }
 
+    if (request.method === "POST" && request.url === "/live/deregister") {
+      const body = await readJson(request);
+      const actor = requiredString(body.actor, "actor");
+      const parsedProvider = ProviderSchema.safeParse(body.provider);
+      if (!parsedProvider.success) throw new Error("invalid provider");
+      this.edge.live.deregister(actor, parsedProvider.data);
+      return json(response, 200, { ok: true });
+    }
+
     if (request.method === "POST" && request.url === "/outcome") {
       const body = await readJson(request);
       const deliveryId = Number(body.deliveryId);

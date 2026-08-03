@@ -46,6 +46,7 @@ function delivery(id: number): Delivery {
     nextAttemptAt: null,
     coalesceKey: "ariadne:C1:100.1",
     coalescedEventIds: [],
+    coalescedMessages: [],
     initialSnapshot: null,
     snapshotTs: null,
     createdAt: "2026-08-01T00:00:00.000Z",

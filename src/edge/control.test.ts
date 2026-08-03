@@ -92,3 +92,28 @@ test("a stale socket file is replaced on start and a non-socket path is refused"
   await again.start();
   await again.stop();
 });
+
+test("a terminal-session deregister withdraws liveness immediately and is idempotent", async (t) => {
+  const { root, socketPath, live, server } = fixture();
+  t.after(async () => {
+    await server.stop();
+    rmSync(root, { recursive: true, force: true });
+  });
+  await server.start();
+
+  await udsRequestJson(socketPath, "POST", "/live/register", {
+    actor: "claude-1",
+    provider: "claude",
+    socketPath: join(root, "inbox", "claude-1"),
+    sessionId: "session-9",
+    surfaceVersion: "claude-hook",
+    ttlMs: 120_000,
+  });
+  assert.ok(live.get("claude-1", "claude"));
+
+  await udsRequestJson(socketPath, "POST", "/live/deregister", { actor: "claude-1", provider: "claude" });
+  assert.equal(live.get("claude-1", "claude"), null);
+  // Idempotent: a second withdrawal of an absent binding succeeds.
+  const again = await udsRequestJson<{ ok: boolean }>(socketPath, "POST", "/live/deregister", { actor: "claude-1", provider: "claude" });
+  assert.equal(again.ok, true);
+});
