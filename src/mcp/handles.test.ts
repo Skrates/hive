@@ -8,10 +8,11 @@ import {
   parseEdgeHandle,
 } from "./handles.js";
 import {
-  HIVE_HANDLE_MANIFEST,
+  BROKER_HANDLE_DEFINITIONS,
+  EDGE_HANDLE_DEFINITIONS,
   type HiveBrokerHandleKind,
   type HiveEdgeHandleKind,
-} from "./schemas.js";
+} from "./handles.js";
 
 const BROKER_UUID = "01234567-89ab-4cde-8f01-23456789abcd";
 
@@ -27,23 +28,12 @@ const brokerCases: readonly BrokerCase[] = [
   { kind: "delivery", values: { deliveryId: 1 }, suffix: "deliveries/1" },
   { kind: "deliveryTransitions", values: { deliveryId: 1 }, suffix: "deliveries/1/transitions" },
   { kind: "deliveryReplay", values: { deliveryId: 1 }, suffix: "deliveries/1/replay" },
-  { kind: "deliveryEvidence", values: { deliveryId: 1, cursor: "next page" }, suffix: "deliveries/1/evidence?cursor=next%20page" },
-  { kind: "deliveryEvidenceItem", values: { deliveryId: 1, evidenceId: "evidence one" }, suffix: "deliveries/1/evidence/evidence%20one" },
-  { kind: "dispatch", values: { deliveryId: 1, generation: 2, providerAttempt: 3 }, suffix: "dispatches/1/2/3" },
-  { kind: "dispatchEvidence", values: { deliveryId: 1, generation: 2, providerAttempt: 3, cursor: "c:4" }, suffix: "dispatches/1/2/3/evidence?cursor=c%3A4" },
-  { kind: "reconciliationPending", suffix: "reconciliation/pending" },
-  { kind: "reconciliationObligation", values: { obligationId: "obligation-1" }, suffix: "reconciliation/obligations/obligation-1" },
-  { kind: "integrityAlerts", values: { cursor: "alerts:2" }, suffix: "reconciliation/integrity-alerts?cursor=alerts%3A2" },
-  { kind: "integrityAlert", values: { alertId: "alert-1" }, suffix: "reconciliation/integrity-alerts/alert-1" },
   { kind: "outbox", values: { cursor: "outbox:2" }, suffix: "outbox?cursor=outbox%3A2" },
   { kind: "outboxItem", values: { outboxId: "outbox-1" }, suffix: "outbox/outbox-1" },
   { kind: "subscriptions", suffix: "subscriptions" },
   { kind: "subscription", values: { actor: "colonel ariadne" }, suffix: "subscriptions/colonel%20ariadne" },
   { kind: "edges", values: { cursor: "edge:2" }, suffix: "edges?cursor=edge%3A2" },
   { kind: "edge", values: { edgeId: "mac.local" }, suffix: "edges/mac.local" },
-  { kind: "credentialLineage", values: { edgeId: "mac", lineageId: "lineage-1" }, suffix: "edges/mac/credential-lineages/lineage-1" },
-  { kind: "credentialKey", values: { edgeId: "mac", lineageId: "lineage-1", keyId: "key-1" }, suffix: "edges/mac/credential-lineages/lineage-1/keys/key-1" },
-  { kind: "edgePending", values: { edgeId: "mac" }, suffix: "edges/mac/pending" },
   { kind: "provider", values: { edgeId: "mac", provider: "claude" }, suffix: "providers/mac/claude" },
   { kind: "workspace", values: { workspaceId: "workspace-1" }, suffix: "workspaces/workspace-1" },
   { kind: "reasonCodes", suffix: "reason-codes" },
@@ -56,16 +46,15 @@ interface EdgeCase {
 }
 
 const edgeCases: readonly EdgeCase[] = [
-  { kind: "localBinding", values: { bindingId: "binding-1", epoch: 2, revision: 3 }, suffix: "bindings/binding-1?epoch=2&revision=3" },
   { kind: "localProvider", values: { provider: "claude", providerSessionRef: "session:opaque" }, suffix: "providers/claude/session%3Aopaque" },
 ];
 
 test("all canonical broker handle templates format and parse byte-identically", () => {
   assert.deepEqual(
     new Set(brokerCases.map((specimen) => specimen.kind)),
-    new Set(HIVE_HANDLE_MANIFEST.broker.map((definition) => definition.kind)),
+    new Set(BROKER_HANDLE_DEFINITIONS.map((definition) => definition.kind)),
   );
-  assert.equal(brokerCases.length, HIVE_HANDLE_MANIFEST.broker.length);
+  assert.equal(brokerCases.length, BROKER_HANDLE_DEFINITIONS.length);
   for (const specimen of brokerCases) {
     const uri = formatBrokerHandle(BROKER_UUID, specimen.kind, specimen.values);
     assert.equal(uri, `hive://${BROKER_UUID}/v1/${specimen.suffix}`, specimen.kind);
@@ -78,9 +67,9 @@ test("all canonical broker handle templates format and parse byte-identically", 
 test("all canonical edge-local handle templates format and parse byte-identically", () => {
   assert.deepEqual(
     new Set(edgeCases.map((specimen) => specimen.kind)),
-    new Set(HIVE_HANDLE_MANIFEST.edge.map((definition) => definition.kind)),
+    new Set(EDGE_HANDLE_DEFINITIONS.map((definition) => definition.kind)),
   );
-  assert.equal(edgeCases.length, HIVE_HANDLE_MANIFEST.edge.length);
+  assert.equal(edgeCases.length, EDGE_HANDLE_DEFINITIONS.length);
   for (const specimen of edgeCases) {
     const uri = formatEdgeHandle(specimen.kind, specimen.values);
     assert.equal(uri, `hive://edge/v1/${specimen.suffix}`, specimen.kind);
@@ -143,19 +132,19 @@ test("positive integer coordinates reject zero, signs, leading zeroes, fractions
   );
 });
 
-test("edge-local binding query is exact, ordered, and contains only ABA fences", () => {
-  const invalid = [
-    "hive://edge/v1/bindings/binding-1",
-    "hive://edge/v1/bindings/binding-1?revision=3&epoch=2",
-    "hive://edge/v1/bindings/binding-1?epoch=2&revision=3&token=secret",
-    "hive://edge/v1/bindings/binding-1?epoch=02&revision=3",
-    "hive://edge/v1/bindings/binding-1?epoch=2&revision=0",
+test("superseded handle families are no longer parseable (ADR-0003)", () => {
+  const superseded = [
+    `hive://${BROKER_UUID}/v1/deliveries/1/evidence`,
+    `hive://${BROKER_UUID}/v1/dispatches/1/2/3`,
+    `hive://${BROKER_UUID}/v1/reconciliation/pending`,
+    `hive://${BROKER_UUID}/v1/reconciliation/integrity-alerts`,
+    `hive://${BROKER_UUID}/v1/edges/mac/credential-lineages/lineage-1`,
+    `hive://${BROKER_UUID}/v1/edges/mac/pending`,
   ];
-  for (const uri of invalid) assert.throws(() => parseEdgeHandle(uri), InvalidHiveHandleError, uri);
-  assert.throws(
-    () => formatEdgeHandle("localBinding", { bindingId: "binding-1", epoch: 2, revision: 3, capability: "secret" }),
-    InvalidHiveHandleError,
-  );
+  for (const uri of superseded) {
+    assert.throws(() => parseBrokerHandle(uri, BROKER_UUID), InvalidHiveHandleError, uri);
+  }
+  assert.throws(() => parseEdgeHandle("hive://edge/v1/bindings/binding-1?epoch=2&revision=3"), InvalidHiveHandleError);
 });
 
 test("broker and edge-local authorities cannot cross parser boundaries", () => {

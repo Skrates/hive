@@ -1,15 +1,20 @@
 import { spawn } from "node:child_process";
+import { closeSync, fsyncSync, mkdirSync, openSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import type { Delivery, Provider, Subscription } from "../domain.js";
+import { udsRequestJson } from "../local/uds.js";
 import type { LiveIngress } from "./live-registry.js";
 
 export interface ProviderDispatch {
   receipt: string;
+  /** True when the provider run itself completed and the receipt is the outcome. */
   processed: boolean;
 }
 
 export type ProviderPreDispatchErrorCode =
   | "live_ingress_rejected"
-  | "provider_permission_profile_invalid";
+  | "provider_permission_profile_invalid"
+  | "account_profile_missing";
 
 /** A deterministic rejection that proves no provider turn was started. */
 export class ProviderPreDispatchError extends Error {
@@ -22,49 +27,43 @@ export class ProviderPreDispatchError extends Error {
 export interface ProviderAdapter {
   provider: Provider;
   preflight?(subscription: Subscription): void;
-  deliverLive(
-    ingress: LiveIngress,
-    delivery: Delivery,
-    framed: string,
-    ackCapability: string,
-  ): Promise<ProviderDispatch>;
+  deliverLive(ingress: LiveIngress, delivery: Delivery, framed: string): Promise<ProviderDispatch>;
   resume(subscription: Subscription, cwd: string, framed: string): Promise<ProviderDispatch>;
   spawn(subscription: Subscription, cwd: string, framed: string): Promise<ProviderDispatch>;
+}
+
+/**
+ * ADR-0003 R-5: a wake always executes under the enrolled agent's pinned
+ * account profile. A missing profile is a hard pre-dispatch failure — never a
+ * fallback to whatever seat the edge process happens to be logged into.
+ */
+export function requireAccountProfile(subscription: Subscription): string {
+  try {
+    if (statSync(subscription.accountProfile).isDirectory()) return subscription.accountProfile;
+  } catch {
+    // fall through to the hard failure below
+  }
+  throw new ProviderPreDispatchError("account_profile_missing");
 }
 
 export class CodexProvider implements ProviderAdapter {
   readonly provider = "codex" as const;
 
-  constructor(private readonly localToken: string) {}
-
   preflight(subscription: Subscription): void {
     codexPermissionArgs(subscription.permissionProfile);
+    requireAccountProfile(subscription);
   }
 
-  async deliverLive(
-    ingress: LiveIngress,
-    delivery: Delivery,
-    framed: string,
-    ackCapability: string,
-  ): Promise<ProviderDispatch> {
-    const response = await fetch(ingress.callbackUrl, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer ${this.localToken}` },
-      body: JSON.stringify({
-        delivery,
-        framed,
-        ackCapability,
-        binding: {
-          bindingId: ingress.bindingId,
-          bindingRevision: ingress.bindingRevision,
-        },
-      }),
+  async deliverLive(ingress: LiveIngress, delivery: Delivery, framed: string): Promise<ProviderDispatch> {
+    const result = await udsRequestJson<{ receipt?: unknown }>(ingress.socketPath, "POST", "/deliver", {
+      delivery,
+      framed,
     });
-    assertLiveIngressAccepted(response, "Codex");
-    return {
-      receipt: await safeLiveReceipt(response, "Codex", ackCapability, this.localToken),
-      processed: false,
-    };
+    const receipt = result.receipt;
+    if (typeof receipt !== "string" || receipt.length === 0 || receipt.length > 1_000) {
+      throw new Error("Codex live ingress invalid response");
+    }
+    return { receipt, processed: false };
   }
 
   resume(subscription: Subscription, cwd: string, framed: string): Promise<ProviderDispatch> {
@@ -74,6 +73,7 @@ export class CodexProvider implements ProviderAdapter {
       ["exec", "resume", subscription.sessionId, "-", "--json", ...codexPermissionArgs(subscription.permissionProfile)],
       cwd,
       framed,
+      { CODEX_HOME: requireAccountProfile(subscription) },
     );
   }
 
@@ -83,43 +83,61 @@ export class CodexProvider implements ProviderAdapter {
       ["exec", "--cd", cwd, "--json", ...codexPermissionArgs(subscription.permissionProfile), "-"],
       cwd,
       framed,
+      { CODEX_HOME: requireAccountProfile(subscription) },
     );
   }
+}
+
+export interface ClaudeInboxConfig {
+  /** Root directory for per-actor ingress inboxes (owner-only). */
+  ingressRoot: string;
 }
 
 export class ClaudeProvider implements ProviderAdapter {
   readonly provider = "claude" as const;
 
-  constructor(private readonly localToken: string) {}
+  constructor(private readonly inbox: ClaudeInboxConfig) {}
 
   preflight(subscription: Subscription): void {
     claudePermissionArgs(subscription.permissionProfile);
+    requireAccountProfile(subscription);
   }
 
-  async deliverLive(
-    ingress: LiveIngress,
-    delivery: Delivery,
-    framed: string,
-    ackCapability: string,
-  ): Promise<ProviderDispatch> {
-    const response = await fetch(ingress.callbackUrl, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer ${this.localToken}` },
-      body: JSON.stringify({
-        delivery,
-        framed,
-        ackCapability,
-        binding: {
-          bindingId: ingress.bindingId,
-          bindingRevision: ingress.bindingRevision,
-        },
-      }),
+  /**
+   * ADR-0003 R-4 steering matrix: Claude Code delivery is next-boundary. The
+   * session's Stop/PostToolUse hook keeps the actor's live registration fresh
+   * (the registration TTL is the heartbeat), so a live hit here means an
+   * active session will see the inbox at its next natural boundary. The
+   * envelope lands durably in the actor's owner-only ingress inbox; a lapsed
+   * registration falls through to the `--resume`/`-p` idle-wake ladder
+   * instead. A double delivery is permitted and self-identifying.
+   */
+  async deliverLive(_ingress: LiveIngress, delivery: Delivery, framed: string): Promise<ProviderDispatch> {
+    const receipt = this.writeInbox(delivery, framed);
+    return { receipt, processed: false };
+  }
+
+  writeInbox(delivery: Delivery, framed: string): string {
+    const directory = join(this.inbox.ingressRoot, delivery.actor);
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const finalPath = join(directory, `delivery-${delivery.id}-attempt-${delivery.attempts}.json`);
+    const temporaryPath = `${finalPath}.tmp`;
+    const payload = JSON.stringify({
+      deliveryId: delivery.id,
+      attempt: delivery.attempts,
+      dedupe: `${delivery.event.messageTs}:${delivery.id}`,
+      framed,
+      writtenAt: new Date().toISOString(),
     });
-    assertLiveIngressAccepted(response, "Claude");
-    return {
-      receipt: await safeLiveReceipt(response, "Claude", ackCapability, this.localToken),
-      processed: false,
-    };
+    writeFileSync(temporaryPath, payload, { mode: 0o600 });
+    const descriptor = openSync(temporaryPath, "r+");
+    try {
+      fsyncSync(descriptor);
+    } finally {
+      closeSync(descriptor);
+    }
+    renameSync(temporaryPath, finalPath);
+    return `claude-inbox:${finalPath}`;
   }
 
   resume(subscription: Subscription, cwd: string, framed: string): Promise<ProviderDispatch> {
@@ -129,6 +147,7 @@ export class ClaudeProvider implements ProviderAdapter {
       ["-p", "--resume", subscription.sessionId, "--output-format", "stream-json", ...claudePermissionArgs(subscription.permissionProfile), framed],
       cwd,
       null,
+      { CLAUDE_CONFIG_DIR: requireAccountProfile(subscription) },
     );
   }
 
@@ -138,47 +157,23 @@ export class ClaudeProvider implements ProviderAdapter {
       ["-p", "--output-format", "stream-json", ...claudePermissionArgs(subscription.permissionProfile), framed],
       cwd,
       null,
+      { CLAUDE_CONFIG_DIR: requireAccountProfile(subscription) },
     );
   }
 }
 
-function assertLiveIngressAccepted(response: Response, provider: "Codex" | "Claude"): void {
-  if (response.ok) return;
-  if (response.status >= 400 && response.status < 500) {
-    throw new ProviderPreDispatchError("live_ingress_rejected");
-  }
-  throw new Error(`${provider} live ingress ${response.status}`);
-}
-
-async function safeLiveReceipt(
-  response: Response,
-  provider: "Codex" | "Claude",
-  ackCapability: string,
-  localToken: string,
-): Promise<string> {
-  let value: unknown;
-  try {
-    value = await response.json();
-  } catch {
-    throw new Error(`${provider} live ingress invalid response`);
-  }
-  const receipt = value && typeof value === "object"
-    ? (value as { receipt?: unknown }).receipt
-    : null;
-  if (
-    typeof receipt !== "string"
-    || receipt.length === 0
-    || receipt.length > 1_000
-    || receipt.includes(ackCapability)
-    || receipt.includes(localToken)
-  ) {
-    throw new Error(`${provider} live ingress invalid response`);
-  }
-  return receipt;
-}
-
-async function runHeadless(command: string, args: string[], cwd: string, stdin: string | null): Promise<ProviderDispatch> {
-  const child = spawn(command, args, { cwd, stdio: ["pipe", "pipe", "pipe"], env: process.env });
+async function runHeadless(
+  command: string,
+  args: string[],
+  cwd: string,
+  stdin: string | null,
+  profileEnv: Record<string, string>,
+): Promise<ProviderDispatch> {
+  const child = spawn(command, args, {
+    cwd,
+    stdio: ["pipe", "pipe", "pipe"],
+    env: { ...process.env, ...profileEnv },
+  });
   if (stdin !== null) child.stdin.end(stdin); else child.stdin.end();
   const stdout: Buffer[] = [];
   const stderr: Buffer[] = [];

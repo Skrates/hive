@@ -7,8 +7,7 @@ export type LocalDispatchStatus =
   | "dispatched"
   | "processed"
   | "undeliverable"
-  | "ambiguous"
-  | "dead_letter";
+  | "released";
 
 interface LocalRow {
   delivery_id: number;
@@ -73,7 +72,8 @@ export class EdgeStore {
     return this.db.prepare("SELECT * FROM local_deliveries WHERE delivery_id=?").get(deliveryId) as LocalRow | undefined ?? null;
   }
 
-  listAmbiguousAfterRestart(): LocalRow[] {
+  /** Deliveries an edge crash left mid-dispatch; ADR-0003 R-3 requeues them via broker release. */
+  listInterruptedDispatches(): LocalRow[] {
     return this.db.prepare("SELECT * FROM local_deliveries WHERE status='dispatching' ORDER BY delivery_id").all() as LocalRow[];
   }
 

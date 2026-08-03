@@ -1,10 +1,5 @@
-import { frameUntrustedSlack, type Delivery, type Provider, type Reason } from "../domain.js";
+import { frameWakeInstruction, type Delivery, type Provider, type Reason } from "../domain.js";
 import { BrokerClient } from "./broker-client.js";
-import {
-  DispatchCapabilityError,
-  DispatchCapabilityRegistry,
-  type DispatchCapabilityBinding,
-} from "./dispatch-capability.js";
 import { LiveIngressRegistry } from "./live-registry.js";
 import {
   ProviderPreDispatchError,
@@ -32,7 +27,6 @@ export class EdgeService {
     readonly store: EdgeStore,
     readonly live: LiveIngressRegistry,
     adapters: ProviderAdapter[],
-    private readonly dispatchCapabilities = new DispatchCapabilityRegistry(),
     private readonly timers = systemEdgeTimers,
   ) {
     this.adapters = new Map(adapters.map((adapter) => [adapter.provider, adapter]));
@@ -60,19 +54,23 @@ export class EdgeService {
     }
   }
 
+  /**
+   * ADR-0003 R-3: an edge restart mid-dispatch is ordinary uncertainty. Ask
+   * the broker to requeue each interrupted delivery; a stale fence means the
+   * broker's lease-expiry sweep already owns the requeue. Either way the
+   * delivery retries — never a reconciliation obligation.
+   */
   async recoverInterruptedDispatches(): Promise<number> {
     let recovered = 0;
-    for (const local of this.store.listAmbiguousAfterRestart()) {
+    for (const local of this.store.listInterruptedDispatches()) {
       const delivery = this.store.delivery(local.delivery_id);
       if (!delivery) continue;
       try {
-        await this.broker.finish(delivery, {
-          generation: local.generation,
-          status: "ambiguous",
-          reasons: [{ code: "edge_restarted_during_dispatch", detail: "local edge restarted before provider dispatch outcome was durably recorded" }],
-          providerReceipt: local.provider_receipt,
+        await this.broker.release(delivery, {
+          code: "edge_restarted_during_dispatch",
+          detail: "local edge restarted before the provider dispatch outcome was recorded",
         });
-        this.store.setStatus(local.delivery_id, local.generation, "ambiguous", local.provider_receipt);
+        this.store.setStatus(local.delivery_id, local.generation, "released");
         recovered += 1;
       } catch {
         // A stale fence means the broker is authoritative and its lease-expiry sweep owns recovery.
@@ -93,106 +91,75 @@ export class EdgeService {
 
     let current = delivery;
     let providerStarted = false;
-    const capabilityState: { current: ActiveDispatchCapability | null } = { current: null };
     try {
-      // A successful claim extends the shared actor lease. Keep every ACK
-      // capability governed by that exact actor/generation fence aligned with it.
-      this.dispatchCapabilities.renewLeaseScope(
-        delivery.actor,
-        generation,
-        delivery.subscription.leaseTtlMs,
-      );
       const existing = this.store.receive(delivery, generation);
       if (["dispatched", "processed"].includes(existing.status)) return true;
 
       current = await this.broker.accept(delivery);
       const replay = await this.broker.replay(current);
-      const framed = frameUntrustedSlack(current, replay);
+      const framed = frameWakeInstruction(current, replay);
       current = await this.broker.beginDispatch(current);
       this.store.setStatus(current.id, generation, "dispatching");
 
       const dispatch = await this.withLeaseHeartbeat(
         current,
-        () => capabilityState.current,
-        () => this.dispatch(
-          current,
-          framed,
-          () => { providerStarted = true; },
-          (capability) => { capabilityState.current = capability; },
-          async (capability) => {
-            // Live surfaces may acknowledge synchronously while accepting the
-            // turn. Publish durable dispatched state and activate the bearer
-            // before allowing the callback to emit anything.
-            current = await this.broker.markDispatched(current);
-            this.store.setStatus(current.id, generation, "dispatched");
-            this.dispatchCapabilities.activate(capability.capability, capability.binding);
-          },
-        ),
+        () => this.dispatch(current, framed, () => { providerStarted = true; }),
       );
-      if (capabilityState.current) {
-        // Do not overwrite a synchronous live acknowledgement. Otherwise retain
-        // the callback receipt as recovery evidence while awaiting explicit ACK.
-        if (this.store.get(current.id)?.status === "dispatched") {
-          this.store.setStatus(current.id, generation, "dispatched", dispatch.receipt);
-        }
-      } else {
-        current = await this.broker.markDispatched(current);
-        this.store.setStatus(current.id, generation, "dispatched", dispatch.receipt);
-      }
+      current = await this.broker.markDispatched(current);
+      this.store.setStatus(current.id, generation, "dispatched", dispatch.receipt);
       if (dispatch.processed) {
-        if (capabilityState.current) {
-          this.dispatchCapabilities.revoke(capabilityState.current.capability);
-        }
+        // Headless run: the receipt is the agent's outcome — post it.
         await this.broker.reply(current, headlessAcknowledgement(dispatch.receipt));
-        await this.broker.finish(current, { generation, status: "processed", reasons: [], providerReceipt: dispatch.receipt });
-        this.store.setStatus(current.id, generation, "processed", dispatch.receipt);
       }
+      await this.broker.finish(current, { generation, status: "processed", reasons: [], providerReceipt: dispatch.receipt });
+      this.store.setStatus(current.id, generation, "processed", dispatch.receipt);
       return true;
     } catch (error) {
-      if (capabilityState.current) {
-        this.dispatchCapabilities.revoke(capabilityState.current.capability);
-      }
       await this.recordDeliveryFailure(current, generation, providerStarted, error);
       return true;
     }
   }
 
+  /**
+   * ADR-0003 R-3 failure split: a deterministic pre-dispatch rejection proves
+   * no provider effect and terminalizes as `undeliverable`; everything else is
+   * uncertainty and releases the delivery for another attempt. The broker
+   * decides whether the release requeues or exhausts into `failed`.
+   */
   private async recordDeliveryFailure(
     delivery: Delivery,
     generation: number,
     providerStarted: boolean,
     error: unknown,
   ): Promise<void> {
-    const providerOutcomeUnknown = providerStarted && !(error instanceof ProviderPreDispatchError);
-    const status = providerOutcomeUnknown ? "ambiguous" as const : "undeliverable" as const;
-    const reason = classifyDeliveryFailure(error, providerOutcomeUnknown);
+    const reason = classifyDeliveryFailure(error, providerStarted);
+    const deterministic = error instanceof ProviderPreDispatchError
+      || (error instanceof PreDispatchError && !providerStarted);
     console.error("hive edge delivery failed", delivery.id, generation, reason.code);
     try {
-      await this.broker.finish(delivery, {
-        generation,
-        status,
-        reasons: [reason],
-        providerReceipt: null,
-      });
-    } catch (finishError) {
+      if (deterministic) {
+        await this.broker.finish(delivery, { generation, status: "undeliverable", reasons: [reason], providerReceipt: null });
+      } else {
+        await this.broker.release(delivery, reason);
+      }
+    } catch (dispositionError) {
       // The broker lease-expiry sweep is the authority of last resort. Never let one
       // poisoned delivery terminate the edge loop merely because its disposition
       // could not be recorded during the same iteration.
-      console.error("hive edge delivery disposition failed", safeEdgeErrorCode(finishError));
+      console.error("hive edge delivery disposition failed", safeEdgeErrorCode(dispositionError));
       return;
     }
     try {
-      this.store.setStatus(delivery.id, generation, status);
+      this.store.setStatus(delivery.id, generation, deterministic ? "undeliverable" : "released");
     } catch (storeError) {
       // Broker state is already durable. A local journal write failure is isolated
-      // to this delivery and will be reconciled by the broker fence after restart.
+      // to this delivery and reconverges on the next receive.
       console.error("hive edge local disposition failed", safeEdgeErrorCode(storeError));
     }
   }
 
   private async withLeaseHeartbeat<T>(
     delivery: Delivery,
-    capability: () => ActiveDispatchCapability | null,
     operation: () => Promise<T>,
   ): Promise<T> {
     const intervalMs = Math.max(250, Math.floor(delivery.subscription.leaseTtlMs / 3));
@@ -216,19 +183,11 @@ export class EdgeService {
       releaseWait = null;
       release?.();
     };
-    const renewLeaseScope = async (): Promise<void> => {
-      await this.broker.renew(delivery);
-      this.dispatchCapabilities.renewLeaseScope(
-        delivery.actor,
-        requiredGeneration(delivery),
-        delivery.subscription.leaseTtlMs,
-      );
-    };
 
     // Accept and replay may have consumed most of the TTL acquired by claim.
-    // Refresh the broker fence synchronously before minting authority or invoking
-    // any provider, then serialize all periodic renewals behind this one.
-    await renewLeaseScope();
+    // Refresh the broker fence synchronously before invoking any provider,
+    // then serialize all periodic renewals behind this one.
+    await this.broker.renew(delivery);
     const heartbeat = (async () => {
       while (!stopped) {
         await waitForInterval();
@@ -236,11 +195,9 @@ export class EdgeService {
         try {
           // Renewals are intentionally serialized. A failed renewal is sticky and
           // terminates this loop, so no later success can resurrect stale authority.
-          await renewLeaseScope();
+          await this.broker.renew(delivery);
         } catch (error) {
           heartbeatError = error;
-          const active = capability();
-          if (active) this.dispatchCapabilities.revoke(active.capability);
           stopped = true;
         }
       }
@@ -265,83 +222,34 @@ export class EdgeService {
     return result as T;
   }
 
-  async acknowledge(delivery: Delivery, text: string): Promise<void> {
-    const generation = requiredGeneration(delivery);
-    await this.broker.reply(delivery, text);
-    await this.broker.finish(delivery, { generation, status: "processed", reasons: [], providerReceipt: text });
-    try {
-      this.store.setStatus(delivery.id, generation, "processed", text);
-    } catch (error) {
-      // Broker completion is authoritative. Never turn a successful ACK into an
-      // apparent failure merely because the local journal could not catch up.
-      console.error("hive edge local acknowledgement failed", safeEdgeErrorCode(error));
-    }
-  }
-
-  async acknowledgeByCapability(deliveryId: number, capability: string, text: string): Promise<void> {
-    const local = this.store.get(deliveryId);
-    const delivery = this.store.delivery(deliveryId);
-    if (local?.status !== "dispatched" || !delivery || delivery.leaseGeneration === null || delivery.attempts < 1) {
-      throw new DispatchCapabilityError();
-    }
-    const generation = requiredGeneration(delivery);
-    this.dispatchCapabilities.consume(capability, dispatchBinding(delivery));
-    try {
-      await this.acknowledge(delivery, text);
-    } catch (error) {
-      // Consumption is final. If the Slack reply or broker completion has an
-      // uncertain outcome, promptly ask the broker to fence the delivery as
-      // ambiguous without ever restoring the bearer.
-      await this.recordDeliveryFailure(
-        delivery,
-        generation,
-        true,
-        new ProviderAcknowledgementUnknownError(),
-      );
-      throw error;
-    }
-  }
-
   private async dispatch(
     delivery: Delivery,
     framed: string,
     onProviderStart: () => void,
-    onCapability: (capability: ActiveDispatchCapability) => void,
-    prepareLive: (capability: ActiveDispatchCapability) => Promise<void>,
   ): Promise<ProviderDispatch> {
     const subscription = delivery.subscription;
     const adapter = this.adapters.get(subscription.provider);
     if (!adapter) throw new PreDispatchError("provider_adapter_missing");
+    adapter.preflight?.(subscription);
+
     const live = this.live.get(delivery.actor, subscription.provider);
     if (live) {
-      const binding = dispatchBinding(delivery);
-      const minted = this.dispatchCapabilities.mint(binding, subscription.leaseTtlMs, delivery.actor);
-      const capability = { capability: minted.capability, binding };
-      onCapability(capability);
-      await prepareLive(capability);
       onProviderStart();
-      return adapter.deliverLive(live, delivery, framed, minted.capability);
+      return adapter.deliverLive(live, delivery, framed);
     }
     if (subscription.wakePolicy === "live_only") throw new PreDispatchError("live_ingress_unavailable");
 
     const workspace = subscription.edgeWorkspaces.find((item) => item.edgeId === this.broker.edgeId);
     if (!workspace) throw new PreDispatchError("workspace_not_mapped");
     if (subscription.sessionId && this.broker.edgeId === subscription.homeEdge) {
-      adapter.preflight?.(subscription);
       onProviderStart();
       return adapter.resume(subscription, workspace.cwd, framed);
     }
     if (subscription.wakePolicy === "resume") throw new PreDispatchError("resume_target_missing");
-    adapter.preflight?.(subscription);
     if (!await this.broker.reserveSpawn(delivery)) throw new PreDispatchError("spawn_rate_limited");
     onProviderStart();
     return adapter.spawn(subscription, workspace.cwd, framed);
   }
-}
-
-interface ActiveDispatchCapability {
-  capability: string;
-  binding: DispatchCapabilityBinding;
 }
 
 type PreDispatchErrorCode =
@@ -355,13 +263,6 @@ class PreDispatchError extends Error {
   constructor(readonly code: PreDispatchErrorCode) {
     super(code);
     this.name = "PreDispatchError";
-  }
-}
-
-class ProviderAcknowledgementUnknownError extends Error {
-  constructor() {
-    super("provider_acknowledgement_unknown");
-    this.name = "ProviderAcknowledgementUnknownError";
   }
 }
 
@@ -382,26 +283,7 @@ export function headlessAcknowledgement(receipt: string): string {
   return best.length <= 2_500 ? best : `${best.slice(0, 2_497)}…`;
 }
 
-function requiredGeneration(delivery: Delivery): number {
-  if (delivery.leaseGeneration === null) throw new Error("delivery has no lease generation");
-  return delivery.leaseGeneration;
-}
-
-function dispatchBinding(delivery: Delivery): DispatchCapabilityBinding {
-  return {
-    deliveryId: delivery.id,
-    generation: requiredGeneration(delivery),
-    providerAttempt: delivery.attempts,
-  };
-}
-
 function classifyDeliveryFailure(error: unknown, providerStarted: boolean): Reason {
-  if (error instanceof ProviderAcknowledgementUnknownError) {
-    return {
-      code: "provider_acknowledgement_unknown",
-      detail: "provider dispatch was accepted but the explicit acknowledgement outcome was not confirmed",
-    };
-  }
   if (error instanceof ProviderPreDispatchError) {
     return { code: error.code, detail: preDispatchDetail(error.code) };
   }
@@ -427,8 +309,9 @@ function preDispatchDetail(code: string): string {
     case "workspace_not_mapped": return "the claiming edge had no declared workspace mapping";
     case "provider_adapter_missing": return "the declared provider adapter was unavailable";
     case "spawn_rate_limited": return "the actor spawn window was exhausted";
-    case "live_ingress_rejected": return "the live callback rejected dispatch before starting a provider turn";
+    case "live_ingress_rejected": return "the live surface rejected dispatch before starting a provider turn";
     case "provider_permission_profile_invalid": return "the configured provider permission profile was invalid";
+    case "account_profile_missing": return "the pinned account profile directory does not exist on this edge (ADR-0003 R-5: profile misbinding is a hard failure)";
     default: return "provider dispatch was rejected before invocation";
   }
 }
@@ -443,6 +326,7 @@ function safeEdgeErrorCode(error: unknown): string {
     "workspace_not_mapped",
     "provider_adapter_missing",
     "spawn_rate_limited",
+    "account_profile_missing",
     "stale lease",
   ].find((code) => message.includes(code)) ?? "edge_iteration_failed";
 }

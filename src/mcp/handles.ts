@@ -1,9 +1,33 @@
-import {
-  HIVE_HANDLE_MANIFEST,
-  type HiveBrokerHandleKind,
-  type HiveEdgeHandleKind,
-  type HiveHandleKind,
-} from "./schemas.js";
+/**
+ * ADR-0003 retains ADR-0002 D6: canonical `hive://` handles identify, never
+ * authorize. The kind table below is v0.5 truth — the evidence, reconciliation,
+ * credential-lineage, and binding-fence handle families left with the strata
+ * that owned them.
+ */
+export const BROKER_HANDLE_DEFINITIONS = [
+  { kind: "event", path: "events/{eventId}" },
+  { kind: "deliveries", path: "deliveries", optionalQuery: ["cursor"] },
+  { kind: "delivery", path: "deliveries/{deliveryId}", positiveIntegers: ["deliveryId"] },
+  { kind: "deliveryTransitions", path: "deliveries/{deliveryId}/transitions", positiveIntegers: ["deliveryId"] },
+  { kind: "deliveryReplay", path: "deliveries/{deliveryId}/replay", positiveIntegers: ["deliveryId"] },
+  { kind: "outbox", path: "outbox", optionalQuery: ["cursor"] },
+  { kind: "outboxItem", path: "outbox/{outboxId}" },
+  { kind: "subscriptions", path: "subscriptions", optionalQuery: ["cursor"] },
+  { kind: "subscription", path: "subscriptions/{actor}" },
+  { kind: "edges", path: "edges", optionalQuery: ["cursor"] },
+  { kind: "edge", path: "edges/{edgeId}" },
+  { kind: "provider", path: "providers/{edgeId}/{provider}" },
+  { kind: "workspace", path: "workspaces/{workspaceId}" },
+  { kind: "reasonCodes", path: "reason-codes" },
+] as const satisfies readonly HandleDefinition[];
+
+export const EDGE_HANDLE_DEFINITIONS = [
+  { kind: "localProvider", path: "providers/{provider}/{providerSessionRef}" },
+] as const satisfies readonly HandleDefinition[];
+
+export type HiveBrokerHandleKind = typeof BROKER_HANDLE_DEFINITIONS[number]["kind"];
+export type HiveEdgeHandleKind = typeof EDGE_HANDLE_DEFINITIONS[number]["kind"];
+export type HiveHandleKind = HiveBrokerHandleKind | HiveEdgeHandleKind;
 
 const BROKER_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const PLACEHOLDER_PATTERN = /^\{([A-Za-z][A-Za-z0-9]*)\}$/;
@@ -304,11 +328,11 @@ function templateParameterNames(path: string): string[] {
 }
 
 function brokerDefinitions(): readonly HandleDefinition[] {
-  return HIVE_HANDLE_MANIFEST.broker as readonly HandleDefinition[];
+  return BROKER_HANDLE_DEFINITIONS;
 }
 
 function edgeDefinitions(): readonly HandleDefinition[] {
-  return HIVE_HANDLE_MANIFEST.edge as readonly HandleDefinition[];
+  return EDGE_HANDLE_DEFINITIONS;
 }
 
 function isCanonicalAscii(value: string): boolean {

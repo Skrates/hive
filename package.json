@@ -6,19 +6,15 @@
   "type": "module",
   "bin": {
     "hive": "./dist/cli.js",
-    "hive-claude-channel": "./dist/channel/claude.js",
+    "hive-claude-hook": "./dist/channel/claude-hook.js",
     "hive-codex-live": "./dist/codex/live.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "check": "pnpm check:mcp-generated && pnpm check:mcp-imports && pnpm build && pnpm test",
-    "check:mcp-generated": "node scripts/generate-mcp-artifacts.mjs --check",
+    "check": "pnpm check:mcp-imports && pnpm build && pnpm test",
     "check:mcp-imports": "node scripts/check-mcp-import-boundary.mjs",
     "dev": "node --enable-source-maps dist/cli.js",
-    "generate:mcp": "node scripts/generate-mcp-artifacts.mjs",
-    "test": "node --test 'dist/**/*.test.js' && pnpm test:mcp-core && pnpm test:mcp-tasks",
-    "test:mcp-core": "node --test dist/mcp/core-conformance.conformance.js",
-    "test:mcp-tasks": "node --test dist/mcp/tasks-conformance.conformance.js"
+    "test": "node --test 'dist/**/*.test.js'"
   },
   "engines": {
     "node": ">=22"
@@ -27,13 +23,11 @@
   "dependencies": {
     "@modelcontextprotocol/client": "2.0.0",
     "@modelcontextprotocol/node": "2.0.0",
-    "@modelcontextprotocol/sdk": "1.29.0",
     "@modelcontextprotocol/server": "2.0.0",
     "@slack/socket-mode": "^2.0.5",
     "@slack/web-api": "^7.13.0",
     "better-sqlite3": "^12.6.2",
     "commander": "^14.0.3",
-    "hono": "4.11.4",
     "ws": "^8.21.0",
     "zod": "^4.3.6"
   },
@@ -41,8 +35,6 @@
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^24.10.9",
     "@types/ws": "^8.18.1",
-    "ajv": "8.17.1",
-    "ajv-formats": "3.0.1",
     "typescript": "^5.9.3"
   }
 }

@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { BrokerStore, InvalidTransitionError, StaleLeaseError } from "./store.js";
-import type { SlackEventInput, SubscriptionInput } from "../domain.js";
+import { retryBackoffMs, type SlackEventInput, type SubscriptionInput } from "../domain.js";
 import type { Clock } from "../time.js";
 
 class FakeClock implements Clock {
@@ -46,10 +46,12 @@ function subscription(overrides: Partial<SubscriptionInput> = {}): SubscriptionI
     ],
     wakePolicy: "spawn",
     permissionProfile: "read-only",
+    accountProfile: "/home/user/.codex-hive",
     leaseTtlMs: 1_000,
-    deliveryTtlMs: 5_000,
+    deliveryTtlMs: 60_000,
     homeGraceMs: 2_000,
     spawnRateLimit: 1,
+    maxAttempts: 3,
     expiresAt: null,
     ...overrides,
   };
@@ -165,7 +167,7 @@ test("an unmapped or foreign edge skips work without disposing it", () => {
   store.close();
 });
 
-test("pending delivery expires at its configured TTL", () => {
+test("pending delivery expires at its configured TTL with a thread-visible notice", () => {
   const { store, clock } = fixture({ wakePolicy: "resume", sessionId: "thread-1", deliveryTtlMs: 100 });
   store.ingestEvent(event());
   clock.advance(101);
@@ -173,6 +175,9 @@ test("pending delivery expires at its configured TTL", () => {
   const expired = store.getDelivery(1);
   assert.equal(expired.status, "undeliverable");
   assert.equal(expired.reasons[0]?.code, "delivery_ttl_expired");
+  const notices = store.listUnsentOutbox();
+  assert.equal(notices.length, 1);
+  assert.match(notices[0]!.text, /undeliverable/);
   store.close();
 });
 
@@ -242,36 +247,29 @@ test("delivery transitions require the current fenced lease", () => {
   store.close();
 });
 
-test("expired pre-dispatch claim is safely requeued with a new fence", () => {
-  const { store, clock } = fixture();
-  store.ingestEvent(event());
-  const first = store.claimNext("mac", 0)!;
-  store.transition(first.id, "mac", 1, "claimed", "accepted_local");
-  clock.advance(2_001);
-  store.markAmbiguousForExpiredDispatches();
-  assert.equal(store.getDelivery(first.id).status, "pending");
-  const second = store.claimNext("dev", 0)!;
-  assert.equal(second.leaseGeneration, 2);
-  assert.equal(second.claimedBy, "dev");
-  store.close();
-});
-
-test("expired dispatching lease becomes ambiguous rather than redelivered", () => {
+test("an expired lease requeues the delivery for redelivery behind backoff (ADR-0003 R-3)", () => {
   const { store, clock } = fixture();
   store.ingestEvent(event());
   const claimed = store.claimNext("mac", 0)!;
   store.transition(claimed.id, "mac", claimed.leaseGeneration!, "claimed", "accepted_local");
   store.transition(claimed.id, "mac", claimed.leaseGeneration!, "accepted_local", "dispatching");
   clock.advance(1_001);
-  assert.equal(store.markAmbiguousForExpiredDispatches(), 1);
-  const delivery = store.getDelivery(claimed.id);
-  assert.equal(delivery.status, "ambiguous");
-  assert.equal(delivery.reasons[0]?.code, "dispatch_outcome_unknown");
-  assert.equal(store.claimNext("dev", 0), null);
+  assert.equal(store.requeueExpiredLeases(), 1);
+  const requeued = store.getDelivery(claimed.id);
+  assert.equal(requeued.status, "pending");
+  assert.notEqual(requeued.nextAttemptAt, null);
+  // Backoff holds the delivery out of claim until its retry horizon passes.
+  assert.equal(store.claimNext("mac", 0), null);
+  clock.advance(retryBackoffMs(1) + 1);
+  const reclaimed = store.claimNext("mac", 0)!;
+  assert.equal(reclaimed.leaseGeneration, 2);
+  assert.equal(reclaimed.attempts, 2);
+  // The retry is visible in the thread.
+  assert.ok(store.listUnsentOutbox().some((entry) => /retrying delivery/.test(entry.text)));
   store.close();
 });
 
-test("live dispatch awaiting acknowledgement becomes ambiguous when its lease expires", () => {
+test("a dispatched delivery whose lease expires is redelivered, not quarantined", () => {
   const { store, clock } = fixture();
   store.ingestEvent(event());
   const claimed = store.claimNext("mac", 0)!;
@@ -279,8 +277,45 @@ test("live dispatch awaiting acknowledgement becomes ambiguous when its lease ex
   store.transition(claimed.id, "mac", 1, "accepted_local", "dispatching");
   store.transition(claimed.id, "mac", 1, "dispatching", "dispatched");
   clock.advance(1_001);
-  assert.equal(store.markAmbiguousForExpiredDispatches(), 1);
-  assert.equal(store.getDelivery(claimed.id).status, "ambiguous");
+  assert.equal(store.requeueExpiredLeases(), 1);
+  assert.equal(store.getDelivery(claimed.id).status, "pending");
+  store.close();
+});
+
+test("attempt exhaustion terminalizes as failed with a thread-visible notice", () => {
+  const { store, clock } = fixture({ maxAttempts: 2 });
+  store.ingestEvent(event());
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    const claimed = store.claimNext("mac", 0)!;
+    assert.equal(claimed.attempts, attempt);
+    store.transition(claimed.id, "mac", claimed.leaseGeneration!, "claimed", "accepted_local");
+    store.transition(claimed.id, "mac", claimed.leaseGeneration!, "accepted_local", "dispatching");
+    clock.advance(1_001);
+    store.requeueExpiredLeases();
+    clock.advance(retryBackoffMs(attempt) + 1);
+  }
+  const terminal = store.getDelivery(1);
+  assert.equal(terminal.status, "failed");
+  assert.equal(terminal.reasons[0]?.code, "lease_expired");
+  assert.ok(store.listUnsentOutbox().some((entry) => /failed after 2 attempt/.test(entry.text)));
+  // A sixth attempt is impossible: nothing is claimable and the status is terminal.
+  clock.advance(60 * 60_000);
+  assert.equal(store.claimNext("mac", 0), null);
+  store.close();
+});
+
+test("release requeues with backoff and exhausts into failed", () => {
+  const { store, clock } = fixture({ maxAttempts: 1 });
+  store.ingestEvent(event());
+  const claimed = store.claimNext("mac", 0)!;
+  const released = store.release(claimed.id, "mac", claimed.leaseGeneration!, {
+    code: "provider_dispatch_unknown",
+    detail: "test uncertainty",
+  });
+  assert.equal(released.status, "failed");
+  assert.ok(store.listUnsentOutbox().some((entry) => /failed after 1 attempt/.test(entry.text)));
+  clock.advance(1);
+  assert.equal(store.claimNext("mac", 0), null);
   store.close();
 });
 
@@ -293,7 +328,7 @@ test("lease renewal preserves the fence during a long provider dispatch", () => 
   clock.advance(800);
   store.renewDeliveryLease(claimed.id, "mac", claimed.leaseGeneration!);
   clock.advance(800);
-  assert.equal(store.markAmbiguousForExpiredDispatches(), 0);
+  assert.equal(store.requeueExpiredLeases(), 0);
   assert.equal(store.getDelivery(claimed.id).status, "dispatching");
   store.close();
 });
@@ -315,24 +350,37 @@ test("spawn reservations enforce the per-actor minute window", () => {
   store.close();
 });
 
-test("ambiguous delivery requires explicit processed or requeue reconciliation", () => {
+test("an agent outcome report closes the loop without a lease fence (ADR-0003 R-6)", () => {
   const { store, clock } = fixture();
   store.ingestEvent(event());
   const claimed = store.claimNext("mac", 0)!;
-  store.transition(claimed.id, "mac", claimed.leaseGeneration!, "claimed", "accepted_local");
-  store.transition(claimed.id, "mac", claimed.leaseGeneration!, "accepted_local", "dispatching");
-  clock.advance(1_001);
-  store.markAmbiguousForExpiredDispatches();
-  assert.equal(store.reconcile(claimed.id, "requeue", "provider transcript showed no injection").status, "pending");
-  const reclaimed = store.claimNext("mac", 0)!;
-  assert.equal(reclaimed.leaseGeneration, 2);
-  store.transition(reclaimed.id, "mac", 2, "claimed", "accepted_local");
-  store.transition(reclaimed.id, "mac", 2, "accepted_local", "dispatching");
-  clock.advance(1_001);
-  store.markAmbiguousForExpiredDispatches();
-  const processed = store.reconcile(reclaimed.id, "processed", "provider transcript contained the wake");
-  assert.equal(processed.status, "processed");
-  assert.equal(processed.reasons[0]?.code, "operator_reconciled_processed");
+  store.transition(claimed.id, "mac", 1, "claimed", "accepted_local");
+  store.transition(claimed.id, "mac", 1, "accepted_local", "dispatching");
+  store.transition(claimed.id, "mac", 1, "dispatching", "dispatched");
+  // The lease expires — the agent is still working. Its report must still land.
+  clock.advance(60_000);
+  const reported = store.recordOutcome(claimed.id, "done: merged the fix");
+  assert.equal(reported.status, "processed");
+  const outbox = store.listUnsentOutbox();
+  assert.ok(outbox.some((entry) => /done: merged the fix/.test(entry.text)));
+  // The outcome post is self-identifying via the dedupe key.
+  assert.ok(outbox.some((entry) => new RegExp(`dedupe 100\\.2:${claimed.id}`).test(entry.text)));
+
+  // A duplicate outcome on a terminal delivery still posts and keeps recorded truth.
+  const duplicate = store.recordOutcome(claimed.id, "done: merged the fix");
+  assert.equal(duplicate.status, "processed");
+  store.close();
+});
+
+test("outbox rows drain once and survive send failure", () => {
+  const { store } = fixture();
+  store.enqueueThreadNotice("C1", "100.1", "⛔ dropped sender notice");
+  const unsent = store.listUnsentOutbox();
+  assert.equal(unsent.length, 1);
+  store.markOutboxAttempt(unsent[0]!.outboxId);
+  assert.equal(store.listUnsentOutbox().length, 1);
+  store.markOutboxSent(unsent[0]!.outboxId);
+  assert.equal(store.listUnsentOutbox().length, 0);
   store.close();
 });
 
