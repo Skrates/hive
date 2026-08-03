@@ -1,0 +1,19 @@
+{
+  "actor": "claude-1",
+  "provider": "claude",
+  "providerSurface": "claude-code",
+  "providerVersion": "2.x",
+  "sessionId": null,
+  "homeEdge": "laptop",
+  "workspace": "projects",
+  "edgeWorkspaces": [{ "edgeId": "laptop", "cwd": "/home/rationallyprime/projects", "worktree": null }],
+  "wakePolicy": "spawn",
+  "permissionProfile": "workspace-write",
+  "accountProfile": "/home/rationallyprime/.hive/profiles/claude-1",
+  "leaseTtlMs": 60000,
+  "deliveryTtlMs": 86400000,
+  "homeGraceMs": 30000,
+  "spawnRateLimit": 2,
+  "maxAttempts": 5,
+  "expiresAt": null
+}

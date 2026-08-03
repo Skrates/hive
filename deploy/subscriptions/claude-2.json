@@ -1,0 +1,19 @@
+{
+  "actor": "claude-2",
+  "provider": "claude",
+  "providerSurface": "claude-code",
+  "providerVersion": "2.x",
+  "sessionId": null,
+  "homeEdge": "cx43",
+  "workspace": "work",
+  "edgeWorkspaces": [{ "edgeId": "cx43", "cwd": "/home/hive/work", "worktree": null }],
+  "wakePolicy": "spawn",
+  "permissionProfile": "workspace-write",
+  "accountProfile": "/home/hive/.hive/profiles/claude-2",
+  "leaseTtlMs": 60000,
+  "deliveryTtlMs": 86400000,
+  "homeGraceMs": 30000,
+  "spawnRateLimit": 2,
+  "maxAttempts": 5,
+  "expiresAt": null
+}

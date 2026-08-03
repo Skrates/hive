@@ -1,0 +1,19 @@
+{
+  "actor": "codex-1",
+  "provider": "codex",
+  "providerSurface": "app-server",
+  "providerVersion": "0.x",
+  "sessionId": null,
+  "homeEdge": "mac",
+  "workspace": "projects",
+  "edgeWorkspaces": [{ "edgeId": "mac", "cwd": "/Users/hakon/projects", "worktree": null }],
+  "wakePolicy": "spawn",
+  "permissionProfile": "workspace-write",
+  "accountProfile": "/Users/hakon/.hive/profiles/codex-1",
+  "leaseTtlMs": 60000,
+  "deliveryTtlMs": 86400000,
+  "homeGraceMs": 30000,
+  "spawnRateLimit": 2,
+  "maxAttempts": 5,
+  "expiresAt": null
+}
