@@ -1,7 +1,17 @@
 import assert from "node:assert/strict";
+import Database from "better-sqlite3";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
-import { BrokerStore, InvalidTransitionError, StaleLeaseError } from "./store.js";
-import type { SlackEventInput, SubscriptionInput } from "../domain.js";
+import {
+  BrokerStore,
+  DISPATCHED_OUTCOME_GRACE_MS,
+  InvalidTransitionError,
+  LegacyDatabaseError,
+  StaleLeaseError,
+} from "./store.js";
+import { frameWakeInstruction, retryBackoffMs, SubscriptionInputSchema, type SlackEventInput, type SubscriptionInput } from "../domain.js";
 import type { Clock } from "../time.js";
 
 class FakeClock implements Clock {
@@ -42,10 +52,12 @@ function subscription(overrides: Partial<SubscriptionInput> = {}): SubscriptionI
     ],
     wakePolicy: "spawn",
     permissionProfile: "read-only",
+    accountProfile: "/home/user/.codex-hive",
     leaseTtlMs: 1_000,
-    deliveryTtlMs: 5_000,
+    deliveryTtlMs: 60_000,
     homeGraceMs: 2_000,
     spawnRateLimit: 1,
+    maxAttempts: 3,
     expiresAt: null,
     ...overrides,
   };
@@ -59,6 +71,79 @@ function fixture(overrides: Partial<SubscriptionInput> = {}) {
   store.upsertSubscription(subscription(overrides));
   return { store, clock, macToken, devToken };
 }
+
+test("broker UUID is canonical, durable across opens, and unique per database", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "hive-broker-uuid-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const firstPath = join(directory, "first.sqlite");
+  const secondPath = join(directory, "second.sqlite");
+
+  const first = new BrokerStore(firstPath);
+  const firstUuid = first.brokerUuid;
+  assert.match(firstUuid, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+  const sameDatabase = new BrokerStore(firstPath);
+  assert.equal(sameDatabase.brokerUuid, firstUuid);
+  const second = new BrokerStore(secondPath);
+  assert.notEqual(second.brokerUuid, firstUuid);
+
+  second.close();
+  sameDatabase.close();
+  first.close();
+});
+
+test("broker UUID migration upgrades an old database and metadata is immutable", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "hive-broker-metadata-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const path = join(directory, "broker.sqlite");
+  const old = new Database(path);
+  old.exec("CREATE TABLE old_install_marker(value TEXT NOT NULL)");
+  old.close();
+
+  const upgraded = new BrokerStore(path);
+  const uuid = upgraded.brokerUuid;
+  assert.throws(
+    () => upgraded.db.prepare("UPDATE broker_metadata SET broker_uuid = ? WHERE singleton = 1").run(uuid.toUpperCase()),
+    /broker_metadata_immutable/,
+  );
+  assert.throws(
+    () => upgraded.db.prepare("DELETE FROM broker_metadata WHERE singleton = 1").run(),
+    /broker_metadata_immutable/,
+  );
+  assert.throws(
+    () => upgraded.db.prepare(`
+      INSERT OR REPLACE INTO broker_metadata(singleton, broker_uuid, created_at)
+      VALUES (1, '22222222-2222-4222-8222-222222222222', '2026-08-02T00:00:00.000Z')
+    `).run(),
+    /broker_metadata_immutable/,
+  );
+  assert.equal(
+    (upgraded.db.prepare("SELECT broker_uuid FROM broker_metadata WHERE singleton = 1").get() as { broker_uuid: string }).broker_uuid,
+    uuid,
+  );
+  upgraded.close();
+
+  const reopened = new BrokerStore(path);
+  assert.equal(reopened.brokerUuid, uuid);
+  reopened.close();
+});
+
+test("pre-existing noncanonical broker metadata fails closed", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "hive-broker-corrupt-metadata-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const path = join(directory, "broker.sqlite");
+  const corrupt = new Database(path);
+  corrupt.exec(`
+    CREATE TABLE broker_metadata (
+      singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+      broker_uuid TEXT NOT NULL UNIQUE CHECK(length(broker_uuid) = 36),
+      created_at TEXT NOT NULL
+    );
+    INSERT INTO broker_metadata(singleton, broker_uuid, created_at)
+    VALUES (1, 'AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA', '2026-08-01T00:00:00.000Z');
+  `);
+  corrupt.close();
+  assert.throws(() => new BrokerStore(path), /invalid_broker_uuid_metadata/);
+});
 
 test("event ingestion is idempotent and produces one delivery", () => {
   const { store } = fixture();
@@ -88,7 +173,7 @@ test("an unmapped or foreign edge skips work without disposing it", () => {
   store.close();
 });
 
-test("pending delivery expires at its configured TTL", () => {
+test("pending delivery expires at its configured TTL with a thread-visible notice", () => {
   const { store, clock } = fixture({ wakePolicy: "resume", sessionId: "thread-1", deliveryTtlMs: 100 });
   store.ingestEvent(event());
   clock.advance(101);
@@ -96,6 +181,9 @@ test("pending delivery expires at its configured TTL", () => {
   const expired = store.getDelivery(1);
   assert.equal(expired.status, "undeliverable");
   assert.equal(expired.reasons[0]?.code, "delivery_ttl_expired");
+  const notices = store.listUnsentOutbox();
+  assert.equal(notices.length, 1);
+  assert.match(notices[0]!.text, /undeliverable/);
   store.close();
 });
 
@@ -165,36 +253,49 @@ test("delivery transitions require the current fenced lease", () => {
   store.close();
 });
 
-test("expired pre-dispatch claim is safely requeued with a new fence", () => {
-  const { store, clock } = fixture();
-  store.ingestEvent(event());
-  const first = store.claimNext("mac", 0)!;
-  store.transition(first.id, "mac", 1, "claimed", "accepted_local");
-  clock.advance(2_001);
-  store.markAmbiguousForExpiredDispatches();
-  assert.equal(store.getDelivery(first.id).status, "pending");
-  const second = store.claimNext("dev", 0)!;
-  assert.equal(second.leaseGeneration, 2);
-  assert.equal(second.claimedBy, "dev");
-  store.close();
-});
-
-test("expired dispatching lease becomes ambiguous rather than redelivered", () => {
+test("an expired lease requeues the delivery for redelivery behind backoff (ADR-0003 R-3)", () => {
   const { store, clock } = fixture();
   store.ingestEvent(event());
   const claimed = store.claimNext("mac", 0)!;
   store.transition(claimed.id, "mac", claimed.leaseGeneration!, "claimed", "accepted_local");
   store.transition(claimed.id, "mac", claimed.leaseGeneration!, "accepted_local", "dispatching");
   clock.advance(1_001);
-  assert.equal(store.markAmbiguousForExpiredDispatches(), 1);
-  const delivery = store.getDelivery(claimed.id);
-  assert.equal(delivery.status, "ambiguous");
-  assert.equal(delivery.reasons[0]?.code, "dispatch_outcome_unknown");
-  assert.equal(store.claimNext("dev", 0), null);
+  assert.equal(store.requeueExpiredLeases(), 1);
+  const requeued = store.getDelivery(claimed.id);
+  assert.equal(requeued.status, "pending");
+  assert.notEqual(requeued.nextAttemptAt, null);
+  // Backoff holds the delivery out of claim until its retry horizon passes.
+  assert.equal(store.claimNext("mac", 0), null);
+  clock.advance(retryBackoffMs(1) + 1);
+  const reclaimed = store.claimNext("mac", 0)!;
+  assert.equal(reclaimed.leaseGeneration, 2);
+  assert.equal(reclaimed.attempts, 2);
+  // The retry is visible in the thread.
+  assert.ok(store.listUnsentOutbox().some((entry) => /retrying delivery/.test(entry.text)));
   store.close();
 });
 
-test("live dispatch awaiting acknowledgement becomes ambiguous when its lease expires", () => {
+test("a dispatched delivery waits out the outcome grace, then is redelivered, not quarantined", () => {
+  const { store, clock } = fixture();
+  store.ingestEvent(event());
+  const claimed = store.claimNext("mac", 0)!;
+  store.transition(claimed.id, "mac", 1, "claimed", "accepted_local");
+  store.transition(claimed.id, "mac", 1, "accepted_local", "dispatching");
+  store.transition(claimed.id, "mac", 1, "dispatching", "dispatched");
+  // Inside the grace the delivery stays open for the agent's outcome report —
+  // an expired lease alone must NOT requeue a durably dispatched wake.
+  clock.advance(1_001);
+  assert.equal(store.requeueExpiredLeases(), 0);
+  assert.equal(store.getDelivery(claimed.id).status, "dispatched");
+  // An outcome arriving during the grace closes the loop without redelivery.
+  // (Separate delivery below proves the requeue side.)
+  clock.advance(DISPATCHED_OUTCOME_GRACE_MS + 1);
+  assert.equal(store.requeueExpiredLeases(), 1);
+  assert.equal(store.getDelivery(claimed.id).status, "pending");
+  store.close();
+});
+
+test("an outcome report during the dispatched grace closes the delivery without redelivery", () => {
   const { store, clock } = fixture();
   store.ingestEvent(event());
   const claimed = store.claimNext("mac", 0)!;
@@ -202,8 +303,47 @@ test("live dispatch awaiting acknowledgement becomes ambiguous when its lease ex
   store.transition(claimed.id, "mac", 1, "accepted_local", "dispatching");
   store.transition(claimed.id, "mac", 1, "dispatching", "dispatched");
   clock.advance(1_001);
-  assert.equal(store.markAmbiguousForExpiredDispatches(), 1);
-  assert.equal(store.getDelivery(claimed.id).status, "ambiguous");
+  store.recordOutcome(claimed.id, "done");
+  clock.advance(DISPATCHED_OUTCOME_GRACE_MS + 1);
+  assert.equal(store.requeueExpiredLeases(), 0);
+  assert.equal(store.getDelivery(claimed.id).status, "processed");
+  store.close();
+});
+
+test("attempt exhaustion terminalizes as failed with a thread-visible notice", () => {
+  const { store, clock } = fixture({ maxAttempts: 2 });
+  store.ingestEvent(event());
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    const claimed = store.claimNext("mac", 0)!;
+    assert.equal(claimed.attempts, attempt);
+    store.transition(claimed.id, "mac", claimed.leaseGeneration!, "claimed", "accepted_local");
+    store.transition(claimed.id, "mac", claimed.leaseGeneration!, "accepted_local", "dispatching");
+    clock.advance(1_001);
+    store.requeueExpiredLeases();
+    clock.advance(retryBackoffMs(attempt) + 1);
+  }
+  const terminal = store.getDelivery(1);
+  assert.equal(terminal.status, "failed");
+  assert.equal(terminal.reasons[0]?.code, "lease_expired");
+  assert.ok(store.listUnsentOutbox().some((entry) => /failed after 2 attempt/.test(entry.text)));
+  // A sixth attempt is impossible: nothing is claimable and the status is terminal.
+  clock.advance(60 * 60_000);
+  assert.equal(store.claimNext("mac", 0), null);
+  store.close();
+});
+
+test("release requeues with backoff and exhausts into failed", () => {
+  const { store, clock } = fixture({ maxAttempts: 1 });
+  store.ingestEvent(event());
+  const claimed = store.claimNext("mac", 0)!;
+  const released = store.release(claimed.id, "mac", claimed.leaseGeneration!, {
+    code: "provider_dispatch_unknown",
+    detail: "test uncertainty",
+  });
+  assert.equal(released.status, "failed");
+  assert.ok(store.listUnsentOutbox().some((entry) => /failed after 1 attempt/.test(entry.text)));
+  clock.advance(1);
+  assert.equal(store.claimNext("mac", 0), null);
   store.close();
 });
 
@@ -216,7 +356,7 @@ test("lease renewal preserves the fence during a long provider dispatch", () => 
   clock.advance(800);
   store.renewDeliveryLease(claimed.id, "mac", claimed.leaseGeneration!);
   clock.advance(800);
-  assert.equal(store.markAmbiguousForExpiredDispatches(), 0);
+  assert.equal(store.requeueExpiredLeases(), 0);
   assert.equal(store.getDelivery(claimed.id).status, "dispatching");
   store.close();
 });
@@ -238,25 +378,74 @@ test("spawn reservations enforce the per-actor minute window", () => {
   store.close();
 });
 
-test("ambiguous delivery requires explicit processed or requeue reconciliation", () => {
+test("an agent outcome report closes the loop without a lease fence (ADR-0003 R-6)", () => {
   const { store, clock } = fixture();
   store.ingestEvent(event());
   const claimed = store.claimNext("mac", 0)!;
-  store.transition(claimed.id, "mac", claimed.leaseGeneration!, "claimed", "accepted_local");
-  store.transition(claimed.id, "mac", claimed.leaseGeneration!, "accepted_local", "dispatching");
-  clock.advance(1_001);
-  store.markAmbiguousForExpiredDispatches();
-  assert.equal(store.reconcile(claimed.id, "requeue", "provider transcript showed no injection").status, "pending");
-  const reclaimed = store.claimNext("mac", 0)!;
-  assert.equal(reclaimed.leaseGeneration, 2);
-  store.transition(reclaimed.id, "mac", 2, "claimed", "accepted_local");
-  store.transition(reclaimed.id, "mac", 2, "accepted_local", "dispatching");
-  clock.advance(1_001);
-  store.markAmbiguousForExpiredDispatches();
-  const processed = store.reconcile(reclaimed.id, "processed", "provider transcript contained the wake");
-  assert.equal(processed.status, "processed");
-  assert.equal(processed.reasons[0]?.code, "operator_reconciled_processed");
+  store.transition(claimed.id, "mac", 1, "claimed", "accepted_local");
+  store.transition(claimed.id, "mac", 1, "accepted_local", "dispatching");
+  store.transition(claimed.id, "mac", 1, "dispatching", "dispatched");
+  // The lease expires — the agent is still working. Its report must still land.
+  clock.advance(60_000);
+  const reported = store.recordOutcome(claimed.id, "done: merged the fix");
+  assert.equal(reported.status, "processed");
+  const outbox = store.listUnsentOutbox();
+  assert.ok(outbox.some((entry) => /done: merged the fix/.test(entry.text)));
+  // The outcome post is self-identifying via the dedupe key.
+  assert.ok(outbox.some((entry) => new RegExp(`dedupe 100\\.2:${claimed.id}`).test(entry.text)));
+
+  // A duplicate outcome on a terminal delivery still posts and keeps recorded truth.
+  const duplicate = store.recordOutcome(claimed.id, "done: merged the fix");
+  assert.equal(duplicate.status, "processed");
   store.close();
+});
+
+test("outbox rows drain once, back off after failure, and survive to retry", () => {
+  const { store, clock } = fixture();
+  store.enqueueThreadNotice("C1", "100.1", "⛔ dropped sender notice");
+  const unsent = store.listUnsentOutbox();
+  assert.equal(unsent.length, 1);
+  store.markOutboxAttempt(unsent[0]!.outboxId);
+  // A failed row backs off — it must not immediately reoccupy the page.
+  assert.equal(store.listUnsentOutbox().length, 0);
+  clock.advance(retryBackoffMs(1) + 1);
+  assert.equal(store.listUnsentOutbox().length, 1);
+  store.markOutboxSent(unsent[0]!.outboxId);
+  clock.advance(retryBackoffMs(2) + 1);
+  assert.equal(store.listUnsentOutbox().length, 0);
+  store.close();
+});
+
+test("a poisoned outbox row cannot starve later rows and is finally abandoned", () => {
+  const { store, clock } = fixture();
+  store.enqueueThreadNotice("C-archived", "100.1", "poisoned row");
+  store.enqueueThreadNotice("C-healthy", "100.2", "healthy row");
+  // The poisoned row fails forever; the healthy row must still surface.
+  const first = store.listUnsentOutbox();
+  assert.equal(first.length, 2);
+  store.markOutboxAttempt(first[0]!.outboxId);
+  const during = store.listUnsentOutbox();
+  assert.deepEqual(during.map((entry) => entry.channelId), ["C-healthy"]);
+  // Exhaust the poisoned row's attempts entirely: it leaves the page for good.
+  for (let i = 0; i < 60; i += 1) {
+    clock.advance(11 * 60_000);
+    for (const entry of store.listUnsentOutbox()) {
+      if (entry.channelId === "C-archived") store.markOutboxAttempt(entry.outboxId);
+    }
+  }
+  clock.advance(11 * 60_000);
+  assert.ok(store.listUnsentOutbox().every((entry) => entry.channelId !== "C-archived"));
+  store.close();
+});
+
+test("a pre-v0.5 broker database is refused loudly, never migrated in place", () => {
+  const dir = mkdtempSync(join(tmpdir(), "hive-legacy-"));
+  const path = join(dir, "broker.sqlite");
+  const legacy = new Database(path);
+  legacy.exec("CREATE TABLE deliveries (delivery_id INTEGER PRIMARY KEY, status TEXT)");
+  legacy.close();
+  assert.throws(() => new BrokerStore(path), LegacyDatabaseError);
+  rmSync(dir, { recursive: true, force: true });
 });
 
 test("terminal and out-of-order transitions fail closed", () => {
@@ -275,4 +464,34 @@ test("terminal and out-of-order transitions fail closed", () => {
     InvalidTransitionError,
   );
   store.close();
+});
+
+test("a coalesced second instruction is delivered imperatively, not demoted to data", () => {
+  const { store } = fixture();
+  store.ingestEvent(event());
+  const second = store.ingestEvent(event({
+    eventId: "Ev2",
+    messageTs: "100.3",
+    text: "WAKE: ariadne | also do the second thing",
+  }));
+  assert.equal(second.deliveryId, 1);
+  const claimed = store.claimNext("mac", 0)!;
+  assert.equal(claimed.coalescedMessages.length, 1);
+  assert.equal(claimed.coalescedMessages[0]!.text, "WAKE: ariadne | also do the second thing");
+  const framed = frameWakeInstruction(claimed, null);
+  // Both trusted instructions ride in the imperative section.
+  assert.match(framed, /Additional message from U1 in the same thread/);
+  assert.match(framed, /also do the second thing/);
+  assert.match(framed, /Act on these messages/);
+  // And neither is exiled to the data-only replay block.
+  assert.doesNotMatch(framed, /<thread_replay/);
+  store.close();
+});
+
+test("a relative accountProfile is rejected at the schema boundary (R-5)", () => {
+  assert.throws(() => SubscriptionInputSchema.parse({
+    ...subscription(),
+    accountProfile: "profiles/claude-1",
+  }));
+  assert.doesNotThrow(() => SubscriptionInputSchema.parse(subscription()));
 });

@@ -1,4 +1,4 @@
-import type { Delivery, DeliveryResultInput, ReplaySnapshot, SubscriptionInput } from "../domain.js";
+import type { Delivery, DeliveryResultInput, Reason, ReplaySnapshot, SubscriptionInput } from "../domain.js";
 
 export class BrokerClient {
   constructor(
@@ -35,6 +35,24 @@ export class BrokerClient {
       body: JSON.stringify({ generation: requiredGeneration(delivery) }),
     });
     return (await this.json<{ reserved: boolean }>(response)).reserved;
+  }
+
+  /** ADR-0003 R-3: release a delivery back to the broker for another attempt after uncertainty. */
+  async release(delivery: Delivery, reason: Reason): Promise<Delivery> {
+    const response = await this.request(`/v1/deliveries/${delivery.id}/release`, {
+      method: "POST",
+      body: JSON.stringify({ generation: requiredGeneration(delivery), reason }),
+    });
+    return this.json<Delivery>(response);
+  }
+
+  /** ADR-0003 R-6: relay an agent's outcome report; deliberately not lease-fenced. */
+  async outcome(deliveryId: number, text: string): Promise<Delivery> {
+    const response = await this.request(`/v1/deliveries/${deliveryId}/outcome`, {
+      method: "POST",
+      body: JSON.stringify({ text }),
+    });
+    return this.json<Delivery>(response);
   }
 
   async finish(delivery: Delivery, result: DeliveryResultInput): Promise<Delivery> {

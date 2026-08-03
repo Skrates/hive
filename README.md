@@ -20,9 +20,9 @@ Deployment and secret-store requirements are in [the operations guide](docs/oper
 ## Development
 
 ```sh
-pnpm install
-pnpm check
-pnpm build
+bun install
+bun run check
+bun run build
 ```
 
 No live credential belongs in the repository. Broker and edge credentials are injected from the

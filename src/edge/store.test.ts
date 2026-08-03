@@ -13,8 +13,10 @@ function delivery(generation: number, attempts = generation): Delivery {
     leaseGeneration: generation,
     claimedBy: "mac",
     attempts,
+    nextAttemptAt: null,
     coalesceKey: "ariadne:C1:1.0",
     coalescedEventIds: ["Ev1"],
+    coalescedMessages: [],
     initialSnapshot: null,
     snapshotTs: null,
     createdAt: "2026-07-12T00:00:00.000Z",
@@ -23,8 +25,8 @@ function delivery(generation: number, attempts = generation): Delivery {
       actor: "ariadne", provider: "codex", providerSurface: "app-server", providerVersion: "test",
       sessionId: "thread-1", homeEdge: "mac", workspace: "hive",
       edgeWorkspaces: [{ edgeId: "mac", cwd: "/tmp", worktree: null }], wakePolicy: "resume",
-      permissionProfile: "read-only", leaseTtlMs: 1_000, deliveryTtlMs: 5_000, homeGraceMs: 0,
-      spawnRateLimit: 1, expiresAt: null, updatedAt: "2026-07-12T00:00:00.000Z",
+      permissionProfile: "read-only", accountProfile: "/profiles/ariadne", leaseTtlMs: 1_000, deliveryTtlMs: 5_000, homeGraceMs: 0,
+      spawnRateLimit: 1, maxAttempts: 5, expiresAt: null, updatedAt: "2026-07-12T00:00:00.000Z",
     },
     event: {
       eventId: "Ev1", workspaceId: "T1", channelId: "C1", threadTs: "1.0", messageTs: "1.1",
@@ -34,10 +36,10 @@ function delivery(generation: number, attempts = generation): Delivery {
   };
 }
 
-test("a reconciled requeue replaces stale local generation state", () => {
+test("a redelivered higher generation replaces stale local state", () => {
   const store = new EdgeStore(":memory:");
   store.receive(delivery(1), 1);
-  store.setStatus(1, 1, "ambiguous");
+  store.setStatus(1, 1, "released");
   const refreshed = store.receive(delivery(2), 2);
   assert.equal(refreshed.generation, 2);
   assert.equal(refreshed.status, "received");
@@ -45,10 +47,10 @@ test("a reconciled requeue replaces stale local generation state", () => {
   store.close();
 });
 
-test("a reconciled requeue replaces stale local provider-attempt state within one lease generation", () => {
+test("a redelivered higher attempt replaces stale local state within one lease generation", () => {
   const store = new EdgeStore(":memory:");
   store.receive(delivery(1, 1), 1);
-  store.setStatus(1, 1, "ambiguous");
+  store.setStatus(1, 1, "released");
 
   const refreshed = store.receive(delivery(1, 2), 1);
 

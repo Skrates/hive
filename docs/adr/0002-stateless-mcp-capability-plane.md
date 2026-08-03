@@ -8,6 +8,12 @@
   that mandate loopback callbacks or `claude/channel`; and the narrowly defined no-effect requeue
   rules in ADR-0001. All other ADR-0001 invariants remain authoritative
 - Does not authorize: production cutover or removal of `/v1`; that remains an explicit KRA-912 gate
+- v0.5 note: largely superseded by [ADR-0003](./0003-sender-attributed-trust.md). The
+  delivery-authority capability (`authorize_live_injection` and the launch-grant/key-rotation/
+  clock-skew stratum), no-effect proofs, supervisor phase ledgers, `ambiguous` reconciliation
+  obligations, `legacyDraining` fences, operator scope partition, and pagination-snapshot ceremony
+  are removed. Retained: D1–D8, the sender-visible Slack outbox, the operator CLI skeleton, and
+  D15 observability. This document remains as the historical record of the superseded contract
 
 ## Context and authority
 
@@ -131,10 +137,13 @@ fresh replay.
 
 The broker endpoint accepts one JSON-RPC message per POST and returns JSON or request-scoped SSE.
 It validates `Origin`, `Accept`, `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`, and all mirrored
-header/body values. It rejects GET and DELETE, mints no `Mcp-Session-Id`, ignores no missing modern
-metadata, and implements no `Last-Event-ID` resume. Every request carries protocol version, client
-identity, and capabilities in `_meta`; `server/discover` is implemented. Closing a request stream is
-transport cancellation, not proof that application work stopped.
+header/body values. It rejects GET and DELETE and rejects missing required modern metadata. It never
+mints or echoes `Mcp-Session-Id`; incoming `Mcp-Session-Id` and `Last-Event-ID` are removed final-core
+mechanisms and are ignored and stripped before authentication/dispatch, never interpreted as a
+session or resume request. Every modern POST carries protocol version and client capabilities in
+`_meta`. `clientInfo` is optional, display-only implementation metadata and never authority;
+`server/discover` is implemented. Closing a request stream is transport cancellation, not proof that
+application work stopped.
 
 Local MCP uses HTTP/1.1 Streamable HTTP request/response framing over a Unix-domain socket, including
 real request and response headers; it is not newline-delimited stdio or a custom JSON framing. The
@@ -533,15 +542,57 @@ separate manifest entries and never authorize response emission. In particular,
 `Hive-Expired-Live-Injection-Capability` is request-only, non-authorizing evidence metadata and can
 never appear in a response.
 
-These closed-set response headers are stripped before any MCP result,
+For a call that can emit one of these headers, the client binding consumes the source `tools/call`
+into a one-MiB, one-second, fatal-UTF-8 snapshot and returns the exact captured `Request` that must be
+transported beside a one-shot interceptor. The server seam likewise passes its captured request to
+the handler. Method, ID, headers, protected request values, body classification, transport, and later
+response validation therefore derive from one snapshot; callers cannot supply a method label, result
+label, or response variant. The interceptor then requires an unambiguous HTTP
+`200 application/json` response, rejects non-identity content encodings, validates a complete non-error
+`CallToolResult` with the same ID, and derives the actual result variant from that result before
+consulting the closed manifest. HTTP `202` is notification-only in the Hive profile and can never
+authorize a secret-bearing response.
+
+Authority-managed JSON responses reject duplicate object member names, including escape-equivalent
+names, at every nesting depth before parsed route/result validation or release of the captured bytes.
+The registered secret-free `no_claimable_delivery` path additionally requires the complete canonical
+JSON-RPC envelope, result, and response-header map; no unknown envelope member, result member, or
+response header is released.
+
+These closed-set response headers are persisted to the registered direction- and consumer-specific
+owner-only sink before they are stripped and before any MCP result,
 Task, model-visible `_meta`, log, trace, diagnostic, or provider prompt is constructed. The edge
-transport, isolated supervisor client, or credential-admin adapter persists them directly into its owner-only secret store before
+transport, isolated supervisor client, or credential-admin adapter persists them directly into the
+registered owner-only sink for that transport/consumer before
 committing its local command receipt. An exact authorized command replay decrypts the stored envelope
 and reproduces the byte-identical header; it does not mint or extend authority. Replaying an expired
 or revoked credential may reproduce the same bytes, but never restores its validity. Wrapping-key rotation transactionally
 rewraps live envelopes and retains the prior key decrypt-only until every command tombstone it
 protects expires. Missing keys or failed authentication fail closed. Ciphertext is not a bearer and
 never participates in capability verification.
+
+The adapter firewall rejects a response if any protected request or response secret occurs in raw
+response bytes, any decoded JSON string token, response headers, status metadata, or an SSE event's
+decoded JSON payload. Protected request values include the complete Authorization value, its bearer,
+and every `Hive-*` value and comma-canonicalized component; ambiguous comma-joined credentials fail
+before authentication or dispatch. Encoded response bodies fail closed before media-specific
+scanning. JSON and `application/*+json` responses are completely preflighted before release with a
+one-MiB and one-second bound, fatal UTF-8 decoding, every string token scanned before duplicate-member
+collapse, and a constant valid JSON-RPC replacement on failure. SSE alone remains streaming: one
+fixed one-MiB event accumulator validates fatal-UTF-8 event text and every decoded JSON string in
+linear time before releasing each event. Its pull-driven parser releases at most one event or CRLF
+continuation per downstream pull, so one large source chunk cannot amplify into an unbounded output
+queue. A body-bearing response with any other or ambiguous media type fails closed.
+Candidate text that is itself a substring of the immutable JSON-RPC rejection scaffold (for example
+`id`, `jsonrpc`, or `2.0`) is a protocol-grammar collision, not evidence that application output
+reflected the credential. Such a credential is rejected before authentication or dispatch, its
+original response is discarded, and only the fixed valid JSON-RPC rejection scaffold is emitted;
+no application-controlled response byte or metadata survives that path. These paths preserve SSE
+backpressure and never buffer an unbounded response. KRA-898 proves this
+request-bound interception and an injected owner-only sink seam, including idempotent duplicate
+interception. The durable encrypted replay envelopes and crash-boundary persistence for each
+consumer remain the explicitly
+assigned work of KRA-900, KRA-904, and KRA-908.
 
 ### Durable command identity
 
@@ -1393,6 +1444,16 @@ no prompt, subscription, tool, or resource capability that is not actually imple
 identity is display-only and never participates in authorization. The per-edge pending resource
 contains only a queue revision and `hasWork`, never delivery content; a resource-update notification
 for it is a lossy doorbell.
+
+The complete potential surface is the generated canonical instance of
+`urn:skrates:hive:mcp:potential-capabilities:v1`: 25 readable resource templates, two
+reference-only handles, and 37 tools, each with its server, direction, result class, semantic owner,
+implementation owner, caller-policy key, and discovery scope hints. Discovery returns only the
+intersection of that potential definition, handlers registered in the current server process, and
+the current request's authoritative policy decision. Scope strings in the generated catalog are
+descriptive inputs, not authorization; the same policy callback runs again at invocation and every
+subject-bearing result is filtered independently. The generated manifest fixes private list
+metadata at `ttlMs=5000` and caller-independent static descriptors at public `ttlMs=300000`.
 
 The delivery, edge, and subscription collection templates are advertised only under
 `delivery:read`, `edge:read`, and `subscription:read`, respectively; mutation scopes never imply list
@@ -2375,11 +2436,14 @@ implementation owner.
 - **Invariant/uncertainty:** exact final-core behavior while Tasks remains separately experimental.
 - **Smallest falsifier:** compile and conformance probe against exact package/schema revisions.
 - **Ruling:** exact `@modelcontextprotocol/{client,server,node}@2.0.0` and the Node adapter's exact
-  `hono@4.11.4` peer; adapter boundary; exact upstream Tasks schema provenance. The current unified
-  SDK manifest range `^1.25.3` lock-resolves to `1.29.0`; KRA-898 MUST make that manifest pin exact
-  before protocol work, and KRA-908 later removes it.
+  `hono@4.11.4` peer; adapter boundary; exact official-core fixture commit/tree/blob provenance; and
+  exact upstream Tasks schema/specification commit/blob/hash provenance. The unified v1 SDK is
+  quarantined at exact `1.29.0` solely in `src/channel/claude.ts`; KRA-908 removes it.
 - **Rejected:** caret/floating dependencies, leaked SDK types, or claiming Tasks as stable core.
-- **Owner/acceptance:** KRA-898; lockfile, schema provenance, discovery, and conformance are reachable.
+- **Owner/acceptance:** KRA-898; lockfile, schema provenance, discovery, and separate core/Tasks
+  conformance are root-gate reachable. The split-v2 core registry deliberately rejects `tasks/*`;
+  KRA-901 owns a beside-SDK Tasks dispatcher that preserves the same envelope/header ladder and
+  normalizes the extension's `-32003` missing-capability code to final-core `-32021`.
 
 ### D4 — machine identity and authentication
 
@@ -2599,9 +2663,11 @@ These fixtures are part of the owning issues' acceptance, not optional integrati
 
 - Generate the direction/method/result-variant manifest from one canonical source and plant a unique
   canary in each of all eight response headers. Each canary appears byte-identically only on its
-  registered response path, reaches the correct injected owner-only sink before local success, and
+  registered response path and only on a pinned-core-valid `resultType:"complete"`, non-error
+  `CallToolResult`; it reaches the correct injected owner-only sink before local success, and
   is absent from bodies, Tasks, `_meta`, DTOs, errors, logs, traces, diagnostics, provider prompts,
-  child environments, and every other sink. Exact command replay returns the same singleton value.
+  child environments, and every other sink, including after JSON escape decoding. Exact command
+  replay returns the same singleton value.
 - On every method/result fixture, attempt the other seven known response names, the request-only
   `Hive-Expired-Live-Injection-Capability`, an unknown `Hive-*` name, duplicate lines, and a
   comma-joined value. Each fails closed before the SDK/domain result is acknowledged. Race parallel

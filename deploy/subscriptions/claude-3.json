@@ -1,0 +1,19 @@
+{
+  "actor": "claude-3",
+  "provider": "claude",
+  "providerSurface": "claude-code",
+  "providerVersion": "2.x",
+  "sessionId": null,
+  "homeEdge": "runpod",
+  "workspace": "workspace",
+  "edgeWorkspaces": [{ "edgeId": "runpod", "cwd": "/workspace", "worktree": null }],
+  "wakePolicy": "spawn",
+  "permissionProfile": "workspace-write",
+  "accountProfile": "/workspace/.hive/profiles/claude-3",
+  "leaseTtlMs": 60000,
+  "deliveryTtlMs": 86400000,
+  "homeGraceMs": 30000,
+  "spawnRateLimit": 2,
+  "maxAttempts": 5,
+  "expiresAt": null
+}

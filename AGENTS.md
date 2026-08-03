@@ -1,22 +1,31 @@
 # Hive implementation guide
 
-The authoritative design is `docs/adr/0001-broker-edge-architecture.md`, transcribed from
-KRA-717. Read the relevant section before changing a contract.
+The authoritative design is `docs/adr/0003-sender-attributed-trust.md` (v0.5), which supersedes
+most of ADR-0002's authority strata and ADR-0001's channel-mistrust invariant. Read the relevant
+ruling before changing a contract; ADR-0001/0002 remain as history and for their retained
+invariants.
 
-## Non-negotiable shape
+## Non-negotiable shape (ADR-0003)
 
 - Slack Socket Mode and Slack credentials live only at the central broker.
-- Workstation edges connect outward and persist their provider dispatch journal locally.
-- Delivery is at-least-once with a single fenced owner; exactly-once processing is not claimed.
-- A dispatch crash without provider-proven idempotency becomes `ambiguous`, never an automatic
-  retry or inferred success.
+- Trust is sender identity: the broker's admission policy is a closed trust set; a trust-set
+  message is delivered as an instruction, framed imperatively. Anyone else is dropped with a
+  thread notice. Hive never inspects, gates, or grades content — the authority ceiling is the
+  receiving agent's own harness configuration.
+- Workstation edges connect outward and expose no inbound network port. The machine-local plane is
+  owner-only Unix domain sockets; filesystem ownership is the local authentication.
+- Delivery is at-least-once with a single fenced claimant; exactly-once is not claimed and not
+  reconstructed. Uncertainty retries behind backoff; exhaustion terminalizes as `failed` with a
+  thread-visible notice. Duplicates are tolerated and self-identifying (dedupe key + attempt).
+- Every wake produces two thread-visible events through the durable outbox: a delivery status and
+  the agent's outcome (`hive reply`). Silence is a defect.
+- A wake executes under the subscription's pinned account profile; a missing profile is a hard
+  pre-dispatch failure, never a fallback.
 - `resume` never escalates to `spawn`.
-- Slack bodies are untrusted data. `WAKE` authorizes dispatch only and cannot elevate permissions.
-- The broker may assemble a fresh Slack thread replay but may not summarize or interpret it.
 
 ## Gate
 
 ```sh
-pnpm check
-pnpm build
+bun run check
+bun run build
 ```

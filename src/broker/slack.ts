@@ -14,6 +14,7 @@ interface SlackMessageEvent {
   app_id?: string;
   bot_id?: string;
   subtype?: string;
+  metadata?: { event_type?: string };
 }
 
 interface SlackEnvelopeBody {
@@ -24,6 +25,15 @@ interface SlackEnvelopeBody {
 
 interface SlackEventIngester {
   ingest(event: SlackEventInput, initialSnapshot?: unknown | null): unknown;
+}
+
+/**
+ * ADR-0003 R-1: a message from outside the closed trust set is dropped and the
+ * drop is visible in its thread. The notice is durably enqueued through the
+ * broker outbox rather than posted inline, so a Slack hiccup cannot lose it.
+ */
+export interface DropNotifier {
+  noticeDroppedSender(channelId: string, threadTs: string, senderId: string): void;
 }
 
 export const MISSING_SLACK_EVENT_ID_DIAGNOSTIC =
@@ -40,6 +50,7 @@ export interface SlackEnvelopeHandlerContext {
   workspaceId: string;
   policy: AdmissionPolicy;
   broker: SlackEventIngester;
+  dropNotifier?: DropNotifier;
   now?: () => Date;
   logDiagnostic?: (message: string) => void;
 }
@@ -58,6 +69,7 @@ export async function handleSlackEnvelope(
     workspaceId,
     policy,
     broker,
+    dropNotifier,
     now = () => new Date(),
     logDiagnostic = (message) => console.error(message),
   }: SlackEnvelopeHandlerContext,
@@ -79,6 +91,13 @@ export async function handleSlackEnvelope(
     await ack();
     return;
   }
+  // Hive's own outbox posts (receipts, outcomes, notices) carry hive_* message
+  // metadata. They are never re-ingested as wakes: an agent outcome that quotes
+  // a `WAKE:` line must not recursively mint a fresh trusted delivery.
+  if (event.metadata?.event_type?.startsWith("hive_")) {
+    await ack();
+    return;
+  }
   const addressed = parseAddressedWake(event.text);
   if (!addressed) {
     await ack();
@@ -86,12 +105,25 @@ export async function handleSlackEnvelope(
   }
   const senderKind = event.user ? "user" : "app";
   const senderId = event.user ?? event.app_id ?? event.bot_id;
+  // Surface admission first: a message in a workspace or channel Hive does not
+  // occupy is silently ignored — posting notices into foreign channels is not
+  // Hive's place. Inside an admitted surface, an addressed message from a
+  // principal outside the closed trust set is dropped with a thread notice
+  // (ADR-0003 R-1): delivered-but-silently-swallowed would be indistinguishable
+  // from delivered-and-ignored, and silence is always a defect.
+  if (!policy.workspaceIds.has(workspaceId) || !policy.channelIds.has(event.channel)) {
+    await ack();
+    return;
+  }
   if (!senderId || !isAdmitted(policy, {
     workspaceId,
     channelId: event.channel,
     senderId,
     senderKind,
   })) {
+    if (senderId && dropNotifier) {
+      dropNotifier.noticeDroppedSender(event.channel, event.thread_ts ?? event.ts, senderId);
+    }
     await ack();
     return;
   }
@@ -201,6 +233,15 @@ export class SlackSocketIngress {
           workspaceId: this.workspaceId,
           policy: this.policy,
           broker: this.broker,
+          dropNotifier: {
+            noticeDroppedSender: (channelId, threadTs, senderId) => {
+              this.broker.store.enqueueThreadNotice(
+                channelId,
+                threadTs,
+                `⛔ message from ${senderId} was not delivered — sender is not in the Hive trust set`,
+              );
+            },
+          },
         });
       } catch {
         // No acknowledgement was sent if ingest failed. If acknowledgement itself failed, the

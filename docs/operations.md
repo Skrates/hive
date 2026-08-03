@@ -4,80 +4,96 @@
 
 The broker is the only process that receives Slack credentials. Supply all secrets through the
 host secret store or a mode-0600 environment file; never commit them. Edges receive a broker-minted
-machine token and a separate random loopback token used by live provider callbacks.
+machine token. The machine-local plane (edge control socket, live surface sockets, ingress inboxes)
+authenticates by filesystem ownership — owner-only Unix domain sockets and directories, no local
+tokens.
 
 Socket Mode requires both `HIVE_SLACK_APP_TOKEN` (`xapp-…`) and `HIVE_SLACK_BOT_TOKEN` (`xoxb-…`).
-The bot needs message history/reply access to the admitted private channel. The app subscribes to
-message events and the admission policy still independently checks workspace, channel, and sender.
+The bot needs message history/reply access to the admitted private channel.
 
-## Broker
+## Trust set (ADR-0003 R-1)
 
-Required variables are visible with `hive broker --help`; the admission policy is JSON whose fields
-are arrays:
+The admission policy is the closed trust set: the operator's Slack user ID(s) plus each enrolled
+agent identity. A message from a trust-set principal in an admitted channel is delivered as an
+instruction. A message from anyone else in an admitted channel is dropped with a thread notice.
+Messages outside admitted workspaces/channels are ignored silently.
 
 ```json
 {
   "workspaceIds": ["T…"],
   "channelIds": ["C…"],
-  "userIds": ["U…"],
-  "appIds": ["A…"]
+  "userIds": ["U-operator-1", "U-operator-2"],
+  "appIds": ["A-hive-app"]
 }
 ```
 
-Bind the HTTP listener to loopback when broker and edge share a host. Across hosts, put it behind a
-private tunnel or mutually controlled HTTPS endpoint. The edge credential is bearer authority, so
-plain off-box HTTP is forbidden.
+## Broker
+
+Required variables are visible with `hive broker --help`. Bind the HTTP listener to loopback when
+broker and edge share a host. Across hosts, put it behind a private tailnet or mutually controlled
+HTTPS endpoint. The edge credential is bearer authority, so plain off-box HTTP is forbidden.
 
 ```sh
 hive broker
 hive create-edge mac
 hive put-subscription ariadne.json
+hive status
 ```
 
-The broker SQLite file is the delivery ledger. Back it up with SQLite's online backup mechanism or
-while the service is stopped; copying a live database without its WAL is not a backup.
+The broker SQLite file is the delivery ledger and the durable outbox. Back it up with SQLite's
+online backup mechanism or while the service is stopped; copying a live database without its WAL is
+not a backup.
 
-## Edge and live surfaces
+## Edge and local surfaces
 
-Run `hive edge` on each mapped workstation. `HIVE_EDGE_LOCAL_TOKEN` is shared only with local live
-surface processes and the edge HTTP listener remains on loopback. It authorizes registration and
-edge-to-surface callback admission; it is deliberately insufficient to acknowledge a delivery.
+Run `hive edge` on each mapped machine. The edge serves its control plane on an owner-only UDS
+socket (`HIVE_EDGE_SOCKET`, default `~/.hive/edge.sock`):
 
-Initial registration returns a pending edge-issued `bindingId` and monotonic `bindingRevision`; an
-immediate exact-fence renewal confirms it before the edge may dispatch. A surface keeps that fence
-process-locally and supplies both values on every later serialized TTL renewal. The
-actor, provider, callback URL, session, and surface version are immutable within a binding epoch;
-a stale or retargeted renewal fails closed. Every callback carries the exact selected fence and the
-surface rejects it before delivery when it does not match its current binding.
+- live surfaces and hooks renew their liveness registration there (the TTL is the heartbeat);
+- `hive reply <delivery-id> "<summary>"` relays an agent's outcome to the broker — not lease-fenced,
+  safe to run long after the wake.
 
-For each live dispatch the edge also mints a single-use ACK bearer bound to delivery ID, lease
-generation, and provider attempt. The bearer expires with the broker lease and is the only
-authorization accepted by `POST /v1/live/ack`; never persist, log, place in a provider transcript,
-or forward it as model-visible metadata. A live surface with an explicit agent-ACK interface
-resolves it process-locally when handling that acknowledgement. `HIVE_EDGE_LOCAL_TOKEN` presented
-to the ACK route fails closed.
+Every subscription pins an `accountProfile` — the absolute path of the agent's login profile
+(`CLAUDE_CONFIG_DIR` for Claude Code, `CODEX_HOME` for Codex) on its home edge. A missing profile
+directory is a hard pre-dispatch failure (`account_profile_missing`); Hive never falls back to
+whatever seat the edge process is logged into (ADR-0003 R-5).
 
-For Codex live steering, run `hive-codex-live` with the current Codex thread ID. It connects by
-WebSocket to the app-server Unix control socket and registers only when that same server reports the
-thread `active` or `idle`. A persisted Desktop-owned thread that the standalone daemon reports as
-`notLoaded` is not a live target; Hive fails closed rather than opening a competing session.
-Codex app-server does not support adding a typed tool to an already-created thread. The v0.3
-surface therefore never treats generic turn completion as an ACK and never exposes the bearer to
-the transcript; an attached Codex delivery remains `dispatched` until an explicit ACK seam exists
-or the lease expires to honest `ambiguous` reconciliation.
+### Codex live steering
 
-For Claude Code, register `hive-claude-channel` as a custom channel MCP server. During the Channels
-preview Claude Code also requires its custom-channel development flag. Headless resume/spawn does
-not depend on the channel surface. Its `hive_ack` tool resolves the exact delivery, generation, and
-provider-attempt bearer inside the channel process.
+Run `hive-codex-live` with the current Codex thread ID. It connects to the app-server control
+socket, verifies the thread is live, serves `/deliver` on its own owner-only UDS socket, and keeps
+its registration fresh with the edge. A wake injected into an active thread is true mid-turn
+steering; without a live registration the edge falls back to `codex exec resume` / spawn.
 
-## Ambiguity
+### Claude Code boundary delivery
 
-If a lease expires after provider dispatch begins but before durable completion, Hive records
-`ambiguous` and never silently retries. Inspect the provider transcript, then call the authenticated
-admin reconciliation endpoint with either `processed` or `requeue` and a non-empty audit detail.
+Register `hive-claude-hook` as a Stop and PostToolUse hook in the agent's pinned profile
+(`$CLAUDE_CONFIG_DIR/settings.json`):
 
-```text
-POST /v1/admin/deliveries/{delivery_id}/reconcile
-{"disposition":"processed","detail":"wake visible in provider transcript"}
+```json
+{
+  "hooks": {
+    "Stop": [{ "hooks": [{ "type": "command", "command": "hive-claude-hook" }] }],
+    "PostToolUse": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "hive-claude-hook" }] }]
+  }
+}
 ```
+
+The hook needs `HIVE_ACTOR` in the session environment. At every boundary it renews the actor's
+liveness registration and drains the owner-only ingress inbox (`~/.hive/ingress/<actor>/`),
+injecting pending wake envelopes into the session. While the heartbeat is fresh the edge delivers
+by inbox alone; once it lapses the edge wakes the session with `--resume`/`-p` instead. Both paths
+may occasionally deliver the same message — duplicates are tolerated and self-identifying by
+dedupe key (ADR-0003 R-3).
+
+## Delivery lifecycle (ADR-0003 R-3/R-6)
+
+At-least-once with one fenced claimant per attempt. Uncertainty (edge crash, lost provider
+outcome, expired lease) requeues the delivery behind exponential backoff; after `maxAttempts`
+(default 5) it terminalizes as `failed`. Every state the sender cares about is posted to the
+thread through the durable outbox: delivery receipt, retry notices, failure notices, dropped-sender
+notices, and the agent's own `hive reply` outcome. Silence is a defect — a delivered wake with no
+outcome post means the agent never closed the loop.
+
+There is no reconciliation surface. If a delivery failed, the thread says so; send the message
+again or fix the edge.

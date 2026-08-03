@@ -6,21 +6,25 @@
   "type": "module",
   "bin": {
     "hive": "./dist/cli.js",
-    "hive-claude-channel": "./dist/channel/claude.js",
+    "hive-claude-hook": "./dist/channel/claude-hook.js",
     "hive-codex-live": "./dist/codex/live.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "check": "pnpm build && pnpm test",
+    "check": "bun run check:mcp-imports && bun run build && bun run test",
+    "check:mcp-imports": "node scripts/check-mcp-import-boundary.mjs",
     "dev": "node --enable-source-maps dist/cli.js",
     "test": "node --test 'dist/**/*.test.js'"
   },
   "engines": {
     "node": ">=22"
   },
-  "packageManager": "pnpm@11.7.0",
+  "packageManager": "bun@1.3.11",
+  "trustedDependencies": ["better-sqlite3"],
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.25.3",
+    "@modelcontextprotocol/client": "2.0.0",
+    "@modelcontextprotocol/node": "2.0.0",
+    "@modelcontextprotocol/server": "2.0.0",
     "@slack/socket-mode": "^2.0.5",
     "@slack/web-api": "^7.13.0",
     "better-sqlite3": "^12.6.2",
