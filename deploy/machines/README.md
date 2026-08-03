@@ -7,7 +7,7 @@ Ratified topology, 2026-08-02/03. One broker, four edges, all links outbound-onl
 | dev box (`192.168.1.238`) | broker | — | joins the tailnet; edges dial in over it |
 | linux laptop | edge `laptop` | `claude-1` (Claude Max, rationallyprime@gmail.com) | sleep = dark agent; failures stay thread-visible |
 | macbook | edge `mac` | `codex-1` (ChatGPT Max) | app-server socket must be same-machine for mid-turn steering |
-| cx53 (dedicated Hetzner VM, to provision) | edge `cx53` | `claude-2` (Claude Team, rationallyprime@gmail.com) | dedicated agent VM + self-hosted CI runner — deliberately NOT the Coolify demo box (see its README) |
+| cx53 (`agent-cx53`, hel1, 62.238.51.63) | edge `cx53` | `gnomon` (Claude Team, rationallyprime@gmail.com — name self-chosen) | dedicated agent VM + self-hosted CI runner — deliberately NOT the Coolify demo box (see its README) |
 | runpod (EUR-IS-1) | edge `runpod` | `claude-3` (Claude Team, hakon@sokrates.is) | the hive's actuator: Sovereign dev, capability-registry model tests, LoRA runs; seat = custom-image CPU pod spawning sibling GPU pods; durable state on network volume `w65u1o4qbn` (100 GB) |
 
 Seat-to-machine assignment is a subscription-time decision; the mapping above is the ratified

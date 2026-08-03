@@ -1,4 +1,4 @@
-# Edge: cx53 (dedicated Hetzner VM) — seat claude-2 (Claude Team, rationallyprime@gmail.com)
+# Edge: cx53 (dedicated Hetzner VM) — seat gnomon (Claude Team, rationallyprime@gmail.com)
 
 **Provisioned 2026-08-03:** `agent-cx53` (16 shared vCPU / 32 GB / 320 GB, ~€29/mo) at
 **hel1 / 62.238.51.63** (fsn1 and nbg1 had no cx53 stock), firewall `agent-cx53-fw` (inbound
@@ -12,9 +12,9 @@ Under ADR-0003 R-2 the ONLY ceiling on what a wake can cause is this agent's har
 configuration — Hive gates nothing — so the edge still runs caged:
 
 - Dedicated non-sudo user `hive`; no docker-group membership unless a workload demands it.
-- `HIVE_HOME=/home/hive/.hive`; profile `/home/hive/.hive/profiles/claude-2`
+- `HIVE_HOME=/home/hive/.hive`; profile `/home/hive/.hive/profiles/gnomon`
   (interactive login: Hákon's step).
-- Subscription `deploy/subscriptions/claude-2.json` pins `permissionProfile: workspace-write`
+- Subscription `deploy/subscriptions/gnomon.json` pins `permissionProfile: workspace-write`
   and a workspace cwd inside `/home/hive/work`.
 - Tailscale joined; `HIVE_BROKER_URL` = broker tailnet address. Outbound only, no inbound port.
 - systemd system unit (copy `deploy/systemd/hive-edge.service`, set `User=hive`,

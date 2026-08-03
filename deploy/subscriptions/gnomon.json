@@ -1,5 +1,5 @@
 {
-  "actor": "claude-2",
+  "actor": "gnomon",
   "provider": "claude",
   "providerSurface": "claude-code",
   "providerVersion": "2.x",
@@ -9,7 +9,7 @@
   "edgeWorkspaces": [{ "edgeId": "cx53", "cwd": "/home/hive/work", "worktree": null }],
   "wakePolicy": "spawn",
   "permissionProfile": "workspace-write",
-  "accountProfile": "/home/hive/.hive/profiles/claude-2",
+  "accountProfile": "/home/hive/.hive/profiles/gnomon",
   "leaseTtlMs": 60000,
   "deliveryTtlMs": 86400000,
   "homeGraceMs": 30000,
