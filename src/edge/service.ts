@@ -1,4 +1,4 @@
-import { frameWakeInstruction, type Delivery, type Provider, type Reason } from "../domain.js";
+import { frameWakeInstruction, type Delivery, type Provider, type Reason, type ReplaySnapshot } from "../domain.js";
 import { BrokerClient } from "./broker-client.js";
 import { LiveIngressRegistry } from "./live-registry.js";
 import {
@@ -97,13 +97,12 @@ export class EdgeService {
 
       current = await this.broker.accept(delivery);
       const replay = await this.broker.replay(current);
-      const framed = frameWakeInstruction(current, replay);
       current = await this.broker.beginDispatch(current);
       this.store.setStatus(current.id, generation, "dispatching");
 
       const dispatch = await this.withLeaseHeartbeat(
         current,
-        () => this.dispatch(current, framed, () => { providerStarted = true; }),
+        () => this.dispatch(current, replay, () => { providerStarted = true; }),
       );
       current = await this.broker.markDispatched(current);
       this.store.setStatus(current.id, generation, "dispatched", dispatch.receipt);
@@ -240,7 +239,7 @@ export class EdgeService {
 
   private async dispatch(
     delivery: Delivery,
-    framed: string,
+    replay: ReplaySnapshot | null,
     onProviderStart: () => void,
   ): Promise<ProviderDispatch> {
     const subscription = delivery.subscription;
@@ -251,12 +250,13 @@ export class EdgeService {
     const live = this.live.get(delivery.actor, subscription.provider);
     if (live) {
       onProviderStart();
-      return adapter.deliverLive(live, delivery, framed);
+      return adapter.deliverLive(live, delivery, frameWakeInstruction(delivery, replay, "agent"));
     }
     if (subscription.wakePolicy === "live_only") throw new PreDispatchError("live_ingress_unavailable");
 
     const workspace = subscription.edgeWorkspaces.find((item) => item.edgeId === this.broker.edgeId);
     if (!workspace) throw new PreDispatchError("workspace_not_mapped");
+    const framed = frameWakeInstruction(delivery, replay, "edge");
     if (subscription.sessionId && this.broker.edgeId === subscription.homeEdge) {
       onProviderStart();
       return adapter.resume(subscription, workspace.cwd, framed);
