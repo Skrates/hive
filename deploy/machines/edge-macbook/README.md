@@ -6,7 +6,10 @@
    token, and `HIVE_BROKER_URL` pointing at the BROKER'S TAILNET ADDRESS on the dev box —
    `run-edge.zsh` sources this file; nothing is hardcoded local.
 3. Pinned auth home (R-5): `CODEX_HOME=/Users/hakon/.hive/profiles/codex-1` — run `codex login`
-   under it once (Hákon's step). The subscription's `accountProfile` is that path.
+   under it once (Hákon's step). The subscription's `accountProfile` is that path. Keep this as a
+   dedicated Codex home: its `config.toml` must not contain the legacy `sandbox_mode` or
+   `sandbox_workspace_write` settings, because Hive selects a least-privilege permission profile
+   that adds only the owner-only edge socket needed by `hive reply`.
 4. Mid-turn steering (R-4): the live daemon must run under the SAME pinned home as the login —
    `CODEX_HOME` in the env, not just on the login invocation, or the app-server client silently
    binds `~/.codex` and wakes deliver through the wrong account:

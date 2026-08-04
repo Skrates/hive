@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { closeSync, fsyncSync, mkdirSync, openSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import type { Delivery, Provider, Subscription } from "../domain.js";
 import { udsRequestJson } from "../local/uds.js";
@@ -215,17 +216,40 @@ async function runHeadless(
 
 /**
  * Codex exposes `--sandbox` on `codex exec`, but not on the nested
- * `codex exec resume` command. The equivalent config override is accepted by
- * both command shapes, so use one representation for spawn and resume instead
- * of letting a valid subscription fail at the CLI parser before dispatch.
+ * `codex exec resume` command. Config overrides are accepted by both shapes.
+ *
+ * A sandboxed agent still needs one machine-local capability: the owner-only
+ * edge socket used by `hive reply`. Permission profiles let us grant that
+ * exact AF_UNIX path without opening ordinary outbound network access. The
+ * otherwise-unreachable `.invalid` allow entry makes the domain policy an
+ * allowlist rather than Codex's full-network default when network support is
+ * enabled for Unix-socket proxying.
+ *
+ * The pinned CODEX_HOME must use permission profiles rather than the legacy
+ * `sandbox_mode` setting; Codex intentionally does not compose the two models.
  */
-export function codexPermissionArgs(profile: string): string[] {
+export function codexPermissionArgs(
+  profile: string,
+  edgeSocketPath = process.env.HIVE_EDGE_SOCKET ?? join(homedir(), ".hive", "edge.sock"),
+): string[] {
   switch (profile) {
-    case "read-only": return ["-c", 'sandbox_mode="read-only"'];
-    case "workspace-write": return ["-c", 'sandbox_mode="workspace-write"'];
+    case "read-only": return codexSocketPermissionProfile("hive-read-only", ":read-only", edgeSocketPath);
+    case "workspace-write": return codexSocketPermissionProfile("hive-workspace", ":workspace", edgeSocketPath);
     case "danger-full-access": return ["--dangerously-bypass-approvals-and-sandbox"];
     default: throw new ProviderPreDispatchError("provider_permission_profile_invalid");
   }
+}
+
+function codexSocketPermissionProfile(name: string, parent: ":read-only" | ":workspace", edgeSocketPath: string): string[] {
+  const socketKey = JSON.stringify(edgeSocketPath);
+  return [
+    "-c", "features.network_proxy=true",
+    "-c", `permissions.${name}.extends=${JSON.stringify(parent)}`,
+    "-c", `permissions.${name}.network.enabled=true`,
+    "-c", `permissions.${name}.network.domains={"hive.invalid"="allow"}`,
+    "-c", `permissions.${name}.network.unix_sockets={${socketKey}="allow"}`,
+    "-c", `default_permissions=${JSON.stringify(name)}`,
+  ];
 }
 
 function claudePermissionArgs(profile: string): string[] {
