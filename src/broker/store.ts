@@ -337,12 +337,14 @@ export class BrokerStore {
    * silence, so silence is not evidence of a wedged Slack link.
    */
   hasActiveSubscription(): boolean {
-    const row = this.db.prepare(`
-      SELECT 1 FROM subscriptions
-      WHERE expires_at IS NULL OR expires_at > ?
-      LIMIT 1
-    `).get(iso(this.clock)) as Row | undefined;
-    return row !== undefined;
+    // Compare expiries by parsed instant, not by raw ISO string. `expiresAt` is a
+    // z.string().datetime() value, whose fractional-second precision and offset can
+    // vary, so a lexical SQL `expires_at > ?` can order two valid timestamps wrongly
+    // near a boundary. `isExpired` normalises through Date.getTime(), matching the
+    // eligibility check on the dispatch path.
+    const now = this.clock.now();
+    const rows = this.db.prepare("SELECT expires_at FROM subscriptions").all() as Array<{ expires_at: string | null }>;
+    return rows.some((row) => !isExpired(row.expires_at, now));
   }
 
   ingestEvent(event: SlackEventInput, initialSnapshot: unknown | null = null): { created: boolean; deliveryId: number | null } {

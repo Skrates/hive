@@ -495,3 +495,45 @@ test("a relative accountProfile is rejected at the schema boundary (R-5)", () =>
   }));
   assert.doesNotThrow(() => SubscriptionInputSchema.parse(subscription()));
 });
+
+test("hasActiveSubscription orders expiry by instant, not by ISO string (fractional-precision boundary)", () => {
+  // A NULL expiry is always live, an already-past expiry never is.
+  {
+    const store = new BrokerStore(":memory:", new FakeClock(new Date("2026-07-12T00:00:00.950Z")));
+    store.createEdge("mac");
+    store.createEdge("dev");
+    store.upsertSubscription(subscription({ expiresAt: null }));
+    assert.equal(store.hasActiveSubscription(), true);
+    store.close();
+  }
+
+  // The trap: `expires_at` is a z.string().datetime() whose fractional precision
+  // can vary, so a lexical `expires_at > ?` SQL compare orders wrongly near a
+  // boundary. Here now = ...00.950Z and the only subscription expired at ...00.9Z
+  // (i.e. .900s — 50ms in the PAST). By instant it is expired, so the broker has
+  // no live subscription. But lexically "…00.9Z" > "…00.950Z" (the 'Z' terminator
+  // outranks the digit '5'), so a string compare would wrongly report it live and
+  // arm the deafness watchdog against a broker that legitimately expects silence.
+  {
+    const store = new BrokerStore(":memory:", new FakeClock(new Date("2026-07-12T00:00:00.950Z")));
+    store.createEdge("mac");
+    store.createEdge("dev");
+    store.upsertSubscription(subscription({ expiresAt: "2026-07-12T00:00:00.9Z" }));
+    assert.equal(
+      store.hasActiveSubscription(),
+      false,
+      "an expiry 50ms in the past is not live, however its ISO string happens to sort",
+    );
+    store.close();
+  }
+
+  // A genuinely future expiry is live.
+  {
+    const store = new BrokerStore(":memory:", new FakeClock(new Date("2026-07-12T00:00:00.950Z")));
+    store.createEdge("mac");
+    store.createEdge("dev");
+    store.upsertSubscription(subscription({ expiresAt: "2026-07-12T00:00:01.000Z" }));
+    assert.equal(store.hasActiveSubscription(), true);
+    store.close();
+  }
+});

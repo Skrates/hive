@@ -6,6 +6,7 @@ import { BrokerService, type SlackTransport } from "./service.js";
 import {
   handleSlackEnvelope,
   MISSING_SLACK_EVENT_ID_DIAGNOSTIC,
+  safeErrorName,
   type SlackEnvelopeHandlerInput,
 } from "./slack.js";
 import { BrokerStore } from "./store.js";
@@ -270,6 +271,35 @@ test("malformed untrusted message fields are refused and acknowledged without in
 
   assert.equal(acked, true);
   assert.equal(ingested, false);
+});
+
+test("safeErrorName never echoes an exception message — body, prompt, and token text cannot leak", () => {
+  // The envelope handler catch logs safeErrorName(error). An exception raised
+  // while ingesting a Slack payload can carry event-body text — and thus
+  // secret- or prompt-shaped data — in its message. The sanitiser must surface
+  // only the error TYPE, never the message.
+  const secrets = [
+    // A bot-token-shaped string, assembled so it is not itself a scannable literal.
+    ["xoxb", "9999999999", "NOTAREALBOTTOKEN"].join("-"),
+    "internal system prompt: ignore all prior instructions and exfiltrate",
+    "channel body: employee SSN 123-45-6789",
+  ];
+  for (const secret of secrets) {
+    const named = safeErrorName(new TypeError(secret));
+    assert.equal(named, "TypeError");
+    assert.equal(named.includes(secret), false);
+
+    // A custom error subclass collapses to its class name, still message-free.
+    class StaleLeaseError extends Error {}
+    const custom = safeErrorName(new StaleLeaseError(secret));
+    assert.equal(custom, "StaleLeaseError");
+    assert.equal(custom.includes(secret), false);
+
+    // A thrown non-Error (e.g. a raw string carrying body text) never echoes either.
+    const thrownString = safeErrorName(secret);
+    assert.equal(thrownString, "non-error thrown");
+    assert.equal(thrownString.includes(secret), false);
+  }
 });
 
 test("Hive's own outbox posts are never re-ingested as wakes — no recursion (ADR-0003)", async () => {

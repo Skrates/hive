@@ -62,7 +62,8 @@ program.command("broker")
     // stream) is invisible without this. First stale cycle forces a reconnect;
     // a second consecutive silent cycle exits for a systemd restart.
     const watchdog = new SlackDeafnessWatchdog({
-      lastActivityAt: () => slack.lastActivityAt(),
+      lastEventAt: () => slack.lastEventAt(),
+      lastConnectAt: () => slack.lastConnectAt(),
       hasActiveSubscription: () => broker.hasActiveSubscription(),
       restart: () => slack.restart(),
       exit: (code) => process.exit(code),
