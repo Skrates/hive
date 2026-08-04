@@ -7,7 +7,8 @@ import test from "node:test";
 import type { Delivery, Subscription } from "../domain.js";
 import { prepareSocketPath } from "../local/uds.js";
 import type { LiveIngress } from "./live-registry.js";
-import { ClaudeProvider, CodexProvider, ProviderPreDispatchError, requireAccountProfile } from "./providers.js";
+import { delimiter, dirname } from "node:path";
+import { ClaudeProvider, CodexProvider, composeChildEnv, prependPathEntry, ProviderPreDispatchError, requireAccountProfile } from "./providers.js";
 
 function subscription(overrides: Partial<Subscription> = {}): Subscription {
   return {
@@ -67,6 +68,26 @@ function delivery(id: number): Delivery {
     },
   };
 }
+
+test("prependPathEntry puts the runtime dir first and never duplicates it", () => {
+  assert.equal(prependPathEntry("/usr/bin:/bin", "/opt/node"), `/opt/node${delimiter}/usr/bin${delimiter}/bin`);
+  // An entry already present is hoisted to the front, not duplicated.
+  assert.equal(prependPathEntry(`/usr/bin${delimiter}/opt/node${delimiter}/bin`, "/opt/node"), `/opt/node${delimiter}/usr/bin${delimiter}/bin`);
+  // An empty or undefined base yields the entry alone.
+  assert.equal(prependPathEntry(undefined, "/opt/node"), "/opt/node");
+  assert.equal(prependPathEntry("", "/opt/node"), "/opt/node");
+});
+
+test("composeChildEnv prepends the running runtime's directory to the child PATH", () => {
+  const runtimeDir = dirname(process.execPath);
+  const env = composeChildEnv({ CLAUDE_CONFIG_DIR: "/profiles/ariadne" });
+  assert.ok(env.PATH, "composed env carries a PATH");
+  assert.ok(env.PATH!.startsWith(`${runtimeDir}${delimiter}`) || env.PATH === runtimeDir, "PATH starts with the runtime dir");
+  // The pinned profile env is preserved alongside the PATH fix.
+  assert.equal(env.CLAUDE_CONFIG_DIR, "/profiles/ariadne");
+  // The runtime dir appears exactly once even if it was already on the inherited PATH.
+  assert.equal(env.PATH!.split(delimiter).filter((part) => part === runtimeDir).length, 1);
+});
 
 test("an invalid permission profile is a deterministic pre-dispatch failure", () => {
   const codex = new CodexProvider();

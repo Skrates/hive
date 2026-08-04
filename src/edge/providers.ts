@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { closeSync, fsyncSync, mkdirSync, openSync, renameSync, statSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import type { Delivery, Provider, Subscription } from "../domain.js";
 import { udsRequestJson } from "../local/uds.js";
 import type { LiveIngress } from "./live-registry.js";
@@ -162,6 +162,31 @@ export class ClaudeProvider implements ProviderAdapter {
   }
 }
 
+/**
+ * Prepend `entry` to a PATH-style value, removing any pre-existing occurrence so
+ * the entry wins without duplicating. An empty/undefined base yields the entry
+ * alone.
+ */
+export function prependPathEntry(pathValue: string | undefined, entry: string): string {
+  const existing = (pathValue ?? "").split(delimiter).filter((part) => part.length > 0 && part !== entry);
+  return [entry, ...existing].join(delimiter);
+}
+
+/**
+ * The edge process is launched from an absolute node path (systemd ExecStart /
+ * launchd), so a spawned provider child can inherit a PATH with no JS runtime on
+ * it. The `hive` and `hive-claude-hook` CLIs are `#!/usr/bin/env node` scripts:
+ * without node on PATH they exit 127 and a seat improvises a shim mid-wake.
+ * Guarantee the running runtime's directory is first on the child's PATH.
+ */
+export function composeChildEnv(profileEnv: Record<string, string>): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    ...profileEnv,
+    PATH: prependPathEntry(process.env.PATH, dirname(process.execPath)),
+  };
+}
+
 async function runHeadless(
   command: string,
   args: string[],
@@ -172,7 +197,7 @@ async function runHeadless(
   const child = spawn(command, args, {
     cwd,
     stdio: ["pipe", "pipe", "pipe"],
-    env: { ...process.env, ...profileEnv },
+    env: composeChildEnv(profileEnv),
   });
   if (stdin !== null) child.stdin.end(stdin); else child.stdin.end();
   const stdout: Buffer[] = [];
