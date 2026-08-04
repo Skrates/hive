@@ -98,6 +98,14 @@ export class BrokerClient {
     return this.json(response);
   }
 
+  async deleteSubscription(adminToken: string, actor: string): Promise<{ actor: string; deleted: boolean }> {
+    const response = await fetch(`${this.baseUrl}/v1/admin/subscriptions/${encodeURIComponent(actor)}`, {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${adminToken}` },
+    });
+    return this.json(response);
+  }
+
   private async transition(delivery: Delivery, action: string): Promise<Delivery> {
     const response = await this.request(`/v1/deliveries/${delivery.id}/${action}`, {
       method: "POST",

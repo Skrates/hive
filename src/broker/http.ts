@@ -72,6 +72,10 @@ export class BrokerHttpServer {
         const input = SubscriptionInputSchema.parse({ ...body, actor });
         return json(response, 200, this.broker.upsertSubscription(input));
       }
+      if (request.method === "DELETE" && url.pathname.startsWith("/v1/admin/subscriptions/")) {
+        const actor = decodeURIComponent(url.pathname.slice("/v1/admin/subscriptions/".length));
+        return json(response, 200, { actor, deleted: this.broker.deleteSubscription(actor) });
+      }
       if (request.method === "GET" && url.pathname === "/v1/admin/deliveries") {
         return json(response, 200, this.broker.store.listDeliveries());
       }

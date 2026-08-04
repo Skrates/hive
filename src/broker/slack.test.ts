@@ -137,6 +137,7 @@ test("crash after commit before ACK makes fresh-envelope redelivery harmless", a
           throw new Error("injected crash after commit before ACK");
         },
         boundActors: () => [],
+        freezeAffinityTargets: () => [],
       },
       now: () => new Date("2026-08-01T00:00:00.000Z"),
     }),
@@ -189,6 +190,7 @@ test("missing event_id refuses envelope identity fallback, logs safely, then ACK
         ingested = event;
       },
       boundActors: () => [],
+      freezeAffinityTargets: () => [],
     },
     logDiagnostic(message) {
       actions.push(`log:${message}`);
@@ -220,6 +222,7 @@ test("ingest failure leaves the envelope unacknowledged for Slack redelivery", a
           throw new Error("injected ingest failure");
         },
         boundActors: () => [],
+        freezeAffinityTargets: () => [],
       },
     }),
     /injected ingest failure/,
@@ -249,7 +252,7 @@ test("a sender outside the trust set is dropped with a thread notice (ADR-0003 R
   }, {
     workspaceId: WORKSPACE_ID,
     policy,
-    broker: { ingest() { ingested = true; }, boundActors: () => [] },
+    broker: { ingest() { ingested = true; }, boundActors: () => [], freezeAffinityTargets: () => [] },
     dropNotifier: {
       noticeDroppedSender(channelId, threadTs, senderId) {
         notices.push({ channelId, threadTs, senderId });
@@ -282,7 +285,7 @@ test("a message in an unadmitted channel is silently ignored — no notice into 
   }, {
     workspaceId: WORKSPACE_ID,
     policy,
-    broker: { ingest() { ingested = true; }, boundActors: () => [] },
+    broker: { ingest() { ingested = true; }, boundActors: () => [], freezeAffinityTargets: () => [] },
     dropNotifier: {
       noticeDroppedSender(_channelId, _threadTs, senderId) {
         notices.push(senderId);
@@ -313,7 +316,7 @@ test("malformed untrusted message fields are refused and acknowledged without in
   }, {
     workspaceId: WORKSPACE_ID,
     policy,
-    broker: { ingest() { ingested = true; }, boundActors: () => [] },
+    broker: { ingest() { ingested = true; }, boundActors: () => [], freezeAffinityTargets: () => [] },
   });
 
   assert.equal(acked, true);
@@ -459,6 +462,80 @@ test("thread affinity: a seat's own outcome post never wakes anyone, including i
   // An envelope-less outcome summary in the bound thread must not affinity-wake either.
   await deliver(broker, messageBody({ eventId: "Ev-self-2", text: "here is my summary", ts: "900.3", threadTs: "900.1", metadataType: "hive_delivery_reply" }));
   assert.equal(store.listDeliveries().length, 1);
+  store.close();
+});
+
+test("thread affinity: a lost-ACK redelivery routes to the FROZEN target set, never an actor bound afterward", async () => {
+  const { store, broker } = affinityFixture(["ariadne", "fable"]);
+  // ariadne is bound; an envelope-less follow-up freezes its affinity target set to [ariadne].
+  await deliver(broker, messageBody({ eventId: "Ev-seed", text: "WAKE: ariadne | start", ts: "1300.1", threadTs: "1300.1" }));
+  store.recordOutcome(1, "done");
+  await deliver(broker, messageBody({ eventId: "Ev-follow", text: "keep going", ts: "1300.2", threadTs: "1300.1" }));
+  // fable joins the thread AFTER the follow-up was posted.
+  await deliver(broker, messageBody({ eventId: "Ev-fable", text: "WAKE: fable | join", ts: "1300.3", threadTs: "1300.1" }));
+  // Live bindings now include fable — a naive recompute would fan the follow-up out to it.
+  assert.deepEqual(broker.boundActors("C1", "1300.1").sort(), ["ariadne", "fable"]);
+
+  // Slack redelivers Ev-follow (ingestion committed; the ACK was lost). The frozen set
+  // still resolves to [ariadne] only — fable, who joined afterward, is never woken by it.
+  await deliver(broker, messageBody({ eventId: "Ev-follow", text: "keep going", ts: "1300.2", threadTs: "1300.1" }));
+  assert.deepEqual(broker.freezeAffinityTargets("Ev-follow", "C1", "1300.1"), ["ariadne"]);
+  const followTargets = store.listDeliveries()
+    .filter((delivery) => delivery.event.text === "keep going")
+    .map((delivery) => delivery.actor);
+  assert.deepEqual(followTargets, ["ariadne"]);
+  // No per-actor event row was ever minted for fable against the follow-up.
+  const fableFollowRows = Number(
+    (store.db.prepare("SELECT count(*) AS count FROM slack_events WHERE event_id = 'Ev-follow#fable'").get() as { count: number }).count,
+  );
+  assert.equal(fableFollowRows, 0);
+  store.close();
+});
+
+test("an untrusted envelope-less reply in an actor-bound thread is dropped WITH a thread notice", async () => {
+  const { store, broker } = affinityFixture(["ariadne"]);
+  // A trusted WAKE binds ariadne to the thread.
+  await deliver(broker, messageBody({ eventId: "Ev-seed", text: "WAKE: ariadne | start", ts: "1400.1", threadTs: "1400.1" }));
+  const notices: Array<{ channelId: string; threadTs: string; senderId: string }> = [];
+  // An untrusted sender posts an envelope-less reply in the bound thread. A trusted
+  // sender's identical reply would route by affinity, so this drop is a real trust-set
+  // rejection and must be thread-visible — not the silent ack an unbound thread gets.
+  await handleSlackEnvelope(
+    {
+      body: messageBody({ eventId: "Ev-intruder", text: "what are you working on?", ts: "1400.2", threadTs: "1400.1", user: "U-intruder" }),
+      async ack() {},
+    },
+    {
+      workspaceId: WORKSPACE_ID,
+      policy,
+      broker,
+      dropNotifier: {
+        noticeDroppedSender(channelId, threadTs, senderId) { notices.push({ channelId, threadTs, senderId }); },
+      },
+    },
+  );
+  assert.deepEqual(notices, [{ channelId: "C1", threadTs: "1400.1", senderId: "U-intruder" }]);
+  assert.equal(store.listDeliveries().length, 1); // only the seed; the intruder minted nothing
+  store.close();
+});
+
+test("an untrusted envelope-less message in an UNBOUND thread stays silent — no notice", async () => {
+  const { store, broker } = affinityFixture(["ariadne"]);
+  const notices: string[] = [];
+  await handleSlackEnvelope(
+    {
+      body: messageBody({ eventId: "Ev-chatter", text: "random noise", ts: "1500.2", threadTs: "1500.1", user: "U-intruder" }),
+      async ack() {},
+    },
+    {
+      workspaceId: WORKSPACE_ID,
+      policy,
+      broker,
+      dropNotifier: { noticeDroppedSender(_channelId, _threadTs, senderId) { notices.push(senderId); } },
+    },
+  );
+  assert.deepEqual(notices, []); // no envelope, no binding → no trusted sender could have routed it
+  assert.equal(store.listDeliveries().length, 0);
   store.close();
 });
 

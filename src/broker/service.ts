@@ -20,6 +20,11 @@ export class BrokerService {
     return this.store.upsertSubscription(input);
   }
 
+  /** Retire an actor: remove its subscription and every binding that kept it addressable. */
+  deleteSubscription(actor: string): boolean {
+    return this.store.deleteSubscription(actor);
+  }
+
   ingest(event: SlackEventInput, initialSnapshot: unknown | null = null) {
     return this.store.ingestEvent(event, initialSnapshot);
   }
@@ -32,6 +37,14 @@ export class BrokerService {
   /** Actors already bound to a Slack thread — the target set for thread affinity. */
   boundActors(channelId: string, threadTs: string): string[] {
     return this.store.actorsBoundToThread(channelId, threadTs);
+  }
+
+  /**
+   * Resolve the thread-affinity targets for a raw Slack event, freezing them on
+   * first sight so a lost-ACK redelivery cannot expand the recipient set.
+   */
+  freezeAffinityTargets(rawEventId: string, channelId: string, threadTs: string): string[] {
+    return this.store.freezeAffinityTargets(rawEventId, channelId, threadTs);
   }
 
   async claim(edgeId: string, after: number, waitMs: number): Promise<Delivery | null> {
