@@ -23,8 +23,20 @@ interface SlackEnvelopeBody {
   [key: string]: unknown;
 }
 
+/**
+ * The durable outcome of one ingest. `created` distinguishes a fresh event row
+ * from a redelivery of one already ingested (deduped by the slack_events primary
+ * key). `deliveryId` is null when the event was recorded but no live subscription
+ * absorbed it into a delivery — the silent dead-letter signal. A fresh event with
+ * no delivery means the wake reached no one, and is what earns a thread notice.
+ */
+export interface IngestResult {
+  created: boolean;
+  deliveryId: number | null;
+}
+
 interface SlackEventIngester {
-  ingest(event: SlackEventInput, initialSnapshot?: unknown | null): unknown;
+  ingest(event: SlackEventInput, initialSnapshot?: unknown | null): IngestResult;
   /** Actors already bound to (channelId, threadTs) — the thread-affinity target set. */
   boundActors(channelId: string, threadTs: string): string[];
   /**
@@ -41,6 +53,14 @@ interface SlackEventIngester {
  */
 export interface DropNotifier {
   noticeDroppedSender(channelId: string, threadTs: string, senderId: string): void;
+  /**
+   * An admitted wake named — or thread affinity resolved to — an actor with no
+   * live subscription, so the event was durably recorded but woke no one. The
+   * notice makes that dead-letter visible in the thread rather than swallowing
+   * it. Same durable-outbox path as {@link noticeDroppedSender}, and it names
+   * only the actor — never the message body.
+   */
+  noticeUnroutableActor(channelId: string, threadTs: string, actor: string): void;
 }
 
 export const MISSING_SLACK_EVENT_ID_DIAGNOSTIC =
@@ -175,7 +195,16 @@ export async function handleSlackEnvelope(
       raw: body,
       receivedAt,
     };
-    await broker.ingest(normalized);
+    // A fresh event row that minted no delivery means this actor has no live
+    // subscription: the wake was durably recorded but reached no one. Surface
+    // that dead-letter in the thread. Keyed on `created` so a lost-ACK
+    // redelivery (which dedupes to created:false) can never double-post the
+    // notice. Covers both entry points — an explicit envelope and affinity
+    // fan-out — since every target passes through this ingest.
+    const result = broker.ingest(normalized);
+    if (result.created && result.deliveryId === null && dropNotifier) {
+      dropNotifier.noticeUnroutableActor(event.channel, threadTs, actor);
+    }
   }
   await ack();
 }
@@ -324,6 +353,13 @@ export class SlackSocketIngress {
                   channelId,
                   threadTs,
                   `⛔ message from ${senderId} was not delivered — sender is not in the Hive trust set`,
+                );
+              },
+              noticeUnroutableActor: (channelId, threadTs, actor) => {
+                this.broker.store.enqueueThreadNotice(
+                  channelId,
+                  threadTs,
+                  `⚠️ no live subscription for actor \`${actor}\` — this wake reached no one. \`hive status\` lists live actors.`,
                 );
               },
             },
