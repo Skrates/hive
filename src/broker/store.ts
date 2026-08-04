@@ -330,6 +330,21 @@ export class BrokerStore {
     return row ? subscriptionFromRow(row) : null;
   }
 
+  /**
+   * True if any subscription is currently live (no expiry, or an expiry still in
+   * the future). The deafness watchdog only arms when the broker actually has an
+   * agent that could be woken — a broker with no live subscriptions expects
+   * silence, so silence is not evidence of a wedged Slack link.
+   */
+  hasActiveSubscription(): boolean {
+    const row = this.db.prepare(`
+      SELECT 1 FROM subscriptions
+      WHERE expires_at IS NULL OR expires_at > ?
+      LIMIT 1
+    `).get(iso(this.clock)) as Row | undefined;
+    return row !== undefined;
+  }
+
   ingestEvent(event: SlackEventInput, initialSnapshot: unknown | null = null): { created: boolean; deliveryId: number | null } {
     return this.db.transaction(() => {
       const inserted = this.db.prepare(`

@@ -213,21 +213,45 @@ export class SlackWebTransport implements SlackTransport {
 }
 
 export class SlackSocketIngress {
-  private readonly socket: SocketModeClient;
+  private socket: SocketModeClient | null = null;
+  private lastActivityMs: number | null = null;
 
   constructor(
-    appToken: string,
+    private readonly appToken: string,
     private readonly workspaceId: string,
     private readonly policy: AdmissionPolicy,
     private readonly broker: BrokerService,
-  ) {
-    this.socket = new SocketModeClient({ appToken });
+    private readonly log: (message: string) => void = (message) => console.error(message),
+    private readonly clock: () => number = () => Date.now(),
+  ) {}
+
+  /** True once the Socket Mode client has been started and not yet stopped. */
+  get connected(): boolean {
+    return this.socket !== null;
+  }
+
+  /**
+   * Epoch-ms of the last sign of life from the Slack link: a received envelope,
+   * or a (re)connect transition. Null before the first `start()`. The deafness
+   * watchdog reads this to distinguish a live-but-quiet link from a wedged one
+   * (half-open socket, or a second Socket Mode consumer stealing the stream).
+   */
+  lastActivityAt(): number | null {
+    return this.lastActivityMs;
   }
 
   async start(): Promise<void> {
+    if (this.socket) return;
+    const socket = new SocketModeClient({ appToken: this.appToken });
+    // A (re)connect is a genuine sign of life — bump activity so a healthy link
+    // that merely refreshed its connection is never mistaken for deaf.
+    socket.on("connected", () => {
+      this.lastActivityMs = this.clock();
+    });
     // @slack/socket-mode unwraps Events API envelopes and emits the inner event type ("message"),
     // not the outer "events_api" envelope type.
-    this.socket.on("message", async ({ body, ack }) => {
+    socket.on("message", async ({ body, ack }) => {
+      this.lastActivityMs = this.clock();
       try {
         await handleSlackEnvelope({ body, ack }, {
           workspaceId: this.workspaceId,
@@ -243,16 +267,36 @@ export class SlackSocketIngress {
             },
           },
         });
-      } catch {
+      } catch (error) {
         // No acknowledgement was sent if ingest failed. If acknowledgement itself failed, the
-        // committed event is also safe to redeliver. Keep hostile event/error data out of stderr.
-        console.error(UNACKNOWLEDGED_SLACK_ENVELOPE_DIAGNOSTIC);
+        // committed event is also safe to redeliver. Surface the error CODE so a wedged handler is
+        // visible in logs, while keeping hostile event body data out of stderr.
+        this.log(`${UNACKNOWLEDGED_SLACK_ENVELOPE_DIAGNOSTIC}: ${safeErrorMessage(error)}`);
       }
     });
-    await this.socket.start();
+    this.socket = socket;
+    this.lastActivityMs = this.clock();
+    await socket.start();
   }
 
   async stop(): Promise<void> {
-    await this.socket.disconnect();
+    const socket = this.socket;
+    this.socket = null;
+    if (socket) await socket.disconnect();
   }
+
+  /** Tear down and re-establish the Socket Mode client — the watchdog's recovery action. */
+  async restart(): Promise<void> {
+    await this.stop();
+    await this.start();
+  }
+}
+
+/**
+ * Reduce an unknown error to a short, log-safe string: our own structured error
+ * messages are safe; a bare object collapses to its type. Never echoes an event body.
+ */
+function safeErrorMessage(error: unknown): string {
+  if (error instanceof Error) return `${error.name}: ${error.message}`.slice(0, 300);
+  return typeof error === "string" ? error.slice(0, 300) : "non-error thrown";
 }

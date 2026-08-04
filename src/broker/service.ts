@@ -24,6 +24,11 @@ export class BrokerService {
     return this.store.ingestEvent(event, initialSnapshot);
   }
 
+  /** True if any subscription is live — the deafness watchdog's arming gate. */
+  hasActiveSubscription(): boolean {
+    return this.store.hasActiveSubscription();
+  }
+
   async claim(edgeId: string, after: number, waitMs: number): Promise<Delivery | null> {
     const deadline = Date.now() + Math.min(Math.max(waitMs, 0), 30_000);
     do {

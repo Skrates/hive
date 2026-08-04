@@ -32,11 +32,25 @@ export class BrokerHttpServer {
     return { host: this.config.host, port: address.port };
   }
 
-  async stop(): Promise<void> {
+  /**
+   * Stop accepting connections and resolve once the server is closed. Edges
+   * long-poll `GET /v1/deliveries` with a server-side wait of up to 30s, and
+   * HTTP keep-alive holds idle sockets open — either would keep `server.close()`
+   * pending indefinitely and turn a SIGTERM into a systemd SIGKILL. So we give
+   * in-flight requests a short drain window, then force the remainder closed
+   * with `closeAllConnections()` (Node ≥18.2) so shutdown always completes.
+   */
+  async stop(drainMs = 2_000): Promise<void> {
     if (!this.server) return;
     const current = this.server;
     this.server = null;
-    await new Promise<void>((resolve, reject) => current.close((error) => error ? reject(error) : resolve()));
+    const closed = new Promise<void>((resolve, reject) => current.close((error) => error ? reject(error) : resolve()));
+    const forceClose = setTimeout(() => current.closeAllConnections(), Math.max(0, drainMs));
+    try {
+      await closed;
+    } finally {
+      clearTimeout(forceClose);
+    }
   }
 
   private async route(request: IncomingMessage, response: ServerResponse): Promise<void> {
