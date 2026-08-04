@@ -97,11 +97,24 @@ test("an invalid permission profile is a deterministic pre-dispatch failure", ()
   );
 });
 
-test("Codex permission arguments are accepted by both exec spawn and exec resume", () => {
-  // `codex exec resume` does not expose the top-level `--sandbox` option. A
-  // TOML config override preserves the same actor-side ceiling on both paths.
-  assert.deepEqual(codexPermissionArgs("read-only"), ["-c", 'sandbox_mode="read-only"']);
-  assert.deepEqual(codexPermissionArgs("workspace-write"), ["-c", 'sandbox_mode="workspace-write"']);
+test("Codex permission arguments grant only the Hive edge socket on spawn and resume", () => {
+  const socketPath = "/tmp/hive edge.sock";
+  assert.deepEqual(codexPermissionArgs("read-only", socketPath), [
+    "-c", "features.network_proxy=true",
+    "-c", 'permissions.hive-read-only.extends=":read-only"',
+    "-c", "permissions.hive-read-only.network.enabled=true",
+    "-c", 'permissions.hive-read-only.network.domains={"hive.invalid"="allow"}',
+    "-c", 'permissions.hive-read-only.network.unix_sockets={"/tmp/hive edge.sock"="allow"}',
+    "-c", 'default_permissions="hive-read-only"',
+  ]);
+  assert.deepEqual(codexPermissionArgs("workspace-write", socketPath), [
+    "-c", "features.network_proxy=true",
+    "-c", 'permissions.hive-workspace.extends=":workspace"',
+    "-c", "permissions.hive-workspace.network.enabled=true",
+    "-c", 'permissions.hive-workspace.network.domains={"hive.invalid"="allow"}',
+    "-c", 'permissions.hive-workspace.network.unix_sockets={"/tmp/hive edge.sock"="allow"}',
+    "-c", 'default_permissions="hive-workspace"',
+  ]);
   assert.deepEqual(codexPermissionArgs("danger-full-access"), ["--dangerously-bypass-approvals-and-sandbox"]);
 });
 

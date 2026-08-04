@@ -58,6 +58,13 @@ Every subscription pins an `accountProfile` — the absolute path of the agent's
 directory is a hard pre-dispatch failure (`account_profile_missing`); Hive never falls back to
 whatever seat the edge process is logged into (ADR-0003 R-5).
 
+For Codex, use a dedicated pinned `CODEX_HOME` with no legacy `sandbox_mode` or
+`sandbox_workspace_write` entries in its `config.toml`. Hive selects a current Codex permission
+profile at dispatch time: read-only or workspace write plus the exact owner-only Hive edge socket,
+with ordinary outbound network denied. Current Codex intentionally does not compose permission
+profiles with legacy sandbox configuration. Authenticate the dedicated home once with
+`CODEX_HOME=/absolute/profile/path codex login` before enrolling the subscription.
+
 ### Codex live steering
 
 Run `hive-codex-live` with the current Codex thread ID. It connects to the app-server control
