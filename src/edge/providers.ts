@@ -213,10 +213,16 @@ async function runHeadless(
   return { receipt: output.slice(-4_000), processed: true };
 }
 
-function codexPermissionArgs(profile: string): string[] {
+/**
+ * Codex exposes `--sandbox` on `codex exec`, but not on the nested
+ * `codex exec resume` command. The equivalent config override is accepted by
+ * both command shapes, so use one representation for spawn and resume instead
+ * of letting a valid subscription fail at the CLI parser before dispatch.
+ */
+export function codexPermissionArgs(profile: string): string[] {
   switch (profile) {
-    case "read-only": return ["--sandbox", "read-only"];
-    case "workspace-write": return ["--sandbox", "workspace-write"];
+    case "read-only": return ["-c", 'sandbox_mode="read-only"'];
+    case "workspace-write": return ["-c", 'sandbox_mode="workspace-write"'];
     case "danger-full-access": return ["--dangerously-bypass-approvals-and-sandbox"];
     default: throw new ProviderPreDispatchError("provider_permission_profile_invalid");
   }

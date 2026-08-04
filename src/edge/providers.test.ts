@@ -8,7 +8,7 @@ import type { Delivery, Subscription } from "../domain.js";
 import { prepareSocketPath } from "../local/uds.js";
 import type { LiveIngress } from "./live-registry.js";
 import { delimiter, dirname } from "node:path";
-import { ClaudeProvider, CodexProvider, composeChildEnv, prependPathEntry, ProviderPreDispatchError, requireAccountProfile } from "./providers.js";
+import { ClaudeProvider, codexPermissionArgs, CodexProvider, composeChildEnv, prependPathEntry, ProviderPreDispatchError, requireAccountProfile } from "./providers.js";
 
 function subscription(overrides: Partial<Subscription> = {}): Subscription {
   return {
@@ -95,6 +95,14 @@ test("an invalid permission profile is a deterministic pre-dispatch failure", ()
     () => codex.preflight(subscription({ permissionProfile: "yolo" })),
     (error: unknown) => error instanceof ProviderPreDispatchError && error.code === "provider_permission_profile_invalid",
   );
+});
+
+test("Codex permission arguments are accepted by both exec spawn and exec resume", () => {
+  // `codex exec resume` does not expose the top-level `--sandbox` option. A
+  // TOML config override preserves the same actor-side ceiling on both paths.
+  assert.deepEqual(codexPermissionArgs("read-only"), ["-c", 'sandbox_mode="read-only"']);
+  assert.deepEqual(codexPermissionArgs("workspace-write"), ["-c", 'sandbox_mode="workspace-write"']);
+  assert.deepEqual(codexPermissionArgs("danger-full-access"), ["--dangerously-bypass-approvals-and-sandbox"]);
 });
 
 test("a missing account profile is a hard pre-dispatch failure, never a fallback (ADR-0003 R-5)", (t) => {
