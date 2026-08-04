@@ -25,8 +25,10 @@ Actor rename (claude-1 → fable): `put-subscription` only ever *upserts*, so re
 actor leaves the old subscription row live and thread-bound — it stays addressable and historical
 threads keep routing to it. Retire the old row explicitly: `hive delete-subscription claude-1` (needs
 `HIVE_BROKER_URL` + `HIVE_ADMIN_TOKEN`). This deletes the subscription and every binding that kept
-it addressable (its deliveries, thread affinity, lease). Do it once per rename, after seating the
-new actor.
+it addressable (its deliveries, thread affinity, lease). Retirement fails closed while any delivery
+for the old actor is still non-terminal, because deleting an in-flight dispatch could erase its
+receipt/outcome coordinate while the provider still acts. Do it once per rename, after seating the
+new actor and letting the old actor's deliveries terminalize.
 
 A closed lid is a dark agent: deliveries queue, retry with backoff, and terminalize visibly after
 maxAttempts. That is the R-3 contract, not a bug. Bump `maxAttempts`/backoff in the subscription

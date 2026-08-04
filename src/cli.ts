@@ -175,7 +175,7 @@ program.command("put-subscription")
 
 program.command("delete-subscription")
   .argument("<actor>")
-  .description("retire an actor: delete its subscription and every binding that kept it addressable")
+  .description("retire an actor after its deliveries terminalize; remove its subscription and bindings")
   .action(async (actor: string) => {
     const client = new BrokerClient(requiredEnv("HIVE_BROKER_URL"), "admin", "unused");
     const result = await client.deleteSubscription(requiredEnv("HIVE_ADMIN_TOKEN"), actor);

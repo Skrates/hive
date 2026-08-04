@@ -412,11 +412,26 @@ export class BrokerStore {
    * against) and unbound (no delivery joins it to any thread), closing the
    * rename-migration gap where a renamed actor's old row stayed live forever.
    *
-   * Foreign keys are enforced, so dependents are removed in reference order
-   * inside one transaction. Returns true if a subscription was actually removed.
+   * A non-terminal delivery is a hard stop: it may already be crossing the
+   * provider-effect boundary, so deleting it would erase the authoritative
+   * receipt/outcome coordinate while the agent could still act. The operator
+   * must let every delivery terminalize before retirement. Foreign keys are
+   * enforced, so dependents are then removed in reference order inside one
+   * transaction. Already-committed outbox posts remain durable and may still be
+   * delivered to Slack. Returns true if a subscription was actually removed.
    */
   deleteSubscription(actor: string): boolean {
     return this.db.transaction(() => {
+      const active = this.db.prepare(`
+        SELECT delivery_id, status FROM deliveries
+        WHERE actor = ? AND status NOT IN ('processed', 'undeliverable', 'failed')
+        ORDER BY delivery_id LIMIT 1
+      `).get(actor) as Row | undefined;
+      if (active) {
+        throw new InvalidTransitionError(
+          `cannot retire ${actor}: delivery ${String(active.delivery_id)} is ${String(active.status)}`,
+        );
+      }
       this.db.prepare(`
         DELETE FROM spawn_reservations
         WHERE delivery_id IN (SELECT delivery_id FROM deliveries WHERE actor = ?)

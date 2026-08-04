@@ -20,7 +20,7 @@ export class BrokerService {
     return this.store.upsertSubscription(input);
   }
 
-  /** Retire an actor: remove its subscription and every binding that kept it addressable. */
+  /** Retire an actor after all of its deliveries have reached a terminal state. */
   deleteSubscription(actor: string): boolean {
     return this.store.deleteSubscription(actor);
   }

@@ -121,23 +121,18 @@ export async function handleSlackEnvelope(
     await ack();
     return;
   }
-  // Admission is never weakened by affinity. A message from a principal outside
-  // the closed trust set is dropped. The drop is thread-visible (ADR-0003 R-1)
-  // whenever the same message from a *trusted* sender would have been delivered:
-  // an addressed envelope, or an envelope-less reply in a thread already bound to
-  // an actor (affinity would have routed it). Both are silent-rejection risks —
-  // delivered-but-silently-swallowed is indistinguishable from
-  // delivered-and-ignored. An envelope-less message in an unbound thread stays
-  // silent: it is stray channel chatter no trusted sender could have routed
-  // either, and notifying it would spam trust-set notices.
+  // Admission is never weakened by affinity. ADR-0003 R-1 makes every message
+  // from an identified principal outside the closed trust set thread-visible on
+  // an admitted surface. Whether a trusted sender would currently have an
+  // affinity target is irrelevant: silently acknowledging the rejected message
+  // would make the trust boundary invisible to the sender and operator.
   if (!senderId || !isAdmitted(policy, {
     workspaceId,
     channelId: event.channel,
     senderId,
     senderKind,
   })) {
-    const affinityRoutable = !addressed && broker.boundActors(event.channel, threadTs).length > 0;
-    if (senderId && dropNotifier && (addressed || affinityRoutable)) {
+    if (senderId && dropNotifier) {
       dropNotifier.noticeDroppedSender(event.channel, threadTs, senderId);
     }
     await ack();

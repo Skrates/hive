@@ -519,7 +519,7 @@ test("an untrusted envelope-less reply in an actor-bound thread is dropped WITH 
   store.close();
 });
 
-test("an untrusted envelope-less message in an UNBOUND thread stays silent — no notice", async () => {
+test("an untrusted envelope-less message in an UNBOUND admitted thread still gets a drop notice", async () => {
   const { store, broker } = affinityFixture(["ariadne"]);
   const notices: string[] = [];
   await handleSlackEnvelope(
@@ -534,7 +534,9 @@ test("an untrusted envelope-less message in an UNBOUND thread stays silent — n
       dropNotifier: { noticeDroppedSender(_channelId, _threadTs, senderId) { notices.push(senderId); } },
     },
   );
-  assert.deepEqual(notices, []); // no envelope, no binding → no trusted sender could have routed it
+  // ADR-0003 R-1 attributes trust by sender on every admitted surface. A missing
+  // affinity target does not make an identified untrusted principal silent.
+  assert.deepEqual(notices, ["U-intruder"]);
   assert.equal(store.listDeliveries().length, 0);
   store.close();
 });
