@@ -24,6 +24,11 @@ export class BrokerService {
     return this.store.ingestEvent(event, initialSnapshot);
   }
 
+  /** True if any subscription is live — the deafness watchdog's arming gate. */
+  hasActiveSubscription(): boolean {
+    return this.store.hasActiveSubscription();
+  }
+
   /** Actors already bound to a Slack thread — the target set for thread affinity. */
   boundActors(channelId: string, threadTs: string): string[] {
     return this.store.actorsBoundToThread(channelId, threadTs);

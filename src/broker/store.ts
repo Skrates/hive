@@ -331,6 +331,23 @@ export class BrokerStore {
   }
 
   /**
+   * True if any subscription is currently live (no expiry, or an expiry still in
+   * the future). The deafness watchdog only arms when the broker actually has an
+   * agent that could be woken — a broker with no live subscriptions expects
+   * silence, so silence is not evidence of a wedged Slack link.
+   */
+  hasActiveSubscription(): boolean {
+    // Compare expiries by parsed instant, not by raw ISO string. `expiresAt` is a
+    // z.string().datetime() value, whose fractional-second precision and offset can
+    // vary, so a lexical SQL `expires_at > ?` can order two valid timestamps wrongly
+    // near a boundary. `isExpired` normalises through Date.getTime(), matching the
+    // eligibility check on the dispatch path.
+    const now = this.clock.now();
+    const rows = this.db.prepare("SELECT expires_at FROM subscriptions").all() as Array<{ expires_at: string | null }>;
+    return rows.some((row) => !isExpired(row.expires_at, now));
+  }
+
+  /**
    * The set of actors bound to a Slack thread: every actor that already has a
    * delivery whose originating event sits in this channel/thread. Thread
    * affinity routes an envelope-less admitted message to exactly this set, so a

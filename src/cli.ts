@@ -9,6 +9,7 @@ import { BrokerHttpServer } from "./broker/http.js";
 import { BrokerService } from "./broker/service.js";
 import { SlackSocketIngress, SlackWebTransport } from "./broker/slack.js";
 import { BrokerStore } from "./broker/store.js";
+import { SlackDeafnessWatchdog } from "./broker/watchdog.js";
 import { SubscriptionInputSchema, type Delivery } from "./domain.js";
 import { ensureEdgeStateDirs } from "./edge/bootstrap.js";
 import { BrokerClient } from "./edge/broker-client.js";
@@ -35,7 +36,13 @@ program.command("broker")
       port: config.HIVE_BROKER_PORT,
       adminToken: config.HIVE_ADMIN_TOKEN,
     });
-    const slack = new SlackSocketIngress(config.HIVE_SLACK_APP_TOKEN, config.HIVE_SLACK_WORKSPACE_ID, policy, broker);
+    const slack = new SlackSocketIngress(
+      config.HIVE_SLACK_APP_TOKEN,
+      config.HIVE_SLACK_WORKSPACE_ID,
+      policy,
+      broker,
+      (message) => console.error(message),
+    );
     await http.start();
     await slack.start();
     // The claim loop also sweeps and drains, but only while an edge is
@@ -51,11 +58,34 @@ program.command("broker")
         console.error("hive broker outbox drain failed", error instanceof Error ? error.message : String(error));
       });
     }, 5_000);
+    // Deafness watchdog: a Socket Mode link that stays "connected" but stops
+    // carrying events (half-open socket, or a second consumer stealing the
+    // stream) is invisible without this. First stale cycle forces a reconnect;
+    // a second consecutive silent cycle exits for a systemd restart.
+    const watchdog = new SlackDeafnessWatchdog({
+      lastEventAt: () => slack.lastEventAt(),
+      lastConnectAt: () => slack.lastConnectAt(),
+      hasActiveSubscription: () => broker.hasActiveSubscription(),
+      restart: () => slack.restart(),
+      exit: (code) => process.exit(code),
+      now: () => Date.now(),
+      log: (message) => console.error(message),
+    }, config.HIVE_WATCHDOG_STALE_MS);
+    const watchdogTimer = setInterval(() => {
+      void watchdog.check().catch((error: unknown) => {
+        console.error("[watchdog] cycle failed", error instanceof Error ? error.message : String(error));
+      });
+    }, config.HIVE_WATCHDOG_STALE_MS);
     await untilSignal(async () => {
       clearInterval(housekeeping);
-      await slack.stop();
-      await http.stop();
+      clearInterval(watchdogTimer);
+      // Bound every teardown step: a hung disconnect or a lingering long-poll
+      // must never turn SIGTERM into a SIGKILL. Force-exit once best-effort
+      // cleanup returns so a stuck socket handle cannot keep the loop alive.
+      await withTimeout(slack.stop(), 5_000, "slack.stop");
+      await withTimeout(http.stop(), 5_000, "http.stop");
       store.close();
+      process.exit(0);
     });
   });
 
@@ -152,6 +182,9 @@ const BrokerConfig = z.object({
   HIVE_SLACK_BOT_TOKEN: z.string().startsWith("xoxb-"),
   HIVE_SLACK_WORKSPACE_ID: z.string().min(1),
   HIVE_ADMISSION_POLICY: z.string().min(2),
+  // Deafness threshold: silence past this while subscriptions are live forces a
+  // Socket Mode reconnect; a second consecutive silent cycle exits for systemd.
+  HIVE_WATCHDOG_STALE_MS: z.coerce.number().int().min(10_000).default(300_000),
 });
 
 const EdgeConfig = z.object({
@@ -167,6 +200,29 @@ function requiredEnv(name: string): string {
   const value = process.env[name];
   if (!value) throw new Error(`${name} is required`);
   return value;
+}
+
+/**
+ * Await `promise`, but never longer than `ms`. On timeout (or rejection) log and
+ * resolve anyway so a shutdown step can't wedge the whole SIGTERM path.
+ */
+async function withTimeout(promise: Promise<unknown>, ms: number, label: string): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const guarded = promise.then(
+    () => {},
+    (error: unknown) => console.error(`[shutdown] ${label} failed:`, error instanceof Error ? error.message : String(error)),
+  );
+  const timeout = new Promise<void>((resolve) => {
+    timer = setTimeout(() => {
+      console.error(`[shutdown] ${label} exceeded ${ms}ms; continuing`);
+      resolve();
+    }, ms);
+  });
+  try {
+    await Promise.race([guarded, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 async function untilSignal(cleanup: () => Promise<void>): Promise<void> {

@@ -241,46 +241,131 @@ export class SlackWebTransport implements SlackTransport {
 }
 
 export class SlackSocketIngress {
-  private readonly socket: SocketModeClient;
+  private socket: SocketModeClient | null = null;
+  private starting = false;
+  private lastEventMs: number | null = null;
+  private lastConnectMs: number | null = null;
 
   constructor(
-    appToken: string,
+    private readonly appToken: string,
     private readonly workspaceId: string,
     private readonly policy: AdmissionPolicy,
     private readonly broker: BrokerService,
-  ) {
-    this.socket = new SocketModeClient({ appToken });
+    private readonly log: (message: string) => void = (message) => console.error(message),
+    private readonly clock: () => number = () => Date.now(),
+  ) {}
+
+  /** True once the Socket Mode client has fully started and not yet stopped. */
+  get connected(): boolean {
+    return this.socket !== null;
+  }
+
+  /**
+   * Epoch-ms of the last genuine inbound Slack envelope, or null before any has
+   * arrived. This is *event* activity — real traffic flowing over the link — and
+   * is deliberately NOT bumped by a (re)connect. A connection can be perfectly
+   * established yet deaf (a half-open socket, or a second Socket Mode consumer
+   * stealing the event stream), so the deafness watchdog must read event flow,
+   * not connection state, when deciding whether the link has gone silent.
+   */
+  lastEventAt(): number | null {
+    return this.lastEventMs;
+  }
+
+  /**
+   * Epoch-ms of the last `connected` transition, or null before the first one.
+   * This is *transport* liveness — proof the socket re-established — kept
+   * separate from {@link lastEventAt} so the watchdog can tell "the reconnect
+   * succeeded but events still aren't flowing" (ambiguous: quiet vs. stolen
+   * stream) from "the reconnect never took" (a wedged transport worth exiting).
+   */
+  lastConnectAt(): number | null {
+    return this.lastConnectMs;
   }
 
   async start(): Promise<void> {
-    // @slack/socket-mode unwraps Events API envelopes and emits the inner event type ("message"),
-    // not the outer "events_api" envelope type.
-    this.socket.on("message", async ({ body, ack }) => {
-      try {
-        await handleSlackEnvelope({ body, ack }, {
-          workspaceId: this.workspaceId,
-          policy: this.policy,
-          broker: this.broker,
-          dropNotifier: {
-            noticeDroppedSender: (channelId, threadTs, senderId) => {
-              this.broker.store.enqueueThreadNotice(
-                channelId,
-                threadTs,
-                `⛔ message from ${senderId} was not delivered — sender is not in the Hive trust set`,
-              );
+    // Single-flight: never build a second client while one is live or a start is
+    // already in flight (the watchdog's restart and a shutdown could otherwise race).
+    if (this.socket || this.starting) return;
+    this.starting = true;
+    try {
+      const socket = new SocketModeClient({ appToken: this.appToken });
+      // A (re)connect is transport liveness only — it is NOT evidence that Slack
+      // events are flowing. Stamping event activity here is exactly what masked the
+      // 2026-08-04 incident: every forced reconnect looked like a fresh event, so a
+      // link that stayed connected-but-deaf never tripped the watchdog.
+      socket.on("connected", () => {
+        this.lastConnectMs = this.clock();
+      });
+      // `slack_event` fires once per inbound envelope of every type — the SDK's
+      // all-envelope signal. This is the true "events are flowing" evidence, so it
+      // (and only it) stamps the event-activity clock. It never acks or processes;
+      // durable ingestion runs off the unwrapped inner `message` event below.
+      socket.on("slack_event", () => {
+        this.lastEventMs = this.clock();
+      });
+      // @slack/socket-mode unwraps Events API envelopes and emits the inner event type ("message"),
+      // not the outer "events_api" envelope type.
+      socket.on("message", async ({ body, ack }) => {
+        try {
+          await handleSlackEnvelope({ body, ack }, {
+            workspaceId: this.workspaceId,
+            policy: this.policy,
+            broker: this.broker,
+            dropNotifier: {
+              noticeDroppedSender: (channelId, threadTs, senderId) => {
+                this.broker.store.enqueueThreadNotice(
+                  channelId,
+                  threadTs,
+                  `⛔ message from ${senderId} was not delivered — sender is not in the Hive trust set`,
+                );
+              },
             },
-          },
-        });
-      } catch {
-        // No acknowledgement was sent if ingest failed. If acknowledgement itself failed, the
-        // committed event is also safe to redeliver. Keep hostile event/error data out of stderr.
-        console.error(UNACKNOWLEDGED_SLACK_ENVELOPE_DIAGNOSTIC);
+          });
+        } catch (error) {
+          // No acknowledgement was sent if ingest failed. If acknowledgement itself failed, the
+          // committed event is also safe to redeliver. Surface the error TYPE so a wedged handler is
+          // visible in logs, while keeping hostile event body data (and any secret- or prompt-shaped
+          // text an exception message might carry) out of stderr.
+          this.log(`${UNACKNOWLEDGED_SLACK_ENVELOPE_DIAGNOSTIC}: ${safeErrorName(error)}`);
+        }
+      });
+      try {
+        await socket.start();
+      } catch (error) {
+        // A rejected start must not leave a half-built client behind advertising
+        // `connected === true` or blocking a later retry. Best-effort tear down, then rethrow.
+        await socket.disconnect().catch(() => {});
+        throw error;
       }
-    });
-    await this.socket.start();
+      // Publish the socket only after startup resolves — never before — so a failed
+      // start can never report false connected state.
+      this.socket = socket;
+    } finally {
+      this.starting = false;
+    }
   }
 
   async stop(): Promise<void> {
-    await this.socket.disconnect();
+    const socket = this.socket;
+    this.socket = null;
+    if (socket) await socket.disconnect();
   }
+
+  /** Tear down and re-establish the Socket Mode client — the watchdog's recovery action. */
+  async restart(): Promise<void> {
+    await this.stop();
+    await this.start();
+  }
+}
+
+/**
+ * Reduce an unknown error to its TYPE name only — never its message. An exception
+ * raised while handling a Slack envelope can carry event body text, and thus
+ * secret- or prompt-shaped data; the class name is a code identifier that cannot.
+ * Truncating the message is not sanitisation, so we drop it entirely.
+ */
+export function safeErrorName(error: unknown): string {
+  if (error instanceof Error) return error.constructor.name;
+  return "non-error thrown";
 }
