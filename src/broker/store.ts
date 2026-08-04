@@ -354,6 +354,19 @@ export class BrokerStore {
   }
 
   /**
+   * Every actor with a live (unexpired) subscription, in a stable order — the
+   * fan-out target set for an `everyone` broadcast. Liveness is decided by the
+   * same `isExpired` instant comparison as {@link hasActiveSubscription}, so a
+   * lapsed seat is never broadcast to.
+   */
+  liveActors(): string[] {
+    const now = this.clock.now();
+    const rows = this.db.prepare("SELECT actor, expires_at FROM subscriptions ORDER BY actor")
+      .all() as Array<{ actor: string; expires_at: string | null }>;
+    return rows.filter((row) => !isExpired(row.expires_at, now)).map((row) => String(row.actor));
+  }
+
+  /**
    * The set of actors bound to a Slack thread: every actor that already has a
    * delivery whose originating event sits in this channel/thread. Thread
    * affinity routes an envelope-less admitted message to exactly this set, so a

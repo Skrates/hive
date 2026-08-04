@@ -496,6 +496,27 @@ test("a relative accountProfile is rejected at the schema boundary (R-5)", () =>
   assert.doesNotThrow(() => SubscriptionInputSchema.parse(subscription()));
 });
 
+test("`everyone` is rejected as a subscription actor name at the schema boundary (KRA-926)", () => {
+  // `everyone` is the broadcast keyword; a real seat must never carry it as a name,
+  // in any casing, so a subscription can neither shadow nor be shadowed by broadcast.
+  assert.throws(() => SubscriptionInputSchema.parse({ ...subscription(), actor: "everyone" }));
+  assert.throws(() => SubscriptionInputSchema.parse({ ...subscription(), actor: "Everyone" }));
+  assert.doesNotThrow(() => SubscriptionInputSchema.parse(subscription()));
+});
+
+test("liveActors enumerates only unexpired subscriptions, in stable order (KRA-926)", () => {
+  const store = new BrokerStore(":memory:", new FakeClock(new Date("2026-07-12T00:00:00.950Z")));
+  store.createEdge("mac");
+  store.createEdge("dev");
+  store.upsertSubscription(subscription({ actor: "gnomon", expiresAt: null }));
+  store.upsertSubscription(subscription({ actor: "ariadne", expiresAt: "2026-07-12T00:00:01.000Z" })); // future — live
+  store.upsertSubscription(subscription({ actor: "fable", expiresAt: "2026-07-12T00:00:00.9Z" })); // 50ms past — lapsed
+  // fable is excluded (instant comparison, matching hasActiveSubscription); the rest
+  // come back sorted, so the broadcast target set is deterministic.
+  assert.deepEqual(store.liveActors(), ["ariadne", "gnomon"]);
+  store.close();
+});
+
 test("hasActiveSubscription orders expiry by instant, not by ISO string (fractional-precision boundary)", () => {
   // A NULL expiry is always live, an already-past expiry never is.
   {

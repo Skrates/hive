@@ -138,6 +138,7 @@ test("crash after commit before ACK makes fresh-envelope redelivery harmless", a
         },
         boundActors: () => [],
         freezeAffinityTargets: () => [],
+        liveActors: () => [],
       },
       now: () => new Date("2026-08-01T00:00:00.000Z"),
     }),
@@ -192,6 +193,7 @@ test("missing event_id refuses envelope identity fallback, logs safely, then ACK
       },
       boundActors: () => [],
       freezeAffinityTargets: () => [],
+      liveActors: () => [],
     },
     logDiagnostic(message) {
       actions.push(`log:${message}`);
@@ -224,6 +226,7 @@ test("ingest failure leaves the envelope unacknowledged for Slack redelivery", a
         },
         boundActors: () => [],
         freezeAffinityTargets: () => [],
+        liveActors: () => [],
       },
     }),
     /injected ingest failure/,
@@ -253,7 +256,7 @@ test("a sender outside the trust set is dropped with a thread notice (ADR-0003 R
   }, {
     workspaceId: WORKSPACE_ID,
     policy,
-    broker: { ingest() { ingested = true; return { created: true, deliveryId: 1 }; }, boundActors: () => [], freezeAffinityTargets: () => [] },
+    broker: { ingest() { ingested = true; return { created: true, deliveryId: 1 }; }, boundActors: () => [], freezeAffinityTargets: () => [], liveActors: () => [] },
     dropNotifier: {
       noticeDroppedSender(channelId, threadTs, senderId) {
         notices.push({ channelId, threadTs, senderId });
@@ -289,7 +292,7 @@ test("a message in an unadmitted channel is silently ignored — no notice into 
   }, {
     workspaceId: WORKSPACE_ID,
     policy,
-    broker: { ingest() { ingested = true; return { created: true, deliveryId: 1 }; }, boundActors: () => [], freezeAffinityTargets: () => [] },
+    broker: { ingest() { ingested = true; return { created: true, deliveryId: 1 }; }, boundActors: () => [], freezeAffinityTargets: () => [], liveActors: () => [] },
     dropNotifier: {
       noticeDroppedSender(_channelId, _threadTs, senderId) {
         notices.push(senderId);
@@ -323,7 +326,7 @@ test("malformed untrusted message fields are refused and acknowledged without in
   }, {
     workspaceId: WORKSPACE_ID,
     policy,
-    broker: { ingest() { ingested = true; return { created: true, deliveryId: 1 }; }, boundActors: () => [], freezeAffinityTargets: () => [] },
+    broker: { ingest() { ingested = true; return { created: true, deliveryId: 1 }; }, boundActors: () => [], freezeAffinityTargets: () => [], liveActors: () => [] },
   });
 
   assert.equal(acked, true);
@@ -647,6 +650,103 @@ test("a wake naming a live actor mints its delivery and posts no unroutable noti
   const deliveries = store.listDeliveries();
   assert.equal(deliveries.length, 1);
   assert.equal(deliveries[0]!.actor, "ariadne");
+  store.close();
+});
+
+test("a WAKE list wakes every named live actor exactly once (KRA-926)", async () => {
+  const { store, broker } = affinityFixture(["fable", "gnomon", "ariadne"]);
+  await deliver(broker, messageBody({ eventId: "Ev-list", text: "WAKE: fable, gnomon, ariadne | all three", ts: "2100.1", threadTs: "2100.1" }));
+  const deliveries = store.listDeliveries();
+  assert.equal(deliveries.length, 3);
+  assert.deepEqual(deliveries.map((delivery) => delivery.actor).sort(), ["ariadne", "fable", "gnomon"]);
+  store.close();
+});
+
+test("a WAKE list with a dead name wakes the live ones and thread-notices the dead one (KRA-926 × KRA-925)", async () => {
+  const { store, broker } = affinityFixture(["fable", "gnomon"]);
+  const unroutable: string[] = [];
+  await handleSlackEnvelope(
+    { body: messageBody({ eventId: "Ev-mixed", text: "WAKE: fable, ghost, gnomon | mixed", ts: "2200.1", threadTs: "2200.1" }), async ack() {} },
+    {
+      workspaceId: WORKSPACE_ID,
+      policy,
+      broker,
+      dropNotifier: {
+        noticeDroppedSender() { throw new Error("the sender is trusted; this is not a sender drop"); },
+        noticeUnroutableActor(_channelId, _threadTs, actor) { unroutable.push(actor); },
+      },
+    },
+  );
+  const deliveries = store.listDeliveries();
+  assert.deepEqual(deliveries.map((delivery) => delivery.actor).sort(), ["fable", "gnomon"]);
+  assert.deepEqual(unroutable, ["ghost"]); // the dead name dead-letters; the live ones still wake
+  store.close();
+});
+
+test("`everyone` from a human wakes every live actor (KRA-926)", async () => {
+  const { store, broker } = affinityFixture(["fable", "gnomon", "ariadne"]);
+  await deliver(broker, messageBody({ eventId: "Ev-all", text: "WAKE: everyone | all hands", ts: "2300.1", threadTs: "2300.1" }));
+  const deliveries = store.listDeliveries();
+  assert.deepEqual(deliveries.map((delivery) => delivery.actor).sort(), ["ariadne", "fable", "gnomon"]);
+  store.close();
+});
+
+test("`everyone` from a bot sender is unroutable — a thread notice and zero deliveries (KRA-926)", async () => {
+  const { store, broker } = affinityFixture(["fable", "gnomon"]);
+  // A bot posts ingress under the trusted app identity — admitted, but its
+  // `everyone` must never expand. It flows through as the literal unsubscribable
+  // target and dead-letters, so a quoted broadcast in an agent reply cannot
+  // chain-wake the fleet.
+  const appPolicy: AdmissionPolicy = { ...policy, appIds: new Set(["A-bot"]) };
+  const unroutable: string[] = [];
+  await handleSlackEnvelope(
+    {
+      body: {
+        event_id: "Ev-bot-all",
+        envelope_id: "env-bot-all",
+        event: {
+          type: "message",
+          channel: "C1",
+          text: "WAKE: everyone | quoted from an agent reply",
+          ts: "2400.1",
+          thread_ts: "2400.1",
+          app_id: "A-bot",
+        },
+      },
+      async ack() {},
+    },
+    {
+      workspaceId: WORKSPACE_ID,
+      policy: appPolicy,
+      broker,
+      dropNotifier: {
+        noticeDroppedSender() { throw new Error("the bot is admitted; this is not a sender drop"); },
+        noticeUnroutableActor(_channelId, _threadTs, actor) { unroutable.push(actor); },
+      },
+    },
+  );
+  assert.deepEqual(unroutable, ["everyone"]);
+  assert.equal(store.listDeliveries().length, 0);
+  store.close();
+});
+
+test("a redelivery of a WAKE list creates no duplicate deliveries (KRA-926)", async () => {
+  const { store, broker } = affinityFixture(["fable", "gnomon"]);
+  const env = messageBody({ eventId: "Ev-dup", text: "WAKE: fable, gnomon | once", ts: "2500.1", threadTs: "2500.1" });
+  await deliver(broker, env);
+  await deliver(broker, env); // lost-ACK redelivery of the same event_id
+  const deliveries = store.listDeliveries();
+  // Per-actor `Ev-dup#<actor>` identities dedupe under INSERT OR IGNORE.
+  assert.equal(deliveries.length, 2);
+  assert.deepEqual(deliveries.map((delivery) => delivery.actor).sort(), ["fable", "gnomon"]);
+  store.close();
+});
+
+test("a NEXT list form wakes every named actor, identical to WAKE (KRA-926)", async () => {
+  const { store, broker } = affinityFixture(["fable", "gnomon"]);
+  await deliver(broker, messageBody({ eventId: "Ev-next", text: "NEXT fable, gnomon — both of you", ts: "2600.1", threadTs: "2600.1" }));
+  const deliveries = store.listDeliveries();
+  assert.deepEqual(deliveries.map((delivery) => delivery.actor).sort(), ["fable", "gnomon"]);
   store.close();
 });
 
