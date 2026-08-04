@@ -7,6 +7,8 @@ export interface SlackTransport {
 }
 
 export class BrokerService {
+  private outboxDrain: Promise<number> | null = null;
+
   constructor(
     readonly store: BrokerStore,
     private readonly slack: SlackTransport,
@@ -112,11 +114,24 @@ export class BrokerService {
   }
 
   /**
-   * Deliver every unsent outbox row to Slack. Failures leave the row unsent —
-   * the next drain retries it. At-least-once with duplicates tolerated, same
-   * as every other Hive lane.
+   * Deliver every unsent outbox row to Slack. Overlapping healthy callers
+   * share one in-process pass; without that single-flight fence, every polling
+   * edge plus housekeeping can post the same row before any caller marks it
+   * sent. Crash/transport uncertainty still leaves the row unsent for the next
+   * pass, preserving the required at-least-once semantics.
    */
-  async drainOutbox(): Promise<number> {
+  drainOutbox(): Promise<number> {
+    if (this.outboxDrain) return this.outboxDrain;
+    const active = this.drainOutboxOnce();
+    this.outboxDrain = active;
+    active.then(
+      () => { if (this.outboxDrain === active) this.outboxDrain = null; },
+      () => { if (this.outboxDrain === active) this.outboxDrain = null; },
+    );
+    return active;
+  }
+
+  private async drainOutboxOnce(): Promise<number> {
     const entries = this.store.listUnsentOutbox();
     let sent = 0;
     for (const entry of entries) {
