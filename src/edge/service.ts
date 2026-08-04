@@ -283,20 +283,55 @@ class PreDispatchError extends Error {
 }
 
 export function headlessAcknowledgement(receipt: string): string {
-  let best = "Headless provider turn completed successfully.";
+  // Three sources in precedence order. Claude's terminal `result` line is the
+  // clean-run outcome; Codex's `item.completed`/`agent_message` is its
+  // equivalent. But when a run is disturbed — e.g. a hook_non_blocking_error
+  // aborts the clean result — Claude may emit no usable `result`, leaving only
+  // the assistant turns. Falling back to the last assistant message keeps the
+  // real final text out of the empty-summary hole instead of surfacing the
+  // "completed successfully" placeholder.
+  let resultText: string | null = null;
+  let agentMessageText: string | null = null;
+  let lastAssistantText: string | null = null;
   for (const line of receipt.split("\n")) {
     try {
       const value = JSON.parse(line) as Record<string, unknown>;
-      if (value.type === "result" && typeof value.result === "string") best = value.result;
+      if (value.type === "result" && typeof value.result === "string" && value.result.length > 0) {
+        resultText = value.result;
+      }
       const item = value.item as Record<string, unknown> | undefined;
       if (value.type === "item.completed" && item?.type === "agent_message" && typeof item.text === "string") {
-        best = item.text;
+        agentMessageText = item.text;
+      }
+      if (value.type === "assistant") {
+        const text = assistantMessageText(value.message);
+        if (text) lastAssistantText = text;
       }
     } catch {
       // Provider receipts are JSONL on supported surfaces; non-JSON diagnostics are ignored.
     }
   }
+  const best = resultText ?? agentMessageText ?? lastAssistantText ?? "Headless provider turn completed successfully.";
   return best.length <= 2_500 ? best : `${best.slice(0, 2_497)}…`;
+}
+
+/** Concatenate the text blocks of a Claude `assistant` stream-json message. */
+function assistantMessageText(message: unknown): string | null {
+  if (!message || typeof message !== "object") return null;
+  const content = (message as { content?: unknown }).content;
+  if (!Array.isArray(content)) return null;
+  const parts: string[] = [];
+  for (const block of content) {
+    if (
+      block && typeof block === "object"
+      && (block as { type?: unknown }).type === "text"
+      && typeof (block as { text?: unknown }).text === "string"
+    ) {
+      parts.push((block as { text: string }).text);
+    }
+  }
+  const joined = parts.join("").trim();
+  return joined.length > 0 ? joined : null;
 }
 
 function classifyDeliveryFailure(error: unknown, providerStarted: boolean): Reason {

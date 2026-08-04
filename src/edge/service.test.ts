@@ -25,6 +25,26 @@ test("Claude stream JSON receipt yields the result", () => {
   assert.equal(headlessAcknowledgement(receipt), "Done from Claude.");
 });
 
+test("a hook-disturbed Claude run falls back to the last assistant message, not the placeholder", () => {
+  // A hook_non_blocking_error left the terminal result line unusable (no string
+  // `result`), so the clean-run source is absent. The final assistant turn is
+  // still the real outcome and must surface instead of the empty-summary placeholder.
+  const receipt = [
+    JSON.stringify({ type: "system", subtype: "init", session_id: "s1" }),
+    JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "Fixed the PATH and pushed the branch." }] } }),
+    JSON.stringify({ type: "result", subtype: "error_during_execution", result: null }),
+  ].join("\n");
+  assert.equal(headlessAcknowledgement(receipt), "Fixed the PATH and pushed the branch.");
+});
+
+test("a clean Claude result still wins over earlier assistant turns", () => {
+  const receipt = [
+    JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "thinking out loud" }] } }),
+    JSON.stringify({ type: "result", subtype: "success", result: "Final answer." }),
+  ].join("\n");
+  assert.equal(headlessAcknowledgement(receipt), "Final answer.");
+});
+
 function subscription(overrides: Partial<Subscription> = {}): Subscription {
   return {
     actor: "ariadne",

@@ -29,6 +29,11 @@ export class BrokerService {
     return this.store.hasActiveSubscription();
   }
 
+  /** Actors already bound to a Slack thread — the target set for thread affinity. */
+  boundActors(channelId: string, threadTs: string): string[] {
+    return this.store.actorsBoundToThread(channelId, threadTs);
+  }
+
   async claim(edgeId: string, after: number, waitMs: number): Promise<Delivery | null> {
     const deadline = Date.now() + Math.min(Math.max(waitMs, 0), 30_000);
     do {

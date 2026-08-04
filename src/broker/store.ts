@@ -347,6 +347,28 @@ export class BrokerStore {
     return rows.some((row) => !isExpired(row.expires_at, now));
   }
 
+  /**
+   * The set of actors bound to a Slack thread: every actor that already has a
+   * delivery whose originating event sits in this channel/thread. Thread
+   * affinity routes an envelope-less admitted message to exactly this set, so a
+   * conversation started with a `WAKE:` continues without re-addressing.
+   *
+   * Binding is derived from the persisted store (deliveries joined to their
+   * events), never from process memory, so it survives a broker restart. Every
+   * delivery counts regardless of status: a completed delivery still means the
+   * actor is part of this thread's conversation.
+   */
+  actorsBoundToThread(channelId: string, threadTs: string): string[] {
+    const rows = this.db.prepare(`
+      SELECT DISTINCT d.actor
+      FROM deliveries d
+      JOIN slack_events e ON e.event_id = d.event_id
+      WHERE e.channel_id = ? AND e.thread_ts = ?
+      ORDER BY d.actor
+    `).all(channelId, threadTs) as Row[];
+    return rows.map((row) => String(row.actor));
+  }
+
   ingestEvent(event: SlackEventInput, initialSnapshot: unknown | null = null): { created: boolean; deliveryId: number | null } {
     return this.db.transaction(() => {
       const inserted = this.db.prepare(`

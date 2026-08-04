@@ -11,6 +11,7 @@ import { SlackSocketIngress, SlackWebTransport } from "./broker/slack.js";
 import { BrokerStore } from "./broker/store.js";
 import { SlackDeafnessWatchdog } from "./broker/watchdog.js";
 import { SubscriptionInputSchema, type Delivery } from "./domain.js";
+import { ensureEdgeStateDirs } from "./edge/bootstrap.js";
 import { BrokerClient } from "./edge/broker-client.js";
 import { EdgeControlServer } from "./edge/control.js";
 import { LiveIngressRegistry } from "./edge/live-registry.js";
@@ -92,17 +93,20 @@ program.command("edge")
   .description("run a workstation edge")
   .action(async () => {
     const config = EdgeConfig.parse(process.env);
+    const ingressRoot = config.HIVE_INGRESS_DIR ?? join(hiveHome(), "ingress");
+    const socketPath = config.HIVE_EDGE_SOCKET ?? join(hiveHome(), "edge.sock");
+    // A fresh machine has no ~/.hive/ tree; better-sqlite3 and the control
+    // socket both refuse to open into a missing directory. Bootstrap the state
+    // dirs before anything opens them.
+    ensureEdgeStateDirs({ dbPath: config.HIVE_EDGE_DB, socketPath, ingressDir: ingressRoot });
     const broker = new BrokerClient(config.HIVE_BROKER_URL, config.HIVE_EDGE_ID, config.HIVE_EDGE_TOKEN);
     const store = new EdgeStore(config.HIVE_EDGE_DB);
     const live = new LiveIngressRegistry();
-    const ingressRoot = config.HIVE_INGRESS_DIR ?? join(hiveHome(), "ingress");
     const edge = new EdgeService(broker, store, live, [
       new CodexProvider(),
       new ClaudeProvider({ ingressRoot }),
     ]);
-    const control = new EdgeControlServer(edge, {
-      socketPath: config.HIVE_EDGE_SOCKET ?? join(hiveHome(), "edge.sock"),
-    });
+    const control = new EdgeControlServer(edge, { socketPath });
     await control.start();
     const controller = new AbortController();
     const run = edge.run(controller.signal);

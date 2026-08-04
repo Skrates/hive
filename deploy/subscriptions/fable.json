@@ -1,5 +1,5 @@
 {
-  "actor": "claude-1",
+  "actor": "fable",
   "provider": "claude",
   "providerSurface": "claude-code",
   "providerVersion": "2.x",
@@ -9,7 +9,7 @@
   "edgeWorkspaces": [{ "edgeId": "laptop", "cwd": "/home/rationallyprime/projects", "worktree": null }],
   "wakePolicy": "spawn",
   "permissionProfile": "workspace-write",
-  "accountProfile": "/home/rationallyprime/.hive/profiles/claude-1",
+  "accountProfile": "/home/rationallyprime/.hive/profiles/fable",
   "leaseTtlMs": 60000,
   "deliveryTtlMs": 86400000,
   "homeGraceMs": 30000,
