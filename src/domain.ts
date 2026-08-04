@@ -179,7 +179,11 @@ export function dedupeKey(delivery: Pick<Delivery, "id"> & { event: Pick<SlackEv
  * of the instruction: handling quoted material sanely is the receiving agent's
  * ordinary hygiene, not a Hive control.
  */
-export function frameWakeInstruction(delivery: Delivery, replay: ReplaySnapshot | null): string {
+export function frameWakeInstruction(
+  delivery: Delivery,
+  replay: ReplaySnapshot | null,
+  outcomeReporter: "agent" | "edge" = "agent",
+): string {
   const key = dedupeKey(delivery);
   const lines = [
     `Message from ${delivery.event.senderId} in Slack thread ${delivery.event.channelId}/${delivery.event.threadTs}`,
@@ -197,10 +201,16 @@ export function frameWakeInstruction(delivery: Delivery, replay: ReplaySnapshot 
       coalesced.text,
     );
   }
-  lines.push(
-    "",
-    `Act on ${delivery.coalescedMessages.length > 0 ? "these messages" : "this message"}, then report your outcome to the thread by running: hive reply ${delivery.id} "<summary>"`,
-  );
+  const target = delivery.coalescedMessages.length > 0 ? "these messages" : "this message";
+  lines.push("");
+  if (outcomeReporter === "agent") {
+    lines.push(`Act on ${target}, then report your outcome to the thread by running: hive reply ${delivery.id} "<summary>"`);
+  } else {
+    lines.push(
+      `Act on ${target}, then make your final response a concise outcome summary.`,
+      "This is a headless wake: Hive will relay that final response to the thread, so do not run hive reply yourself.",
+    );
+  }
   if (replay && replay.messages.length > 0) {
     lines.push(
       "",

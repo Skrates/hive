@@ -160,6 +160,7 @@ class StubAdapter implements ProviderAdapter {
   readonly spawns: string[] = [];
   readonly resumes: string[] = [];
   readonly liveDeliveries: number[] = [];
+  readonly liveFrames: string[] = [];
 
   constructor(
     private readonly behavior: {
@@ -177,7 +178,7 @@ class StubAdapter implements ProviderAdapter {
   async deliverLive(_ingress: LiveIngress, value: Delivery, framed: string): Promise<ProviderDispatch> {
     if (this.behavior.dispatchError) throw this.behavior.dispatchError;
     this.liveDeliveries.push(value.id);
-    void framed;
+    this.liveFrames.push(framed);
     return this.behavior.liveResult ?? { receipt: `live:${value.id}`, processed: false };
   }
 
@@ -202,11 +203,15 @@ test("a headless resume dispatch completes, posts its outcome, and finishes proc
 
   assert.equal(await edge.processOne(), true);
   assert.equal(adapter.resumes.length, 1);
-  // The envelope is imperative, self-identifying, and instructs the outcome report.
+  // The envelope is imperative and self-identifying. A headless provider's
+  // final response is the outcome, so it must not race the edge by calling the
+  // live-session outcome command itself.
   assert.match(adapter.resumes[0]!, /^Message from U1 /);
   assert.match(adapter.resumes[0]!, /dedupe 100\.1:1/);
   assert.match(adapter.resumes[0]!, /attempt 1/);
-  assert.match(adapter.resumes[0]!, /hive reply 1/);
+  assert.match(adapter.resumes[0]!, /Hive will relay that final response/);
+  assert.match(adapter.resumes[0]!, /do not run hive reply/);
+  assert.doesNotMatch(adapter.resumes[0]!, /hive reply 1/);
   assert.doesNotMatch(adapter.resumes[0]!, /untrusted/i);
   assert.equal(broker.markCount, 1);
   // The outcome rides INSIDE the terminal transition (one durable broker
@@ -234,6 +239,8 @@ test("a live injection leaves the delivery dispatched until the agent's outcome 
 
   assert.equal(await edge.processOne(), true);
   assert.deepEqual(adapter.liveDeliveries, [2]);
+  assert.match(adapter.liveFrames[0]!, /hive reply 2/);
+  assert.doesNotMatch(adapter.liveFrames[0]!, /Hive will relay that final response/);
   assert.equal(broker.markCount, 1);
   // Live injection produces no synthetic reply and NO terminal transition:
   // the receipt only proves durable dispatch, so the delivery stays
