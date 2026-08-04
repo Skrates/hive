@@ -25,6 +25,8 @@ interface SlackEnvelopeBody {
 
 interface SlackEventIngester {
   ingest(event: SlackEventInput, initialSnapshot?: unknown | null): unknown;
+  /** Actors already bound to (channelId, threadTs) — the thread-affinity target set. */
+  boundActors(channelId: string, threadTs: string): string[];
 }
 
 /**
@@ -98,51 +100,77 @@ export async function handleSlackEnvelope(
     await ack();
     return;
   }
+  // An explicit WAKE:/NEXT envelope names its recipient and always takes
+  // precedence. Without one, thread affinity may still route the message to the
+  // actors already bound to its thread — but only after the same admission
+  // checks. Parsing is not routing; admission decides first.
   const addressed = parseAddressedWake(event.text);
-  if (!addressed) {
-    await ack();
-    return;
-  }
   const senderKind = event.user ? "user" : "app";
   const senderId = event.user ?? event.app_id ?? event.bot_id;
-  // Surface admission first: a message in a workspace or channel Hive does not
+  const threadTs = event.thread_ts ?? event.ts;
+
+  // Surface occupancy first: a message in a workspace or channel Hive does not
   // occupy is silently ignored — posting notices into foreign channels is not
-  // Hive's place. Inside an admitted surface, an addressed message from a
-  // principal outside the closed trust set is dropped with a thread notice
-  // (ADR-0003 R-1): delivered-but-silently-swallowed would be indistinguishable
-  // from delivered-and-ignored, and silence is always a defect.
+  // Hive's place.
   if (!policy.workspaceIds.has(workspaceId) || !policy.channelIds.has(event.channel)) {
     await ack();
     return;
   }
+  // Admission is never weakened by affinity. A message from a principal outside
+  // the closed trust set is dropped. An addressed drop is thread-visible
+  // (ADR-0003 R-1): delivered-but-silently-swallowed would be indistinguishable
+  // from delivered-and-ignored. An envelope-less drop stays silent — it matches
+  // today's "no envelope → ignored" behavior and keeps stray channel chatter
+  // from spamming trust-set notices.
   if (!senderId || !isAdmitted(policy, {
     workspaceId,
     channelId: event.channel,
     senderId,
     senderKind,
   })) {
-    if (senderId && dropNotifier) {
-      dropNotifier.noticeDroppedSender(event.channel, event.thread_ts ?? event.ts, senderId);
+    if (addressed && senderId && dropNotifier) {
+      dropNotifier.noticeDroppedSender(event.channel, threadTs, senderId);
     }
     await ack();
     return;
   }
 
-  const normalized: SlackEventInput = {
-    eventId,
-    workspaceId,
-    channelId: event.channel,
-    threadTs: event.thread_ts ?? event.ts,
-    messageTs: event.ts,
-    senderId,
-    senderKind,
-    actor: addressed.actor,
-    text: event.text,
-    raw: body,
-    receivedAt: now().toISOString(),
-  };
+  // Admitted. An explicit envelope targets its named actor and binds that actor
+  // to the thread going forward. Otherwise thread affinity routes to every actor
+  // already bound to this thread (derived from the persisted store, so it
+  // survives a broker restart). A thread with no binding and no envelope is
+  // ignored exactly as before.
+  const targets = addressed
+    ? [addressed.actor]
+    : broker.boundActors(event.channel, threadTs);
+  if (targets.length === 0) {
+    await ack();
+    return;
+  }
 
-  await broker.ingest(normalized);
+  const receivedAt = now().toISOString();
+  for (const actor of targets) {
+    // One Slack message fans out to one delivery per target actor. A lone
+    // explicit envelope keeps the Slack event_id verbatim; affinity fan-out
+    // derives a per-actor durable identity so the slack_events primary key never
+    // collides across a multi-actor thread, while a Slack redelivery of the same
+    // event still deduplicates per actor and coalesces per actor as today.
+    const perActorEventId = addressed && targets.length === 1 ? eventId : `${eventId}#${actor}`;
+    const normalized: SlackEventInput = {
+      eventId: perActorEventId,
+      workspaceId,
+      channelId: event.channel,
+      threadTs,
+      messageTs: event.ts,
+      senderId,
+      senderKind,
+      actor,
+      text: event.text,
+      raw: body,
+      receivedAt,
+    };
+    await broker.ingest(normalized);
+  }
   await ack();
 }
 

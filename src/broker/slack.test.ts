@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import type { AdmissionPolicy } from "../addressing.js";
 import type { SlackEventInput, SubscriptionInput } from "../domain.js";
@@ -72,6 +75,47 @@ function fixture() {
   return { store, broker: new BrokerService(store, slack) };
 }
 
+function subscriptionFor(actor: string): SubscriptionInput {
+  return { ...subscription(), actor };
+}
+
+function affinityFixture(actors: string[], path = ":memory:") {
+  const store = new BrokerStore(path);
+  store.createEdge("edge-1");
+  for (const actor of actors) store.upsertSubscription(subscriptionFor(actor));
+  return { store, broker: new BrokerService(store, slack) };
+}
+
+function messageBody(opts: {
+  eventId: string;
+  text: string;
+  ts: string;
+  threadTs?: string;
+  user?: string;
+  metadataType?: string;
+}) {
+  return {
+    event_id: opts.eventId,
+    envelope_id: `env-${opts.eventId}`,
+    event: {
+      type: "message",
+      channel: "C1",
+      text: opts.text,
+      ts: opts.ts,
+      ...(opts.threadTs ? { thread_ts: opts.threadTs } : {}),
+      user: opts.user ?? "U1",
+      ...(opts.metadataType ? { metadata: { event_type: opts.metadataType } } : {}),
+    },
+  };
+}
+
+async function deliver(broker: BrokerService, bodyValue: ReturnType<typeof messageBody>): Promise<void> {
+  await handleSlackEnvelope(
+    { body: bodyValue, async ack() {} },
+    { workspaceId: WORKSPACE_ID, policy, broker },
+  );
+}
+
 test("crash after commit before ACK makes fresh-envelope redelivery harmless", async () => {
   const { store, broker } = fixture();
   let firstAckAttempts = 0;
@@ -91,6 +135,7 @@ test("crash after commit before ACK makes fresh-envelope redelivery harmless", a
           broker.ingest(event);
           throw new Error("injected crash after commit before ACK");
         },
+        boundActors: () => [],
       },
       now: () => new Date("2026-08-01T00:00:00.000Z"),
     }),
@@ -142,6 +187,7 @@ test("missing event_id refuses envelope identity fallback, logs safely, then ACK
       ingest(event) {
         ingested = event;
       },
+      boundActors: () => [],
     },
     logDiagnostic(message) {
       actions.push(`log:${message}`);
@@ -172,6 +218,7 @@ test("ingest failure leaves the envelope unacknowledged for Slack redelivery", a
         ingest() {
           throw new Error("injected ingest failure");
         },
+        boundActors: () => [],
       },
     }),
     /injected ingest failure/,
@@ -201,7 +248,7 @@ test("a sender outside the trust set is dropped with a thread notice (ADR-0003 R
   }, {
     workspaceId: WORKSPACE_ID,
     policy,
-    broker: { ingest() { ingested = true; } },
+    broker: { ingest() { ingested = true; }, boundActors: () => [] },
     dropNotifier: {
       noticeDroppedSender(channelId, threadTs, senderId) {
         notices.push({ channelId, threadTs, senderId });
@@ -234,7 +281,7 @@ test("a message in an unadmitted channel is silently ignored — no notice into 
   }, {
     workspaceId: WORKSPACE_ID,
     policy,
-    broker: { ingest() { ingested = true; } },
+    broker: { ingest() { ingested = true; }, boundActors: () => [] },
     dropNotifier: {
       noticeDroppedSender(_channelId, _threadTs, senderId) {
         notices.push(senderId);
@@ -265,7 +312,7 @@ test("malformed untrusted message fields are refused and acknowledged without in
   }, {
     workspaceId: WORKSPACE_ID,
     policy,
-    broker: { ingest() { ingested = true; } },
+    broker: { ingest() { ingested = true; }, boundActors: () => [] },
   });
 
   assert.equal(acked, true);
@@ -299,4 +346,114 @@ test("Hive's own outbox posts are never re-ingested as wakes — no recursion (A
   assert.equal(acked, 1);
   assert.equal(store.listDeliveries().length, 0);
   store.close();
+});
+
+test("thread affinity: an envelope-less admitted message wakes the actor bound to its thread", async () => {
+  const { store, broker } = affinityFixture(["ariadne"]);
+  // A WAKE binds ariadne to thread 500.1.
+  await deliver(broker, messageBody({ eventId: "Ev-seed", text: "WAKE: ariadne | start", ts: "500.1", threadTs: "500.1" }));
+  store.recordOutcome(1, "handled"); // terminalize so the follow-up creates a fresh delivery, not a coalesce.
+  // A follow-up with NO envelope routes by affinity — no re-addressing.
+  await deliver(broker, messageBody({ eventId: "Ev-follow", text: "and do the second thing", ts: "500.2", threadTs: "500.1" }));
+  const deliveries = store.listDeliveries();
+  assert.deepEqual(deliveries.map((delivery) => delivery.actor), ["ariadne", "ariadne"]);
+  assert.equal(deliveries[1]!.event.text, "and do the second thing");
+  store.close();
+});
+
+test("thread affinity: an envelope-less message fans out to every actor bound to the thread", async () => {
+  const { store, broker } = affinityFixture(["ariadne", "fable"]);
+  await deliver(broker, messageBody({ eventId: "Ev-a", text: "WAKE: ariadne | one", ts: "600.1", threadTs: "600.1" }));
+  await deliver(broker, messageBody({ eventId: "Ev-b", text: "WAKE: fable | two", ts: "600.2", threadTs: "600.1" }));
+  store.recordOutcome(1, "x");
+  store.recordOutcome(2, "y");
+  await deliver(broker, messageBody({ eventId: "Ev-c", text: "carry on both of you", ts: "600.3", threadTs: "600.1" }));
+  const deliveries = store.listDeliveries();
+  assert.equal(deliveries.length, 4);
+  assert.deepEqual(deliveries.slice(2).map((delivery) => delivery.actor).sort(), ["ariadne", "fable"]);
+  store.close();
+});
+
+test("thread affinity: coalescing still folds an envelope-less burst per actor", async () => {
+  const { store, broker } = affinityFixture(["ariadne"]);
+  await deliver(broker, messageBody({ eventId: "Ev-seed", text: "WAKE: ariadne | start", ts: "650.1", threadTs: "650.1" }));
+  store.recordOutcome(1, "done"); // clear the seed so the first affinity message opens a fresh pending delivery.
+  await deliver(broker, messageBody({ eventId: "Ev-1", text: "first follow-up", ts: "650.2", threadTs: "650.1" }));
+  await deliver(broker, messageBody({ eventId: "Ev-2", text: "second follow-up", ts: "650.3", threadTs: "650.1" }));
+  const deliveries = store.listDeliveries();
+  // Two envelope-less messages against one pending delivery coalesce, exactly as an addressed burst would.
+  assert.equal(deliveries.length, 2);
+  const affinityDelivery = deliveries[1]!;
+  assert.equal(affinityDelivery.actor, "ariadne");
+  assert.deepEqual(affinityDelivery.coalescedMessages.map((message) => message.text), ["second follow-up"]);
+  store.close();
+});
+
+test("thread affinity: an explicit envelope takes precedence and binds the new actor going forward", async () => {
+  const { store, broker } = affinityFixture(["ariadne", "fable"]);
+  await deliver(broker, messageBody({ eventId: "Ev-1", text: "WAKE: ariadne | start", ts: "700.1", threadTs: "700.1" }));
+  store.recordOutcome(1, "x");
+  // An explicit WAKE: fable in the ariadne-bound thread targets fable ONLY — precedence, not affinity fan-out.
+  await deliver(broker, messageBody({ eventId: "Ev-2", text: "WAKE: fable | you take this one", ts: "700.2", threadTs: "700.1" }));
+  const afterExplicit = store.listDeliveries();
+  assert.equal(afterExplicit.length, 2);
+  assert.equal(afterExplicit[1]!.actor, "fable");
+  store.recordOutcome(2, "y");
+  // fable is now bound too: the next envelope-less message wakes both.
+  await deliver(broker, messageBody({ eventId: "Ev-3", text: "both please", ts: "700.3", threadTs: "700.1" }));
+  const all = store.listDeliveries();
+  assert.equal(all.length, 4);
+  assert.deepEqual(all.slice(2).map((delivery) => delivery.actor).sort(), ["ariadne", "fable"]);
+  store.close();
+});
+
+test("thread affinity: a message in a thread with no binding and no envelope is ignored", async () => {
+  const { store, broker } = affinityFixture(["ariadne"]);
+  let acked = false;
+  await handleSlackEnvelope(
+    { body: messageBody({ eventId: "Ev-chatter", text: "just thinking out loud", ts: "800.2", threadTs: "800.1" }), async ack() { acked = true; } },
+    { workspaceId: WORKSPACE_ID, policy, broker },
+  );
+  assert.equal(acked, true);
+  assert.equal(store.listDeliveries().length, 0);
+  store.close();
+});
+
+test("thread affinity: a seat's own outcome post never wakes anyone, including itself", async () => {
+  const { store, broker } = affinityFixture(["ariadne"]);
+  await deliver(broker, messageBody({ eventId: "Ev-seed", text: "WAKE: ariadne | start", ts: "900.1", threadTs: "900.1" }));
+  store.recordOutcome(1, "done");
+  // Hive's own outbox posts carry hive_* metadata. Even in a bound thread, and
+  // even when the text parses as an addressed wake, they must not mint a delivery.
+  await deliver(broker, messageBody({ eventId: "Ev-self-1", text: "WAKE: ariadne | quoted in an outcome", ts: "900.2", threadTs: "900.1", metadataType: "hive_delivery_reply" }));
+  // An envelope-less outcome summary in the bound thread must not affinity-wake either.
+  await deliver(broker, messageBody({ eventId: "Ev-self-2", text: "here is my summary", ts: "900.3", threadTs: "900.1", metadataType: "hive_delivery_reply" }));
+  assert.equal(store.listDeliveries().length, 1);
+  store.close();
+});
+
+test("thread affinity survives a broker restart — bindings derive from the persisted store", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "hive-affinity-"));
+  const dbPath = join(dir, "broker.sqlite");
+  try {
+    const storeA = new BrokerStore(dbPath);
+    storeA.createEdge("edge-1");
+    storeA.upsertSubscription(subscriptionFor("ariadne"));
+    const brokerA = new BrokerService(storeA, slack);
+    await deliver(brokerA, messageBody({ eventId: "Ev-seed", text: "WAKE: ariadne | start", ts: "1000.1", threadTs: "1000.1" }));
+    storeA.recordOutcome(1, "done");
+    storeA.close();
+
+    // A fresh store instance over the same file — a broker restart with no process memory.
+    const storeB = new BrokerStore(dbPath);
+    const brokerB = new BrokerService(storeB, slack);
+    await deliver(brokerB, messageBody({ eventId: "Ev-after-restart", text: "still here?", ts: "1000.2", threadTs: "1000.1" }));
+    const deliveries = storeB.listDeliveries();
+    assert.equal(deliveries.length, 2);
+    assert.equal(deliveries[1]!.actor, "ariadne");
+    assert.equal(deliveries[1]!.event.text, "still here?");
+    storeB.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
