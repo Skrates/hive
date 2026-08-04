@@ -173,6 +173,15 @@ program.command("put-subscription")
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
   });
 
+program.command("delete-subscription")
+  .argument("<actor>")
+  .description("retire an actor after its deliveries terminalize; remove its subscription and bindings")
+  .action(async (actor: string) => {
+    const client = new BrokerClient(requiredEnv("HIVE_BROKER_URL"), "admin", "unused");
+    const result = await client.deleteSubscription(requiredEnv("HIVE_ADMIN_TOKEN"), actor);
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+  });
+
 const BrokerConfig = z.object({
   HIVE_BROKER_DB: z.string().min(1).default("hive-broker.sqlite"),
   HIVE_BROKER_HOST: z.string().min(1).default("127.0.0.1"),

@@ -27,6 +27,11 @@ interface SlackEventIngester {
   ingest(event: SlackEventInput, initialSnapshot?: unknown | null): unknown;
   /** Actors already bound to (channelId, threadTs) — the thread-affinity target set. */
   boundActors(channelId: string, threadTs: string): string[];
+  /**
+   * Actors targeted by this raw Slack event, frozen on first sight so a lost-ACK
+   * redelivery routes to the same set even if the thread's bindings changed.
+   */
+  freezeAffinityTargets(rawEventId: string, channelId: string, threadTs: string): string[];
 }
 
 /**
@@ -116,19 +121,18 @@ export async function handleSlackEnvelope(
     await ack();
     return;
   }
-  // Admission is never weakened by affinity. A message from a principal outside
-  // the closed trust set is dropped. An addressed drop is thread-visible
-  // (ADR-0003 R-1): delivered-but-silently-swallowed would be indistinguishable
-  // from delivered-and-ignored. An envelope-less drop stays silent — it matches
-  // today's "no envelope → ignored" behavior and keeps stray channel chatter
-  // from spamming trust-set notices.
+  // Admission is never weakened by affinity. ADR-0003 R-1 makes every message
+  // from an identified principal outside the closed trust set thread-visible on
+  // an admitted surface. Whether a trusted sender would currently have an
+  // affinity target is irrelevant: silently acknowledging the rejected message
+  // would make the trust boundary invisible to the sender and operator.
   if (!senderId || !isAdmitted(policy, {
     workspaceId,
     channelId: event.channel,
     senderId,
     senderKind,
   })) {
-    if (addressed && senderId && dropNotifier) {
+    if (senderId && dropNotifier) {
       dropNotifier.noticeDroppedSender(event.channel, threadTs, senderId);
     }
     await ack();
@@ -137,12 +141,14 @@ export async function handleSlackEnvelope(
 
   // Admitted. An explicit envelope targets its named actor and binds that actor
   // to the thread going forward. Otherwise thread affinity routes to every actor
-  // already bound to this thread (derived from the persisted store, so it
-  // survives a broker restart). A thread with no binding and no envelope is
-  // ignored exactly as before.
+  // already bound to this thread — frozen by raw event ID on first sight, so a
+  // lost-ACK redelivery reaches exactly the set bound when the message was first
+  // seen and never an actor that joined afterward (derived from the persisted
+  // store, so it also survives a broker restart). A thread with no binding and no
+  // envelope is ignored exactly as before.
   const targets = addressed
     ? [addressed.actor]
-    : broker.boundActors(event.channel, threadTs);
+    : broker.freezeAffinityTargets(eventId, event.channel, threadTs);
   if (targets.length === 0) {
     await ack();
     return;

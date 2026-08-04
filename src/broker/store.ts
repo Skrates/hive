@@ -236,6 +236,12 @@ export class BrokerStore {
 
       CREATE INDEX IF NOT EXISTS outbox_unsent_idx
         ON outbox(sent_at, outbox_id);
+
+      CREATE TABLE IF NOT EXISTS event_targets (
+        raw_event_id TEXT PRIMARY KEY,
+        actors_json TEXT NOT NULL,
+        frozen_at TEXT NOT NULL
+      );
     `);
   }
 
@@ -367,6 +373,80 @@ export class BrokerStore {
       ORDER BY d.actor
     `).all(channelId, threadTs) as Row[];
     return rows.map((row) => String(row.actor));
+  }
+
+  /**
+   * Resolve — and permanently freeze — the thread-affinity target set for one raw
+   * Slack event. The first call for a `rawEventId` computes the currently-bound
+   * actors and records them atomically; every later call (a lost-ACK redelivery
+   * of the same event) returns that frozen set verbatim, ignoring the live
+   * bindings.
+   *
+   * Without this freeze, a redelivery would recompute `actorsBoundToThread` and
+   * could pick up an actor that was bound to the thread *after* this message was
+   * posted — waking it with an instruction issued before it joined. The freeze
+   * is keyed by the raw Slack event ID (the identity Slack retries under) and
+   * happens inside one transaction, so concurrent redeliveries can never expand
+   * the recipient set. An empty set is frozen too: a message posted into an
+   * unbound thread stays unbound on redelivery.
+   */
+  freezeAffinityTargets(rawEventId: string, channelId: string, threadTs: string): string[] {
+    return this.db.transaction(() => {
+      const existing = this.db.prepare(
+        "SELECT actors_json FROM event_targets WHERE raw_event_id = ?",
+      ).get(rawEventId) as Row | undefined;
+      if (existing) return JSON.parse(String(existing.actors_json)) as string[];
+      const actors = this.actorsBoundToThread(channelId, threadTs);
+      this.db.prepare(
+        "INSERT INTO event_targets(raw_event_id, actors_json, frozen_at) VALUES (?, ?, ?)",
+      ).run(rawEventId, JSON.stringify(actors), iso(this.clock));
+      return actors;
+    })();
+  }
+
+  /**
+   * Retire an actor: delete its subscription and every row that keeps it
+   * addressable or thread-bound — its deliveries (and their delivery_events,
+   * spawn_reservations), the slack_events they originated from, its spawn windows
+   * and lease. After this the actor is unaddressable (no subscription to dispatch
+   * against) and unbound (no delivery joins it to any thread), closing the
+   * rename-migration gap where a renamed actor's old row stayed live forever.
+   *
+   * A non-terminal delivery is a hard stop: it may already be crossing the
+   * provider-effect boundary, so deleting it would erase the authoritative
+   * receipt/outcome coordinate while the agent could still act. The operator
+   * must let every delivery terminalize before retirement. Foreign keys are
+   * enforced, so dependents are then removed in reference order inside one
+   * transaction. Already-committed outbox posts remain durable and may still be
+   * delivered to Slack. Returns true if a subscription was actually removed.
+   */
+  deleteSubscription(actor: string): boolean {
+    return this.db.transaction(() => {
+      const active = this.db.prepare(`
+        SELECT delivery_id, status FROM deliveries
+        WHERE actor = ? AND status NOT IN ('processed', 'undeliverable', 'failed')
+        ORDER BY delivery_id LIMIT 1
+      `).get(actor) as Row | undefined;
+      if (active) {
+        throw new InvalidTransitionError(
+          `cannot retire ${actor}: delivery ${String(active.delivery_id)} is ${String(active.status)}`,
+        );
+      }
+      this.db.prepare(`
+        DELETE FROM spawn_reservations
+        WHERE delivery_id IN (SELECT delivery_id FROM deliveries WHERE actor = ?)
+      `).run(actor);
+      this.db.prepare(`
+        DELETE FROM delivery_events
+        WHERE delivery_id IN (SELECT delivery_id FROM deliveries WHERE actor = ?)
+      `).run(actor);
+      this.db.prepare("DELETE FROM deliveries WHERE actor = ?").run(actor);
+      this.db.prepare("DELETE FROM slack_events WHERE actor = ?").run(actor);
+      this.db.prepare("DELETE FROM spawn_windows WHERE actor = ?").run(actor);
+      this.db.prepare("DELETE FROM actor_leases WHERE actor = ?").run(actor);
+      const result = this.db.prepare("DELETE FROM subscriptions WHERE actor = ?").run(actor);
+      return result.changes > 0;
+    })();
   }
 
   ingestEvent(event: SlackEventInput, initialSnapshot: unknown | null = null): { created: boolean; deliveryId: number | null } {

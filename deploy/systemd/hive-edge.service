@@ -5,6 +5,14 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# systemd does NOT inherit the login shell's PATH: a service gets a fixed minimal
+# PATH, so a node installed outside it (nvm, a versioned prefix) is invisible and
+# `/usr/bin/env node` would exit 127 in a Restart loop. This default finds a
+# distro node (/usr/bin/node). A machine whose node lives elsewhere sets PATH in
+# edge.env with its node's bin dir prepended — that later EnvironmentFile
+# assignment overrides this line. (The executable itself must stay a literal
+# path, so it cannot be a variable; /usr/bin/env resolves node from PATH.)
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 EnvironmentFile=%h/.config/hive/edge.env
 ExecStart=/usr/bin/env node %h/.local/lib/hive/dist/cli.js edge
 Restart=on-failure

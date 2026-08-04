@@ -8,6 +8,11 @@ Type=simple
 User=hive
 Group=hive
 WorkingDirectory=/opt/hive
+# systemd gives a service a fixed minimal PATH, not the login shell's, so
+# `/usr/bin/env node` would exit 127 if node is not under it. This default finds
+# a distro node (/usr/bin/node); a machine whose node lives elsewhere prepends
+# its bin dir to PATH in broker.env, whose later assignment overrides this line.
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 EnvironmentFile=/etc/hive/broker.env
 ExecStart=/usr/bin/env node /opt/hive/dist/cli.js broker
 Restart=on-failure

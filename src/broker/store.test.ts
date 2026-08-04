@@ -537,3 +537,69 @@ test("hasActiveSubscription orders expiry by instant, not by ISO string (fractio
     store.close();
   }
 });
+
+test("delete-subscription retires an actor: unaddressable, unbound, and idempotent", () => {
+  const { store } = fixture(); // ariadne, spawn policy, home edge mac
+  store.ingestEvent(event()); // delivery 1 for ariadne in thread 100.1
+  // Drive the delivery to a spawn reservation so every actor-scoped table has a row
+  // to prove the FK-ordered cascade, not just the subscription row, is removed.
+  const claimed = store.claimNext("mac", 0)!;
+  const generation = claimed.leaseGeneration!;
+  store.transition(1, "mac", generation, "claimed", "accepted_local");
+  store.transition(1, "mac", generation, "accepted_local", "dispatching");
+  assert.equal(store.reserveSpawn(1, "mac", generation), true);
+  store.finish(1, "mac", generation, "processed", [], "completed before retirement");
+
+  const rowsFor = (table: string) =>
+    Number((store.db.prepare(`SELECT count(*) AS count FROM ${table} WHERE actor = 'ariadne'`).get() as { count: number }).count);
+  const deliveryEventRows = () =>
+    Number((store.db.prepare("SELECT count(*) AS count FROM delivery_events").get() as { count: number }).count);
+
+  // Addressable and bound before retirement, with a row in every dependent table.
+  assert.notEqual(store.getSubscription("ariadne"), null);
+  assert.deepEqual(store.actorsBoundToThread("C1", "100.1"), ["ariadne"]);
+  for (const table of ["deliveries", "slack_events", "spawn_reservations", "spawn_windows", "actor_leases"]) {
+    assert.equal(rowsFor(table), 1, `${table} should have an ariadne row before delete`);
+  }
+  assert.equal(deliveryEventRows(), 1);
+
+  assert.equal(store.deleteSubscription("ariadne"), true);
+
+  // Unaddressable (no subscription to dispatch against) and unbound (no delivery
+  // joins it to any thread); every dependent row is gone — the FK cascade held.
+  assert.equal(store.getSubscription("ariadne"), null);
+  assert.deepEqual(store.actorsBoundToThread("C1", "100.1"), []);
+  assert.equal(store.listDeliveries().length, 0);
+  for (const table of ["deliveries", "slack_events", "spawn_reservations", "spawn_windows", "actor_leases"]) {
+    assert.equal(rowsFor(table), 0, `${table} should be empty after delete`);
+  }
+  assert.equal(deliveryEventRows(), 0);
+  // The already-committed outcome is deliberately not erased with the actor's
+  // addressability state; durable outbox posts still close the Slack loop.
+  assert.equal(store.listUnsentOutbox().length, 1);
+  assert.equal(store.listUnsentOutbox()[0]?.deliveryId, 1);
+
+  // Idempotent: retiring an already-absent actor is a no-op, not an error.
+  assert.equal(store.deleteSubscription("ariadne"), false);
+  store.close();
+});
+
+test("delete-subscription refuses to erase an in-flight provider coordinate", () => {
+  const { store } = fixture();
+  store.ingestEvent(event());
+  const claimed = store.claimNext("mac", 0)!;
+  const generation = claimed.leaseGeneration!;
+  store.transition(1, "mac", generation, "claimed", "accepted_local");
+  store.transition(1, "mac", generation, "accepted_local", "dispatching");
+
+  assert.throws(
+    () => store.deleteSubscription("ariadne"),
+    (error: unknown) =>
+      error instanceof InvalidTransitionError
+      && error.message === "cannot retire ariadne: delivery 1 is dispatching",
+  );
+  assert.notEqual(store.getSubscription("ariadne"), null);
+  assert.equal(store.getDelivery(1).status, "dispatching");
+  assert.deepEqual(store.actorsBoundToThread("C1", "100.1"), ["ariadne"]);
+  store.close();
+});
