@@ -4,7 +4,7 @@ import { isAdmitted, parseAddressedWake } from "./addressing.js";
 
 test("WAKE envelope addresses exactly one normalized actor", () => {
   assert.deepEqual(parseAddressedWake("WAKE: Fable | review this\nbody"), {
-    actor: "fable",
+    actors: ["fable"],
     envelope: "WAKE: Fable",
   });
   assert.equal(parseAddressedWake("FYI: fable | no action"), null);
@@ -12,15 +12,43 @@ test("WAKE envelope addresses exactly one normalized actor", () => {
 
 test("NEXT explicitly addresses its named recipient", () => {
   assert.deepEqual(parseAddressedWake("[actor=ariadne]\nNEXT fable — checksum"), {
-    actor: "fable",
+    actors: ["fable"],
     envelope: "NEXT fable",
   });
-  assert.equal(parseAddressedWake("[actor=ariadne]\nNEXT ariadne — continue")?.actor, "ariadne");
+  assert.deepEqual(parseAddressedWake("[actor=ariadne]\nNEXT ariadne — continue")?.actors, ["ariadne"]);
 });
 
 test("NEXT routing does not trust or require a body-declared sender", () => {
-  assert.equal(parseAddressedWake("[actor=ariadne]\nNEXT ariadne")?.actor, "ariadne");
-  assert.equal(parseAddressedWake("NEXT fable")?.actor, "fable");
+  assert.deepEqual(parseAddressedWake("[actor=ariadne]\nNEXT ariadne")?.actors, ["ariadne"]);
+  assert.deepEqual(parseAddressedWake("NEXT fable")?.actors, ["fable"]);
+});
+
+test("WAKE list addresses every named actor, normalized and de-duplicated in order", () => {
+  assert.deepEqual(parseAddressedWake("WAKE: fable, gnomon, ariadne | do the thing"), {
+    actors: ["fable", "gnomon", "ariadne"],
+    envelope: "WAKE: fable, gnomon, ariadne",
+  });
+  // Whitespace variants around commas, mixed case, and a repeat all collapse.
+  assert.deepEqual(parseAddressedWake("WAKE: Fable,gnomon , FABLE")?.actors, ["fable", "gnomon"]);
+  // The list stays on the envelope's first line — a comma cannot reach into body text.
+  assert.deepEqual(parseAddressedWake("WAKE: fable | gnomon, ariadne")?.actors, ["fable"]);
+});
+
+test("NEXT list form is identical to WAKE", () => {
+  assert.deepEqual(parseAddressedWake("NEXT fable, gnomon — carry on")?.actors, ["fable", "gnomon"]);
+});
+
+test("`everyone` parses as a single verbatim token — broadcast is a routing decision, not a parse one", () => {
+  assert.deepEqual(parseAddressedWake("WAKE: everyone | all hands")?.actors, ["everyone"]);
+});
+
+test("a malformed token rejects the whole line — malformed is not an envelope, distinct from unknown", () => {
+  // A well-formed-but-unknown name still parses (it dead-letters downstream); a
+  // token that fails the grammar after a comma poisons the whole envelope.
+  assert.equal(parseAddressedWake("WAKE: fable, 9gnomon"), null);
+  assert.equal(parseAddressedWake("WAKE: fable,"), null);
+  // Unknown-but-well-formed still resolves — the routing layer decides its fate.
+  assert.deepEqual(parseAddressedWake("WAKE: ghost")?.actors, ["ghost"]);
 });
 
 test("admission gates workspace, channel, and sender identity", () => {

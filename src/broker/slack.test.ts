@@ -138,6 +138,7 @@ test("crash after commit before ACK makes fresh-envelope redelivery harmless", a
         },
         boundActors: () => [],
         freezeAffinityTargets: () => [],
+        liveActors: () => [],
       },
       now: () => new Date("2026-08-01T00:00:00.000Z"),
     }),
@@ -188,9 +189,11 @@ test("missing event_id refuses envelope identity fallback, logs safely, then ACK
     broker: {
       ingest(event) {
         ingested = event;
+        return { created: true, deliveryId: 1 };
       },
       boundActors: () => [],
       freezeAffinityTargets: () => [],
+      liveActors: () => [],
     },
     logDiagnostic(message) {
       actions.push(`log:${message}`);
@@ -223,6 +226,7 @@ test("ingest failure leaves the envelope unacknowledged for Slack redelivery", a
         },
         boundActors: () => [],
         freezeAffinityTargets: () => [],
+        liveActors: () => [],
       },
     }),
     /injected ingest failure/,
@@ -252,10 +256,13 @@ test("a sender outside the trust set is dropped with a thread notice (ADR-0003 R
   }, {
     workspaceId: WORKSPACE_ID,
     policy,
-    broker: { ingest() { ingested = true; }, boundActors: () => [], freezeAffinityTargets: () => [] },
+    broker: { ingest() { ingested = true; return { created: true, deliveryId: 1 }; }, boundActors: () => [], freezeAffinityTargets: () => [], liveActors: () => [] },
     dropNotifier: {
       noticeDroppedSender(channelId, threadTs, senderId) {
         notices.push({ channelId, threadTs, senderId });
+      },
+      noticeUnroutableActor() {
+        throw new Error("a trust-set drop must not be reported as an unroutable actor");
       },
     },
   });
@@ -285,10 +292,13 @@ test("a message in an unadmitted channel is silently ignored — no notice into 
   }, {
     workspaceId: WORKSPACE_ID,
     policy,
-    broker: { ingest() { ingested = true; }, boundActors: () => [], freezeAffinityTargets: () => [] },
+    broker: { ingest() { ingested = true; return { created: true, deliveryId: 1 }; }, boundActors: () => [], freezeAffinityTargets: () => [], liveActors: () => [] },
     dropNotifier: {
       noticeDroppedSender(_channelId, _threadTs, senderId) {
         notices.push(senderId);
+      },
+      noticeUnroutableActor(_channelId, _threadTs, actor) {
+        notices.push(actor);
       },
     },
   });
@@ -316,7 +326,7 @@ test("malformed untrusted message fields are refused and acknowledged without in
   }, {
     workspaceId: WORKSPACE_ID,
     policy,
-    broker: { ingest() { ingested = true; }, boundActors: () => [], freezeAffinityTargets: () => [] },
+    broker: { ingest() { ingested = true; return { created: true, deliveryId: 1 }; }, boundActors: () => [], freezeAffinityTargets: () => [], liveActors: () => [] },
   });
 
   assert.equal(acked, true);
@@ -511,6 +521,9 @@ test("an untrusted envelope-less reply in an actor-bound thread is dropped WITH 
       broker,
       dropNotifier: {
         noticeDroppedSender(channelId, threadTs, senderId) { notices.push({ channelId, threadTs, senderId }); },
+        noticeUnroutableActor() {
+          throw new Error("a trust-set drop must not be reported as an unroutable actor");
+        },
       },
     },
   );
@@ -531,13 +544,209 @@ test("an untrusted envelope-less message in an UNBOUND admitted thread still get
       workspaceId: WORKSPACE_ID,
       policy,
       broker,
-      dropNotifier: { noticeDroppedSender(_channelId, _threadTs, senderId) { notices.push(senderId); } },
+      dropNotifier: {
+        noticeDroppedSender(_channelId, _threadTs, senderId) { notices.push(senderId); },
+        noticeUnroutableActor() {
+          throw new Error("a trust-set drop must not be reported as an unroutable actor");
+        },
+      },
     },
   );
   // ADR-0003 R-1 attributes trust by sender on every admitted surface. A missing
   // affinity target does not make an identified untrusted principal silent.
   assert.deepEqual(notices, ["U-intruder"]);
   assert.equal(store.listDeliveries().length, 0);
+  store.close();
+});
+
+test("an admitted wake naming an actor with no live subscription is thread-noticed, mints no delivery (KRA-925)", async () => {
+  const { store, broker } = fixture(); // ariadne is the only subscribed actor
+  const unroutable: Array<{ channelId: string; threadTs: string; actor: string }> = [];
+  let droppedSenders = 0;
+  await handleSlackEnvelope(
+    { body: messageBody({ eventId: "Ev-ghost", text: "WAKE: ghost | are you there?", ts: "1700.1", threadTs: "1700.1" }), async ack() {} },
+    {
+      workspaceId: WORKSPACE_ID,
+      policy,
+      broker,
+      dropNotifier: {
+        // The SENDER is trusted; only the TARGET actor is unroutable. A sender
+        // drop here would misattribute the failure.
+        noticeDroppedSender() { droppedSenders += 1; },
+        noticeUnroutableActor(channelId, threadTs, actor) { unroutable.push({ channelId, threadTs, actor }); },
+      },
+    },
+  );
+  assert.deepEqual(unroutable, [{ channelId: "C1", threadTs: "1700.1", actor: "ghost" }]);
+  assert.equal(droppedSenders, 0);
+  assert.equal(store.listDeliveries().length, 0);
+  // The ingress row is retained regardless — it is the audit trail; only the
+  // silence was the bug.
+  assert.equal(
+    Number((store.db.prepare("SELECT count(*) AS count FROM slack_events WHERE event_id = 'Ev-ghost'").get() as { count: number }).count),
+    1,
+  );
+  store.close();
+});
+
+test("a lost-ACK redelivery of an unroutable wake never double-posts the notice (KRA-925)", async () => {
+  const { store, broker } = fixture();
+  const unroutable: string[] = [];
+  const dropNotifier = {
+    noticeDroppedSender() {},
+    noticeUnroutableActor(_channelId: string, _threadTs: string, actor: string) { unroutable.push(actor); },
+  };
+  const env = messageBody({ eventId: "Ev-ghost", text: "WAKE: ghost | hello", ts: "1800.1", threadTs: "1800.1" });
+  await handleSlackEnvelope({ body: env, async ack() {} }, { workspaceId: WORKSPACE_ID, policy, broker, dropNotifier });
+  // Slack redelivers the same event_id after a lost ACK. Ingest dedupes to
+  // created:false, so the notice — keyed on created:true — cannot repeat.
+  await handleSlackEnvelope({ body: env, async ack() {} }, { workspaceId: WORKSPACE_ID, policy, broker, dropNotifier });
+  assert.deepEqual(unroutable, ["ghost"]);
+  assert.equal(store.listDeliveries().length, 0);
+  store.close();
+});
+
+test("thread affinity to an expiresAt-retired actor is thread-noticed by name (KRA-925)", async () => {
+  const { store, broker } = affinityFixture(["ariadne"]);
+  // ariadne is live: a WAKE binds her to the thread and mints a delivery.
+  await deliver(broker, messageBody({ eventId: "Ev-seed", text: "WAKE: ariadne | start", ts: "1600.1", threadTs: "1600.1" }));
+  // Her subscription lapses. She stays bound to the thread — the delivery
+  // persists — but is no longer routable, exactly the rename-migration gap.
+  store.upsertSubscription({ ...subscriptionFor("ariadne"), expiresAt: "2000-01-01T00:00:00.000Z" });
+  const unroutable: Array<{ channelId: string; threadTs: string; actor: string }> = [];
+  await handleSlackEnvelope(
+    { body: messageBody({ eventId: "Ev-follow", text: "still there?", ts: "1600.2", threadTs: "1600.1" }), async ack() {} },
+    {
+      workspaceId: WORKSPACE_ID,
+      policy,
+      broker,
+      dropNotifier: {
+        noticeDroppedSender() { throw new Error("the sender is trusted; this is not a sender drop"); },
+        noticeUnroutableActor(channelId, threadTs, actor) { unroutable.push({ channelId, threadTs, actor }); },
+      },
+    },
+  );
+  // The follow-up routed by affinity to the retired actor and reached no one.
+  assert.deepEqual(unroutable, [{ channelId: "C1", threadTs: "1600.1", actor: "ariadne" }]);
+  store.close();
+});
+
+test("a wake naming a live actor mints its delivery and posts no unroutable notice (KRA-925)", async () => {
+  const { store, broker } = fixture();
+  let unroutable = 0;
+  await handleSlackEnvelope(
+    { body: messageBody({ eventId: "Ev-live", text: "WAKE: ariadne | go", ts: "1900.1", threadTs: "1900.1" }), async ack() {} },
+    {
+      workspaceId: WORKSPACE_ID,
+      policy,
+      broker,
+      dropNotifier: {
+        noticeDroppedSender() {},
+        noticeUnroutableActor() { unroutable += 1; },
+      },
+    },
+  );
+  assert.equal(unroutable, 0);
+  const deliveries = store.listDeliveries();
+  assert.equal(deliveries.length, 1);
+  assert.equal(deliveries[0]!.actor, "ariadne");
+  store.close();
+});
+
+test("a WAKE list wakes every named live actor exactly once (KRA-926)", async () => {
+  const { store, broker } = affinityFixture(["fable", "gnomon", "ariadne"]);
+  await deliver(broker, messageBody({ eventId: "Ev-list", text: "WAKE: fable, gnomon, ariadne | all three", ts: "2100.1", threadTs: "2100.1" }));
+  const deliveries = store.listDeliveries();
+  assert.equal(deliveries.length, 3);
+  assert.deepEqual(deliveries.map((delivery) => delivery.actor).sort(), ["ariadne", "fable", "gnomon"]);
+  store.close();
+});
+
+test("a WAKE list with a dead name wakes the live ones and thread-notices the dead one (KRA-926 × KRA-925)", async () => {
+  const { store, broker } = affinityFixture(["fable", "gnomon"]);
+  const unroutable: string[] = [];
+  await handleSlackEnvelope(
+    { body: messageBody({ eventId: "Ev-mixed", text: "WAKE: fable, ghost, gnomon | mixed", ts: "2200.1", threadTs: "2200.1" }), async ack() {} },
+    {
+      workspaceId: WORKSPACE_ID,
+      policy,
+      broker,
+      dropNotifier: {
+        noticeDroppedSender() { throw new Error("the sender is trusted; this is not a sender drop"); },
+        noticeUnroutableActor(_channelId, _threadTs, actor) { unroutable.push(actor); },
+      },
+    },
+  );
+  const deliveries = store.listDeliveries();
+  assert.deepEqual(deliveries.map((delivery) => delivery.actor).sort(), ["fable", "gnomon"]);
+  assert.deepEqual(unroutable, ["ghost"]); // the dead name dead-letters; the live ones still wake
+  store.close();
+});
+
+test("`everyone` from a human wakes every live actor (KRA-926)", async () => {
+  const { store, broker } = affinityFixture(["fable", "gnomon", "ariadne"]);
+  await deliver(broker, messageBody({ eventId: "Ev-all", text: "WAKE: everyone | all hands", ts: "2300.1", threadTs: "2300.1" }));
+  const deliveries = store.listDeliveries();
+  assert.deepEqual(deliveries.map((delivery) => delivery.actor).sort(), ["ariadne", "fable", "gnomon"]);
+  store.close();
+});
+
+test("`everyone` from a bot sender is unroutable — a thread notice and zero deliveries (KRA-926)", async () => {
+  const { store, broker } = affinityFixture(["fable", "gnomon"]);
+  // A bot posts ingress under the trusted app identity — admitted, but its
+  // `everyone` must never expand. It flows through as the literal unsubscribable
+  // target and dead-letters, so a quoted broadcast in an agent reply cannot
+  // chain-wake the fleet.
+  const appPolicy: AdmissionPolicy = { ...policy, appIds: new Set(["A-bot"]) };
+  const unroutable: string[] = [];
+  await handleSlackEnvelope(
+    {
+      body: {
+        event_id: "Ev-bot-all",
+        envelope_id: "env-bot-all",
+        event: {
+          type: "message",
+          channel: "C1",
+          text: "WAKE: everyone | quoted from an agent reply",
+          ts: "2400.1",
+          thread_ts: "2400.1",
+          app_id: "A-bot",
+        },
+      },
+      async ack() {},
+    },
+    {
+      workspaceId: WORKSPACE_ID,
+      policy: appPolicy,
+      broker,
+      dropNotifier: {
+        noticeDroppedSender() { throw new Error("the bot is admitted; this is not a sender drop"); },
+        noticeUnroutableActor(_channelId, _threadTs, actor) { unroutable.push(actor); },
+      },
+    },
+  );
+  assert.deepEqual(unroutable, ["everyone"]);
+  assert.equal(store.listDeliveries().length, 0);
+  store.close();
+});
+
+test("a redelivery of a WAKE list creates no duplicate deliveries (KRA-926)", async () => {
+  const { store, broker } = affinityFixture(["fable", "gnomon"]);
+  const env = messageBody({ eventId: "Ev-dup", text: "WAKE: fable, gnomon | once", ts: "2500.1", threadTs: "2500.1" });
+  await deliver(broker, env);
+  await deliver(broker, env); // lost-ACK redelivery of the same event_id
+  const deliveries = store.listDeliveries();
+  // Per-actor `Ev-dup#<actor>` identities dedupe under INSERT OR IGNORE.
+  assert.equal(deliveries.length, 2);
+  assert.deepEqual(deliveries.map((delivery) => delivery.actor).sort(), ["fable", "gnomon"]);
+  store.close();
+});
+
+test("a NEXT list form wakes every named actor, identical to WAKE (KRA-926)", async () => {
+  const { store, broker } = affinityFixture(["fable", "gnomon"]);
+  await deliver(broker, messageBody({ eventId: "Ev-next", text: "NEXT fable, gnomon — both of you", ts: "2600.1", threadTs: "2600.1" }));
+  const deliveries = store.listDeliveries();
+  assert.deepEqual(deliveries.map((delivery) => delivery.actor).sort(), ["fable", "gnomon"]);
   store.close();
 });
 

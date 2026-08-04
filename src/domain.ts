@@ -4,6 +4,14 @@ import { z } from "zod";
 export const WakePolicySchema = z.enum(["live_only", "resume", "spawn"]);
 export type WakePolicy = z.infer<typeof WakePolicySchema>;
 
+/**
+ * The reserved broadcast keyword. As a wake target it fans out to every live
+ * subscription (human sender only, KRA-926); it is therefore forbidden as a
+ * subscription actor name so a real seat can never shadow — or be shadowed by —
+ * the broadcast.
+ */
+export const EVERYONE = "everyone";
+
 export const ProviderSchema = z.enum(["codex", "claude"]);
 export type Provider = z.infer<typeof ProviderSchema>;
 
@@ -56,7 +64,9 @@ export const EdgeWorkspaceSchema = z.object({
 export type EdgeWorkspace = z.infer<typeof EdgeWorkspaceSchema>;
 
 export const SubscriptionInputSchema = z.object({
-  actor: z.string().min(1),
+  actor: z.string().min(1).refine((value) => value.toLowerCase() !== EVERYONE, {
+    message: "`everyone` is a reserved broadcast keyword and cannot be a subscription actor name",
+  }),
   provider: ProviderSchema,
   providerSurface: z.string().min(1),
   providerVersion: z.string().min(1),
@@ -157,7 +167,14 @@ export interface ReplaySnapshot {
 }
 
 export interface AddressedWake {
-  actor: string;
+  /**
+   * The recipients named on the envelope line, lowercased and de-duplicated in
+   * first-seen order. A single `WAKE: fable` yields `["fable"]`; a list
+   * `WAKE: fable, gnomon` yields `["fable", "gnomon"]`. The literal `everyone`
+   * is carried through verbatim here — broadcast expansion is a routing decision
+   * made against sender identity, not a parse concern.
+   */
+  actors: string[];
   envelope: string;
 }
 

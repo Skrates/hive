@@ -36,6 +36,11 @@ export class BrokerService {
     return this.store.hasActiveSubscription();
   }
 
+  /** Every actor with a live subscription — the `everyone` broadcast target set. */
+  liveActors(): string[] {
+    return this.store.liveActors();
+  }
+
   /** Actors already bound to a Slack thread — the target set for thread affinity. */
   boundActors(channelId: string, threadTs: string): string[] {
     return this.store.actorsBoundToThread(channelId, threadTs);
