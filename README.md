@@ -27,3 +27,11 @@ bun run build
 
 No live credential belongs in the repository. Broker and edge credentials are injected from the
 host secret store.
+
+## Toolchain
+
+ruff/ty/uv are not pinned here — the Weave-wide version authority is the private
+`weave-doctrine` repo: its `mise.toml` pins every tool for every seat and CI
+runner (`just tools` there installs them; the prek hooks call the bare binaries
+off PATH). CI carries transitional pinned installs until the self-hosted-runner
+migration.
