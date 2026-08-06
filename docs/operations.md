@@ -84,6 +84,16 @@ returns its final assistant text as the provider outcome, so live Codex turns mu
 uncertainty and is retried. Without a live registration the edge falls back to `codex exec resume`
 or spawn according to the subscription policy.
 
+The supervisor's pinned thread is the dedicated fallback. To route an actor into the foreground
+Codex Desktop task from that task's shell, run `hive attach <actor>` (or pass `--session <id>` when
+`CODEX_THREAD_ID` is unavailable). Attachment is never inferred from "most recent": Hive verifies
+an unarchived primary user task at the exact `--cwd`, writes an owner-only revision file, follows
+that exact task through Desktop's owner-only IPC stream, and waits for the live surface to confirm
+the revision. `hive detach <actor>` removes the binding and waits for the dedicated fallback to be
+restored. A present attachment that is invalid, stale, or lacks a Desktop owner withdraws live
+registration; it never silently sends the wake to the dedicated task. `GET /binding` on the
+actor's owner-only live UDS exposes only the mode, cwd, and attachment revision for diagnosis.
+
 ### Claude Code boundary delivery
 
 Register `hive-claude-hook` as a Stop and PostToolUse hook in the agent's pinned profile

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { Delivery, Subscription } from "../domain.js";
-import { completeCodexDelivery } from "./live.js";
+import { completeCodexDelivery, completeDesktopDelivery } from "./live.js";
 
 test("a completed live turn becomes a processed provider receipt", async () => {
   const budgets: number[] = [];
@@ -34,6 +34,39 @@ test("a failed live turn never becomes a processed outcome", async () => {
   await assert.rejects(
     () => completeCodexDelivery(client, "thread-1", delivery(now), "wake", () => now),
     /turn-failed failed/,
+  );
+});
+
+test("a completed Desktop turn becomes the same processed provider receipt", async () => {
+  const client = {
+    async deliver() {
+      return { turnId: "desktop-turn-41", clientUserMessageId: "hive-delivery-41", mode: "steer" as const };
+    },
+    async waitForTurnCompletion() {
+      return { turnId: "desktop-turn-41", status: "completed" as const, assistantText: "  Foreground reply.  " };
+    },
+  };
+  const now = Date.parse("2026-08-06T11:26:45.000Z");
+  const result = await completeDesktopDelivery(client, "foreground-task", delivery(now), "wake", () => now);
+  assert.deepEqual(JSON.parse(result.receipt), {
+    type: "item.completed",
+    item: { type: "agent_message", text: "Foreground reply." },
+  });
+});
+
+test("an interrupted Desktop turn never becomes a processed outcome", async () => {
+  const client = {
+    async deliver() {
+      return { turnId: "desktop-turn-42", clientUserMessageId: "hive-delivery-42", mode: "start" as const };
+    },
+    async waitForTurnCompletion() {
+      return { turnId: "desktop-turn-42", status: "interrupted" as const, assistantText: null };
+    },
+  };
+  const now = Date.parse("2026-08-06T11:26:45.000Z");
+  await assert.rejects(
+    () => completeDesktopDelivery(client, "foreground-task", delivery(now), "wake", () => now),
+    /desktop-turn-42 interrupted/,
   );
 });
 

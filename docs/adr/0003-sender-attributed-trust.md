@@ -71,7 +71,7 @@ Steering matrix:
 
 | Agent | Provider | Mechanism | Steering class |
 | -- | -- | -- | -- |
-| codex-1 | Codex (ChatGPT Max 20x) | app-server `turn/steer` / `turn/start`; `codex exec resume` headless | true mid-turn |
+| codex-1 | Codex (ChatGPT Max 20x) | explicit Desktop task follower or dedicated app-server `turn/steer` / `turn/start`; `codex exec resume` headless | true mid-turn |
 | claude-1 | Claude Code (Max 20x) | boundary hook (Stop/PostToolUse checks ingress inbox) + `--resume`/`-p` idle wake | next-boundary (≤ one tool call) |
 | claude-2 | Claude Code (Team Premium) | same | next-boundary |
 | claude-3 | Claude Code (Team Premium) | same | next-boundary |
@@ -145,6 +145,12 @@ that are acted on when they arrive.
   the terminal transition. In every completion-tracked case, `processed` and the thread
   post commit in one broker transaction, so a Slack outage after provider completion can
   neither lose the outcome nor rerun the instruction.
+* A foreground Codex attachment is an explicit, owner-local routing choice, not session
+  discovery by recency. The binding names one primary user task, exact cwd, and revision;
+  the live bridge must validate that task in Codex state and acquire its Desktop IPC follower
+  before advertising the revision. A present binding that cannot be validated or followed
+  withdraws liveness rather than falling back to another task. Removing the binding explicitly
+  restores the subscription's pinned dedicated thread.
 * The machine-local plane is owner-only UDS: the edge control socket (`~/.hive/edge.sock`)
   serves live-registration heartbeats and `hive reply` outcome relay; the Codex live
   surface serves `/deliver` on its own socket; Claude delivery is an owner-only ingress
