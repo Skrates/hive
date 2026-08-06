@@ -76,9 +76,13 @@ profiles with legacy sandbox configuration. Authenticate the dedicated home once
 ### Codex live steering
 
 Run `hive-codex-live` with the current Codex thread ID. It connects to the app-server control
-socket, verifies the thread is live, serves `/deliver` on its own owner-only UDS socket, and keeps
-its registration fresh with the edge. A wake injected into an active thread is true mid-turn
-steering; without a live registration the edge falls back to `codex exec resume` / spawn.
+socket, owns or resumes the persisted thread on that long-lived connection, serves `/deliver` on
+its own owner-only UDS socket, and keeps its registration fresh with the edge. A wake injected into
+an active thread is true mid-turn steering. The bridge waits for that exact turn to complete and
+returns its final assistant text as the provider outcome, so live Codex turns must not run
+`hive reply` themselves. Failure, interruption, timeout, disconnect, or loss of correlation is
+uncertainty and is retried. Without a live registration the edge falls back to `codex exec resume`
+or spawn according to the subscription policy.
 
 ### Claude Code boundary delivery
 
@@ -107,8 +111,9 @@ At-least-once with one fenced claimant per attempt. Uncertainty (edge crash, los
 outcome, expired lease) requeues the delivery behind exponential backoff; after `maxAttempts`
 (default 5) it terminalizes as `failed`. Every state the sender cares about is posted to the
 thread through the durable outbox: delivery receipt, retry notices, failure notices, dropped-sender
-notices, and the agent's own `hive reply` outcome. Silence is a defect — a delivered wake with no
-outcome post means the agent never closed the loop.
+notices, and the agent's outcome. Completion-tracked Codex live and headless outcomes are relayed
+by the edge from the provider's final response; Claude live boundary delivery uses `hive reply`.
+Silence is a defect — a delivered wake with no outcome post means the loop never closed.
 
 There is no reconciliation surface. If a delivery failed, the thread says so; send the message
 again or fix the edge.

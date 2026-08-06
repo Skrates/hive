@@ -223,10 +223,15 @@ test("a headless resume dispatch completes, posts its outcome, and finishes proc
   store.close();
 });
 
-test("a live injection leaves the delivery dispatched until the agent's outcome closes it", async () => {
+test("a completion-tracked Codex live injection commits its final response as the outcome", async () => {
   const broker = new FakeBroker([delivery(2, { subscription: subscription({ wakePolicy: "live_only" }) })]);
   const store = new EdgeStore(":memory:");
-  const adapter = new StubAdapter();
+  const adapter = new StubAdapter({
+    liveResult: {
+      receipt: JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "live completed" } }),
+      processed: true,
+    },
+  });
   const live = new LiveIngressRegistry();
   live.register({
     actor: "ariadne",
@@ -239,17 +244,13 @@ test("a live injection leaves the delivery dispatched until the agent's outcome 
 
   assert.equal(await edge.processOne(), true);
   assert.deepEqual(adapter.liveDeliveries, [2]);
-  assert.match(adapter.liveFrames[0]!, /hive reply 2/);
-  assert.doesNotMatch(adapter.liveFrames[0]!, /Hive will relay that final response/);
+  assert.doesNotMatch(adapter.liveFrames[0]!, /hive reply 2/);
+  assert.match(adapter.liveFrames[0]!, /Hive will relay that final response/);
   assert.equal(broker.markCount, 1);
-  // Live injection produces no synthetic reply and NO terminal transition:
-  // the receipt only proves durable dispatch, so the delivery stays
-  // `dispatched` until the agent's own hive-reply outcome closes it (R-6).
-  // A vanished outcome becomes a broker-side requeue after the dispatched
-  // grace — never a silent `processed` with no answer.
   assert.deepEqual(broker.replies, []);
-  assert.deepEqual(broker.finishes, []);
-  assert.equal(store.get(2)?.status, "dispatched");
+  assert.equal(broker.finishes[0]?.result.status, "processed");
+  assert.equal(broker.finishes[0]?.result.outcome, "live completed");
+  assert.equal(store.get(2)?.status, "processed");
   store.close();
 });
 

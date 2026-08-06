@@ -107,8 +107,9 @@ export class EdgeService {
       current = await this.broker.markDispatched(current);
       this.store.setStatus(current.id, generation, "dispatched", dispatch.receipt);
       if (dispatch.processed) {
-        // Headless run: the provider turn completed and its receipt IS the
-        // agent's outcome. The outcome travels inside the terminal transition
+        // A completed provider turn (headless, or a completion-tracked Codex
+        // live turn) carries the agent's outcome in its receipt. The outcome
+        // travels inside the terminal transition
         // so the broker commits `processed` and the durable thread post
         // together — a Slack outage can neither lose the outcome nor cause
         // this trusted instruction to rerun.
@@ -250,7 +251,12 @@ export class EdgeService {
     const live = this.live.get(delivery.actor, subscription.provider);
     if (live) {
       onProviderStart();
-      return adapter.deliverLive(live, delivery, frameWakeInstruction(delivery, replay, "agent"));
+      // Codex live delivery waits for the exact app-server turn and lets the
+      // edge relay its final assistant text. Claude live inbox delivery still
+      // requires the agent-side reply because writing an inbox file is not a
+      // provider completion signal.
+      const outcomeReporter = subscription.provider === "codex" ? "edge" : "agent";
+      return adapter.deliverLive(live, delivery, frameWakeInstruction(delivery, replay, outcomeReporter));
     }
     if (subscription.wakePolicy === "live_only") throw new PreDispatchError("live_ingress_unavailable");
 

@@ -65,15 +65,16 @@ export class CodexProvider implements ProviderAdapter {
   }
 
   async deliverLive(ingress: LiveIngress, delivery: Delivery, framed: string): Promise<ProviderDispatch> {
-    const result = await udsRequestJson<{ receipt?: unknown }>(ingress.socketPath, "POST", "/deliver", {
+    const result = await udsRequestJson<{ receipt?: unknown; processed?: unknown }>(ingress.socketPath, "POST", "/deliver", {
       delivery,
       framed,
     });
     const receipt = result.receipt;
-    if (typeof receipt !== "string" || receipt.length === 0 || receipt.length > 1_000) {
+    if (typeof receipt !== "string" || receipt.length === 0 || receipt.length > 4_000) {
       throw new Error("Codex live ingress invalid response");
     }
-    return { receipt, processed: false };
+    if (result.processed !== true) throw new Error("Codex live ingress returned before turn completion");
+    return { receipt, processed: true };
   }
 
   resume(subscription: Subscription, cwd: string, framed: string): Promise<ProviderDispatch> {

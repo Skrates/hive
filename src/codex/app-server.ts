@@ -12,6 +12,7 @@ interface AppServerResponse {
 interface CodexTurn {
   id: string;
   status: "completed" | "interrupted" | "failed" | "inProgress";
+  items?: Array<{ type?: string; text?: string }>;
 }
 
 interface CodexThread {
@@ -23,7 +24,11 @@ interface CodexThread {
 export class CodexAppServerClient {
   private socket: WebSocket | null = null;
   private nextId = 1;
-  private readonly pending = new Map<number, { resolve(value: unknown): void; reject(error: Error): void }>();
+  private readonly pending = new Map<number, {
+    resolve(value: unknown): void;
+    reject(error: Error): void;
+    timer: NodeJS.Timeout;
+  }>();
 
   constructor(
     private readonly socketPath = join(process.env.CODEX_HOME ?? join(homedir(), ".codex"), "app-server-control", "app-server-control.sock"),
@@ -47,7 +52,7 @@ export class CodexAppServerClient {
     await this.request("initialize", {
       clientInfo: { name: "hive-edge", title: "Hive Codex edge", version: "0.1.0" },
       capabilities: { experimentalApi: true, requestAttestation: false },
-    });
+    }, 10_000);
     this.notify("initialized");
   }
 
@@ -59,9 +64,19 @@ export class CodexAppServerClient {
     await new Promise<void>((resolve) => socket.once("close", resolve));
   }
 
-  async deliver(threadId: string, framed: string, deliveryId: number): Promise<string> {
+  async deliver(
+    threadId: string,
+    framed: string,
+    deliveryId: number,
+    timeoutMs = 30_000,
+  ): Promise<{ turnId: string; mode: "start" | "steer" }> {
+    const deadline = Date.now() + timeoutMs;
     await this.connect();
-    const result = await this.request("thread/read", { threadId, includeTurns: true }) as { thread: CodexThread };
+    const result = await this.request(
+      "thread/read",
+      { threadId, includeTurns: true },
+      Math.min(10_000, remaining(deadline)),
+    ) as { thread: CodexThread };
     const thread = result.thread;
     // ADR-0003 R-1: the framed envelope is already an imperative instruction
     // from an authenticated trust-set principal. No mistrust wrapper — the
@@ -81,14 +96,45 @@ export class CodexAppServerClient {
         expectedTurnId: active.id,
         input,
         clientUserMessageId,
-      }) as { turnId?: string };
-      return `codex-steer:${steered.turnId ?? active.id}:${deliveryId}`;
+      }, remaining(deadline)) as { turnId?: string };
+      return { turnId: steered.turnId ?? active.id, mode: "steer" };
     }
     if (thread.status.type === "idle") {
-      const started = await this.request("turn/start", { threadId, input, clientUserMessageId }) as { turn?: { id?: string } };
-      return `codex-turn:${started.turn?.id ?? "accepted"}:${deliveryId}`;
+      const started = await this.request(
+        "turn/start",
+        { threadId, input, clientUserMessageId },
+        remaining(deadline),
+      ) as { turn?: { id?: string } };
+      const turnId = started.turn?.id;
+      if (!turnId) throw new Error("Codex app-server accepted a turn without a correlatable turn id");
+      return { turnId, mode: "start" };
     }
     throw new Error(`Codex thread is not live: ${thread.status.type}`);
+  }
+
+  async waitForCompletion(
+    threadId: string,
+    turnId: string,
+    timeoutMs: number,
+  ): Promise<{ status: "completed" | "failed" | "interrupted"; assistantText: string | null }> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      await this.connect();
+      const result = await this.request(
+        "thread/read",
+        { threadId, includeTurns: true },
+        Math.min(10_000, remaining(deadline)),
+      ) as { thread: CodexThread };
+      const turn = result.thread.turns.find((candidate) => candidate.id === turnId);
+      if (turn && turn.status !== "inProgress") {
+        const assistant = [...(turn.items ?? [])].reverse().find((item) =>
+          (item.type === "agentMessage" || item.type === "agent_message")
+          && typeof item.text === "string");
+        return { status: turn.status, assistantText: assistant?.text ?? null };
+      }
+      await delay(Math.min(500, Math.max(1, deadline - Date.now())));
+    }
+    throw new Error(`Timed out waiting for Codex app-server turn ${turnId}`);
   }
 
   readThread(threadId: string): Promise<unknown> {
@@ -96,7 +142,13 @@ export class CodexAppServerClient {
   }
 
   async assertLiveThread(threadId: string): Promise<"active" | "idle"> {
-    const result = await this.readThread(threadId) as { thread: CodexThread };
+    let result = await this.readThread(threadId) as { thread: CodexThread };
+    if (result.thread.status.type === "notLoaded") {
+      // App-server thread ownership is scoped to the client connection. Load
+      // the persisted thread on this long-lived supervisor connection so it
+      // remains steerable after any short-lived setup client disconnects.
+      result = await this.request("thread/resume", { threadId }) as { thread: CodexThread };
+    }
     const status = result.thread.status.type;
     if (status !== "active" && status !== "idle") {
       throw new Error(`Codex thread ${threadId} is not owned by this app-server connection: ${status}`);
@@ -104,12 +156,24 @@ export class CodexAppServerClient {
     return status;
   }
 
-  private request(method: string, params: unknown): Promise<unknown> {
+  private request(method: string, params: unknown, timeoutMs = 15_000): Promise<unknown> {
     const socket = this.socket;
     if (!socket || socket.readyState !== WebSocket.OPEN) throw new Error("Codex app-server is not connected");
     const id = this.nextId++;
-    socket.send(JSON.stringify({ id, method, params }));
-    return new Promise((resolve, reject) => this.pending.set(id, { resolve, reject }));
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`Codex app-server ${method} timed out`));
+      }, Math.max(1, timeoutMs));
+      this.pending.set(id, { resolve, reject, timer });
+      try {
+        socket.send(JSON.stringify({ id, method, params }));
+      } catch (error) {
+        clearTimeout(timer);
+        this.pending.delete(id);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
   }
 
   private notify(method: string): void {
@@ -123,13 +187,25 @@ export class CodexAppServerClient {
     const pending = this.pending.get(message.id);
     if (!pending) return;
     this.pending.delete(message.id);
+    clearTimeout(pending.timer);
     if (message.error) pending.reject(new Error(`Codex ${message.error.code}: ${message.error.message}`));
     else pending.resolve(message.result);
   }
 
   private failAll(error: Error): void {
-    for (const pending of this.pending.values()) pending.reject(error);
+    for (const pending of this.pending.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(error);
+    }
     this.pending.clear();
     this.socket = null;
   }
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function remaining(deadline: number): number {
+  return Math.max(1, deadline - Date.now());
 }

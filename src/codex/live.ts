@@ -33,7 +33,8 @@ export async function runCodexLive(config: Config): Promise<void> {
 
   prepareSocketPath(config.surfaceSocket);
   const http = createServer((request, response) => {
-    void handle(request, response, (delivery, framed) => client.deliver(config.threadId, framed, delivery.id))
+    void handle(request, response, (delivery, framed) =>
+      completeCodexDelivery(client, config.threadId, delivery, framed))
       .catch((error: unknown) => {
         const code = error instanceof SurfaceError ? error.code : "live_delivery_failed";
         const body = JSON.stringify({ error: code });
@@ -78,7 +79,7 @@ class SurfaceError extends Error {
 async function handle(
   request: IncomingMessage,
   response: ServerResponse,
-  deliver: (delivery: Delivery, framed: string) => Promise<string>,
+  deliver: (delivery: Delivery, framed: string) => Promise<{ receipt: string; processed: boolean }>,
 ): Promise<void> {
   if (request.method !== "POST" || request.url !== "/deliver") throw new SurfaceError("not_found");
   const chunks: Buffer[] = [];
@@ -90,10 +91,49 @@ async function handle(
     throw new SurfaceError("live_delivery_invalid");
   }
   const payload = parseLiveDeliveryPayload(body);
-  const receipt = await deliver(payload.delivery, payload.framed);
-  const encoded = JSON.stringify({ receipt });
+  const result = await deliver(payload.delivery, payload.framed);
+  const encoded = JSON.stringify(result);
   response.writeHead(200, { "content-type": "application/json", "content-length": Buffer.byteLength(encoded) });
   response.end(encoded);
+}
+
+/**
+ * A live Codex turn is complete only when the exact turn accepted for this
+ * Hive delivery reaches a terminal state. The final assistant text is the
+ * actor's outcome; returning it as a processed provider receipt lets the edge
+ * commit delivery completion and the durable Slack outbox post together.
+ */
+export async function completeCodexDelivery(
+  client: Pick<CodexAppServerClient, "deliver" | "waitForCompletion">,
+  threadId: string,
+  delivery: Delivery,
+  framed: string,
+  now: () => number = Date.now,
+): Promise<{ receipt: string; processed: true }> {
+  const createdAt = Date.parse(delivery.createdAt);
+  const deadline = Number.isFinite(createdAt)
+    ? createdAt + delivery.subscription.deliveryTtlMs
+    : now() + delivery.subscription.deliveryTtlMs;
+  const accepted = await client.deliver(
+    threadId,
+    framed,
+    delivery.id,
+    remainingBefore(deadline, now),
+  );
+  const completion = await client.waitForCompletion(
+    threadId,
+    accepted.turnId,
+    remainingBefore(deadline, now),
+  );
+  if (completion.status !== "completed") {
+    throw new Error(`Codex app-server turn ${accepted.turnId} ${completion.status}`);
+  }
+  const text = completion.assistantText?.trim()
+    || `Codex ${accepted.mode} turn ${accepted.turnId} completed without a textual final message.`;
+  return {
+    receipt: JSON.stringify({ type: "item.completed", item: { type: "agent_message", text } }),
+    processed: true,
+  };
 }
 
 interface LiveDeliveryPayload {
@@ -123,6 +163,12 @@ export function parseLiveDeliveryPayload(value: unknown): LiveDeliveryPayload {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function remainingBefore(deadline: number, now: () => number): number {
+  const remaining = deadline - now();
+  if (remaining <= 0) throw new Error("Codex live delivery exceeded its absolute deadline");
+  return remaining;
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
