@@ -9,6 +9,7 @@ import { BrokerStore } from "./store.js";
 const slack: SlackTransport = {
   async replay(): Promise<ReplaySnapshot> { throw new Error("not used"); },
   async reply(): Promise<string> { throw new Error("not used"); },
+  async react(): Promise<void> { throw new Error("not used"); },
 };
 
 test("stop() force-closes an in-flight long-poll instead of hanging on it", { timeout: 5_000 }, async (t) => {

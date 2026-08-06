@@ -55,10 +55,19 @@ export interface OutboxEntry {
   channelId: string;
   threadTs: string;
   text: string;
+  /** Optional lifecycle stamp on the originating wake messages (emoji name, no colons). */
+  reaction: string | null;
+  /** Every wake message the stamp targets: the primary event plus any coalesced ones. */
+  reactionTargets: string[];
   createdAt: string;
   sentAt: string | null;
   attempts: number;
 }
+
+/** Delivery-lifecycle reaction stamps: glanceable state on the wake message itself. */
+export const REACTION_DISPATCHED = "eyes";
+export const REACTION_PROCESSED = "white_check_mark";
+export const REACTION_FAILED = "x";
 
 export class BrokerStore {
   readonly db: Database.Database;
@@ -227,6 +236,8 @@ export class BrokerStore {
         channel_id TEXT NOT NULL,
         thread_ts TEXT NOT NULL,
         text TEXT NOT NULL,
+        reaction TEXT,
+        reaction_targets_json TEXT,
         created_at TEXT NOT NULL,
         sent_at TEXT,
         attempts INTEGER NOT NULL DEFAULT 0,
@@ -243,6 +254,22 @@ export class BrokerStore {
         frozen_at TEXT NOT NULL
       );
     `);
+    this.ensureOutboxReactionColumns();
+  }
+
+  /** Forward-only schema step: pre-reaction databases gain the two nullable columns in place. */
+  private ensureOutboxReactionColumns(): void {
+    const columns = (this.db.pragma("table_info(outbox)") as { name: string }[]).map((c) => c.name);
+    if (!columns.includes("reaction")) {
+      this.db.exec("ALTER TABLE outbox ADD COLUMN reaction TEXT");
+    }
+    if (!columns.includes("reaction_targets_json")) {
+      this.db.exec("ALTER TABLE outbox ADD COLUMN reaction_targets_json TEXT");
+    }
+    // The single-timestamp shape never shipped past this branch; no dual readers survive it.
+    if (columns.includes("reaction_target_ts")) {
+      this.db.exec("ALTER TABLE outbox DROP COLUMN reaction_target_ts");
+    }
   }
 
   private loadOrCreateBrokerUuid(): string {
@@ -708,6 +735,7 @@ export class BrokerStore {
       this.enqueueOutbox(
         delivery,
         `→ delivered to ${delivery.actor} (delivery ${delivery.id}, attempt ${delivery.attempts}/${delivery.subscription.maxAttempts})`,
+        REACTION_DISPATCHED,
       );
       return delivery;
     })();
@@ -730,11 +758,11 @@ export class BrokerStore {
         UPDATE deliveries SET status=?, reasons_json=?, terminal_at=?, updated_at=? WHERE delivery_id=?
       `).run(status, JSON.stringify(reasons), now, now, deliveryId);
       if (status !== "processed") {
-        this.enqueueOutbox(current, failureNotice(current, status, reasons));
+        this.enqueueOutbox(current, failureNotice(current, status, reasons), REACTION_FAILED);
       } else if (outcomeText !== null) {
         // R-6: a headless outcome commits with the terminal transition so a
         // Slack outage can neither lose it nor rerun the trusted instruction.
-        this.enqueueOutbox(current, outcomePost(current, outcomeText));
+        this.enqueueOutbox(current, outcomePost(current, outcomeText), REACTION_PROCESSED);
       }
       return this.getDelivery(deliveryId);
     })();
@@ -803,7 +831,7 @@ export class BrokerStore {
         UPDATE deliveries SET status='failed', reasons_json=?, terminal_at=?, updated_at=?
         WHERE delivery_id=? AND status IN ('claimed', 'accepted_local', 'dispatching', 'dispatched')
       `).run(JSON.stringify([reason]), now, now, delivery.id);
-      this.enqueueOutbox(delivery, failureNotice(delivery, "failed", [reason]));
+      this.enqueueOutbox(delivery, failureNotice(delivery, "failed", [reason]), REACTION_FAILED);
       return;
     }
     const nextAttemptAt = new Date(this.clock.now().getTime() + retryBackoffMs(delivery.attempts)).toISOString();
@@ -836,7 +864,7 @@ export class BrokerStore {
           WHERE delivery_id=?
         `).run(JSON.stringify([{ code: "agent_outcome_reported", detail: "the agent reported its outcome" }]), now, now, deliveryId);
       }
-      this.enqueueOutbox(current, outcomePost(current, text));
+      this.enqueueOutbox(current, outcomePost(current, text), REACTION_PROCESSED);
       return this.getDelivery(deliveryId);
     })();
   }
@@ -848,11 +876,27 @@ export class BrokerStore {
     `).run(channelId, threadTs, text, iso(this.clock));
   }
 
-  enqueueOutbox(delivery: Delivery, text: string): void {
+  enqueueOutbox(delivery: Delivery, text: string, reaction: string | null = null): void {
+    // A coalesced delivery answers several wake messages at once; the stamp
+    // must land on every one of them, not only the primary event's.
+    const targets = reaction === null
+      ? null
+      : JSON.stringify([...new Set([
+          delivery.event.messageTs,
+          ...delivery.coalescedMessages.map((message) => message.messageTs),
+        ])]);
     this.db.prepare(`
-      INSERT INTO outbox(delivery_id, channel_id, thread_ts, text, created_at)
-      VALUES (?, ?, ?, ?, ?)
-    `).run(delivery.id, delivery.event.channelId, delivery.event.threadTs, text, iso(this.clock));
+      INSERT INTO outbox(delivery_id, channel_id, thread_ts, text, reaction, reaction_targets_json, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      delivery.id,
+      delivery.event.channelId,
+      delivery.event.threadTs,
+      text,
+      reaction,
+      targets,
+      iso(this.clock),
+    );
   }
 
   /**
@@ -958,7 +1002,7 @@ export class BrokerStore {
       WHERE delivery_id=? AND status='pending'
     `).run(status, JSON.stringify(reasons), now, now, deliveryId);
     if (result.changes === 1) {
-      this.enqueueOutbox(delivery, failureNotice(delivery, status, reasons));
+      this.enqueueOutbox(delivery, failureNotice(delivery, status, reasons), REACTION_FAILED);
     }
   }
 }
@@ -1064,6 +1108,10 @@ function outboxFromRow(row: Row): OutboxEntry {
     channelId: String(row.channel_id),
     threadTs: String(row.thread_ts),
     text: String(row.text),
+    reaction: row.reaction === null || row.reaction === undefined ? null : String(row.reaction),
+    reactionTargets: row.reaction_targets_json === null || row.reaction_targets_json === undefined
+      ? []
+      : (JSON.parse(String(row.reaction_targets_json)) as string[]),
     createdAt: String(row.created_at),
     sentAt: row.sent_at === null ? null : String(row.sent_at),
     attempts: Number(row.attempts),
