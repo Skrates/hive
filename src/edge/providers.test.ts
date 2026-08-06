@@ -196,13 +196,14 @@ test("Codex live delivery travels over the surface's owner-only UDS socket", asy
   prepareSocketPath(socketPath);
 
   const seen: unknown[] = [];
+  const longOutcome = "F".repeat(9_471);
   const server = createServer((request, response) => {
     const chunks: Buffer[] = [];
     request.on("data", (chunk: Buffer) => chunks.push(chunk));
     request.on("end", () => {
       seen.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
       const body = JSON.stringify({
-        receipt: JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "done" } }),
+        receipt: JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: longOutcome } }),
         processed: true,
       });
       response.writeHead(200, { "content-type": "application/json" });
@@ -223,6 +224,7 @@ test("Codex live delivery travels over the surface's owner-only UDS socket", asy
   };
   const result = await codex.deliverLive(ingress, delivery(11), "framed body");
   assert.match(result.receipt, /agent_message/);
+  assert.equal((JSON.parse(result.receipt) as { item: { text: string } }).item.text, longOutcome);
   assert.equal(result.processed, true);
   const payload = seen[0] as { delivery: { id: number }; framed: string };
   assert.equal(payload.delivery.id, 11);
@@ -236,7 +238,7 @@ test("an oversized live receipt is rejected", async (t) => {
   prepareSocketPath(socketPath);
   const server = createServer((_request, response) => {
     response.writeHead(200, { "content-type": "application/json" });
-    response.end(JSON.stringify({ receipt: "x".repeat(5_000), processed: true }));
+    response.end(JSON.stringify({ receipt: "x".repeat(40_001), processed: true }));
   });
   await new Promise<void>((resolve) => server.listen({ path: socketPath }, resolve));
   t.after(() => server.close());

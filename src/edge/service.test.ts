@@ -20,6 +20,26 @@ test("Codex JSONL receipt yields the final agent message", () => {
   assert.equal(headlessAcknowledgement(receipt), "Handled and recorded.");
 });
 
+test("a long live Codex answer reaches the thread verbatim within the bounded outcome budget", () => {
+  const answer = "F".repeat(9_471);
+  const receipt = JSON.stringify({
+    type: "item.completed",
+    item: { type: "agent_message", text: answer },
+  });
+  assert.equal(headlessAcknowledgement(receipt), answer);
+});
+
+test("thread outcomes truncate only above the 30,000 character budget", () => {
+  const answer = "x".repeat(30_001);
+  const receipt = JSON.stringify({
+    type: "item.completed",
+    item: { type: "agent_message", text: answer },
+  });
+  const outcome = headlessAcknowledgement(receipt);
+  assert.equal(outcome.length, 30_000);
+  assert.ok(outcome.endsWith("…"));
+});
+
 test("Claude stream JSON receipt yields the result", () => {
   const receipt = JSON.stringify({ type: "result", subtype: "success", result: "Done from Claude." });
   assert.equal(headlessAcknowledgement(receipt), "Done from Claude.");

@@ -6,6 +6,9 @@ import type { Delivery, Provider, Subscription } from "../domain.js";
 import { udsRequestJson } from "../local/uds.js";
 import type { LiveIngress } from "./live-registry.js";
 
+const MAX_CODEX_LIVE_RECEIPT_CHARS = 40_000;
+const MAX_THREAD_OUTCOME_CHARS = 30_000;
+
 export interface ProviderDispatch {
   /** Diagnostic tail of the provider's raw output — for the ledger, never for parsing. */
   receipt: string;
@@ -70,7 +73,8 @@ export class CodexProvider implements ProviderAdapter {
       framed,
     });
     const receipt = result.receipt;
-    if (typeof receipt !== "string" || receipt.length === 0 || receipt.length > 4_000) {
+    if (typeof receipt !== "string" || receipt.length === 0
+      || receipt.length > MAX_CODEX_LIVE_RECEIPT_CHARS) {
       throw new Error("Codex live ingress invalid response");
     }
     if (result.processed !== true) throw new Error("Codex live ingress returned before turn completion");
@@ -305,7 +309,9 @@ export function headlessAcknowledgement(output: string): string {
     }
   }
   const best = resultText ?? agentMessageText ?? lastAssistantText ?? "Headless provider turn completed successfully.";
-  return best.length <= 2_500 ? best : `${best.slice(0, 2_497)}…`;
+  return best.length <= MAX_THREAD_OUTCOME_CHARS
+    ? best
+    : `${best.slice(0, MAX_THREAD_OUTCOME_CHARS - 1)}…`;
 }
 
 /** Concatenate the text blocks of an `assistant` wire message (Claude/Grok shape). */
