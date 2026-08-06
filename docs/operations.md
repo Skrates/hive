@@ -46,8 +46,12 @@ not a backup.
 
 ## Edge and local surfaces
 
-Run `hive edge` on each mapped machine. The edge serves its control plane on an owner-only UDS
-socket (`HIVE_EDGE_SOCKET`, default `~/.hive/edge.sock`):
+Run `hive edge` on each mapped machine. The edge's environment file MUST set a `PATH` that
+contains the provider CLI and `~/.local/bin` (where `hive`, `hive-claude-hook`, and the `node`
+symlink live) — a service manager's bare default PATH makes every headless spawn die on ENOENT,
+which surfaces as `provider_dispatch_unknown` with no stderr, and stays invisible as long as live
+deliveries keep succeeding. The edge serves its control plane on an owner-only UDS socket
+(`HIVE_EDGE_SOCKET`, default `~/.hive/edge.sock`):
 
 - live surfaces and hooks renew their liveness registration there (the TTL is the heartbeat);
 - `hive reply <delivery-id> "<summary>"` relays an agent's outcome to the broker — not lease-fenced,
@@ -104,3 +108,22 @@ outcome post means the agent never closed the loop.
 
 There is no reconciliation surface. If a delivery failed, the thread says so; send the message
 again or fix the edge.
+
+The wake message itself also carries glanceable state as emoji reactions, stamped by the broker
+when the corresponding outbox row drains: :eyes: once the delivery is dispatched, :white_check_mark:
+when an outcome closes it, :x: on any terminal failure. Reactions are annotation, not contract —
+the thread posts above remain the durable record, and a failed stamp is logged and dropped.
+
+## Scheduled wakes
+
+A Slack message scheduled with the native **Send later** posts as the scheduling user at the
+chosen time and reaches the broker as an ordinary message event — so a scheduled
+`WAKE: <actor> …` is cron-style agent scheduling with zero new infrastructure. Recurring
+operator rituals (morning status sweeps, deploy-window checks) should be scheduled messages, not
+human memory.
+
+The admission boundary is unchanged: the *sender at post time* must be in the trust set. That is
+true for an operator's Send-later message. It is NOT generally true for messages scheduled by a
+seat through a Slack API client — those post under that app's bot identity, and an unadmitted bot
+is dropped with a thread notice. Admitting such an identity widens the trust set to everyone who
+can make that app post; that is an operator policy decision, never a default.
