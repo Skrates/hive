@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  assertCodexAttachmentActor,
   createCodexForegroundBinding,
   readCodexForegroundBinding,
   removeCodexForegroundBinding,
@@ -45,6 +46,14 @@ test("attachment is exact-cwd, primary-task verified, atomic, and owner-only", a
 
   await removeCodexForegroundBinding(bindingFile);
   assert.equal(await readCodexForegroundBinding(bindingFile), null);
+});
+
+test("the attachment actor grammar rejects names that would escape the bindings directory", () => {
+  assertCodexAttachmentActor("ariadne");
+  assertCodexAttachmentActor("claude-1");
+  for (const actor of ["../../.config/foo", "a/b", "/absolute", "..", "Ariadne", "", "everyone"]) {
+    assert.throws(() => assertCodexAttachmentActor(actor), /invalid Hive actor/, actor);
+  }
 });
 
 test("attachment rejects the wrong cwd and spawned child tasks", async (t) => {

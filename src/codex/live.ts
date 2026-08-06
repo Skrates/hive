@@ -1,8 +1,9 @@
 #!/usr/bin/env node
+import { realpath } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import type { Delivery } from "../domain.js";
+import { dedupeKey, type Delivery } from "../domain.js";
 import { prepareSocketPath, udsRequestJson } from "../local/uds.js";
 import { CodexAppServerClient } from "./app-server.js";
 import { readCodexForegroundBinding, type CodexForegroundBinding } from "./binding.js";
@@ -25,6 +26,13 @@ interface Config {
   surfaceVersion: string;
   appServerSocket?: string;
   bindingFile: string;
+  /**
+   * The Codex installation this surface follows for a foreground attachment
+   * (`CODEX_HOME` of the running Desktop app). ADR-0003 R-5 pins execution to
+   * the subscription's account profile, so this home must be that same
+   * profile — the check happens per delivery, where the pinned profile is known.
+   */
+  desktopHome: string;
   desktopIpcSocket: string;
   desktopStateDatabase: string;
 }
@@ -79,6 +87,9 @@ export async function runCodexLive(config: Config): Promise<void> {
     void handle(request, response, () => bindingStatus(config.actor, target), async (delivery, framed) => {
       const acceptedTarget = target;
       if (!acceptedTarget) throw new Error("Codex explicit foreground attachment is unavailable");
+      if (acceptedTarget.kind === "desktop") {
+        await assertPinnedDesktopAccount(config.desktopHome, delivery.subscription.accountProfile);
+      }
       return acceptedTarget.kind === "desktop"
         ? completeDesktopDelivery(desktopClient, acceptedTarget.sessionId, delivery, framed)
         : completeCodexDelivery(appClient, acceptedTarget.sessionId, delivery, framed);
@@ -126,9 +137,15 @@ export async function runCodexLive(config: Config): Promise<void> {
         const key = binding ? binding.revision : "dedicated";
         const currentKey = target?.kind === "desktop" ? target.revision : target?.kind ?? "unavailable";
         if (key === currentKey) {
-          if (target?.kind !== "desktop" || desktopClient.isFollowing(target.sessionId)) return;
+          if (target?.kind !== "desktop") return;
+          // An unchanged revision is not proof the task is still routable: it
+          // can be archived, or moved out of its exact cwd, under a follower
+          // that stays connected. Re-run the same validation a fresh
+          // attachment would face — a rejection lands in the catch below and
+          // withdraws liveness instead of routing wakes into a dead task.
+          const wasFollowing = desktopClient.isFollowing(target.sessionId);
           target = await prepareDesktop(binding!);
-          await register();
+          if (!wasFollowing) await register();
           return;
         }
         target = binding ? await prepareDesktop(binding) : await prepareDedicated();
@@ -213,10 +230,7 @@ export async function completeCodexDelivery(
   framed: string,
   now: () => number = Date.now,
 ): Promise<{ receipt: string; processed: true }> {
-  const createdAt = Date.parse(delivery.createdAt);
-  const deadline = Number.isFinite(createdAt)
-    ? createdAt + delivery.subscription.deliveryTtlMs
-    : now() + delivery.subscription.deliveryTtlMs;
+  const deadline = turnDeadline(delivery, now);
   const accepted = await client.deliver(
     threadId,
     framed,
@@ -246,11 +260,13 @@ export async function completeDesktopDelivery(
   framed: string,
   now: () => number = Date.now,
 ): Promise<{ receipt: string; processed: true }> {
-  const createdAt = Date.parse(delivery.createdAt);
-  const deadline = Number.isFinite(createdAt)
-    ? createdAt + delivery.subscription.deliveryTtlMs
-    : now() + delivery.subscription.deliveryTtlMs;
-  const accepted = await client.deliver(sessionId, framed, delivery.id, remainingBefore(deadline, now));
+  const deadline = turnDeadline(delivery, now);
+  const accepted = await client.deliver(
+    sessionId,
+    framed,
+    desktopDeliveryKey(delivery),
+    remainingBefore(deadline, now),
+  );
   const completion = await client.waitForDeliveryOutcome(
     sessionId,
     accepted,
@@ -302,6 +318,64 @@ function remainingBefore(deadline: number, now: () => number): number {
   return remaining;
 }
 
+/**
+ * The execution budget for a live turn starts at the claim, not at delivery
+ * creation. `deliveryTtlMs` is the broker's *pre-claim* window — it decides
+ * whether a pending delivery may still be handed to an edge. Anchoring the turn
+ * deadline at `createdAt` would give a delivery claimed late in that window
+ * (after backoff, say) almost no time to run: the turn would time out as
+ * uncertainty while still executing, and the released delivery would then
+ * expire on its next claim — losing the outcome and skipping retry exhaustion.
+ * The live surface is only reached after the claim, so the budget starts here.
+ */
+function turnDeadline(delivery: Delivery, now: () => number): number {
+  return now() + delivery.subscription.deliveryTtlMs;
+}
+
+/**
+ * The Desktop idempotency coordinate. Recovery searches a followed foreground
+ * task's entire history, and that task outlives any single broker ledger: a
+ * recreated or restored ledger reissues low delivery ids, so the bare integer
+ * could match an unrelated earlier wake and hand back its answer. The full
+ * dedupe coordinate — workspace, channel, Slack message ts, delivery id —
+ * cannot collide.
+ */
+export function desktopDeliveryKey(delivery: Delivery): string {
+  return `hive-delivery-${delivery.event.workspaceId}-${delivery.event.channelId}-${dedupeKey(delivery)}`;
+}
+
+/**
+ * ADR-0003 R-5: a wake executes under the subscription's pinned account
+ * profile, never whatever seat the edge happens to be logged into. The
+ * foreground Desktop installation is selected independently of the
+ * subscription (`HIVE_CODEX_DESKTOP_HOME`), and the provider preflight only
+ * proves the pinned directory exists — so an attachment could otherwise
+ * execute as, and consume quota from, another Codex account. This is a hard
+ * pre-dispatch failure: it runs before any turn is injected, and it never
+ * falls back.
+ */
+export async function assertPinnedDesktopAccount(
+  desktopHome: string,
+  accountProfile: string,
+): Promise<void> {
+  let home: string;
+  let pinned: string;
+  try {
+    [home, pinned] = await Promise.all([realpath(desktopHome), realpath(accountProfile)]);
+  } catch (error) {
+    throw new Error(
+      `Cannot verify the Codex Desktop account profile binding: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
+  if (home !== pinned) {
+    throw new Error(
+      `Codex Desktop home ${home} is not the subscription's pinned account profile ${pinned}`,
+    );
+  }
+}
+
 if (import.meta.url === `file://${process.argv[1]}`) {
   const required = (name: string): string => {
     const value = process.env[name];
@@ -318,6 +392,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     surfaceSocket: process.env.HIVE_SURFACE_SOCKET ?? join(hiveHome, `codex-live-${actor}.sock`),
     surfaceVersion: process.env.HIVE_PROVIDER_VERSION ?? "unknown",
     bindingFile: process.env.HIVE_CODEX_BINDING_FILE ?? join(hiveHome, "codex-bindings", `${actor}.json`),
+    desktopHome,
     desktopIpcSocket: process.env.HIVE_CODEX_DESKTOP_IPC_SOCKET ?? join(desktopHome, "ipc", "ipc.sock"),
     desktopStateDatabase: process.env.HIVE_CODEX_DESKTOP_STATE_DB ?? join(desktopHome, "state_5.sqlite"),
     ...(process.env.HIVE_CODEX_APP_SERVER_SOCKET

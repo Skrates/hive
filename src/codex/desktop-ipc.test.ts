@@ -68,7 +68,7 @@ test("Desktop IPC correlates the exact steered final answer before the foregroun
 
   await client.connect();
   await client.follow("thread-1", 100);
-  const accepted = await client.deliver("thread-1", "<untrusted/>", 7);
+  const accepted = await client.deliver("thread-1", "<untrusted/>", "hive-delivery-7");
   assert.equal(accepted.turnId, "turn-1");
   assert.equal(accepted.mode, "steer");
   const completion = await client.waitForDeliveryOutcome("thread-1", accepted, 100);
@@ -104,7 +104,7 @@ test("Desktop IPC retry recovers an accepted delivery and its final answer witho
 
   await client.connect();
   await client.follow("thread-1", 100);
-  const accepted = await client.deliver("thread-1", "redelivery", 48);
+  const accepted = await client.deliver("thread-1", "redelivery", "hive-delivery-48");
   const outcome = await client.waitForDeliveryOutcome("thread-1", accepted, 100);
 
   assert.deepEqual(accepted, {
@@ -158,7 +158,7 @@ test("uncertain or mismatched steer responses never fall through to start", asyn
     try {
       await client.connect();
       await client.follow("thread-1", 50);
-      await assert.rejects(() => client.deliver("thread-1", "body", 1));
+      await assert.rejects(() => client.deliver("thread-1", "body", "hive-delivery-1"));
       await delay(30);
       assert.equal(starts, 0, behavior);
     } finally {
@@ -208,7 +208,7 @@ test("an ended active-turn race falls through from steer to start", async (t) =>
 
   await client.connect();
   await client.follow("thread-1", 100);
-  const accepted = await client.deliver("thread-1", "body", 9);
+  const accepted = await client.deliver("thread-1", "body", "hive-delivery-9");
 
   assert.deepEqual(accepted, {
     turnId: "turn-new",
@@ -241,7 +241,7 @@ test("stale owner patches are ignored and revision divergence fails completion",
   t.after(() => client.close());
   await client.connect();
   await client.follow("thread-1", 100);
-  const accepted = await client.deliver("thread-1", "body", 1);
+  const accepted = await client.deliver("thread-1", "body", "hive-delivery-1");
   const waiting = client.waitForTurnCompletion("thread-1", accepted.turnId, 200);
   clientSocket!.write(streamPatch("other-owner", 1, 2, [{
     op: "replace",
@@ -276,7 +276,7 @@ test("a competing owner snapshot fails closed until an explicit follower reset",
   t.after(() => client.close());
   await client.connect();
   await client.follow("thread-1", 100);
-  const accepted = await client.deliver("thread-1", "body", 1);
+  const accepted = await client.deliver("thread-1", "body", "hive-delivery-1");
   const waiting = client.waitForTurnCompletion("thread-1", accepted.turnId, 200);
 
   clientSocket!.write(streamSnapshot("owner-b", 2, "turn-1", "completed", [
@@ -313,7 +313,7 @@ test("an owner conflict before the steer response rejects completion immediately
   t.after(() => client.close());
   await client.connect();
   await client.follow("thread-1", 100);
-  const accepted = await client.deliver("thread-1", "body", 1);
+  const accepted = await client.deliver("thread-1", "body", "hive-delivery-1");
 
   await assert.rejects(
     () => client.waitForTurnCompletion("thread-1", accepted.turnId, 5_000),

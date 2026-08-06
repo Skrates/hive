@@ -11,6 +11,19 @@ export interface CodexForegroundBinding {
   attachedAt: string;
 }
 
+/**
+ * The actor grammar for every Codex attachment path. Actor names are
+ * interpolated into owner-only file paths, so the grammar must be applied
+ * before any path is constructed, read, or removed — not only on the write
+ * path. A name containing path segments would otherwise escape the bindings
+ * directory.
+ */
+export function assertCodexAttachmentActor(actor: string): void {
+  if (!/^[a-z0-9][a-z0-9._-]{0,63}$/.test(actor) || actor === "everyone") {
+    throw new Error("invalid Hive actor for Codex attachment");
+  }
+}
+
 export async function createCodexForegroundBinding(input: {
   actor: string;
   sessionId: string;
@@ -18,7 +31,7 @@ export async function createCodexForegroundBinding(input: {
   stateDatabase: string;
   bindingFile: string;
 }): Promise<CodexForegroundBinding> {
-  validateActor(input.actor);
+  assertCodexAttachmentActor(input.actor);
   if (!input.sessionId) throw new Error("Codex attachment requires a session id");
   if (!input.cwd.startsWith("/")) throw new Error("Codex attachment cwd must be absolute");
   const catalog = new CodexThreadCatalog(input.stateDatabase);
@@ -63,7 +76,7 @@ export async function readCodexForegroundBinding(
     revision: requiredString(value.revision, "revision"),
     attachedAt: requiredString(value.attachedAt, "attachedAt"),
   };
-  validateActor(binding.actor);
+  assertCodexAttachmentActor(binding.actor);
   if (!binding.cwd.startsWith("/") || !Number.isFinite(Date.parse(binding.attachedAt))) {
     throw new Error("Codex attachment file is invalid");
   }
@@ -82,12 +95,6 @@ async function writeBinding(path: string, binding: CodexForegroundBinding): Prom
   await writeFile(temporary, `${JSON.stringify(binding, null, 2)}\n`, { mode: 0o600, flag: "wx" });
   await rename(temporary, path);
   await chmod(path, 0o600);
-}
-
-function validateActor(actor: string): void {
-  if (!/^[a-z0-9][a-z0-9._-]{0,63}$/.test(actor) || actor === "everyone") {
-    throw new Error("invalid Hive actor for Codex attachment");
-  }
 }
 
 function requiredString(value: unknown, name: string): string {

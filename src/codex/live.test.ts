@@ -1,7 +1,15 @@
 import assert from "node:assert/strict";
+import { mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import type { Delivery, Subscription } from "../domain.js";
-import { completeCodexDelivery, completeDesktopDelivery } from "./live.js";
+import {
+  assertPinnedDesktopAccount,
+  completeCodexDelivery,
+  completeDesktopDelivery,
+  desktopDeliveryKey,
+} from "./live.js";
 
 test("a completed live turn becomes a processed provider receipt", async () => {
   const budgets: number[] = [];
@@ -70,7 +78,76 @@ test("an interrupted Desktop turn never becomes a processed outcome", async () =
   );
 });
 
-function delivery(now: number): Delivery {
+test("a late-claimed delivery gets a full post-claim turn budget", async () => {
+  const budgets: number[] = [];
+  const appClient = {
+    async deliver(_threadId: string, _framed: string, _deliveryId: number, timeoutMs?: number) {
+      budgets.push(timeoutMs ?? 0);
+      return { turnId: "turn-late", mode: "steer" as const };
+    },
+    async waitForCompletion(_threadId: string, _turnId: string, timeoutMs: number) {
+      budgets.push(timeoutMs);
+      return { status: "completed" as const, assistantText: "Answered." };
+    },
+  };
+  const desktopBudgets: number[] = [];
+  const desktopClient = {
+    async deliver(_sessionId: string, _framed: string, _key: string, timeoutMs?: number) {
+      desktopBudgets.push(timeoutMs ?? 0);
+      return { turnId: "turn-late", clientUserMessageId: "k", mode: "steer" as const };
+    },
+    async waitForDeliveryOutcome(_sessionId: string, _accepted: unknown, timeoutMs: number) {
+      desktopBudgets.push(timeoutMs);
+      return { turnId: "turn-late", status: "completed" as const, assistantText: "Answered." };
+    },
+  };
+  const now = Date.parse("2026-08-06T11:26:45.000Z");
+  // Claimed 59s into a 60s pre-claim TTL — anchoring on `createdAt` would leave
+  // a 1s budget for the whole turn.
+  const claimedLate = delivery(now, now - 59_000);
+
+  await completeCodexDelivery(appClient, "thread-1", claimedLate, "wake", () => now);
+  await completeDesktopDelivery(desktopClient, "foreground-task", claimedLate, "wake", () => now);
+
+  assert.deepEqual(budgets, [60_000, 60_000]);
+  assert.deepEqual(desktopBudgets, [60_000, 60_000]);
+});
+
+test("the Desktop idempotency key carries the full Slack dedupe coordinate", () => {
+  const now = Date.parse("2026-08-06T11:26:45.000Z");
+  const first = delivery(now);
+  const key = desktopDeliveryKey(first);
+  assert.equal(key, "hive-delivery-T1-C1-100.1:35");
+  // A recreated ledger reissuing the same integer for a different Slack message
+  // must not collide with the recorded answer of the first one.
+  const reissued: Delivery = { ...first, event: { ...first.event, messageTs: "200.2" } };
+  assert.notEqual(desktopDeliveryKey(reissued), key);
+});
+
+test("a Desktop delivery is refused unless its home is the pinned account profile", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "hive-codex-account-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const pinned = join(root, "profiles", "ariadne");
+  const other = join(root, "profiles", "someone-else");
+  const linked = join(root, "desktop-home");
+  await mkdir(pinned, { recursive: true });
+  await mkdir(other, { recursive: true });
+  await symlink(pinned, linked);
+
+  // The same profile reached through a symlink is the same account.
+  await assertPinnedDesktopAccount(linked, pinned);
+  await assert.rejects(
+    () => assertPinnedDesktopAccount(other, pinned),
+    /is not the subscription's pinned account profile/,
+  );
+  // An unresolvable home or profile is a hard failure, never a pass-through.
+  await assert.rejects(
+    () => assertPinnedDesktopAccount(join(root, "missing"), pinned),
+    /Cannot verify the Codex Desktop account profile binding/,
+  );
+});
+
+function delivery(now: number, createdAt: number = now): Delivery {
   const subscription: Subscription = {
     actor: "ariadne",
     provider: "codex",
@@ -106,7 +183,7 @@ function delivery(now: number): Delivery {
     coalescedMessages: [],
     initialSnapshot: null,
     snapshotTs: null,
-    createdAt: new Date(now).toISOString(),
+    createdAt: new Date(createdAt).toISOString(),
     updatedAt: new Date(now).toISOString(),
     subscription,
     event: {

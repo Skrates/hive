@@ -22,6 +22,7 @@ import { EdgeService } from "./edge/service.js";
 import { EdgeStore } from "./edge/store.js";
 import { udsRequestJson } from "./local/uds.js";
 import {
+  assertCodexAttachmentActor,
   createCodexForegroundBinding,
   readCodexForegroundBinding,
   removeCodexForegroundBinding,
@@ -288,6 +289,12 @@ function codexAttachmentPaths(actor: string): {
   surfaceSocket: string;
   stateDatabase: string;
 } {
+  // The actor is interpolated into the binding path and the surface socket
+  // path, and `detach` removes the file it names. Apply the grammar before any
+  // of those paths exist, so a name carrying path segments can never reach the
+  // filesystem — `attach` alone validating inside the binding writer is not
+  // enough to cover removal.
+  assertCodexAttachmentActor(actor);
   const desktopHome = process.env.HIVE_CODEX_DESKTOP_HOME ?? join(homedir(), ".codex");
   return {
     bindingFile: process.env.HIVE_CODEX_BINDING_FILE ?? join(hiveHome(), "codex-bindings", `${actor}.json`),
