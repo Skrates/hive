@@ -30,6 +30,9 @@ const slack: SlackTransport = {
   async reply() {
     throw new Error("not used");
   },
+  async react() {
+    throw new Error("not used");
+  },
 };
 
 function subscription(): SubscriptionInput {

@@ -286,6 +286,20 @@ export class SlackWebTransport implements SlackTransport {
     if (!result.ts) throw new Error("Slack reply returned no timestamp");
     return result.ts;
   }
+
+  /**
+   * Lifecycle stamps are idempotent by contract: redelivery re-stamps the same
+   * emoji and Slack answers `already_reacted`, which is success, not failure.
+   */
+  async react(channelId: string, messageTs: string, name: string): Promise<void> {
+    try {
+      await this.web.reactions.add({ channel: channelId, timestamp: messageTs, name });
+    } catch (error) {
+      const code = (error as { data?: { error?: string } }).data?.error;
+      if (code === "already_reacted") return;
+      throw error;
+    }
+  }
 }
 
 export class SlackSocketIngress {

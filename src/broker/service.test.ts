@@ -24,6 +24,7 @@ test("overlapping outbox drains share one healthy in-process pass", async (t) =>
       await blocked;
       return "100.2";
     },
+    async react(): Promise<void> {},
   };
   const broker = new BrokerService(store, slack);
 
@@ -40,4 +41,62 @@ test("overlapping outbox drains share one healthy in-process pass", async (t) =>
   // The single-flight latch clears after completion, so a future enqueue gets
   // its own pass instead of remaining attached to the completed promise.
   assert.equal(await broker.drainOutbox(), 0);
+});
+
+test("drain stamps the row's reaction on the wake message and a reaction failure never blocks the row", async (t) => {
+  const store = new BrokerStore(":memory:");
+  t.after(() => store.close());
+  store.createEdge("mac");
+  store.upsertSubscription({
+    actor: "ariadne",
+    provider: "codex",
+    providerSurface: "app-server",
+    providerVersion: "0.144.0-alpha.4",
+    sessionId: null,
+    homeEdge: "mac",
+    workspace: "taxis",
+    edgeWorkspaces: [{ edgeId: "mac", cwd: "/work/taxis", worktree: null }],
+    wakePolicy: "spawn",
+    permissionProfile: "read-only",
+    accountProfile: "/home/user/.codex-hive",
+    leaseTtlMs: 1_000,
+    deliveryTtlMs: 60_000,
+    homeGraceMs: 2_000,
+    spawnRateLimit: 1,
+    maxAttempts: 3,
+    expiresAt: null,
+  });
+  store.ingestEvent({
+    eventId: "Ev1",
+    workspaceId: "T1",
+    channelId: "C1",
+    threadTs: "100.1",
+    messageTs: "100.2",
+    senderId: "U1",
+    senderKind: "user",
+    actor: "ariadne",
+    text: "WAKE: ariadne | test",
+    raw: { type: "message" },
+    receivedAt: "2026-07-12T00:00:00.000Z",
+  });
+  const claimed = store.claimNext("mac", 0)!;
+  store.transition(claimed.id, "mac", 1, "claimed", "accepted_local");
+  store.transition(claimed.id, "mac", 1, "accepted_local", "dispatching");
+  store.markDispatched(claimed.id, "mac", 1);
+
+  const reactions: Array<{ ts: string; name: string }> = [];
+  const slack: SlackTransport = {
+    async replay(): Promise<ReplaySnapshot> { throw new Error("not used"); },
+    async reply(): Promise<string> { return "100.3"; },
+    async react(_channel, ts, name): Promise<void> {
+      reactions.push({ ts, name });
+      throw new Error("reactions API down");
+    },
+  };
+  const broker = new BrokerService(store, slack);
+  assert.equal(await broker.drainOutbox(), 1);
+  // The stamp targeted the wake message with the dispatched emoji...
+  assert.deepEqual(reactions, [{ ts: "100.2", name: "eyes" }]);
+  // ...and its failure did not keep the row unsent (the text post is the contract).
+  assert.deepEqual(store.listUnsentOutbox(), []);
 });

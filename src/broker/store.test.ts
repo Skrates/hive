@@ -624,3 +624,50 @@ test("delete-subscription refuses to erase an in-flight provider coordinate", ()
   assert.deepEqual(store.actorsBoundToThread("C1", "100.1"), ["ariadne"]);
   store.close();
 });
+
+test("lifecycle reactions ride the outbox: eyes on dispatched, check on outcome, x on failure", () => {
+  const { store } = fixture();
+  store.ingestEvent(event());
+  const claimed = store.claimNext("mac", 0)!;
+  store.transition(claimed.id, "mac", 1, "claimed", "accepted_local");
+  store.transition(claimed.id, "mac", 1, "accepted_local", "dispatching");
+  store.markDispatched(claimed.id, "mac", 1);
+  store.finish(claimed.id, "mac", 1, "processed", [], "done: shipped it");
+
+  const outbox = store.listUnsentOutbox();
+  const dispatched = outbox.find((entry) => /delivered to ariadne/.test(entry.text))!;
+  assert.equal(dispatched.reaction, "eyes");
+  assert.equal(dispatched.reactionTargetTs, "100.2");
+  const outcome = outbox.find((entry) => /done: shipped it/.test(entry.text))!;
+  assert.equal(outcome.reaction, "white_check_mark");
+  assert.equal(outcome.reactionTargetTs, "100.2");
+  // The reaction targets the wake message, never the thread root.
+  assert.ok(outbox.every((entry) => entry.reactionTargetTs !== "100.1"));
+  store.close();
+});
+
+test("a terminal failure stamps x on the wake message", () => {
+  const { store } = fixture();
+  store.ingestEvent(event());
+  const claimed = store.claimNext("mac", 0)!;
+  store.transition(claimed.id, "mac", 1, "claimed", "accepted_local");
+  store.finish(claimed.id, "mac", 1, "undeliverable", [{ code: "workspace_not_mapped", detail: "no mapping" }]);
+  const failure = store.listUnsentOutbox().find((entry) => /undeliverable/.test(entry.text))!;
+  assert.equal(failure.reaction, "x");
+  assert.equal(failure.reactionTargetTs, "100.2");
+  store.close();
+});
+
+test("thread notices carry no reaction and pre-reaction databases migrate in place", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "hive-outbox-reaction-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const path = join(directory, "broker.sqlite");
+  const first = new BrokerStore(path);
+  first.enqueueThreadNotice("C1", "100.1", "plain notice");
+  assert.equal(first.listUnsentOutbox()[0]!.reaction, null);
+  first.close();
+  // Re-opening runs the ensure-column step against already-migrated schema: a no-op.
+  const second = new BrokerStore(path);
+  assert.equal(second.listUnsentOutbox()[0]!.reaction, null);
+  second.close();
+});

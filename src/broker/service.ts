@@ -4,6 +4,8 @@ import { BrokerStore } from "./store.js";
 export interface SlackTransport {
   replay(channelId: string, threadTs: string): Promise<ReplaySnapshot>;
   reply(channelId: string, threadTs: string, text: string, metadata?: Record<string, string>): Promise<string>;
+  /** Stamp an emoji reaction on a message. Duplicate stamps must resolve, not throw. */
+  react(channelId: string, messageTs: string, name: string): Promise<void>;
 }
 
 export class BrokerService {
@@ -144,6 +146,15 @@ export class BrokerService {
         await this.slack.reply(entry.channelId, entry.threadTs, entry.text, entry.deliveryId === null
           ? {}
           : { delivery_id: String(entry.deliveryId) });
+        // The reaction is a glanceable annotation on the wake message, not part of
+        // the two-events contract: its failure never blocks or retries the row.
+        if (entry.reaction !== null && entry.reactionTargetTs !== null) {
+          try {
+            await this.slack.react(entry.channelId, entry.reactionTargetTs, entry.reaction);
+          } catch (error) {
+            console.error("hive outbox reaction failed", entry.outboxId, entry.reaction, error);
+          }
+        }
         this.store.markOutboxSent(entry.outboxId);
         sent += 1;
       } catch {
