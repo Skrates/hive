@@ -8,8 +8,12 @@ machine token. The machine-local plane (edge control socket, live surface socket
 authenticates by filesystem ownership — owner-only Unix domain sockets and directories, no local
 tokens.
 
-Socket Mode requires both `HIVE_SLACK_APP_TOKEN` (`xapp-…`) and `HIVE_SLACK_BOT_TOKEN` (`xoxb-…`).
-The bot needs message history/reply access to the admitted private channel.
+Socket Mode requires both `HIVE_SLACK_APP_TOKEN` (`xapp-…`, scope `connections:write`) and
+`HIVE_SLACK_BOT_TOKEN` (`xoxb-…`). The bot token needs, for the admitted private channel:
+`groups:history` (thread replay), `chat:write` (outbox posts), and `reactions:write` (lifecycle
+stamps on wake messages). A missing `reactions:write` does not block delivery — every stamp fails
+as `missing_scope`, logged and dropped — so grant it up front rather than discovering the silence
+later.
 
 ## Trust set (ADR-0003 R-1)
 

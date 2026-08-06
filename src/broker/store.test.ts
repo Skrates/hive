@@ -637,12 +637,32 @@ test("lifecycle reactions ride the outbox: eyes on dispatched, check on outcome,
   const outbox = store.listUnsentOutbox();
   const dispatched = outbox.find((entry) => /delivered to ariadne/.test(entry.text))!;
   assert.equal(dispatched.reaction, "eyes");
-  assert.equal(dispatched.reactionTargetTs, "100.2");
+  assert.deepEqual(dispatched.reactionTargets, ["100.2"]);
   const outcome = outbox.find((entry) => /done: shipped it/.test(entry.text))!;
   assert.equal(outcome.reaction, "white_check_mark");
-  assert.equal(outcome.reactionTargetTs, "100.2");
+  assert.deepEqual(outcome.reactionTargets, ["100.2"]);
   // The reaction targets the wake message, never the thread root.
-  assert.ok(outbox.every((entry) => entry.reactionTargetTs !== "100.1"));
+  assert.ok(outbox.every((entry) => !entry.reactionTargets.includes("100.1")));
+  store.close();
+});
+
+test("a coalesced delivery stamps every wake message it absorbed, not only the primary", () => {
+  const { store } = fixture();
+  store.ingestEvent(event());
+  // Two more wakes land in the same thread while the delivery is still pending.
+  store.ingestEvent(event({ eventId: "Ev2", messageTs: "100.3", text: "WAKE: ariadne | again" }));
+  store.ingestEvent(event({ eventId: "Ev3", messageTs: "100.4", text: "WAKE: ariadne | and again" }));
+  const claimed = store.claimNext("mac", 0)!;
+  store.transition(claimed.id, "mac", 1, "claimed", "accepted_local");
+  store.transition(claimed.id, "mac", 1, "accepted_local", "dispatching");
+  store.markDispatched(claimed.id, "mac", 1);
+  store.recordOutcome(claimed.id, "done: all three answered");
+
+  const outbox = store.listUnsentOutbox();
+  const dispatched = outbox.find((entry) => /delivered to ariadne/.test(entry.text))!;
+  assert.deepEqual(dispatched.reactionTargets, ["100.2", "100.3", "100.4"]);
+  const outcome = outbox.find((entry) => /all three answered/.test(entry.text))!;
+  assert.deepEqual(outcome.reactionTargets, ["100.2", "100.3", "100.4"]);
   store.close();
 });
 
@@ -654,7 +674,7 @@ test("a terminal failure stamps x on the wake message", () => {
   store.finish(claimed.id, "mac", 1, "undeliverable", [{ code: "workspace_not_mapped", detail: "no mapping" }]);
   const failure = store.listUnsentOutbox().find((entry) => /undeliverable/.test(entry.text))!;
   assert.equal(failure.reaction, "x");
-  assert.equal(failure.reactionTargetTs, "100.2");
+  assert.deepEqual(failure.reactionTargets, ["100.2"]);
   store.close();
 });
 
@@ -665,9 +685,17 @@ test("thread notices carry no reaction and pre-reaction databases migrate in pla
   const first = new BrokerStore(path);
   first.enqueueThreadNotice("C1", "100.1", "plain notice");
   assert.equal(first.listUnsentOutbox()[0]!.reaction, null);
+  assert.deepEqual(first.listUnsentOutbox()[0]!.reactionTargets, []);
   first.close();
-  // Re-opening runs the ensure-column step against already-migrated schema: a no-op.
+  // A database carrying the abandoned single-timestamp column loses it in place.
+  const raw = new Database(path);
+  raw.exec("ALTER TABLE outbox ADD COLUMN reaction_target_ts TEXT");
+  raw.close();
+  // Re-opening runs the ensure-column step: no-op for current columns, drop for the stale one.
   const second = new BrokerStore(path);
   assert.equal(second.listUnsentOutbox()[0]!.reaction, null);
+  const columns = (second.db.pragma("table_info(outbox)") as { name: string }[]).map((c) => c.name);
+  assert.ok(!columns.includes("reaction_target_ts"));
+  assert.ok(columns.includes("reaction_targets_json"));
   second.close();
 });

@@ -238,6 +238,9 @@ function asSlackMessageEvent(value: unknown): SlackMessageEvent | null {
   return candidate as SlackMessageEvent;
 }
 
+/** Upper bound on one reaction stamp: past this the annotation is abandoned as failed. */
+export const REACTION_TIMEOUT_MS = 10_000;
+
 export class SlackWebTransport implements SlackTransport {
   private readonly web: WebClient;
 
@@ -290,14 +293,27 @@ export class SlackWebTransport implements SlackTransport {
   /**
    * Lifecycle stamps are idempotent by contract: redelivery re-stamps the same
    * emoji and Slack answers `already_reacted`, which is success, not failure.
+   * The stamp is optional annotation, so a call held by rate-limit retries is
+   * abandoned after a short bound rather than left pending indefinitely.
    */
   async react(channelId: string, messageTs: string, name: string): Promise<void> {
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error("reaction_timeout")), REACTION_TIMEOUT_MS);
+      timer.unref?.();
+    });
+    const add = this.web.reactions.add({ channel: channelId, timestamp: messageTs, name });
+    // A late rejection after the timeout wins the race must not surface as an
+    // unhandled rejection; the race result already carried the outcome.
+    add.catch(() => {});
     try {
-      await this.web.reactions.add({ channel: channelId, timestamp: messageTs, name });
+      await Promise.race([add, timeout]);
     } catch (error) {
       const code = (error as { data?: { error?: string } }).data?.error;
       if (code === "already_reacted") return;
       throw error;
+    } finally {
+      clearTimeout(timer);
     }
   }
 }

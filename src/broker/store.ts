@@ -55,9 +55,10 @@ export interface OutboxEntry {
   channelId: string;
   threadTs: string;
   text: string;
-  /** Optional lifecycle stamp on the originating wake message (emoji name, no colons). */
+  /** Optional lifecycle stamp on the originating wake messages (emoji name, no colons). */
   reaction: string | null;
-  reactionTargetTs: string | null;
+  /** Every wake message the stamp targets: the primary event plus any coalesced ones. */
+  reactionTargets: string[];
   createdAt: string;
   sentAt: string | null;
   attempts: number;
@@ -236,7 +237,7 @@ export class BrokerStore {
         thread_ts TEXT NOT NULL,
         text TEXT NOT NULL,
         reaction TEXT,
-        reaction_target_ts TEXT,
+        reaction_targets_json TEXT,
         created_at TEXT NOT NULL,
         sent_at TEXT,
         attempts INTEGER NOT NULL DEFAULT 0,
@@ -262,8 +263,12 @@ export class BrokerStore {
     if (!columns.includes("reaction")) {
       this.db.exec("ALTER TABLE outbox ADD COLUMN reaction TEXT");
     }
-    if (!columns.includes("reaction_target_ts")) {
-      this.db.exec("ALTER TABLE outbox ADD COLUMN reaction_target_ts TEXT");
+    if (!columns.includes("reaction_targets_json")) {
+      this.db.exec("ALTER TABLE outbox ADD COLUMN reaction_targets_json TEXT");
+    }
+    // The single-timestamp shape never shipped past this branch; no dual readers survive it.
+    if (columns.includes("reaction_target_ts")) {
+      this.db.exec("ALTER TABLE outbox DROP COLUMN reaction_target_ts");
     }
   }
 
@@ -872,8 +877,16 @@ export class BrokerStore {
   }
 
   enqueueOutbox(delivery: Delivery, text: string, reaction: string | null = null): void {
+    // A coalesced delivery answers several wake messages at once; the stamp
+    // must land on every one of them, not only the primary event's.
+    const targets = reaction === null
+      ? null
+      : JSON.stringify([...new Set([
+          delivery.event.messageTs,
+          ...delivery.coalescedMessages.map((message) => message.messageTs),
+        ])]);
     this.db.prepare(`
-      INSERT INTO outbox(delivery_id, channel_id, thread_ts, text, reaction, reaction_target_ts, created_at)
+      INSERT INTO outbox(delivery_id, channel_id, thread_ts, text, reaction, reaction_targets_json, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)
     `).run(
       delivery.id,
@@ -881,7 +894,7 @@ export class BrokerStore {
       delivery.event.threadTs,
       text,
       reaction,
-      reaction === null ? null : delivery.event.messageTs,
+      targets,
       iso(this.clock),
     );
   }
@@ -1096,9 +1109,9 @@ function outboxFromRow(row: Row): OutboxEntry {
     threadTs: String(row.thread_ts),
     text: String(row.text),
     reaction: row.reaction === null || row.reaction === undefined ? null : String(row.reaction),
-    reactionTargetTs: row.reaction_target_ts === null || row.reaction_target_ts === undefined
-      ? null
-      : String(row.reaction_target_ts),
+    reactionTargets: row.reaction_targets_json === null || row.reaction_targets_json === undefined
+      ? []
+      : (JSON.parse(String(row.reaction_targets_json)) as string[]),
     createdAt: String(row.created_at),
     sentAt: row.sent_at === null ? null : String(row.sent_at),
     attempts: Number(row.attempts),
