@@ -42,7 +42,7 @@ test("a completed Desktop turn becomes the same processed provider receipt", asy
     async deliver() {
       return { turnId: "desktop-turn-41", clientUserMessageId: "hive-delivery-41", mode: "steer" as const };
     },
-    async waitForTurnCompletion() {
+    async waitForDeliveryOutcome() {
       return { turnId: "desktop-turn-41", status: "completed" as const, assistantText: "  Foreground reply.  " };
     },
   };
@@ -59,7 +59,7 @@ test("an interrupted Desktop turn never becomes a processed outcome", async () =
     async deliver() {
       return { turnId: "desktop-turn-42", clientUserMessageId: "hive-delivery-42", mode: "start" as const };
     },
-    async waitForTurnCompletion() {
+    async waitForDeliveryOutcome() {
       return { turnId: "desktop-turn-42", status: "interrupted" as const, assistantText: null };
     },
   };

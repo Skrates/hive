@@ -8,7 +8,7 @@ import { CodexDesktopIpcClient, DesktopIpcError } from "./desktop-ipc.js";
 
 interface Message { [key: string]: unknown }
 
-test("Desktop IPC follows an owner, steers with v1, and correlates terminal output", async (t) => {
+test("Desktop IPC correlates the exact steered final answer before the foreground turn ends", async (t) => {
   const seen: Message[] = [];
   const router = await mockRouter((socket, message) => {
     seen.push(message);
@@ -43,8 +43,22 @@ test("Desktop IPC follows an owner, steers with v1, and correlates terminal outp
         "owner-1",
         2,
         "turn-1",
-        "completed",
-        [{ type: "agentMessage", text: "Handled from Desktop." }],
+        "inProgress",
+        [
+          {
+            type: "steeringUserMessage",
+            clientUserMessageId: "hive-delivery-7",
+            status: "accepted",
+          },
+          { type: "agentMessage", phase: "final_answer", text: "Previous foreground answer." },
+          { type: "steered" },
+          {
+            type: "steeringUserMessage",
+            clientUserMessageId: "later-human-message",
+            status: "accepted",
+          },
+          { type: "agentMessage", phase: "final_answer", text: "Handled from Desktop." },
+        ],
       )), 5);
     }
   });
@@ -57,13 +71,53 @@ test("Desktop IPC follows an owner, steers with v1, and correlates terminal outp
   const accepted = await client.deliver("thread-1", "<untrusted/>", 7);
   assert.equal(accepted.turnId, "turn-1");
   assert.equal(accepted.mode, "steer");
-  const completion = await client.waitForTurnCompletion("thread-1", accepted.turnId, 100);
+  const completion = await client.waitForDeliveryOutcome("thread-1", accepted, 100);
   assert.deepEqual(completion, {
     turnId: "turn-1",
     status: "completed",
     assistantText: "Handled from Desktop.",
   });
   assert.equal(seen.filter((message) => message.method === "thread-follower-start-turn").length, 0);
+});
+
+test("Desktop IPC retry recovers an accepted delivery and its final answer without reinjection", async (t) => {
+  let steerRequests = 0;
+  const router = await mockRouter((socket, message) => {
+    if (message.method === "initialize") initialize(socket, message);
+    if (message.method === "thread-stream-following-changed") {
+      socket.write(streamSnapshot("owner", 4, "turn-48", "inProgress", [
+        {
+          type: "steeringUserMessage",
+          clientUserMessageId: "hive-delivery-48",
+          status: "accepted",
+        },
+        { type: "agentMessage", phase: "final_answer", text: "Unrelated earlier answer." },
+        { type: "steered" },
+        { type: "agentMessage", phase: "final_answer", text: "Recovered Fable answer." },
+      ]));
+    }
+    if (message.method === "thread-follower-steer-turn") steerRequests += 1;
+  });
+  t.after(() => router.close());
+  const client = new CodexDesktopIpcClient(router.path, 100);
+  t.after(() => client.close());
+
+  await client.connect();
+  await client.follow("thread-1", 100);
+  const accepted = await client.deliver("thread-1", "redelivery", 48);
+  const outcome = await client.waitForDeliveryOutcome("thread-1", accepted, 100);
+
+  assert.deepEqual(accepted, {
+    turnId: "turn-48",
+    clientUserMessageId: "hive-delivery-48",
+    mode: "steer",
+  });
+  assert.deepEqual(outcome, {
+    turnId: "turn-48",
+    status: "completed",
+    assistantText: "Recovered Fable answer.",
+  });
+  assert.equal(steerRequests, 0);
 });
 
 test("Desktop IPC reports no owner without a mutating history probe", async (t) => {
@@ -374,4 +428,3 @@ function encode(value: unknown): Buffer {
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
-

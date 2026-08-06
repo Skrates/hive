@@ -2,7 +2,8 @@
 import { Command } from "commander";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { AdmissionPolicySchema } from "./addressing.js";
 import { BrokerHttpServer } from "./broker/http.js";
@@ -26,6 +27,7 @@ import {
   removeCodexForegroundBinding,
 } from "./codex/binding.js";
 import type { BindingStatus } from "./codex/live.js";
+import { installCodexSkill } from "./codex/skill-install.js";
 
 const program = new Command().name("hive").description("Hive broker/edge wake router");
 
@@ -175,6 +177,19 @@ program.command("detach")
     await removeCodexForegroundBinding(paths.bindingFile);
     await waitForBinding(paths.surfaceSocket, (status) => status.actor === actor && status.mode === "dedicated");
     process.stdout.write(`detached ${actor}; dedicated Codex task restored\n`);
+  });
+
+program.command("install-codex-skill")
+  .description("install Hive Attach in the supported user-level Codex skill directory")
+  .action(async () => {
+    const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+    const result = await installCodexSkill(
+      join(packageRoot, ".agents", "skills", "hive-attach"),
+      join(homedir(), ".agents", "skills", "hive-attach"),
+    );
+    process.stdout.write(result.installed
+      ? "installed Hive Attach for Codex; open the slash menu and choose Hive Attach\n"
+      : "Hive Attach is already installed for Codex\n");
   });
 
 program.command("status")

@@ -240,7 +240,7 @@ export async function completeCodexDelivery(
 }
 
 export async function completeDesktopDelivery(
-  client: Pick<CodexDesktopIpcClient, "deliver" | "waitForTurnCompletion">,
+  client: Pick<CodexDesktopIpcClient, "deliver" | "waitForDeliveryOutcome">,
   sessionId: string,
   delivery: Delivery,
   framed: string,
@@ -251,9 +251,9 @@ export async function completeDesktopDelivery(
     ? createdAt + delivery.subscription.deliveryTtlMs
     : now() + delivery.subscription.deliveryTtlMs;
   const accepted = await client.deliver(sessionId, framed, delivery.id, remainingBefore(deadline, now));
-  const completion = await client.waitForTurnCompletion(
+  const completion = await client.waitForDeliveryOutcome(
     sessionId,
-    accepted.turnId,
+    accepted,
     remainingBefore(deadline, now),
   );
   if (completion.status !== "completed") {

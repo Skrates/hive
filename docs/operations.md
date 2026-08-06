@@ -78,11 +78,14 @@ profiles with legacy sandbox configuration. Authenticate the dedicated home once
 Run `hive-codex-live` with the current Codex thread ID. It connects to the app-server control
 socket, owns or resumes the persisted thread on that long-lived connection, serves `/deliver` on
 its own owner-only UDS socket, and keeps its registration fresh with the edge. A wake injected into
-an active thread is true mid-turn steering. The bridge waits for that exact turn to complete and
-returns its final assistant text as the provider outcome, so live Codex turns must not run
-`hive reply` themselves. Failure, interruption, timeout, disconnect, or loss of correlation is
-uncertainty and is retried. Without a live registration the edge falls back to `codex exec resume`
-or spawn according to the subscription policy.
+an active thread is true mid-turn steering. For a foreground Desktop task, the bridge correlates
+the stable Hive delivery message, waits through its `steered` boundary, and returns the next
+durable `final_answer` as the provider outcome even if the enclosing task remains active. A retry
+recovers that recorded answer instead of injecting the same delivery again. Dedicated app-server
+delivery still waits for its exact terminal turn. Live Codex turns must not run `hive reply`
+themselves. Failure, interruption, timeout, disconnect, or loss of correlation is uncertainty and
+is retried. Without a live registration the edge falls back to `codex exec resume` or spawn
+according to the subscription policy.
 
 The supervisor's pinned thread is the dedicated fallback. To route an actor into the foreground
 Codex Desktop task from that task's shell, run `hive attach <actor>` (or pass `--session <id>` when
@@ -93,6 +96,12 @@ the revision. `hive detach <actor>` removes the binding and waits for the dedica
 restored. A present attachment that is invalid, stale, or lacks a Desktop owner withdraws live
 registration; it never silently sends the wake to the dedicated task. `GET /binding` on the
 actor's owner-only live UDS exposes only the mode, cwd, and attachment revision for diagnosis.
+
+Install the repository-owned Codex command once with `hive install-codex-skill`. Codex lists it
+as **Hive Attach** in the `/` menu (its explicit skill token is `$hive-attach`). The command defaults
+to `ariadne`, reads `CODEX_THREAD_ID` only from the invoking task, resolves that task's physical cwd,
+and runs the same revision-confirmed `hive attach` path above. It is marked explicit-only, so ordinary
+conversation cannot silently change the foreground binding.
 
 ### Claude Code boundary delivery
 
