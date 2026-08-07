@@ -89,6 +89,50 @@ export class CodexProvider implements ProviderAdapter {
   }
 }
 
+/**
+ * Grok Build (xAI's agentic CLI) keeps everything — auth artifact, config.toml,
+ * session state — under `~/.grok/` and exposes no config-dir override env var.
+ * Pinning R-5's account profile therefore pins HOME itself: the profile
+ * directory IS the child's home, and `~/.grok` resolves inside it. For a seat
+ * whose durable state must live on its network volume anyway, home-as-profile
+ * is coherent rather than a workaround; the adapter comment is the contract.
+ *
+ * v1 is deliberately narrow and loud about it:
+ * - spawn-only: Grok Build documents no headless session-resume surface, so
+ *   `resume` terminalizes rather than pretending (subscriptions must use
+ *   wakePolicy "spawn").
+ * - `danger-full-access` only: no documented sandbox/approval flags means we
+ *   cannot prove a "read-only"/"workspace-write" promise is honored — claiming
+ *   one would be a lie. The seat's own machine boundary (its pod) is the
+ *   isolation, per the permissive-on-own-box ruling.
+ */
+export class GrokProvider implements ProviderAdapter {
+  readonly provider = "grok" as const;
+
+  preflight(subscription: Subscription): void {
+    grokPermissionArgs(subscription.permissionProfile);
+    requireAccountProfile(subscription);
+  }
+
+  deliverLive(): Promise<ProviderDispatch> {
+    return Promise.reject(new Error("Grok Build has no live-ingress surface; deliveries fall through to spawn"));
+  }
+
+  resume(): Promise<ProviderDispatch> {
+    return Promise.reject(new Error("Grok Build documents no headless resume; use wakePolicy \"spawn\""));
+  }
+
+  spawn(subscription: Subscription, cwd: string, framed: string): Promise<ProviderDispatch> {
+    return runHeadless(
+      process.env.HIVE_GROK_COMMAND ?? "grok",
+      ["-p", "--output-format", "streaming-json", ...grokPermissionArgs(subscription.permissionProfile), framed],
+      cwd,
+      null,
+      { HOME: requireAccountProfile(subscription) },
+    );
+  }
+}
+
 export interface ClaudeInboxConfig {
   /** Root directory for per-actor ingress inboxes (owner-only). */
   ingressRoot: string;
@@ -250,6 +294,19 @@ function codexSocketPermissionProfile(name: string, parent: ":read-only" | ":wor
     "-c", `permissions.${name}.network.unix_sockets={${socketKey}="allow"}`,
     "-c", `default_permissions=${JSON.stringify(name)}`,
   ];
+}
+
+/**
+ * Grok Build's documented flag surface (docs.x.ai/build, 2026-08) carries no
+ * sandbox or approval-mode flags yet. Only the profile whose semantics we can
+ * actually honor is accepted; narrower profiles fail pre-dispatch rather than
+ * run under confinement the CLI does not provide.
+ */
+export function grokPermissionArgs(profile: string): string[] {
+  switch (profile) {
+    case "danger-full-access": return [];
+    default: throw new ProviderPreDispatchError("provider_permission_profile_invalid");
+  }
 }
 
 function claudePermissionArgs(profile: string): string[] {

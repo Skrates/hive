@@ -8,7 +8,7 @@ import type { Delivery, Subscription } from "../domain.js";
 import { prepareSocketPath } from "../local/uds.js";
 import type { LiveIngress } from "./live-registry.js";
 import { delimiter, dirname } from "node:path";
-import { ClaudeProvider, codexPermissionArgs, CodexProvider, composeChildEnv, prependPathEntry, ProviderPreDispatchError, requireAccountProfile } from "./providers.js";
+import { ClaudeProvider, codexPermissionArgs, CodexProvider, composeChildEnv, GrokProvider, grokPermissionArgs, prependPathEntry, ProviderPreDispatchError, requireAccountProfile } from "./providers.js";
 
 function subscription(overrides: Partial<Subscription> = {}): Subscription {
   return {
@@ -95,6 +95,31 @@ test("an invalid permission profile is a deterministic pre-dispatch failure", ()
     () => codex.preflight(subscription({ permissionProfile: "yolo" })),
     (error: unknown) => error instanceof ProviderPreDispatchError && error.code === "provider_permission_profile_invalid",
   );
+});
+
+test("Grok Build honors only the full-access profile until the CLI grows a sandbox surface", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "hive-grok-profile-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const grok = new GrokProvider();
+
+  // The one profile the CLI can actually honor passes with no extra flags.
+  assert.deepEqual(grokPermissionArgs("danger-full-access"), []);
+  grok.preflight(subscription({ provider: "grok", permissionProfile: "danger-full-access", accountProfile: directory }));
+
+  // Profiles promising confinement the CLI does not document fail pre-dispatch.
+  for (const profile of ["read-only", "workspace-write", "yolo"]) {
+    assert.throws(
+      () => grok.preflight(subscription({ provider: "grok", permissionProfile: profile, accountProfile: directory })),
+      (error: unknown) => error instanceof ProviderPreDispatchError && error.code === "provider_permission_profile_invalid",
+      `profile ${profile} must be rejected`,
+    );
+  }
+});
+
+test("Grok Build is spawn-only: resume and live delivery terminalize loudly", async () => {
+  const grok = new GrokProvider();
+  await assert.rejects(grok.resume(), /no headless resume/);
+  await assert.rejects(grok.deliverLive(), /no live-ingress surface/);
 });
 
 test("Codex permission arguments grant only the Hive edge socket on spawn and resume", () => {

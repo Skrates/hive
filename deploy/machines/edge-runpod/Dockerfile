@@ -44,10 +44,14 @@ RUN curl -fsSL https://github.com/runpod/runpodctl/releases/latest/download/runp
 RUN npm install -g @anthropic-ai/claude-code
 ENV DISABLE_AUTOUPDATER=1
 
-# Codex CLI — Talos's harness: the edge's codex provider adapter spawns it under the
-# seat's pinned CODEX_HOME, whose config.toml declares the xAI model provider (the
-# key itself is a file on the volume, never baked into the image).
-RUN npm install -g @openai/codex
+# Grok Build — Talos's harness: xAI's agentic CLI, spawned by the edge's grok
+# provider adapter with HOME pinned to the account profile (Grok Build keeps
+# auth + config under ~/.grok and has no config-dir override). Subscription
+# login artifact lives on the volume, never in the image. The install script
+# has no version pin; the image rebuild IS the pin.
+RUN curl -fsSL https://x.ai/cli/install.sh | bash \
+    && { command -v grok >/dev/null || ln -s /root/.local/bin/grok /usr/local/bin/grok; } \
+    && grok --version
 
 # The hive edge, baked immutable. /workspace/hive stays free for dev checkouts.
 WORKDIR /opt/hive

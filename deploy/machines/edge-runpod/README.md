@@ -1,4 +1,4 @@
-# Edge: runpod — seat talos (Grok 4.5 via Codex CLI + xAI provider)
+# Edge: runpod — seat talos (Grok 4.5 via Grok Build, subscription auth)
 
 The hive's actuator: primarily Sovereign development and local-model testing for the capability
 registry, occasionally the diffusion pipeline (LoRA training). The seat rides a cheap always-on
@@ -19,9 +19,12 @@ cycles.
 ```text
 /workspace/hive/            # dev checkout (the *running* edge is baked into the image)
 /workspace/.hive/           # HIVE_HOME: edge.env, edge.sock, hive-edge.sqlite, ingress/, tailscale/
-/workspace/.hive/profiles/talos/      # pinned CODEX_HOME: config.toml declares the xAI
-                                      # model provider + Grok model; the API key is a file
-                                      # here too (0600), never in the image or a thread
+/workspace/.hive/profiles/talos/      # the seat's pinned HOME: Grok Build keeps auth +
+                                      # config under ~/.grok with no config-dir override,
+                                      # so the profile dir IS the child's home. The
+                                      # subscription login artifact (~/.grok, minted once
+                                      # via browser login) is copied here 0600 over SSH —
+                                      # never through the image or a thread
 /workspace/models/          # checkpoint + LoRA library, HF cache
 /workspace/pipeline/        # the diffusion/training stack (owner's rig, not a tutorial env)
 ```
@@ -31,8 +34,8 @@ Pod-local disk resets on stop; nothing durable may live outside `/workspace`.
 ## Seat pod (custom image)
 
 CI builds `ghcr.io/skrates/hive-edge-runpod` (see `.github/workflows/edge-runpod-image.yml`):
-node 22 + git + tailscale + uv + runpodctl + Claude Code + the hive dist at `/opt/hive`,
-`ENTRYPOINT start-edge.sh`. Pods can't build images (no docker daemon inside), so GHCR is the
+node 22 + git + tailscale + uv + runpodctl + Claude Code + Grok Build + the hive dist at
+`/opt/hive`, `ENTRYPOINT start-edge.sh`. Pods can't build images (no docker daemon inside), so GHCR is the
 only build path. The package is private — add a GHCR pull credential under RunPod → Settings →
 Container Registry Auth before first deploy.
 

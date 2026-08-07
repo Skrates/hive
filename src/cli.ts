@@ -15,7 +15,7 @@ import { ensureEdgeStateDirs } from "./edge/bootstrap.js";
 import { BrokerClient } from "./edge/broker-client.js";
 import { EdgeControlServer } from "./edge/control.js";
 import { LiveIngressRegistry } from "./edge/live-registry.js";
-import { ClaudeProvider, CodexProvider } from "./edge/providers.js";
+import { ClaudeProvider, CodexProvider, GrokProvider } from "./edge/providers.js";
 import { EdgeService } from "./edge/service.js";
 import { EdgeStore } from "./edge/store.js";
 import { udsRequestJson } from "./local/uds.js";
@@ -105,6 +105,7 @@ program.command("edge")
     const edge = new EdgeService(broker, store, live, [
       new CodexProvider(),
       new ClaudeProvider({ ingressRoot }),
+      new GrokProvider(),
     ]);
     const control = new EdgeControlServer(edge, { socketPath });
     await control.start();
