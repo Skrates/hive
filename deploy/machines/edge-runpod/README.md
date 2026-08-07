@@ -1,4 +1,4 @@
-# Edge: runpod — seat claude-3 (Claude Team, hakon@sokrates.is)
+# Edge: runpod — seat talos (Grok 4.5 via Codex CLI + xAI provider)
 
 The hive's actuator: primarily Sovereign development and local-model testing for the capability
 registry, occasionally the diffusion pipeline (LoRA training). The seat rides a cheap always-on
@@ -19,7 +19,9 @@ cycles.
 ```text
 /workspace/hive/            # dev checkout (the *running* edge is baked into the image)
 /workspace/.hive/           # HIVE_HOME: edge.env, edge.sock, hive-edge.sqlite, ingress/, tailscale/
-/workspace/.hive/profiles/claude-3/   # pinned CLAUDE_CONFIG_DIR (interactive login: Hákon)
+/workspace/.hive/profiles/talos/      # pinned CODEX_HOME: config.toml declares the xAI
+                                      # model provider + Grok model; the API key is a file
+                                      # here too (0600), never in the image or a thread
 /workspace/models/          # checkpoint + LoRA library, HF cache
 /workspace/pipeline/        # the diffusion/training stack (owner's rig, not a tutorial env)
 ```
@@ -36,7 +38,7 @@ Container Registry Auth before first deploy.
 
 ```bash
 runpodctl pod create \
-  --name hive-seat-claude-3 \
+  --name hive-seat-talos \
   --compute-type cpu \
   --image ghcr.io/skrates/hive-edge-runpod:latest \
   --data-center-ids EUR-IS-1 \
