@@ -44,6 +44,11 @@ RUN curl -fsSL https://github.com/runpod/runpodctl/releases/latest/download/runp
 RUN npm install -g @anthropic-ai/claude-code
 ENV DISABLE_AUTOUPDATER=1
 
+# Codex CLI — Talos's harness: the edge's codex provider adapter spawns it under the
+# seat's pinned CODEX_HOME, whose config.toml declares the xAI model provider (the
+# key itself is a file on the volume, never baked into the image).
+RUN npm install -g @openai/codex
+
 # The hive edge, baked immutable. /workspace/hive stays free for dev checkouts.
 WORKDIR /opt/hive
 COPY --from=build /app/dist dist/
