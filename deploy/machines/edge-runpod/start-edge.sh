@@ -9,6 +9,13 @@ mkdir -p "$HIVE_HOME"
 chmod 700 "$HIVE_HOME"
 
 # Edge identity + broker route (tailnet). Never bake tokens into the image.
+# First boot on an unseeded volume is a legitimate state, not a crash: idle
+# loudly so the web terminal / SSH stays reachable for provisioning instead
+# of wedging the pod in a restart loop before anyone can seed it.
+if [[ ! -f "$HIVE_HOME/edge.env" ]]; then
+  echo "PROVISIONING MODE: $HIVE_HOME/edge.env not found — idling for seeding (tailscale, profile, credentials). Restart the pod once seeded." >&2
+  exec sleep infinity
+fi
 set -a
 source "$HIVE_HOME/edge.env"
 set +a
