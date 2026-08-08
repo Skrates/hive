@@ -97,29 +97,29 @@ test("an invalid permission profile is a deterministic pre-dispatch failure", ()
   );
 });
 
-test("Grok Build honors only the full-access profile until the CLI grows a sandbox surface", (t) => {
+test("Grok Build maps all three Hive profiles onto --permission-mode; unknowns fail pre-dispatch", (t) => {
   const directory = mkdtempSync(join(tmpdir(), "hive-grok-profile-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const grok = new GrokProvider();
 
-  // The one profile the CLI can actually honor passes with no extra flags.
-  assert.deepEqual(grokPermissionArgs("danger-full-access"), []);
+  assert.deepEqual(grokPermissionArgs("read-only"), ["--permission-mode", "plan"]);
+  assert.deepEqual(grokPermissionArgs("workspace-write"), ["--permission-mode", "acceptEdits"]);
+  assert.deepEqual(grokPermissionArgs("danger-full-access"), ["--permission-mode", "bypassPermissions"]);
   grok.preflight(subscription({ provider: "grok", permissionProfile: "danger-full-access", accountProfile: directory }));
 
-  // Profiles promising confinement the CLI does not document fail pre-dispatch.
-  for (const profile of ["read-only", "workspace-write", "yolo"]) {
-    assert.throws(
-      () => grok.preflight(subscription({ provider: "grok", permissionProfile: profile, accountProfile: directory })),
-      (error: unknown) => error instanceof ProviderPreDispatchError && error.code === "provider_permission_profile_invalid",
-      `profile ${profile} must be rejected`,
-    );
-  }
+  assert.throws(
+    () => grok.preflight(subscription({ provider: "grok", permissionProfile: "yolo", accountProfile: directory })),
+    (error: unknown) => error instanceof ProviderPreDispatchError && error.code === "provider_permission_profile_invalid",
+  );
 });
 
-test("Grok Build is spawn-only: resume and live delivery terminalize loudly", async () => {
+test("Grok Build live delivery terminalizes loudly; resume without a session id is a hard error", async () => {
   const grok = new GrokProvider();
-  await assert.rejects(grok.resume(), /no headless resume/);
   await assert.rejects(grok.deliverLive(), /no live-ingress surface/);
+  await assert.rejects(
+    async () => grok.resume(subscription({ provider: "grok", sessionId: null }), "/tmp", "framed"),
+    /resume target missing/,
+  );
 });
 
 test("Codex permission arguments grant only the Hive edge socket on spawn and resume", () => {
