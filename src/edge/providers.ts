@@ -7,9 +7,18 @@ import { udsRequestJson } from "../local/uds.js";
 import type { LiveIngress } from "./live-registry.js";
 
 export interface ProviderDispatch {
+  /** Diagnostic tail of the provider's raw output — for the ledger, never for parsing. */
   receipt: string;
-  /** True when the provider run itself completed and the receipt is the outcome. */
+  /** True when the provider run itself completed and `outcome` carries its final text. */
   processed: boolean;
+  /**
+   * The agent's final text, extracted from the FULL output stream before any
+   * truncation. Parsing the truncated receipt instead loses long replies: a
+   * report bigger than the receipt window gets its terminal `result` line
+   * front-chopped into unparseable JSON (live-fire finding — Talos's delivery
+   * 61 ran a full inventory whose words never reached the thread).
+   */
+  outcome?: string;
 }
 
 export type ProviderPreDispatchErrorCode =
@@ -261,7 +270,60 @@ async function runHeadless(
   });
   if (code !== 0) throw new Error(`${command} exited ${code}: ${Buffer.concat(stderr).toString("utf8").slice(-2_000)}`);
   const output = Buffer.concat(stdout).toString("utf8");
-  return { receipt: output.slice(-4_000), processed: true };
+  return { receipt: output.slice(-4_000), outcome: headlessAcknowledgement(output), processed: true };
+}
+
+/**
+ * Extract the agent's final text from a full headless output stream. Three
+ * wire shapes in precedence order: the terminal `result` line (Claude
+ * stream-json and Grok streaming-messages-json share it), Codex's
+ * `item.completed`/`agent_message`, and the last `assistant` message as the
+ * fallback when a disturbed run emits no usable `result`. Runs on the FULL
+ * stream — never on a truncated receipt.
+ */
+export function headlessAcknowledgement(output: string): string {
+  let resultText: string | null = null;
+  let agentMessageText: string | null = null;
+  let lastAssistantText: string | null = null;
+  for (const line of output.split("\n")) {
+    try {
+      const value = JSON.parse(line) as Record<string, unknown>;
+      if (value.type === "result" && typeof value.result === "string" && value.result.length > 0) {
+        resultText = value.result;
+      }
+      const item = value.item as Record<string, unknown> | undefined;
+      if (value.type === "item.completed" && item?.type === "agent_message" && typeof item.text === "string") {
+        agentMessageText = item.text;
+      }
+      if (value.type === "assistant") {
+        const text = assistantMessageText(value.message);
+        if (text) lastAssistantText = text;
+      }
+    } catch {
+      // Provider outputs are JSONL on supported surfaces; non-JSON diagnostics are ignored.
+    }
+  }
+  const best = resultText ?? agentMessageText ?? lastAssistantText ?? "Headless provider turn completed successfully.";
+  return best.length <= 2_500 ? best : `${best.slice(0, 2_497)}…`;
+}
+
+/** Concatenate the text blocks of an `assistant` wire message (Claude/Grok shape). */
+function assistantMessageText(message: unknown): string | null {
+  if (!message || typeof message !== "object") return null;
+  const content = (message as { content?: unknown }).content;
+  if (!Array.isArray(content)) return null;
+  const parts: string[] = [];
+  for (const block of content) {
+    if (
+      block && typeof block === "object"
+      && (block as { type?: unknown }).type === "text"
+      && typeof (block as { text?: unknown }).text === "string"
+    ) {
+      parts.push((block as { text: string }).text);
+    }
+  }
+  const joined = parts.join("").trim();
+  return joined.length > 0 ? joined : null;
 }
 
 /**

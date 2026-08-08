@@ -8,7 +8,7 @@ import {
   type ProviderAdapter,
   type ProviderDispatch,
 } from "./providers.js";
-import { headlessAcknowledgement } from "./service.js";
+import { headlessAcknowledgement } from "./providers.js";
 import { EdgeService } from "./service.js";
 import { EdgeStore } from "./store.js";
 
@@ -185,13 +185,13 @@ class StubAdapter implements ProviderAdapter {
   async resume(_subscription: Subscription, _cwd: string, framed: string): Promise<ProviderDispatch> {
     if (this.behavior.dispatchError) throw this.behavior.dispatchError;
     this.resumes.push(framed);
-    return this.behavior.headlessResult ?? { receipt: JSON.stringify({ type: "result", result: "resumed" }), processed: true };
+    return this.behavior.headlessResult ?? { receipt: JSON.stringify({ type: "result", result: "resumed" }), outcome: "resumed", processed: true };
   }
 
   async spawn(_subscription: Subscription, _cwd: string, framed: string): Promise<ProviderDispatch> {
     if (this.behavior.dispatchError) throw this.behavior.dispatchError;
     this.spawns.push(framed);
-    return this.behavior.headlessResult ?? { receipt: JSON.stringify({ type: "result", result: "spawned" }), processed: true };
+    return this.behavior.headlessResult ?? { receipt: JSON.stringify({ type: "result", result: "spawned" }), outcome: "spawned", processed: true };
   }
 }
 
