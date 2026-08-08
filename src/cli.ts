@@ -15,6 +15,7 @@ import { ensureEdgeStateDirs } from "./edge/bootstrap.js";
 import { BrokerClient } from "./edge/broker-client.js";
 import { EdgeControlServer } from "./edge/control.js";
 import { LiveIngressRegistry } from "./edge/live-registry.js";
+import { ProxyAgent, setGlobalDispatcher } from "undici";
 import { ClaudeProvider, CodexProvider, GrokProvider } from "./edge/providers.js";
 import { EdgeService } from "./edge/service.js";
 import { EdgeStore } from "./edge/store.js";
@@ -93,6 +94,7 @@ program.command("edge")
   .description("run a workstation edge")
   .action(async () => {
     const config = EdgeConfig.parse(process.env);
+    if (config.HIVE_BROKER_PROXY) setGlobalDispatcher(new ProxyAgent(config.HIVE_BROKER_PROXY));
     const ingressRoot = config.HIVE_INGRESS_DIR ?? join(hiveHome(), "ingress");
     const socketPath = config.HIVE_EDGE_SOCKET ?? join(hiveHome(), "edge.sock");
     // A fresh machine has no ~/.hive/ tree; better-sqlite3 and the control
@@ -204,6 +206,16 @@ const EdgeConfig = z.object({
   HIVE_EDGE_DB: z.string().min(1).default("hive-edge.sqlite"),
   HIVE_EDGE_SOCKET: z.string().min(1).optional(),
   HIVE_INGRESS_DIR: z.string().min(1).optional(),
+  /**
+   * HTTP CONNECT proxy for the edge's own outbound fetch (the broker dial).
+   * Needed where the tailnet is reachable only through a userspace tailscaled
+   * (no TUN — e.g. a RunPod pod): plain Node fetch cannot route to tailnet
+   * addresses there, so tailscaled's --outbound-http-proxy-listen carries it.
+   * Scoped to this process via undici's global dispatcher — provider children
+   * are spawned with their own env and dial their own providers directly. The
+   * UDS control server uses its own socket transport and is unaffected.
+   */
+  HIVE_BROKER_PROXY: z.string().url().optional(),
 });
 
 function requiredEnv(name: string): string {
