@@ -9,7 +9,6 @@ interface Row {
   updated_at_ms: number;
   thread_source: string;
 }
-
 export interface DiscoveredCodexThread {
   sessionId: string;
   cwd: string;
@@ -88,4 +87,3 @@ function assertPrivateDatabase(path: string): void {
     throw new Error("Codex state database is not securely owned");
   }
 }
-

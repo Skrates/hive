@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -11,7 +11,7 @@ import {
   desktopDeliveryKey,
 } from "./live.js";
 
-test("a completed live turn becomes a processed provider receipt", async () => {
+test("a completed live turn returns its final text separately from the diagnostic receipt", async () => {
   const budgets: number[] = [];
   const client = {
     async deliver(_threadId: string, _framed: string, _deliveryId: number, timeoutMs?: number) {
@@ -26,10 +26,15 @@ test("a completed live turn becomes a processed provider receipt", async () => {
   const now = Date.parse("2026-08-06T11:26:45.000Z");
   const result = await completeCodexDelivery(client, "thread-1", delivery(now), "wake", () => now);
   assert.equal(result.processed, true);
+  assert.equal(result.outcome, "Outcome closed automatically.");
   assert.deepEqual(budgets, [60_000, 60_000]);
   assert.deepEqual(JSON.parse(result.receipt), {
-    type: "item.completed",
-    item: { type: "agent_message", text: "Outcome closed automatically." },
+    type: "hive.live.completed",
+    surface: "app-server",
+    turnId: "turn-35",
+    mode: "start",
+    deliveryId: 35,
+    status: "completed",
   });
 });
 
@@ -45,7 +50,7 @@ test("a failed live turn never becomes a processed outcome", async () => {
   );
 });
 
-test("a completed Desktop turn becomes the same processed provider receipt", async () => {
+test("a completed Desktop turn returns its final text separately from the diagnostic receipt", async () => {
   const client = {
     async deliver() {
       return { turnId: "desktop-turn-41", clientUserMessageId: "hive-delivery-41", mode: "steer" as const };
@@ -56,10 +61,47 @@ test("a completed Desktop turn becomes the same processed provider receipt", asy
   };
   const now = Date.parse("2026-08-06T11:26:45.000Z");
   const result = await completeDesktopDelivery(client, "foreground-task", delivery(now), "wake", () => now);
+  assert.equal(result.outcome, "Foreground reply.");
   assert.deepEqual(JSON.parse(result.receipt), {
-    type: "item.completed",
-    item: { type: "agent_message", text: "Foreground reply." },
+    type: "hive.live.completed",
+    surface: "desktop",
+    turnId: "desktop-turn-41",
+    mode: "steer",
+    deliveryId: 35,
+    status: "completed",
   });
+});
+
+test("a long Desktop outcome remains verbatim within the live outcome budget", async () => {
+  const answer = "F".repeat(9_471);
+  const client = {
+    async deliver() {
+      return { turnId: "desktop-turn-long", clientUserMessageId: "hive-delivery-long", mode: "steer" as const };
+    },
+    async waitForDeliveryOutcome() {
+      return { turnId: "desktop-turn-long", status: "completed" as const, assistantText: answer };
+    },
+  };
+  const now = Date.parse("2026-08-06T11:26:45.000Z");
+  const result = await completeDesktopDelivery(client, "foreground-task", delivery(now), "wake", () => now);
+  assert.equal(result.outcome, answer);
+  assert.ok(result.receipt.length < 4_000);
+});
+
+test("a Desktop outcome truncates only above the 30,000 character live budget", async () => {
+  const answer = "x".repeat(30_001);
+  const client = {
+    async deliver() {
+      return { turnId: "desktop-turn-bounded", clientUserMessageId: "hive-delivery-bounded", mode: "start" as const };
+    },
+    async waitForDeliveryOutcome() {
+      return { turnId: "desktop-turn-bounded", status: "completed" as const, assistantText: answer };
+    },
+  };
+  const now = Date.parse("2026-08-06T11:26:45.000Z");
+  const result = await completeDesktopDelivery(client, "foreground-task", delivery(now), "wake", () => now);
+  assert.equal(result.outcome.length, 30_000);
+  assert.ok(result.outcome.endsWith("…"));
 });
 
 test("an interrupted Desktop turn never becomes a processed outcome", async () => {
@@ -127,23 +169,40 @@ test("the Desktop idempotency key carries the full Slack dedupe coordinate", () 
 test("a Desktop delivery is refused unless its home is the pinned account profile", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "hive-codex-account-"));
   t.after(() => rm(root, { recursive: true, force: true }));
+  const desktop = join(root, "desktop");
   const pinned = join(root, "profiles", "ariadne");
   const other = join(root, "profiles", "someone-else");
-  const linked = join(root, "desktop-home");
+  await mkdir(desktop, { recursive: true });
   await mkdir(pinned, { recursive: true });
   await mkdir(other, { recursive: true });
-  await symlink(pinned, linked);
+  await writeFile(join(desktop, "auth.json"), "desktop-account", { mode: 0o600 });
+  await symlink(join(desktop, "auth.json"), join(pinned, "auth.json"));
+  await writeFile(join(other, "auth.json"), "other-account", { mode: 0o600 });
 
-  // The same profile reached through a symlink is the same account.
-  await assertPinnedDesktopAccount(linked, pinned);
+  // Desktop keeps its own state home while the Hive profile pins the exact
+  // same account credential through its auth link.
+  await assertPinnedDesktopAccount(desktop, pinned);
   await assert.rejects(
-    () => assertPinnedDesktopAccount(other, pinned),
-    /is not the subscription's pinned account profile/,
+    () => assertPinnedDesktopAccount(desktop, other),
+    /account_profile_mismatch/,
   );
   // An unresolvable home or profile is a hard failure, never a pass-through.
   await assert.rejects(
-    () => assertPinnedDesktopAccount(join(root, "missing"), pinned),
-    /Cannot verify the Codex Desktop account profile binding/,
+    () => assertPinnedDesktopAccount(desktop, join(root, "missing")),
+    /account_profile_mismatch/,
+  );
+
+  const insecureDesktop = join(root, "insecure-desktop");
+  const insecurePinned = join(root, "profiles", "insecure");
+  await mkdir(insecureDesktop, { recursive: true });
+  await mkdir(insecurePinned, { recursive: true });
+  const insecureAuth = join(insecureDesktop, "auth.json");
+  await writeFile(insecureAuth, "insecure-account", { mode: 0o600 });
+  await chmod(insecureAuth, 0o644);
+  await symlink(insecureAuth, join(insecurePinned, "auth.json"));
+  await assert.rejects(
+    () => assertPinnedDesktopAccount(insecureDesktop, insecurePinned),
+    /account_profile_mismatch/,
   );
 });
 

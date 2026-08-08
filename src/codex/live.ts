@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { realpath } from "node:fs/promises";
+import { realpath, stat } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -28,9 +28,10 @@ interface Config {
   bindingFile: string;
   /**
    * The Codex installation this surface follows for a foreground attachment
-   * (`CODEX_HOME` of the running Desktop app). ADR-0003 R-5 pins execution to
-   * the subscription's account profile, so this home must be that same
-   * profile — the check happens per delivery, where the pinned profile is known.
+   * (state home of the running Desktop app). ADR-0003 R-5 pins execution to
+   * the subscription's account, so this home's `auth.json` must resolve to the
+   * same artifact as the pinned profile's — checked per delivery, where that
+   * profile is known.
    */
   desktopHome: string;
   desktopIpcSocket: string;
@@ -40,6 +41,13 @@ interface Config {
 const REGISTRATION_TTL_MS = 60_000;
 const RENEWAL_INTERVAL_MS = 20_000;
 const BINDING_POLL_INTERVAL_MS = 1_000;
+const MAX_CODEX_LIVE_OUTCOME_CHARS = 30_000;
+
+interface CompletedLiveDelivery {
+  receipt: string;
+  outcome: string;
+  processed: true;
+}
 
 type LiveTarget =
   | { kind: "dedicated"; sessionId: string }
@@ -171,7 +179,7 @@ export async function runCodexLive(config: Config): Promise<void> {
 }
 
 class SurfaceError extends Error {
-  constructor(readonly code: "not_found" | "live_delivery_invalid" | "live_delivery_failed") {
+  constructor(readonly code: "not_found" | "live_delivery_invalid" | "live_delivery_failed" | "account_profile_mismatch") {
     super(code);
     this.name = "SurfaceError";
   }
@@ -181,7 +189,7 @@ async function handle(
   request: IncomingMessage,
   response: ServerResponse,
   status: () => BindingStatus,
-  deliver: (delivery: Delivery, framed: string) => Promise<{ receipt: string; processed: boolean }>,
+  deliver: (delivery: Delivery, framed: string) => Promise<CompletedLiveDelivery>,
 ): Promise<void> {
   if (request.method === "GET" && request.url === "/binding") {
     return sendJson(response, 200, status());
@@ -220,8 +228,9 @@ function sendJson(response: ServerResponse, status: number, value: unknown): voi
 /**
  * A live Codex turn is complete only when the exact turn accepted for this
  * Hive delivery reaches a terminal state. The final assistant text is the
- * actor's outcome; returning it as a processed provider receipt lets the edge
- * commit delivery completion and the durable Slack outbox post together.
+ * actor's outcome. It travels separately from the bounded diagnostic receipt
+ * so the edge can commit delivery completion and the durable Slack outbox post
+ * together without parsing receipt text.
  */
 export async function completeCodexDelivery(
   client: Pick<CodexAppServerClient, "deliver" | "waitForCompletion">,
@@ -229,7 +238,7 @@ export async function completeCodexDelivery(
   delivery: Delivery,
   framed: string,
   now: () => number = Date.now,
-): Promise<{ receipt: string; processed: true }> {
+): Promise<CompletedLiveDelivery> {
   const deadline = turnDeadline(delivery, now);
   const accepted = await client.deliver(
     threadId,
@@ -245,10 +254,20 @@ export async function completeCodexDelivery(
   if (completion.status !== "completed") {
     throw new Error(`Codex app-server turn ${accepted.turnId} ${completion.status}`);
   }
-  const text = completion.assistantText?.trim()
-    || `Codex ${accepted.mode} turn ${accepted.turnId} completed without a textual final message.`;
+  const text = boundedLiveOutcome(
+    completion.assistantText?.trim()
+      || `Codex ${accepted.mode} turn ${accepted.turnId} completed without a textual final message.`,
+  );
   return {
-    receipt: JSON.stringify({ type: "item.completed", item: { type: "agent_message", text } }),
+    receipt: JSON.stringify({
+      type: "hive.live.completed",
+      surface: "app-server",
+      turnId: accepted.turnId,
+      mode: accepted.mode,
+      deliveryId: delivery.id,
+      status: completion.status,
+    }),
+    outcome: text,
     processed: true,
   };
 }
@@ -259,7 +278,7 @@ export async function completeDesktopDelivery(
   delivery: Delivery,
   framed: string,
   now: () => number = Date.now,
-): Promise<{ receipt: string; processed: true }> {
+): Promise<CompletedLiveDelivery> {
   const deadline = turnDeadline(delivery, now);
   const accepted = await client.deliver(
     sessionId,
@@ -275,12 +294,28 @@ export async function completeDesktopDelivery(
   if (completion.status !== "completed") {
     throw new Error(`Codex Desktop turn ${accepted.turnId} ${completion.status}`);
   }
-  const text = completion.assistantText?.trim()
-    || `Codex Desktop ${accepted.mode} turn ${accepted.turnId} completed without a textual final message.`;
+  const text = boundedLiveOutcome(
+    completion.assistantText?.trim()
+      || `Codex Desktop ${accepted.mode} turn ${accepted.turnId} completed without a textual final message.`,
+  );
   return {
-    receipt: JSON.stringify({ type: "item.completed", item: { type: "agent_message", text } }),
+    receipt: JSON.stringify({
+      type: "hive.live.completed",
+      surface: "desktop",
+      turnId: accepted.turnId,
+      mode: accepted.mode,
+      deliveryId: delivery.id,
+      status: completion.status,
+    }),
+    outcome: text,
     processed: true,
   };
+}
+
+function boundedLiveOutcome(text: string): string {
+  return text.length <= MAX_CODEX_LIVE_OUTCOME_CHARS
+    ? text
+    : `${text.slice(0, MAX_CODEX_LIVE_OUTCOME_CHARS - 1)}…`;
 }
 
 interface LiveDeliveryPayload {
@@ -347,32 +382,36 @@ export function desktopDeliveryKey(delivery: Delivery): string {
 /**
  * ADR-0003 R-5: a wake executes under the subscription's pinned account
  * profile, never whatever seat the edge happens to be logged into. The
- * foreground Desktop installation is selected independently of the
- * subscription (`HIVE_CODEX_DESKTOP_HOME`), and the provider preflight only
- * proves the pinned directory exists — so an attachment could otherwise
- * execute as, and consume quota from, another Codex account. This is a hard
- * pre-dispatch failure: it runs before any turn is injected, and it never
- * falls back.
+ * foreground Desktop installation has its own state home
+ * (`HIVE_CODEX_DESKTOP_HOME`), while the Hive profile may be a separate
+ * directory. Account identity is the resolved `auth.json` artifact shared by
+ * those two homes; comparing the directories themselves would reject a valid
+ * split-state profile. A mismatch is a hard pre-dispatch failure before any
+ * turn is injected, with no fallback.
  */
 export async function assertPinnedDesktopAccount(
   desktopHome: string,
   accountProfile: string,
 ): Promise<void> {
-  let home: string;
-  let pinned: string;
+  let desktopAuth: string;
+  let pinnedAuth: string;
   try {
-    [home, pinned] = await Promise.all([realpath(desktopHome), realpath(accountProfile)]);
+    [desktopAuth, pinnedAuth] = await Promise.all([
+      realpath(join(desktopHome, "auth.json")),
+      realpath(join(accountProfile, "auth.json")),
+    ]);
   } catch (error) {
-    throw new Error(
-      `Cannot verify the Codex Desktop account profile binding: ${
-        error instanceof Error ? error.message : String(error)
-      }`,
-    );
+    throw new SurfaceError("account_profile_mismatch");
   }
-  if (home !== pinned) {
-    throw new Error(
-      `Codex Desktop home ${home} is not the subscription's pinned account profile ${pinned}`,
-    );
+  if (desktopAuth !== pinnedAuth) {
+    throw new SurfaceError("account_profile_mismatch");
+  }
+  const auth = await stat(desktopAuth).catch(() => {
+    throw new SurfaceError("account_profile_mismatch");
+  });
+  const currentUid = process.getuid?.();
+  if (currentUid === undefined || !auth.isFile() || auth.uid !== currentUid || (auth.mode & 0o077) !== 0) {
+    throw new SurfaceError("account_profile_mismatch");
   }
 }
 

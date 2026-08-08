@@ -57,4 +57,3 @@ test("catalog selects only the latest exact-cwd primary user thread", async (t) 
   assert.equal(catalog.primaryUserThread("spawn-child", "/work/hive"), null);
   assert.equal(catalog.latestPrimaryUserThread("/work/missing"), null);
 });
-

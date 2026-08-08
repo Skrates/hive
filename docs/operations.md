@@ -96,6 +96,9 @@ the revision. `hive detach <actor>` removes the binding and waits for the dedica
 restored. A present attachment that is invalid, stale, or lacks a Desktop owner withdraws live
 registration; it never silently sends the wake to the dedicated task. `GET /binding` on the
 actor's owner-only live UDS exposes only the mode, cwd, and attachment revision for diagnosis.
+The Desktop state home and the actor's pinned `CODEX_HOME` may be separate directories, but their
+resolved `auth.json` must be the same owner-only regular file. A missing, insecure, or different
+auth artifact rejects the wake before Desktop injection and terminalizes it as undeliverable.
 
 Install the repository-owned Codex command once with `hive install-codex-skill`. Codex lists it
 as **Hive Attach** in the `/` menu (its explicit skill token is `$hive-attach`). The command defaults

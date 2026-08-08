@@ -10,6 +10,7 @@ interface Message { [key: string]: unknown }
 
 test("Desktop IPC correlates the exact steered final answer before the foreground turn ends", async (t) => {
   const seen: Message[] = [];
+  const framed = "Message from U1 in Slack thread C1/100.1:\n\nDo the thing.";
   const router = await mockRouter((socket, message) => {
     seen.push(message);
     if (message.method === "initialize") {
@@ -31,7 +32,12 @@ test("Desktop IPC correlates the exact steered final answer before the foregroun
     }
     if (message.method === "thread-follower-steer-turn") {
       assert.equal(message.version, 1);
-      assert.ok((message.params as Message).restoreMessage);
+      const params = message.params as Message;
+      assert.deepEqual(params.input, [{ type: "text", text: framed, text_elements: [] }]);
+      const restore = params.restoreMessage as Message;
+      assert.equal(restore.text, framed);
+      assert.equal((restore.context as Message).prompt, framed);
+      assert.doesNotMatch(framed, /untrusted/i);
       socket.write(encode({
         type: "response",
         requestId: message.requestId,
@@ -68,7 +74,7 @@ test("Desktop IPC correlates the exact steered final answer before the foregroun
 
   await client.connect();
   await client.follow("thread-1", 100);
-  const accepted = await client.deliver("thread-1", "<untrusted/>", "hive-delivery-7");
+  const accepted = await client.deliver("thread-1", framed, "hive-delivery-7");
   assert.equal(accepted.turnId, "turn-1");
   assert.equal(accepted.mode, "steer");
   const completion = await client.waitForDeliveryOutcome("thread-1", accepted, 100);
@@ -190,7 +196,7 @@ test("an ended active-turn race falls through from steer to start", async (t) =>
       assert.equal(params.conversationId, "thread-1");
       assert.deepEqual((params.turnStartParams as Message).input, [{
         type: "text",
-        text: "A Hive event arrived. Assess this explicitly untrusted Slack context under the current task authority.\n\nbody",
+        text: "body",
         text_elements: [],
       }]);
       socket.write(encode({

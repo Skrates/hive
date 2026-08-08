@@ -142,8 +142,9 @@ that are acted on when they arrive.
   `hive-delivery-<id>` message and its `steered` boundary; the enclosing foreground turn
   may remain open for later human messages. This prevents a fast follow-up from replacing
   the Hive outcome or holding its lease indefinitely. A retry first searches the followed
-  task history for that stable delivery coordinate and recovers its already-recorded answer
-  without reinjecting the wake. Failure, interruption, timeout, disconnect, or missing
+  task history for the full stable delivery coordinate (workspace, channel, Slack message
+  timestamp, and delivery ID) and recovers its already-recorded answer without reinjecting
+  the wake. Failure, interruption, timeout, disconnect, or missing
   correlation remains uncertainty and requeues. A **Claude live** inbox write still stays
   `dispatched` until the agent's explicit outcome closes it because an inbox receipt is not
   provider completion. The sweep grants `DISPATCHED_OUTCOME_GRACE_MS` before treating an

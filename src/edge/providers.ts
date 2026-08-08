@@ -3,31 +3,40 @@ import { closeSync, fsyncSync, mkdirSync, openSync, renameSync, statSync, writeF
 import { homedir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import type { Delivery, Provider, Subscription } from "../domain.js";
-import { udsRequestJson } from "../local/uds.js";
+import { UdsHttpError, udsRequestJson } from "../local/uds.js";
 import type { LiveIngress } from "./live-registry.js";
 
-const MAX_CODEX_LIVE_RECEIPT_CHARS = 40_000;
-const MAX_THREAD_OUTCOME_CHARS = 30_000;
+const MAX_CODEX_LIVE_RECEIPT_CHARS = 4_000;
+const MAX_CODEX_LIVE_OUTCOME_CHARS = 30_000;
 
-export interface ProviderDispatch {
+interface ProviderDispatchBase {
   /** Diagnostic tail of the provider's raw output — for the ledger, never for parsing. */
   receipt: string;
-  /** True when the provider run itself completed and `outcome` carries its final text. */
-  processed: boolean;
-  /**
-   * The agent's final text, extracted from the FULL output stream before any
-   * truncation. Parsing the truncated receipt instead loses long replies: a
-   * report bigger than the receipt window gets its terminal `result` line
-   * front-chopped into unparseable JSON (live-fire finding — Talos's delivery
-   * 61 ran a full inventory whose words never reached the thread).
-   */
-  outcome?: string;
 }
+
+export type ProviderDispatch = ProviderDispatchBase & (
+  | {
+    /** The provider run completed and `outcome` carries its final text. */
+    processed: true;
+    /**
+     * The agent's final text, extracted before any diagnostic-receipt
+     * truncation. Parsing the receipt instead loses long replies when its
+     * terminal JSON line is front-chopped.
+     */
+    outcome: string;
+  }
+  | {
+    /** Dispatch was accepted, but the provider has not produced an outcome. */
+    processed: false;
+    outcome?: never;
+  }
+);
 
 export type ProviderPreDispatchErrorCode =
   | "live_ingress_rejected"
   | "provider_permission_profile_invalid"
-  | "account_profile_missing";
+  | "account_profile_missing"
+  | "account_profile_mismatch";
 
 /** A deterministic rejection that proves no provider turn was started. */
 export class ProviderPreDispatchError extends Error {
@@ -68,17 +77,27 @@ export class CodexProvider implements ProviderAdapter {
   }
 
   async deliverLive(ingress: LiveIngress, delivery: Delivery, framed: string): Promise<ProviderDispatch> {
-    const result = await udsRequestJson<{ receipt?: unknown; processed?: unknown }>(ingress.socketPath, "POST", "/deliver", {
-      delivery,
-      framed,
-    });
+    let result: { receipt?: unknown; outcome?: unknown; processed?: unknown };
+    try {
+      result = await udsRequestJson(ingress.socketPath, "POST", "/deliver", { delivery, framed });
+    } catch (error) {
+      if (error instanceof UdsHttpError && surfaceErrorCode(error.responseBody) === "account_profile_mismatch") {
+        throw new ProviderPreDispatchError("account_profile_mismatch");
+      }
+      throw error;
+    }
     const receipt = result.receipt;
     if (typeof receipt !== "string" || receipt.length === 0
       || receipt.length > MAX_CODEX_LIVE_RECEIPT_CHARS) {
       throw new Error("Codex live ingress invalid response");
     }
     if (result.processed !== true) throw new Error("Codex live ingress returned before turn completion");
-    return { receipt, processed: true };
+    const outcome = result.outcome;
+    if (typeof outcome !== "string" || outcome.length === 0
+      || outcome.length > MAX_CODEX_LIVE_OUTCOME_CHARS) {
+      throw new Error("Codex live ingress invalid outcome");
+    }
+    return { receipt, outcome, processed: true };
   }
 
   resume(subscription: Subscription, cwd: string, framed: string): Promise<ProviderDispatch> {
@@ -100,6 +119,15 @@ export class CodexProvider implements ProviderAdapter {
       framed,
       { CODEX_HOME: requireAccountProfile(subscription) },
     );
+  }
+}
+
+function surfaceErrorCode(body: string): string | null {
+  try {
+    const value = JSON.parse(body) as { error?: unknown };
+    return typeof value.error === "string" ? value.error : null;
+  } catch {
+    return null;
   }
 }
 
@@ -309,9 +337,7 @@ export function headlessAcknowledgement(output: string): string {
     }
   }
   const best = resultText ?? agentMessageText ?? lastAssistantText ?? "Headless provider turn completed successfully.";
-  return best.length <= MAX_THREAD_OUTCOME_CHARS
-    ? best
-    : `${best.slice(0, MAX_THREAD_OUTCOME_CHARS - 1)}…`;
+  return best.length <= 2_500 ? best : `${best.slice(0, 2_497)}…`;
 }
 
 /** Concatenate the text blocks of an `assistant` wire message (Claude/Grok shape). */

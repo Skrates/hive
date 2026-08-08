@@ -108,17 +108,17 @@ export class EdgeService {
       this.store.setStatus(current.id, generation, "dispatched", dispatch.receipt);
       if (dispatch.processed) {
         // A completed provider turn (headless, or a completion-tracked Codex
-        // live turn) carries the agent's outcome in its receipt. The outcome
-        // travels inside the terminal transition
-        // so the broker commits `processed` and the durable thread post
-        // together — a Slack outage can neither lose the outcome nor cause
-        // this trusted instruction to rerun.
+        // live turn) carries the agent's final text in `outcome`; `receipt` is
+        // bounded diagnostic evidence only. The outcome travels inside the
+        // terminal transition so the broker commits `processed` and the
+        // durable thread post together — a Slack outage can neither lose the
+        // outcome nor cause this trusted instruction to rerun.
         await this.broker.finish(current, {
           generation,
           status: "processed",
           reasons: [],
           providerReceipt: dispatch.receipt,
-          outcome: dispatch.outcome ?? null,
+          outcome: dispatch.outcome,
         });
         this.store.setStatus(current.id, generation, "processed", dispatch.receipt);
         return true;
@@ -317,6 +317,7 @@ function preDispatchDetail(code: string): string {
     case "live_ingress_rejected": return "the live surface rejected dispatch before starting a provider turn";
     case "provider_permission_profile_invalid": return "the configured provider permission profile was invalid";
     case "account_profile_missing": return "the pinned account profile directory does not exist on this edge (ADR-0003 R-5: profile misbinding is a hard failure)";
+    case "account_profile_mismatch": return "the foreground Codex Desktop account does not match the subscription's pinned account profile";
     default: return "provider dispatch was rejected before invocation";
   }
 }
@@ -332,6 +333,7 @@ function safeEdgeErrorCode(error: unknown): string {
     "provider_adapter_missing",
     "spawn_rate_limited",
     "account_profile_missing",
+    "account_profile_mismatch",
     "stale lease",
   ].find((code) => message.includes(code)) ?? "edge_iteration_failed";
 }

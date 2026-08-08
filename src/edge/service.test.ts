@@ -20,26 +20,6 @@ test("Codex JSONL receipt yields the final agent message", () => {
   assert.equal(headlessAcknowledgement(receipt), "Handled and recorded.");
 });
 
-test("a long live Codex answer reaches the thread verbatim within the bounded outcome budget", () => {
-  const answer = "F".repeat(9_471);
-  const receipt = JSON.stringify({
-    type: "item.completed",
-    item: { type: "agent_message", text: answer },
-  });
-  assert.equal(headlessAcknowledgement(receipt), answer);
-});
-
-test("thread outcomes truncate only above the 30,000 character budget", () => {
-  const answer = "x".repeat(30_001);
-  const receipt = JSON.stringify({
-    type: "item.completed",
-    item: { type: "agent_message", text: answer },
-  });
-  const outcome = headlessAcknowledgement(receipt);
-  assert.equal(outcome.length, 30_000);
-  assert.ok(outcome.endsWith("…"));
-});
-
 test("Claude stream JSON receipt yields the result", () => {
   const receipt = JSON.stringify({ type: "result", subtype: "success", result: "Done from Claude." });
   assert.equal(headlessAcknowledgement(receipt), "Done from Claude.");
@@ -248,7 +228,8 @@ test("a completion-tracked Codex live injection commits its final response as th
   const store = new EdgeStore(":memory:");
   const adapter = new StubAdapter({
     liveResult: {
-      receipt: JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "live completed" } }),
+      receipt: JSON.stringify({ type: "hive.live.completed", surface: "desktop", turnId: "turn-2" }),
+      outcome: "live completed",
       processed: true,
     },
   });
@@ -284,6 +265,30 @@ test("a deterministic pre-dispatch failure finishes undeliverable, never release
   assert.equal(broker.releases.length, 0);
   assert.equal(broker.finishes[0]?.result.status, "undeliverable");
   assert.equal(broker.finishes[0]?.result.reasons[0]?.code, "account_profile_missing");
+  store.close();
+});
+
+test("a live Desktop account rejection terminalizes without an uncertainty retry", async () => {
+  const broker = new FakeBroker([delivery(30, { subscription: subscription({ wakePolicy: "live_only" }) })]);
+  const store = new EdgeStore(":memory:");
+  const adapter = new StubAdapter({
+    dispatchError: new ProviderPreDispatchError("account_profile_mismatch"),
+  });
+  const live = new LiveIngressRegistry();
+  live.register({
+    actor: "ariadne",
+    provider: "codex",
+    socketPath: "/tmp/x.sock",
+    sessionId: "thread-1",
+    surfaceVersion: "test",
+  }, 60_000);
+  const edge = new EdgeService(asBrokerClient(broker), store, live, [adapter]);
+
+  assert.equal(await edge.processOne(), true);
+  assert.equal(broker.releases.length, 0);
+  assert.equal(broker.finishes[0]?.result.status, "undeliverable");
+  assert.equal(broker.finishes[0]?.result.reasons[0]?.code, "account_profile_mismatch");
+  assert.deepEqual(adapter.liveDeliveries, []);
   store.close();
 });
 

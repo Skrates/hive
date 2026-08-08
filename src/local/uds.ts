@@ -13,6 +13,17 @@ export interface UdsResponse {
   body: string;
 }
 
+export class UdsHttpError extends Error {
+  constructor(
+    readonly path: string,
+    readonly status: number,
+    readonly responseBody: string,
+  ) {
+    super(`uds ${path} ${status}: ${responseBody.slice(0, 500)}`);
+    this.name = "UdsHttpError";
+  }
+}
+
 export function udsRequest(
   socketPath: string,
   method: "GET" | "POST",
@@ -53,7 +64,7 @@ export async function udsRequestJson<T>(
 ): Promise<T> {
   const response = await udsRequest(socketPath, method, path, body);
   if (response.status < 200 || response.status >= 300) {
-    throw new Error(`uds ${path} ${response.status}: ${response.body.slice(0, 500)}`);
+    throw new UdsHttpError(path, response.status, response.body);
   }
   return JSON.parse(response.body) as T;
 }
