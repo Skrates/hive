@@ -21,8 +21,11 @@ RUN bun run build \
     && bun install --frozen-lockfile --production
 
 FROM node:22-bookworm-slim
+# openssh-server serves provisioning mode only (see start-edge.sh): a custom
+# image gets neither RunPod's web terminal nor their SSH, so an unseeded pod
+# would otherwise be unreachable.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl git jq openssh-client \
+      ca-certificates curl git jq openssh-client openssh-server \
     && rm -rf /var/lib/apt/lists/*
 
 # Tailscale (static build) — tailscaled runs userspace-networking in the pod.

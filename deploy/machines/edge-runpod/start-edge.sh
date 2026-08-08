@@ -10,10 +10,24 @@ chmod 700 "$HIVE_HOME"
 
 # Edge identity + broker route (tailnet). Never bake tokens into the image.
 # First boot on an unseeded volume is a legitimate state, not a crash: idle
-# loudly so the web terminal / SSH stays reachable for provisioning instead
-# of wedging the pod in a restart loop before anyone can seed it.
+# loudly and reachably. A custom image gets neither RunPod's web terminal nor
+# their SSH (both require a terminal server the official templates bundle), so
+# provisioning mode starts its own sshd keyed by the PUBLIC_KEY env RunPod
+# injects — the standard custom-image access pattern. No key, still idle: the
+# operator can fix the pod's env and restart rather than face a crash-loop.
 if [[ ! -f "$HIVE_HOME/edge.env" ]]; then
   echo "PROVISIONING MODE: $HIVE_HOME/edge.env not found — idling for seeding (tailscale, profile, credentials). Restart the pod once seeded." >&2
+  if [[ -n "${PUBLIC_KEY:-}" ]]; then
+    mkdir -p /root/.ssh && chmod 700 /root/.ssh
+    printf '%s\n' "$PUBLIC_KEY" > /root/.ssh/authorized_keys
+    chmod 600 /root/.ssh/authorized_keys
+    mkdir -p /run/sshd
+    ssh-keygen -A
+    /usr/sbin/sshd -e
+    echo "PROVISIONING MODE: sshd up on :22 for the injected PUBLIC_KEY." >&2
+  else
+    echo "PROVISIONING MODE: no PUBLIC_KEY env — unreachable idle; set it on the pod and restart." >&2
+  fi
   exec sleep infinity
 fi
 set -a
