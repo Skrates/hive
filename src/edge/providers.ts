@@ -97,14 +97,13 @@ export class CodexProvider implements ProviderAdapter {
  * whose durable state must live on its network volume anyway, home-as-profile
  * is coherent rather than a workaround; the adapter comment is the contract.
  *
- * v1 is deliberately narrow and loud about it:
- * - spawn-only: Grok Build documents no headless session-resume surface, so
- *   `resume` terminalizes rather than pretending (subscriptions must use
- *   wakePolicy "spawn").
- * - `danger-full-access` only: no documented sandbox/approval flags means we
- *   cannot prove a "read-only"/"workspace-write" promise is honored — claiming
- *   one would be a lie. The seat's own machine boundary (its pod) is the
- *   isolation, per the permissive-on-own-box ruling.
+ * Unlike Claude's boolean `-p` + positional prompt, Grok's `-p/--single` takes
+ * the prompt as its VALUE — the flag must come last with the framed text as
+ * its argument, or clap rejects the invocation (live-fire finding, Talos's
+ * first wake: delivery 59 burned five attempts on exactly this).
+ *
+ * Spawn and resume (`-r <sessionId>`) are both verified live with session
+ * continuity; live delivery has no ingress surface and terminalizes loudly.
  */
 export class GrokProvider implements ProviderAdapter {
   readonly provider = "grok" as const;
@@ -118,14 +117,21 @@ export class GrokProvider implements ProviderAdapter {
     return Promise.reject(new Error("Grok Build has no live-ingress surface; deliveries fall through to spawn"));
   }
 
-  resume(): Promise<ProviderDispatch> {
-    return Promise.reject(new Error("Grok Build documents no headless resume; use wakePolicy \"spawn\""));
+  resume(subscription: Subscription, cwd: string, framed: string): Promise<ProviderDispatch> {
+    if (!subscription.sessionId) throw new Error("resume target missing");
+    return runHeadless(
+      process.env.HIVE_GROK_COMMAND ?? "grok",
+      ["-r", subscription.sessionId, "--output-format", "streaming-json", ...grokPermissionArgs(subscription.permissionProfile), "-p", framed],
+      cwd,
+      null,
+      { HOME: requireAccountProfile(subscription) },
+    );
   }
 
   spawn(subscription: Subscription, cwd: string, framed: string): Promise<ProviderDispatch> {
     return runHeadless(
       process.env.HIVE_GROK_COMMAND ?? "grok",
-      ["-p", "--output-format", "streaming-json", ...grokPermissionArgs(subscription.permissionProfile), framed],
+      ["--output-format", "streaming-json", ...grokPermissionArgs(subscription.permissionProfile), "-p", framed],
       cwd,
       null,
       { HOME: requireAccountProfile(subscription) },
@@ -297,14 +303,15 @@ function codexSocketPermissionProfile(name: string, parent: ":read-only" | ":wor
 }
 
 /**
- * Grok Build's documented flag surface (docs.x.ai/build, 2026-08) carries no
- * sandbox or approval-mode flags yet. Only the profile whose semantics we can
- * actually honor is accepted; narrower profiles fail pre-dispatch rather than
- * run under confinement the CLI does not provide.
+ * The shipping CLI carries `--permission-mode` with Claude-compatible
+ * vocabulary (the public docs lag the binary — verified live on the seat pod,
+ * 2026-08-08), so all three Hive profiles map directly.
  */
 export function grokPermissionArgs(profile: string): string[] {
   switch (profile) {
-    case "danger-full-access": return [];
+    case "read-only": return ["--permission-mode", "plan"];
+    case "workspace-write": return ["--permission-mode", "acceptEdits"];
+    case "danger-full-access": return ["--permission-mode", "bypassPermissions"];
     default: throw new ProviderPreDispatchError("provider_permission_profile_invalid");
   }
 }
