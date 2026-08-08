@@ -121,7 +121,7 @@ export class GrokProvider implements ProviderAdapter {
     if (!subscription.sessionId) throw new Error("resume target missing");
     return runHeadless(
       process.env.HIVE_GROK_COMMAND ?? "grok",
-      ["-r", subscription.sessionId, "--output-format", "streaming-json", ...grokPermissionArgs(subscription.permissionProfile), "-p", framed],
+      ["-r", subscription.sessionId, "--output-format", "streaming-messages-json", ...grokPermissionArgs(subscription.permissionProfile), "-p", framed],
       cwd,
       null,
       { HOME: requireAccountProfile(subscription) },
@@ -131,7 +131,7 @@ export class GrokProvider implements ProviderAdapter {
   spawn(subscription: Subscription, cwd: string, framed: string): Promise<ProviderDispatch> {
     return runHeadless(
       process.env.HIVE_GROK_COMMAND ?? "grok",
-      ["--output-format", "streaming-json", ...grokPermissionArgs(subscription.permissionProfile), "-p", framed],
+      ["--output-format", "streaming-messages-json", ...grokPermissionArgs(subscription.permissionProfile), "-p", framed],
       cwd,
       null,
       { HOME: requireAccountProfile(subscription) },
