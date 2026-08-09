@@ -26,6 +26,12 @@ FROM node:22-bookworm-slim
 # would otherwise be unreachable.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl git jq openssh-client openssh-server \
+      # seat toolchain (Talos cold-inventory, 2026-08-09): burns, CI hardening,
+      # native npm rebuilds, and pod-side debugging when the edge wedges.
+      python3 patch ripgrep zip unzip build-essential pkg-config \
+      shellcheck git-lfs sqlite3 rsync \
+      less file xz-utils bzip2 zstd iproute2 iputils-ping dnsutils \
+      lsof strace wget \
     && rm -rf /var/lib/apt/lists/*
 
 # Tailscale (static build) — tailscaled runs userspace-networking in the pod.
@@ -36,8 +42,39 @@ RUN curl -fsSL "https://pkgs.tailscale.com/stable/tailscale_${TAILSCALE_VERSION}
     && mv /tmp/tailscale_${TAILSCALE_VERSION}_amd64/tailscaled /usr/local/bin/ \
     && rm -rf /tmp/tailscale_${TAILSCALE_VERSION}_amd64
 
+# GitHub CLI — the seat works PRs, reviews, and Actions runs; version is
+# pinned by image rebuild, like everything else here.
+RUN mkdir -p -m 755 /etc/apt/keyrings \
+    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update && apt-get install -y --no-install-recommends gh \
+    && rm -rf /var/lib/apt/lists/*
+
 # uv — the seat does Sovereign python work in /workspace checkouts.
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+
+# bun — the runtime stage never had it; only the build stage did. Seats build
+# hive checkouts and bun-based repos on /workspace.
+COPY --from=oven/bun:1.3 /usr/local/bin/bun /usr/local/bin/bun
+
+# mise — the single version authority (weave-doctrine mise.toml is the ONE
+# pin). The binary rides the image; per-repo tools (just, ruff, ty, prek, ...)
+# resolve at runtime from each checkout's mise.toml on the volume.
+RUN curl -fsSL https://mise.jdx.dev/mise-latest-linux-x64 -o /usr/local/bin/mise \
+    && chmod +x /usr/local/bin/mise && mise --version
+
+# yq — mikefarah single binary (the Debian package is a different tool).
+RUN curl -fsSL https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 \
+      -o /usr/local/bin/yq && chmod +x /usr/local/bin/yq
+
+# Graphite CLI — stacked-PR burns and restacks.
+RUN npm install -g @withgraphite/graphite-cli@stable
+
+# pnpm — corepack is present but pnpm itself is not; many monorepos assume it.
+RUN npm install -g pnpm
 
 # runpodctl — the seat spawns sibling GPU pods (vLLM / TensorRT-LLM / diffusion).
 RUN curl -fsSL https://github.com/runpod/runpodctl/releases/latest/download/runpodctl-linux-amd64 \
