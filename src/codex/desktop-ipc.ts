@@ -125,16 +125,22 @@ export class CodexDesktopIpcClient {
   }
 
   unfollow(conversationId: string): void {
-    if (this.connected) {
-      this.broadcast("thread-stream-following-changed", 1, {
-        conversationId,
-        hostId: "local",
-        following: false,
-      });
+    try {
+      if (this.connected) {
+        this.broadcast("thread-stream-following-changed", 1, {
+          conversationId,
+          hostId: "local",
+          following: false,
+        });
+      }
+    } finally {
+      // Local retirement is unconditional. Even if the best-effort Router
+      // broadcast loses a socket race, Hive must release the retained 64 MiB
+      // snapshot and stop routing patches to this obsolete task.
+      const follower = this.followers.get(conversationId);
+      follower?.fail(new DesktopIpcError("Codex Desktop follower was removed", "transport", "unfollowed"));
+      this.followers.delete(conversationId);
     }
-    const follower = this.followers.get(conversationId);
-    follower?.fail(new DesktopIpcError("Codex Desktop follower was removed", "transport", "unfollowed"));
-    this.followers.delete(conversationId);
   }
 
   waitForTurnCompletion(
@@ -169,13 +175,13 @@ export class CodexDesktopIpcClient {
     return follower.waitForDeliveryOutcome(delivery, timeoutMs);
   }
 
-	  async deliver(
-		conversationId: string,
-		framed: string,
-		deliveryKey: string,
-		timeoutMs = this.requestTimeoutMs,
-	): Promise<DesktopDelivery> {
-		const deadline = Date.now() + timeoutMs;
+  async deliver(
+    conversationId: string,
+    framed: string,
+    deliveryKey: string,
+    timeoutMs = this.requestTimeoutMs,
+  ): Promise<DesktopDelivery> {
+    const deadline = Date.now() + timeoutMs;
     // ADR-0003 R-1: the broker already admitted this sender and framed the
     // instruction. Preserve that trusted envelope verbatim on the Desktop
     // path, exactly as the dedicated app-server path does.
@@ -208,7 +214,7 @@ export class CodexDesktopIpcClient {
           },
           createdAt: Date.now(),
         },
-	      }, remaining(deadline));
+      }, remaining(deadline));
       return {
         turnId: requiredTurnId(result),
         clientUserMessageId,
@@ -218,10 +224,10 @@ export class CodexDesktopIpcClient {
       if (!isDefinitelyIdle(error, conversationId)) throw error;
     }
 
-	    const result = await this.request("thread-follower-start-turn", {
-	      conversationId,
-	      turnStartParams: { input, clientUserMessageId },
-	    }, remaining(deadline));
+    const result = await this.request("thread-follower-start-turn", {
+      conversationId,
+      turnStartParams: { input, clientUserMessageId },
+    }, remaining(deadline));
     return {
       turnId: requiredTurnId(result),
       clientUserMessageId,
@@ -410,7 +416,7 @@ export class CodexDesktopIpcClient {
 }
 
 function remaining(deadline: number): number {
-	return Math.max(1, deadline - Date.now());
+  return Math.max(1, deadline - Date.now());
 }
 
 async function assertSecureSocket(socketPath: string): Promise<void> {
@@ -670,14 +676,20 @@ class ThreadFollower {
 }
 
 function locateDelivery(state: unknown, clientUserMessageId: string): DesktopDelivery | null {
-  for (const turn of turnsIn(state)) {
+  // Retries may legitimately reinject a terminal anchor that never crossed
+  // its response boundary. Search newest-first so a later attempt with the
+  // same stable dedupe coordinate owns recovery, never the abandoned anchor.
+  for (const turn of [...turnsIn(state)].reverse()) {
     if (typeof turn.turnId !== "string" || !Array.isArray(turn.items)) continue;
-    for (const item of turn.items) {
+    for (let index = turn.items.length - 1; index >= 0; index -= 1) {
+      const item = turn.items[index];
       if (!isRecord(item)) continue;
       if (item.type === "steeringUserMessage" && item.clientUserMessageId === clientUserMessageId) {
+        if (!recoverableAnchor(turn, turn.items, index, "steer")) continue;
         return { turnId: turn.turnId, clientUserMessageId, mode: "steer" };
       }
       if (item.type === "userMessage" && item.clientId === clientUserMessageId) {
+        if (!recoverableAnchor(turn, turn.items, index, "start")) continue;
         return { turnId: turn.turnId, clientUserMessageId, mode: "start" };
       }
     }
@@ -689,23 +701,24 @@ function findDeliveryOutcome(state: unknown, delivery: DesktopDelivery): Desktop
   const turn = turnsIn(state).find((candidate) => candidate.turnId === delivery.turnId);
   if (!turn || !Array.isArray(turn.items)) return null;
   const items = turn.items;
-  const anchor = items.findIndex((item) => isRecord(item) && (
-    (delivery.mode === "steer" && item.type === "steeringUserMessage"
-      && item.clientUserMessageId === delivery.clientUserMessageId)
-    || (delivery.mode === "start" && item.type === "userMessage"
-      && item.clientId === delivery.clientUserMessageId)
-  ));
+  const anchor = lastDeliveryAnchor(items, delivery);
   if (anchor < 0) return null;
 
   let responseStart = anchor + 1;
   if (delivery.mode === "steer") {
-    const boundaryOffset = items.slice(responseStart).findIndex((item) =>
-      isRecord(item) && item.type === "steered");
-    if (boundaryOffset < 0) return terminalFailure(turn, delivery.turnId);
-    responseStart += boundaryOffset + 1;
+    const boundary = nextSteeringBoundary(items, responseStart);
+    if (boundary < 0) return terminalBeforeBoundary(turn, delivery.turnId);
+    responseStart = boundary + 1;
   }
 
-  const assistant = items.slice(responseStart).find((item) => isRecord(item)
+  // A later steering boundary starts a different response cycle. Its answer
+  // can never close this delivery, even when both cycles share one enclosing
+  // foreground turn. If the Hive cycle produced no final answer before that
+  // boundary, report uncertainty so the broker retries instead of posting the
+  // later message's answer.
+  const nextBoundary = nextSteeringBoundary(items, responseStart);
+  const responseEnd = nextBoundary < 0 ? items.length : nextBoundary;
+  const assistant = items.slice(responseStart, responseEnd).find((item) => isRecord(item)
     && (item.type === "agentMessage" || item.type === "agent_message")
     && item.phase === "final_answer"
     && typeof item.text === "string");
@@ -716,12 +729,63 @@ function findDeliveryOutcome(state: unknown, delivery: DesktopDelivery): Desktop
       assistantText: assistant.text,
     };
   }
+  if (nextBoundary >= 0) {
+    return { turnId: delivery.turnId, status: "interrupted", assistantText: null };
+  }
   const failed = terminalFailure(turn, delivery.turnId);
   if (failed) return failed;
   if (delivery.mode === "start" && turn.status === "completed") {
     return findCompletion(state, delivery.turnId);
   }
   return null;
+}
+
+function recoverableAnchor(
+  turn: Record<string, unknown>,
+  items: unknown[],
+  anchor: number,
+  mode: DesktopDelivery["mode"],
+): boolean {
+  if (mode === "steer" && nextSteeringBoundary(items, anchor + 1) >= 0) return true;
+  if (mode === "start" && turn.status === "completed") return true;
+  // An in-progress pre-boundary anchor may still be accepted by Desktop; keep
+  // following it. Once the enclosing turn terminalizes before that boundary,
+  // it proves the instruction never entered a response cycle, so recovery
+  // must yield to a fresh steer/start attempt.
+  return !isTerminalTurn(turn);
+}
+
+function lastDeliveryAnchor(items: unknown[], delivery: DesktopDelivery): number {
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index];
+    if (!isRecord(item)) continue;
+    if (delivery.mode === "steer" && item.type === "steeringUserMessage"
+      && item.clientUserMessageId === delivery.clientUserMessageId) return index;
+    if (delivery.mode === "start" && item.type === "userMessage"
+      && item.clientId === delivery.clientUserMessageId) return index;
+  }
+  return -1;
+}
+
+function nextSteeringBoundary(items: unknown[], start: number): number {
+  for (let index = start; index < items.length; index += 1) {
+    const item = items[index];
+    if (isRecord(item) && item.type === "steered") return index;
+  }
+  return -1;
+}
+
+function terminalBeforeBoundary(
+  turn: Record<string, unknown>,
+  turnId: string,
+): DesktopTurnCompletion | null {
+  if (!isTerminalTurn(turn)) return null;
+  const failed = terminalFailure(turn, turnId);
+  return failed ?? { turnId, status: "interrupted", assistantText: null };
+}
+
+function isTerminalTurn(turn: Record<string, unknown>): boolean {
+  return turn.status === "completed" || turn.status === "failed" || turn.status === "interrupted";
 }
 
 function terminalFailure(

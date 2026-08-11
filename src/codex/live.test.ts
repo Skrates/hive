@@ -8,8 +8,45 @@ import {
   assertPinnedDesktopAccount,
   completeCodexDelivery,
   completeDesktopDelivery,
+  DesktopFollowerRetirement,
   desktopDeliveryKey,
 } from "./live.js";
+
+test("an obsolete Desktop follower is retired only after its in-flight delivery settles", async () => {
+  const unfollowed: string[] = [];
+  const retirement = new DesktopFollowerRetirement((sessionId) => unfollowed.push(sessionId));
+  let finish!: () => void;
+  const operation = new Promise<void>((resolve) => { finish = resolve; });
+
+  retirement.keep("task-a");
+  const inFlight = retirement.whileInUse("task-a", () => operation);
+  retirement.retire("task-a");
+  assert.deepEqual(unfollowed, []);
+
+  finish();
+  await inFlight;
+  assert.deepEqual(unfollowed, ["task-a"]);
+
+  retirement.retire("task-b");
+  assert.deepEqual(unfollowed, ["task-a", "task-b"]);
+});
+
+test("reactivating a Desktop task cancels its pending follower retirement", async () => {
+  const unfollowed: string[] = [];
+  const retirement = new DesktopFollowerRetirement((sessionId) => unfollowed.push(sessionId));
+  let finish!: () => void;
+  const operation = new Promise<void>((resolve) => { finish = resolve; });
+
+  const inFlight = retirement.whileInUse("task-a", () => operation);
+  retirement.retire("task-a");
+  retirement.keep("task-a");
+  finish();
+  await inFlight;
+
+  assert.deepEqual(unfollowed, []);
+  retirement.retire("task-a");
+  assert.deepEqual(unfollowed, ["task-a"]);
+});
 
 test("a completed live turn returns its final text separately from the diagnostic receipt", async () => {
   const budgets: number[] = [];

@@ -1,6 +1,6 @@
 interface:
   display_name: "Hive Attach"
   short_description: "Attach a Hive actor to this exact Codex task"
-  default_prompt: "Use $hive-attach to attach the Hive actor ariadne to this exact current Codex Desktop task and verify the binding."
+  default_prompt: "Use $hive-attach to attach the Hive actor codex-1 to this exact current Codex Desktop task and verify the binding."
 policy:
   allow_implicit_invocation: false

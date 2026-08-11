@@ -87,6 +87,25 @@ export async function removeCodexForegroundBinding(bindingFile: string): Promise
   await rm(bindingFile, { force: true });
 }
 
+/**
+ * Roll back an attachment that the live surface did not confirm. The failed
+ * revision fences the cleanup so a newer attachment is never removed. A prior
+ * binding is restored through the same temporary-file + rename path as a new
+ * binding, making the visible replacement atomic; absence is restored by
+ * removing only the still-current failed revision.
+ */
+export async function restoreCodexForegroundBinding(
+  bindingFile: string,
+  failedRevision: string,
+  previous: CodexForegroundBinding | null,
+): Promise<boolean> {
+  const current = await readCodexForegroundBinding(bindingFile);
+  if (current?.revision !== failedRevision) return false;
+  if (previous) await writeBinding(bindingFile, previous);
+  else await removeCodexForegroundBinding(bindingFile);
+  return true;
+}
+
 async function writeBinding(path: string, binding: CodexForegroundBinding): Promise<void> {
   const directory = dirname(path);
   await mkdir(directory, { recursive: true, mode: 0o700 });

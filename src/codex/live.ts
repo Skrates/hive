@@ -53,9 +53,59 @@ type LiveTarget =
   | { kind: "dedicated"; sessionId: string }
   | { kind: "desktop"; sessionId: string; cwd: string; revision: string };
 
+/**
+ * Retire obsolete Desktop followers without tearing down a response stream
+ * that an accepted delivery still needs. Binding switches mark the old task
+ * for retirement; the actual unfollow happens after its final in-flight
+ * delivery releases the lease. Re-activating the same task cancels retirement.
+ */
+export class DesktopFollowerRetirement {
+  private readonly inFlight = new Map<string, number>();
+  private readonly obsolete = new Set<string>();
+
+  constructor(private readonly unfollow: (sessionId: string) => void) {}
+
+  keep(sessionId: string): void {
+    this.obsolete.delete(sessionId);
+  }
+
+  retire(sessionId: string): void {
+    this.obsolete.add(sessionId);
+    this.flush(sessionId);
+  }
+
+  async whileInUse<T>(sessionId: string, operation: () => Promise<T>): Promise<T> {
+    this.inFlight.set(sessionId, (this.inFlight.get(sessionId) ?? 0) + 1);
+    try {
+      return await operation();
+    } finally {
+      const remaining = (this.inFlight.get(sessionId) ?? 1) - 1;
+      if (remaining === 0) this.inFlight.delete(sessionId);
+      else this.inFlight.set(sessionId, remaining);
+      this.flush(sessionId);
+    }
+  }
+
+  private flush(sessionId: string): void {
+    if (!this.obsolete.has(sessionId) || this.inFlight.has(sessionId)) return;
+    this.obsolete.delete(sessionId);
+    this.unfollow(sessionId);
+  }
+}
+
 export async function runCodexLive(config: Config): Promise<void> {
   const appClient = new CodexAppServerClient(config.appServerSocket);
   const desktopClient = new CodexDesktopIpcClient(config.desktopIpcSocket);
+  const desktopRetirement = new DesktopFollowerRetirement((sessionId) => {
+    try {
+      desktopClient.unfollow(sessionId);
+    } catch (error) {
+      // Follower retirement is cleanup after the routing handoff. A local IPC
+      // write race must not replace an already-completed provider outcome with
+      // uncertainty; the disconnected client has already dropped its state.
+      console.error("Hive Codex Desktop unfollow failed", error instanceof Error ? error.message : String(error));
+    }
+  });
   let target: LiveTarget | null = null;
   let refreshPromise: Promise<void> | null = null;
 
@@ -76,6 +126,7 @@ export async function runCodexLive(config: Config): Promise<void> {
     }
     await desktopClient.connect();
     await desktopClient.follow(binding.sessionId);
+    desktopRetirement.keep(binding.sessionId);
     return { kind: "desktop", sessionId: binding.sessionId, cwd: binding.cwd, revision: binding.revision };
   };
   const readTarget = async (): Promise<LiveTarget> => {
@@ -95,12 +146,16 @@ export async function runCodexLive(config: Config): Promise<void> {
     void handle(request, response, () => bindingStatus(config.actor, target), async (delivery, framed) => {
       const acceptedTarget = target;
       if (!acceptedTarget) throw new Error("Codex explicit foreground attachment is unavailable");
-      if (acceptedTarget.kind === "desktop") {
-        await assertPinnedDesktopAccount(config.desktopHome, delivery.subscription.accountProfile);
+      if (acceptedTarget.kind === "dedicated") {
+        return completeCodexDelivery(appClient, acceptedTarget.sessionId, delivery, framed);
       }
-      return acceptedTarget.kind === "desktop"
-        ? completeDesktopDelivery(desktopClient, acceptedTarget.sessionId, delivery, framed)
-        : completeCodexDelivery(appClient, acceptedTarget.sessionId, delivery, framed);
+      // Acquire the follower lease before the first await. A binding switch
+      // may happen while account validation or the provider turn is running;
+      // the old stream stays followed until this exact delivery settles.
+      return desktopRetirement.whileInUse(acceptedTarget.sessionId, async () => {
+        await assertPinnedDesktopAccount(config.desktopHome, delivery.subscription.accountProfile);
+        return completeDesktopDelivery(desktopClient, acceptedTarget.sessionId, delivery, framed);
+      });
     })
       .catch((error: unknown) => {
         const code = error instanceof SurfaceError ? error.code : "live_delivery_failed";
@@ -136,6 +191,25 @@ export async function runCodexLive(config: Config): Promise<void> {
     });
   };
   await register();
+  const retireReplacedDesktop = (previous: LiveTarget | null, next: LiveTarget | null): void => {
+    if (previous?.kind !== "desktop") return;
+    if (next?.kind === "desktop" && next.sessionId === previous.sessionId) return;
+    desktopRetirement.retire(previous.sessionId);
+  };
+  const transitionTarget = async (next: LiveTarget): Promise<void> => {
+    const previous = target;
+    target = next;
+    try {
+      await register();
+    } catch (error) {
+      target = null;
+      retireReplacedDesktop(previous, null);
+      if (previous?.kind !== "desktop" || next.kind !== "desktop"
+        || previous.sessionId !== next.sessionId) retireReplacedDesktop(next, null);
+      throw error;
+    }
+    retireReplacedDesktop(previous, next);
+  };
   const refresh = async (): Promise<void> => {
     if (refreshPromise) return refreshPromise;
     refreshPromise = (async () => {
@@ -152,16 +226,18 @@ export async function runCodexLive(config: Config): Promise<void> {
           // attachment would face — a rejection lands in the catch below and
           // withdraws liveness instead of routing wakes into a dead task.
           const wasFollowing = desktopClient.isFollowing(target.sessionId);
-          target = await prepareDesktop(binding!);
-          if (!wasFollowing) await register();
+          const refreshed = await prepareDesktop(binding!);
+          if (wasFollowing) target = refreshed;
+          else await transitionTarget(refreshed);
           return;
         }
-        target = binding ? await prepareDesktop(binding) : await prepareDedicated();
-        await register();
+        await transitionTarget(binding ? await prepareDesktop(binding) : await prepareDedicated());
       } catch (error) {
         // An explicit binding is an authority choice. If it cannot be validated
         // or reached, withdraw liveness instead of silently steering fallback.
+        const previous = target;
         target = null;
+        retireReplacedDesktop(previous, null);
         await register().catch(() => {});
         console.error("Hive Codex attachment unavailable", error instanceof Error ? error.message : String(error));
       }

@@ -123,7 +123,7 @@ export class EdgeService {
         this.store.setStatus(current.id, generation, "processed", dispatch.receipt);
         return true;
       }
-      // Live delivery (Codex steer accepted / Claude inbox written): dispatch
+      // A non-completion-tracked live delivery (currently Claude inbox write)
       // is durable but the agent has not answered yet. The delivery stays
       // `dispatched` until the agent's `hive reply` closes it (R-6); if no
       // outcome ever arrives, the broker sweep requeues it after the

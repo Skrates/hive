@@ -139,13 +139,14 @@ that are acted on when they arrive.
   `turn/start` or `turn/steer` result runs. A dedicated app-server delivery completes with
   its terminal turn. A foreground Desktop steer instead completes when the Desktop owner
   durably exposes the `final_answer` response cycle after Hive's stable
-  `hive-delivery-<id>` message and its `steered` boundary; the enclosing foreground turn
-  may remain open for later human messages. This prevents a fast follow-up from replacing
-  the Hive outcome or holding its lease indefinitely. A retry first searches the followed
-  task history for the full stable delivery coordinate (workspace, channel, Slack message
-  timestamp, and delivery ID) and recovers its already-recorded answer without reinjecting
-  the wake. Failure, interruption, timeout, disconnect, or missing
-  correlation remains uncertainty and requeues. A **Claude live** inbox write still stays
+  `hive-delivery-<full-coordinate>` message and its `steered` boundary; the response cycle ends at the
+  next `steered` boundary, so a later human message can never supply the Hive outcome. The
+  enclosing foreground turn may remain open for later messages. A retry first searches the
+  followed task history for the full stable delivery coordinate (workspace, channel, Slack
+  message timestamp, and delivery ID) and recovers its already-recorded answer without
+  reinjecting the wake. A terminal anchor that never crossed its first `steered` boundary
+  was not delivered and is reinjected on retry. Failure, interruption, timeout, disconnect,
+  or missing correlation remains uncertainty and requeues. A **Claude live** inbox write still stays
   `dispatched` until the agent's explicit outcome closes it because an inbox receipt is not
   provider completion. The sweep grants `DISPATCHED_OUTCOME_GRACE_MS` before treating an
   absent Claude outcome as uncertainty. A **headless** run likewise carries its outcome
@@ -155,9 +156,13 @@ that are acted on when they arrive.
 * A foreground Codex attachment is an explicit, owner-local routing choice, not session
   discovery by recency. The binding names one primary user task, exact cwd, and revision;
   the live bridge must validate that task in Codex state and acquire its Desktop IPC follower
-  before advertising the revision. A present binding that cannot be validated or followed
+  before advertising the revision. Switching bindings follows and confirms the replacement
+  before retiring the obsolete Desktop follower; an old follower needed by an in-flight delivery
+  remains until that delivery settles. A present binding that cannot be validated or followed
   withdraws liveness rather than falling back to another task. Removing the binding explicitly
-  restores the subscription's pinned dedicated thread.
+  restores the subscription's pinned dedicated thread. The Desktop state home and pinned Codex
+  profile must resolve `auth.json` to the same owner-only file; mismatch is a hard pre-dispatch
+  `undeliverable`, never an uncertainty retry or fallback.
 * The machine-local plane is owner-only UDS: the edge control socket (`~/.hive/edge.sock`)
   serves live-registration heartbeats and `hive reply` outcome relay; the Codex live
   surface serves `/deliver` on its own socket; Claude delivery is an owner-only ingress

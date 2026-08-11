@@ -26,6 +26,7 @@ import {
   createCodexForegroundBinding,
   readCodexForegroundBinding,
   removeCodexForegroundBinding,
+  restoreCodexForegroundBinding,
 } from "./codex/binding.js";
 import type { BindingStatus } from "./codex/live.js";
 import { installCodexSkill } from "./codex/skill-install.js";
@@ -152,6 +153,7 @@ program.command("attach")
     if (!sessionId) throw new Error("--session is required outside a Codex task");
     const cwd = resolve(options.cwd);
     const paths = codexAttachmentPaths(actor);
+    const previous = await readCodexForegroundBinding(paths.bindingFile);
     const binding = await createCodexForegroundBinding({
       actor,
       sessionId,
@@ -163,8 +165,7 @@ program.command("attach")
       await waitForBinding(paths.surfaceSocket, (status) =>
         status.actor === actor && status.mode === "desktop" && status.revision === binding.revision);
     } catch (error) {
-      const current = await readCodexForegroundBinding(paths.bindingFile).catch(() => null);
-      if (current?.revision === binding.revision) await removeCodexForegroundBinding(paths.bindingFile);
+      await restoreCodexForegroundBinding(paths.bindingFile, binding.revision, previous);
       throw error;
     }
     process.stdout.write(`attached ${actor} to foreground Codex task at ${cwd}\n`);

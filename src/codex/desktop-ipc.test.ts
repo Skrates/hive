@@ -126,6 +126,95 @@ test("Desktop IPC retry recovers an accepted delivery and its final answer witho
   assert.equal(steerRequests, 0);
 });
 
+test("Desktop IPC stops a delivery outcome at the next steering boundary", async (t) => {
+  const router = await mockRouter((socket, message) => {
+    if (message.method === "initialize") initialize(socket, message);
+    if (message.method === "thread-stream-following-changed") {
+      socket.write(streamSnapshot("owner", 4, "turn-49", "inProgress", [
+        {
+          type: "steeringUserMessage",
+          clientUserMessageId: "hive-delivery-49",
+          status: "accepted",
+        },
+        { type: "steered" },
+        {
+          type: "steeringUserMessage",
+          clientUserMessageId: "later-human-message",
+          status: "accepted",
+        },
+        { type: "steered" },
+        { type: "agentMessage", phase: "final_answer", text: "Later human answer." },
+      ]));
+    }
+  });
+  t.after(() => router.close());
+  const client = new CodexDesktopIpcClient(router.path, 100);
+  t.after(() => client.close());
+
+  await client.connect();
+  await client.follow("thread-1", 100);
+  const accepted = await client.deliver("thread-1", "redelivery", "hive-delivery-49");
+
+  assert.deepEqual(await client.waitForDeliveryOutcome("thread-1", accepted, 100), {
+    turnId: "turn-49",
+    status: "interrupted",
+    assistantText: null,
+  });
+});
+
+test("Desktop IPC reinjects a terminal steering anchor that never crossed its boundary", async (t) => {
+  let steerRequests = 0;
+  let startRequests = 0;
+  const router = await mockRouter((socket, message) => {
+    if (message.method === "initialize") initialize(socket, message);
+    if (message.method === "thread-stream-following-changed") {
+      socket.write(streamSnapshot("owner", 5, "turn-abandoned", "failed", [
+        {
+          type: "steeringUserMessage",
+          clientUserMessageId: "hive-delivery-50",
+          status: "accepted",
+        },
+      ]));
+    }
+    if (message.method === "thread-follower-steer-turn") {
+      steerRequests += 1;
+      socket.write(encode({
+        type: "response",
+        requestId: message.requestId,
+        resultType: "error",
+        error: "Cannot steer conversation thread-1 because its active turn already ended",
+      }));
+    }
+    if (message.method === "thread-follower-start-turn") {
+      startRequests += 1;
+      const params = message.params as Message;
+      assert.equal((params.turnStartParams as Message).clientUserMessageId, "hive-delivery-50");
+      socket.write(encode({
+        type: "response",
+        requestId: message.requestId,
+        resultType: "success",
+        method: "thread-follower-start-turn",
+        result: { result: { turn: { id: "turn-retry" } } },
+      }));
+    }
+  });
+  t.after(() => router.close());
+  const client = new CodexDesktopIpcClient(router.path, 100);
+  t.after(() => client.close());
+
+  await client.connect();
+  await client.follow("thread-1", 100);
+  const accepted = await client.deliver("thread-1", "retry body", "hive-delivery-50");
+
+  assert.deepEqual(accepted, {
+    turnId: "turn-retry",
+    clientUserMessageId: "hive-delivery-50",
+    mode: "start",
+  });
+  assert.equal(steerRequests, 1);
+  assert.equal(startRequests, 1);
+});
+
 test("Desktop IPC reports no owner without a mutating history probe", async (t) => {
   const methods: string[] = [];
   const router = await mockRouter((socket, message) => {
@@ -139,6 +228,32 @@ test("Desktop IPC reports no owner without a mutating history probe", async (t) 
   await assert.rejects(() => client.follow("missing", 30), (error: unknown) =>
     error instanceof DesktopIpcError && error.code === "no_owner_loaded");
   assert.equal(methods.includes("thread-follower-load-complete-history"), false);
+});
+
+test("Desktop IPC unfollow retires the obsolete task stream and local snapshot", async (t) => {
+  const following: boolean[] = [];
+  const router = await mockRouter((socket, message) => {
+    if (message.method === "initialize") initialize(socket, message);
+    if (message.method === "thread-stream-following-changed") {
+      const params = message.params as Message;
+      following.push(params.following as boolean);
+      if (params.following === true) {
+        socket.write(streamSnapshot("owner", 1, "turn-1", "inProgress", []));
+      }
+    }
+  });
+  t.after(() => router.close());
+  const client = new CodexDesktopIpcClient(router.path, 100);
+  t.after(() => client.close());
+
+  await client.connect();
+  await client.follow("thread-1", 100);
+  assert.equal(client.isFollowing("thread-1"), true);
+  client.unfollow("thread-1");
+  await delay(5);
+
+  assert.equal(client.isFollowing("thread-1"), false);
+  assert.deepEqual(following, [true, false]);
 });
 
 test("uncertain or mismatched steer responses never fall through to start", async (t) => {
