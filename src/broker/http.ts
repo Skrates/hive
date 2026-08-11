@@ -86,7 +86,9 @@ export class BrokerHttpServer {
     if (request.method === "GET" && url.pathname === "/v1/deliveries") {
       const after = integerParam(url.searchParams.get("after"), 0);
       const waitMs = integerParam(url.searchParams.get("wait_ms"), 0);
-      const delivery = await this.broker.claim(edgeId, after, waitMs);
+      const busy = url.searchParams.get("busy");
+      const busyActors = busy ? busy.split(",").filter((item) => item.length > 0) : [];
+      const delivery = await this.broker.claim(edgeId, after, waitMs, busyActors);
       return delivery ? json(response, 200, delivery) : json(response, 204, null);
     }
 

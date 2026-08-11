@@ -551,7 +551,7 @@ export class BrokerStore {
     })();
   }
 
-  claimNext(edgeId: string, _after: number): Delivery | null {
+  claimNext(edgeId: string, _after: number, busyActors: readonly string[] = []): Delivery | null {
     return this.db.transaction(() => {
       // `after` remains a v1 compatibility hint only: broker-side eligibility
       // can change over time, so every pending delivery must remain visible.
@@ -564,6 +564,13 @@ export class BrokerStore {
 
       for (const row of rows) {
         const actor = String(row.actor);
+        // The claiming edge declares actors whose dispatches it is still
+        // running. acquireLease cannot serialize these: a same-edge claim on a
+        // live lease shares the generation by design (a sequential edge's next
+        // claim after a finished turn), so only the edge's own declaration
+        // prevents two concurrent turns for one actor (multi-actor edge,
+        // 2026-08-11).
+        if (busyActors.includes(actor)) continue;
         const subscription = this.getSubscription(actor);
         if (!subscription) continue;
         const now = this.clock.now().getTime();
