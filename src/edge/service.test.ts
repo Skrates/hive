@@ -349,3 +349,50 @@ test("a redelivered higher attempt is dispatched again (duplicates tolerated by 
   assert.equal(broker.finishes[0]?.result.status, "processed");
   store.close();
 });
+
+test("a slow turn for one actor does not starve a co-tenant actor's delivery (multi-actor edge, 2026-08-11)", async () => {
+  // The cx53 incident: the run() loop awaited each provider turn before
+  // claiming again, so gnomon's 80-minute headless turn left theoros's
+  // delivery `pending` at the broker for hours. run() must claim and
+  // dispatch concurrently across actors.
+  let releaseSlowTurn!: () => void;
+  const slowTurn = new Promise<void>((resolve) => { releaseSlowTurn = resolve; });
+  class SlowForGnomonAdapter extends StubAdapter {
+    override async spawn(sub: Subscription, cwd: string, framed: string): Promise<ProviderDispatch> {
+      if (sub.actor === "gnomon") {
+        await slowTurn;
+        return { receipt: JSON.stringify({ type: "result", result: "slow done" }), outcome: "slow done", processed: true };
+      }
+      return super.spawn(sub, cwd, framed);
+    }
+  }
+  const broker = new FakeBroker([
+    delivery(1, { actor: "gnomon", coalesceKey: "gnomon:C1:100.1", subscription: subscription({ actor: "gnomon", sessionId: null }) }),
+    delivery(2, { actor: "theoros", coalesceKey: "theoros:C1:100.2", subscription: subscription({ actor: "theoros", sessionId: null }) }),
+  ]);
+  const store = new EdgeStore(":memory:");
+  const adapter = new SlowForGnomonAdapter();
+  const edge = new EdgeService(asBrokerClient(broker), store, new LiveIngressRegistry(), [adapter]);
+
+  const controller = new AbortController();
+  const run = edge.run(controller.signal);
+  // The theoros delivery must complete while the gnomon turn is still hanging.
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline && !broker.finishes.some((f) => f.deliveryId === 2)) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.ok(
+    broker.finishes.some((f) => f.deliveryId === 2 && f.result.status === "processed"),
+    "theoros delivery processed while gnomon turn still in flight",
+  );
+  assert.ok(!broker.finishes.some((f) => f.deliveryId === 1), "gnomon turn genuinely still hanging");
+  // Release the slow turn; it must also reach a disposition.
+  releaseSlowTurn();
+  const slowDeadline = Date.now() + 2_000;
+  while (Date.now() < slowDeadline && !broker.finishes.some((f) => f.deliveryId === 1)) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.ok(broker.finishes.some((f) => f.deliveryId === 1 && f.result.status === "processed"));
+  controller.abort();
+  await run;
+});
