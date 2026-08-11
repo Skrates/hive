@@ -107,22 +107,23 @@ export class EdgeService {
       current = await this.broker.markDispatched(current);
       this.store.setStatus(current.id, generation, "dispatched", dispatch.receipt);
       if (dispatch.processed) {
-        // Headless run: the provider turn completed and its receipt IS the
-        // agent's outcome. The outcome travels inside the terminal transition
-        // so the broker commits `processed` and the durable thread post
-        // together — a Slack outage can neither lose the outcome nor cause
-        // this trusted instruction to rerun.
+        // A completed provider turn (headless, or a completion-tracked Codex
+        // live turn) carries the agent's final text in `outcome`; `receipt` is
+        // bounded diagnostic evidence only. The outcome travels inside the
+        // terminal transition so the broker commits `processed` and the
+        // durable thread post together — a Slack outage can neither lose the
+        // outcome nor cause this trusted instruction to rerun.
         await this.broker.finish(current, {
           generation,
           status: "processed",
           reasons: [],
           providerReceipt: dispatch.receipt,
-          outcome: dispatch.outcome ?? null,
+          outcome: dispatch.outcome,
         });
         this.store.setStatus(current.id, generation, "processed", dispatch.receipt);
         return true;
       }
-      // Live delivery (Codex steer accepted / Claude inbox written): dispatch
+      // A non-completion-tracked live delivery (currently Claude inbox write)
       // is durable but the agent has not answered yet. The delivery stays
       // `dispatched` until the agent's `hive reply` closes it (R-6); if no
       // outcome ever arrives, the broker sweep requeues it after the
@@ -250,7 +251,12 @@ export class EdgeService {
     const live = this.live.get(delivery.actor, subscription.provider);
     if (live) {
       onProviderStart();
-      return adapter.deliverLive(live, delivery, frameWakeInstruction(delivery, replay, "agent"));
+      // Codex live delivery waits for the exact app-server turn and lets the
+      // edge relay its final assistant text. Claude live inbox delivery still
+      // requires the agent-side reply because writing an inbox file is not a
+      // provider completion signal.
+      const outcomeReporter = subscription.provider === "codex" ? "edge" : "agent";
+      return adapter.deliverLive(live, delivery, frameWakeInstruction(delivery, replay, outcomeReporter));
     }
     if (subscription.wakePolicy === "live_only") throw new PreDispatchError("live_ingress_unavailable");
 
@@ -311,6 +317,7 @@ function preDispatchDetail(code: string): string {
     case "live_ingress_rejected": return "the live surface rejected dispatch before starting a provider turn";
     case "provider_permission_profile_invalid": return "the configured provider permission profile was invalid";
     case "account_profile_missing": return "the pinned account profile directory does not exist on this edge (ADR-0003 R-5: profile misbinding is a hard failure)";
+    case "account_profile_mismatch": return "the foreground Codex Desktop account does not match the subscription's pinned account profile";
     default: return "provider dispatch was rejected before invocation";
   }
 }
@@ -326,6 +333,7 @@ function safeEdgeErrorCode(error: unknown): string {
     "provider_adapter_missing",
     "spawn_rate_limited",
     "account_profile_missing",
+    "account_profile_mismatch",
     "stale lease",
   ].find((code) => message.includes(code)) ?? "edge_iteration_failed";
 }

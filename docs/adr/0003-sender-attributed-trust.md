@@ -71,7 +71,7 @@ Steering matrix:
 
 | Agent | Provider | Mechanism | Steering class |
 | -- | -- | -- | -- |
-| codex-1 | Codex (ChatGPT Max 20x) | app-server `turn/steer` / `turn/start`; `codex exec resume` headless | true mid-turn |
+| codex-1 | Codex (ChatGPT Max 20x) | explicit Desktop task follower or dedicated app-server `turn/steer` / `turn/start`; `codex exec resume` headless | true mid-turn |
 | claude-1 | Claude Code (Max 20x) | boundary hook (Stop/PostToolUse checks ingress inbox) + `--resume`/`-p` idle wake | next-boundary (≤ one tool call) |
 | claude-2 | Claude Code (Team Premium) | same | next-boundary |
 | claude-3 | Claude Code (Team Premium) | same | next-boundary |
@@ -124,22 +124,45 @@ that are acted on when they arrive.
   notice. Foreign workspaces/channels stay silent — Hive does not post into rooms it does
   not occupy.
 * The wake envelope is `frameWakeInstruction`: imperative body, sender, thread reference,
-  `delivery/attempt/dedupe` coordinates, an explicit `hive reply <id> "<summary>"`
-  instruction, and the thread replay delimited as data.
+  `delivery/attempt/dedupe` coordinates, and the thread replay delimited as data. Claude
+  boundary delivery includes an explicit `hive reply <id> "<summary>"` instruction. A
+  completion-tracked Codex live turn instead asks for a concise final response; Hive
+  correlates the exact accepted delivery and relays the response without a model-initiated
+  shell call.
 * Delivery states are `pending → claimed → accepted_local → dispatching → dispatched` with
   terminals `processed | undeliverable | failed`. Uncertainty releases the delivery
   (`release` from the edge, or the broker's lease-expiry sweep) back to `pending` behind
   `retryBackoffMs`; exhaustion terminalizes as `failed`. All failure/retry/receipt/outcome
   posts flow through the durable `outbox` table, drained by the broker with per-row backoff
   (a permanently failing row is finally abandoned and can never starve the page).
-* A **live** delivery (Codex steer accepted, Claude inbox written) stays `dispatched` until
-  the agent's outcome closes it: the receipt proves durable dispatch, not completion. The
-  sweep grants `DISPATCHED_OUTCOME_GRACE_MS` for the outcome before treating its absence as
-  uncertainty and requeueing — delivered-but-never-answered becomes a visible retry and
-  ultimately a visible `failed`, never a silent `processed`. A **headless** run's outcome
-  travels inside the terminal transition (`finish` with `outcome`), committing `processed`
-  and the thread post in one broker transaction, so a Slack outage after provider
-  completion can neither lose the outcome nor rerun the instruction.
+* A completion-tracked **Codex live** delivery holds its fenced lease while the exact
+  `turn/start` or `turn/steer` result runs. A dedicated app-server delivery completes with
+  its terminal turn. A foreground Desktop steer instead completes when the Desktop owner
+  durably exposes the `final_answer` response cycle after Hive's stable
+  `hive-delivery-<full-coordinate>` message and its `steered` boundary; the response cycle ends at the
+  next `steered` boundary, so a later human message can never supply the Hive outcome. The
+  enclosing foreground turn may remain open for later messages. A retry first searches the
+  followed task history for the full stable delivery coordinate (workspace, channel, Slack
+  message timestamp, and delivery ID) and recovers its already-recorded answer without
+  reinjecting the wake. A terminal anchor that never crossed its first `steered` boundary
+  was not delivered and is reinjected on retry. Failure, interruption, timeout, disconnect,
+  or missing correlation remains uncertainty and requeues. A **Claude live** inbox write still stays
+  `dispatched` until the agent's explicit outcome closes it because an inbox receipt is not
+  provider completion. The sweep grants `DISPATCHED_OUTCOME_GRACE_MS` before treating an
+  absent Claude outcome as uncertainty. A **headless** run likewise carries its outcome
+  inside the terminal transition. In every completion-tracked case, `processed` and the
+  thread post commit in one broker transaction, so a Slack outage after provider completion
+  can neither lose the outcome nor rerun the instruction.
+* A foreground Codex attachment is an explicit, owner-local routing choice, not session
+  discovery by recency. The binding names one primary user task, exact cwd, and revision;
+  the live bridge must validate that task in Codex state and acquire its Desktop IPC follower
+  before advertising the revision. Switching bindings follows and confirms the replacement
+  before retiring the obsolete Desktop follower; an old follower needed by an in-flight delivery
+  remains until that delivery settles. A present binding that cannot be validated or followed
+  withdraws liveness rather than falling back to another task. Removing the binding explicitly
+  restores the subscription's pinned dedicated thread. The Desktop state home and pinned Codex
+  profile must resolve `auth.json` to the same owner-only file; mismatch is a hard pre-dispatch
+  `undeliverable`, never an uncertainty retry or fallback.
 * The machine-local plane is owner-only UDS: the edge control socket (`~/.hive/edge.sock`)
   serves live-registration heartbeats and `hive reply` outcome relay; the Codex live
   surface serves `/deliver` on its own socket; Claude delivery is an owner-only ingress

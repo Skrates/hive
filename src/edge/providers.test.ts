@@ -196,12 +196,17 @@ test("Codex live delivery travels over the surface's owner-only UDS socket", asy
   prepareSocketPath(socketPath);
 
   const seen: unknown[] = [];
+  const longOutcome = "F".repeat(9_471);
   const server = createServer((request, response) => {
     const chunks: Buffer[] = [];
     request.on("data", (chunk: Buffer) => chunks.push(chunk));
     request.on("end", () => {
       seen.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
-      const body = JSON.stringify({ receipt: "steered:turn-1" });
+      const body = JSON.stringify({
+        receipt: JSON.stringify({ type: "hive.live.completed", surface: "desktop", turnId: "turn-11" }),
+        outcome: longOutcome,
+        processed: true,
+      });
       response.writeHead(200, { "content-type": "application/json" });
       response.end(body);
     });
@@ -219,8 +224,9 @@ test("Codex live delivery travels over the surface's owner-only UDS socket", asy
     expiresAt: Date.now() + 60_000,
   };
   const result = await codex.deliverLive(ingress, delivery(11), "framed body");
-  assert.equal(result.receipt, "steered:turn-1");
-  assert.equal(result.processed, false);
+  assert.match(result.receipt, /hive\.live\.completed/);
+  assert.equal(result.outcome, longOutcome);
+  assert.equal(result.processed, true);
   const payload = seen[0] as { delivery: { id: number }; framed: string };
   assert.equal(payload.delivery.id, 11);
   assert.equal(payload.framed, "framed body");
@@ -233,7 +239,7 @@ test("an oversized live receipt is rejected", async (t) => {
   prepareSocketPath(socketPath);
   const server = createServer((_request, response) => {
     response.writeHead(200, { "content-type": "application/json" });
-    response.end(JSON.stringify({ receipt: "x".repeat(2_000) }));
+    response.end(JSON.stringify({ receipt: "x".repeat(4_001), outcome: "done", processed: true }));
   });
   await new Promise<void>((resolve) => server.listen({ path: socketPath }, resolve));
   t.after(() => server.close());
@@ -250,5 +256,60 @@ test("an oversized live receipt is rejected", async (t) => {
   await assert.rejects(
     () => codex.deliverLive(ingress, delivery(12), "framed"),
     /invalid response/,
+  );
+});
+
+test("a missing live outcome is rejected instead of parsing the diagnostic receipt", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "hive-uds-no-outcome-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const socketPath = join(root, "surface.sock");
+  prepareSocketPath(socketPath);
+  const server = createServer((_request, response) => {
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ receipt: "completed", processed: true }));
+  });
+  await new Promise<void>((resolve) => server.listen({ path: socketPath }, resolve));
+  t.after(() => server.close());
+
+  const codex = new CodexProvider();
+  const ingress: LiveIngress = {
+    actor: "ariadne",
+    provider: "codex",
+    socketPath,
+    sessionId: "thread-1",
+    surfaceVersion: "test",
+    expiresAt: Date.now() + 60_000,
+  };
+  await assert.rejects(
+    () => codex.deliverLive(ingress, delivery(13), "framed"),
+    /invalid outcome/,
+  );
+});
+
+test("a structured Desktop account rejection remains a deterministic pre-dispatch error", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "hive-uds-account-reject-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const socketPath = join(root, "surface.sock");
+  prepareSocketPath(socketPath);
+  const server = createServer((_request, response) => {
+    response.writeHead(400, { "content-type": "application/json" });
+    response.end(JSON.stringify({ error: "account_profile_mismatch" }));
+  });
+  await new Promise<void>((resolve) => server.listen({ path: socketPath }, resolve));
+  t.after(() => server.close());
+
+  const codex = new CodexProvider();
+  const ingress: LiveIngress = {
+    actor: "ariadne",
+    provider: "codex",
+    socketPath,
+    sessionId: "thread-1",
+    surfaceVersion: "test",
+    expiresAt: Date.now() + 60_000,
+  };
+  await assert.rejects(
+    () => codex.deliverLive(ingress, delivery(14), "framed"),
+    (error: unknown) => error instanceof ProviderPreDispatchError
+      && error.code === "account_profile_mismatch",
   );
 });

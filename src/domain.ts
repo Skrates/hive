@@ -225,7 +225,7 @@ export function frameWakeInstruction(
   } else {
     lines.push(
       `Act on ${target}, then make your final response a concise outcome summary.`,
-      "This is a headless wake: Hive will relay that final response to the thread, so do not run hive reply yourself.",
+      "This is a completion-tracked wake: Hive will relay that final response to the thread, so do not run hive reply yourself.",
     );
   }
   if (replay && replay.messages.length > 0) {

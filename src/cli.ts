@@ -2,7 +2,8 @@
 import { Command } from "commander";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { AdmissionPolicySchema } from "./addressing.js";
 import { BrokerHttpServer } from "./broker/http.js";
@@ -20,6 +21,15 @@ import { ClaudeProvider, CodexProvider, GrokProvider } from "./edge/providers.js
 import { EdgeService } from "./edge/service.js";
 import { EdgeStore } from "./edge/store.js";
 import { udsRequestJson } from "./local/uds.js";
+import {
+  assertCodexAttachmentActor,
+  createCodexForegroundBinding,
+  readCodexForegroundBinding,
+  removeCodexForegroundBinding,
+  restoreCodexForegroundBinding,
+} from "./codex/binding.js";
+import type { BindingStatus } from "./codex/live.js";
+import { installCodexSkill } from "./codex/skill-install.js";
 
 const program = new Command().name("hive").description("Hive broker/edge wake router");
 
@@ -133,6 +143,57 @@ program.command("reply")
     process.stdout.write(`outcome recorded for delivery ${id}\n`);
   });
 
+program.command("attach")
+  .argument("<actor>", "Hive actor whose live Codex route should follow this task")
+  .option("--session <id>", "Codex task id (defaults to CODEX_THREAD_ID)")
+  .option("--cwd <path>", "exact task working directory", process.cwd())
+  .description("explicitly attach an actor to a foreground Codex Desktop task")
+  .action(async (actor: string, options: { session?: string; cwd: string }) => {
+    const sessionId = options.session ?? process.env.CODEX_THREAD_ID;
+    if (!sessionId) throw new Error("--session is required outside a Codex task");
+    const cwd = resolve(options.cwd);
+    const paths = codexAttachmentPaths(actor);
+    const previous = await readCodexForegroundBinding(paths.bindingFile);
+    const binding = await createCodexForegroundBinding({
+      actor,
+      sessionId,
+      cwd,
+      stateDatabase: paths.stateDatabase,
+      bindingFile: paths.bindingFile,
+    });
+    try {
+      await waitForBinding(paths.surfaceSocket, (status) =>
+        status.actor === actor && status.mode === "desktop" && status.revision === binding.revision);
+    } catch (error) {
+      await restoreCodexForegroundBinding(paths.bindingFile, binding.revision, previous);
+      throw error;
+    }
+    process.stdout.write(`attached ${actor} to foreground Codex task at ${cwd}\n`);
+  });
+
+program.command("detach")
+  .argument("<actor>", "Hive actor to return to its dedicated Codex task")
+  .description("detach an actor from a foreground task and restore its dedicated fallback")
+  .action(async (actor: string) => {
+    const paths = codexAttachmentPaths(actor);
+    await removeCodexForegroundBinding(paths.bindingFile);
+    await waitForBinding(paths.surfaceSocket, (status) => status.actor === actor && status.mode === "dedicated");
+    process.stdout.write(`detached ${actor}; dedicated Codex task restored\n`);
+  });
+
+program.command("install-codex-skill")
+  .description("install Hive Attach in the supported user-level Codex skill directory")
+  .action(async () => {
+    const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+    const result = await installCodexSkill(
+      join(packageRoot, ".agents", "skills", "hive-attach"),
+      join(homedir(), ".agents", "skills", "hive-attach"),
+    );
+    process.stdout.write(result.installed
+      ? "installed Hive Attach for Codex; open the slash menu and choose Hive Attach\n"
+      : "Hive Attach is already installed for Codex\n");
+  });
+
 program.command("status")
   .description("summarize broker deliveries (operator, flat surface)")
   .action(async () => {
@@ -222,6 +283,45 @@ function requiredEnv(name: string): string {
   const value = process.env[name];
   if (!value) throw new Error(`${name} is required`);
   return value;
+}
+
+function codexAttachmentPaths(actor: string): {
+  bindingFile: string;
+  surfaceSocket: string;
+  stateDatabase: string;
+} {
+  // The actor is interpolated into the binding path and the surface socket
+  // path, and `detach` removes the file it names. Apply the grammar before any
+  // of those paths exist, so a name carrying path segments can never reach the
+  // filesystem — `attach` alone validating inside the binding writer is not
+  // enough to cover removal.
+  assertCodexAttachmentActor(actor);
+  const desktopHome = process.env.HIVE_CODEX_DESKTOP_HOME ?? join(homedir(), ".codex");
+  return {
+    bindingFile: process.env.HIVE_CODEX_BINDING_FILE ?? join(hiveHome(), "codex-bindings", `${actor}.json`),
+    surfaceSocket: process.env.HIVE_SURFACE_SOCKET ?? join(hiveHome(), `codex-live-${actor}.sock`),
+    stateDatabase: process.env.HIVE_CODEX_DESKTOP_STATE_DB ?? join(desktopHome, "state_5.sqlite"),
+  };
+}
+
+async function waitForBinding(
+  surfaceSocket: string,
+  accepted: (status: BindingStatus) => boolean,
+  timeoutMs = 10_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let last = "surface unavailable";
+  while (Date.now() < deadline) {
+    try {
+      const status = await udsRequestJson<BindingStatus>(surfaceSocket, "GET", "/binding");
+      if (accepted(status)) return;
+      last = status.mode;
+    } catch (error) {
+      last = error instanceof Error ? error.message : String(error);
+    }
+    await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+  }
+  throw new Error(`Codex attachment was not confirmed by the live surface (${last})`);
 }
 
 /**

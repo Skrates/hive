@@ -76,9 +76,39 @@ profiles with legacy sandbox configuration. Authenticate the dedicated home once
 ### Codex live steering
 
 Run `hive-codex-live` with the current Codex thread ID. It connects to the app-server control
-socket, verifies the thread is live, serves `/deliver` on its own owner-only UDS socket, and keeps
-its registration fresh with the edge. A wake injected into an active thread is true mid-turn
-steering; without a live registration the edge falls back to `codex exec resume` / spawn.
+socket, owns or resumes the persisted thread on that long-lived connection, serves `/deliver` on
+its own owner-only UDS socket, and keeps its registration fresh with the edge. A wake injected into
+an active thread is true mid-turn steering. For a foreground Desktop task, the bridge correlates
+the stable Hive delivery message, waits through its `steered` boundary, and returns the next
+durable `final_answer` as the provider outcome even if the enclosing task remains active. A retry
+recovers that recorded answer instead of injecting the same delivery again. Dedicated app-server
+delivery still waits for its exact terminal turn. Live Codex turns must not run `hive reply`
+themselves. Failure, interruption, timeout, disconnect, or loss of correlation is uncertainty and
+is retried. Without a live registration the edge falls back to `codex exec resume` or spawn
+according to the subscription policy.
+
+The supervisor's pinned thread is the dedicated fallback. To route an actor into the foreground
+Codex Desktop task from that task's shell, run `hive attach <actor>` (or pass `--session <id>` when
+`CODEX_THREAD_ID` is unavailable). Attachment is never inferred from "most recent": Hive verifies
+an unarchived primary user task at the exact `--cwd`, writes an owner-only revision file, follows
+that exact task through Desktop's owner-only IPC stream, and waits for the live surface to confirm
+the revision. `hive detach <actor>` removes the binding and waits for the dedicated fallback to be
+restored. If replacement attachment confirmation fails, the CLI revision-fences its rollback and
+atomically restores the prior binding instead of deleting a working route. A present attachment
+that is invalid, stale, or lacks a Desktop owner withdraws live
+registration; it never silently sends the wake to the dedicated task. `GET /binding` on the
+actor's owner-only live UDS exposes only the mode, cwd, and attachment revision for diagnosis.
+The Desktop state home and the actor's pinned `CODEX_HOME` may be separate directories, but their
+resolved `auth.json` must be the same owner-only regular file. Provision the pinned profile by
+linking its `auth.json` to the authenticated Desktop home's artifact; do not run a second independent
+`codex login` in the profile. A missing, insecure, or different auth artifact rejects the wake before
+Desktop injection and terminalizes it as undeliverable.
+
+Install the repository-owned Codex command once with `hive install-codex-skill`. Codex lists it
+as **Hive Attach** in the `/` menu (its explicit skill token is `$hive-attach`). The command defaults
+to the checked-in Codex actor `codex-1`, reads `CODEX_THREAD_ID` only from the invoking task, resolves that task's physical cwd,
+and runs the same revision-confirmed `hive attach` path above. It is marked explicit-only, so ordinary
+conversation cannot silently change the foreground binding.
 
 ### Claude Code boundary delivery
 
@@ -107,8 +137,9 @@ At-least-once with one fenced claimant per attempt. Uncertainty (edge crash, los
 outcome, expired lease) requeues the delivery behind exponential backoff; after `maxAttempts`
 (default 5) it terminalizes as `failed`. Every state the sender cares about is posted to the
 thread through the durable outbox: delivery receipt, retry notices, failure notices, dropped-sender
-notices, and the agent's own `hive reply` outcome. Silence is a defect — a delivered wake with no
-outcome post means the agent never closed the loop.
+notices, and the agent's outcome. Completion-tracked Codex live and headless outcomes are relayed
+by the edge from the provider's final response; Claude live boundary delivery uses `hive reply`.
+Silence is a defect — a delivered wake with no outcome post means the loop never closed.
 
 There is no reconciliation surface. If a delivery failed, the thread says so; send the message
 again or fix the edge.
