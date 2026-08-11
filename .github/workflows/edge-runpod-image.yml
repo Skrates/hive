@@ -18,8 +18,6 @@ permissions:
 
 jobs:
   build-push:
-    # Flip to [self-hosted, cx53] once the Hetzner runner is registered —
-    # persistent buildx layer cache there beats gha cache and costs no minutes.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
