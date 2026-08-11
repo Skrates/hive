@@ -1,0 +1,19 @@
+{
+  "actor": "theoros",
+  "provider": "claude",
+  "providerSurface": "claude-code",
+  "providerVersion": "2.x",
+  "sessionId": null,
+  "homeEdge": "cx53",
+  "workspace": "work-theoros",
+  "edgeWorkspaces": [{ "edgeId": "cx53", "cwd": "/home/hive/work-theoros", "worktree": null }],
+  "wakePolicy": "spawn",
+  "permissionProfile": "workspace-write",
+  "accountProfile": "/home/hive/.hive/profiles/theoros",
+  "leaseTtlMs": 60000,
+  "deliveryTtlMs": 86400000,
+  "homeGraceMs": 30000,
+  "spawnRateLimit": 2,
+  "maxAttempts": 5,
+  "expiresAt": null
+}
