@@ -7,8 +7,9 @@ export class BrokerClient {
     private readonly token: string,
   ) {}
 
-  async claim(after: number, waitMs = 25_000): Promise<Delivery | null> {
-    const response = await this.request(`/v1/deliveries?after=${after}&wait_ms=${waitMs}`, { method: "GET" });
+  async claim(after: number, waitMs = 25_000, busyActors: readonly string[] = []): Promise<Delivery | null> {
+    const busy = busyActors.length > 0 ? `&busy=${encodeURIComponent(busyActors.join(","))}` : "";
+    const response = await this.request(`/v1/deliveries?after=${after}&wait_ms=${waitMs}${busy}`, { method: "GET" });
     if (response.status === 204) return null;
     return this.json<Delivery>(response);
   }

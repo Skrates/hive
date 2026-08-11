@@ -56,12 +56,12 @@ export class BrokerService {
     return this.store.freezeAffinityTargets(rawEventId, channelId, threadTs);
   }
 
-  async claim(edgeId: string, after: number, waitMs: number): Promise<Delivery | null> {
+  async claim(edgeId: string, after: number, waitMs: number, busyActors: readonly string[] = []): Promise<Delivery | null> {
     const deadline = Date.now() + Math.min(Math.max(waitMs, 0), 30_000);
     do {
       this.store.requeueExpiredLeases();
       await this.drainOutbox();
-      const delivery = this.store.claimNext(edgeId, after);
+      const delivery = this.store.claimNext(edgeId, after, busyActors);
       if (delivery) return delivery;
       if (Date.now() >= deadline) return null;
       await delay(Math.min(250, deadline - Date.now()));

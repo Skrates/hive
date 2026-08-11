@@ -699,3 +699,14 @@ test("thread notices carry no reaction and pre-reaction databases migrate in pla
   assert.ok(columns.includes("reaction_targets_json"));
   second.close();
 });
+
+test("claimNext skips actors the claiming edge declared busy", () => {
+  const { store } = fixture();
+  store.ingestEvent(event());
+  // The edge is mid-turn for this actor: its declaration must hide the delivery.
+  assert.equal(store.claimNext("mac", 0, ["ariadne"]), null);
+  assert.equal(store.getDelivery(1).status, "pending");
+  // Once the turn ends the same claim succeeds.
+  assert.equal(store.claimNext("mac", 0, [])?.claimedBy, "mac");
+  store.close();
+});

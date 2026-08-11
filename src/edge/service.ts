@@ -18,9 +18,26 @@ const systemEdgeTimers: EdgeTimers = {
   clear: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
 };
 
+/**
+ * Concurrent provider dispatches an edge will run at once. Discovered the hard
+ * way on the first multi-actor edge (cx53, 2026-08-11): the loop used to await
+ * each provider turn before claiming again, so one actor's 80-minute headless
+ * turn starved every co-tenant actor's deliveries — they sat `pending` at the
+ * broker for hours. Same-actor serialization is NOT the lease's job here — a
+ * same-edge claim on a live lease shares the generation by design — so the
+ * edge declares its busy actors on every claim and the broker skips their
+ * deliveries. This cap therefore bounds how many *distinct* actors run turns
+ * simultaneously on one machine.
+ */
+const MAX_CONCURRENT_DISPATCHES = 4;
+
 export class EdgeService {
   private after = 0;
   private running = false;
+  /** Live background dispatches; each promise settles (never rejects) when its delivery reaches a disposition. */
+  private readonly inFlight = new Set<Promise<void>>();
+  /** Actors with a dispatch currently running — declared to the broker on claim so it never hands out a second concurrent turn for the same actor. */
+  private readonly busyActors = new Set<string>();
 
   constructor(
     readonly broker: BrokerClient,
@@ -41,14 +58,24 @@ export class EdgeService {
       await this.recoverInterruptedDispatches();
       while (!signal?.aborted) {
         try {
-          const worked = await this.processOne(25_000);
-          if (!worked) await delay(100);
+          if (this.inFlight.size >= MAX_CONCURRENT_DISPATCHES) {
+            // At capacity: wait for any running turn to reach a disposition
+            // before claiming more. Dispatch promises never reject.
+            await Promise.race(this.inFlight);
+            continue;
+          }
+          const claimed = await this.claimNext(25_000);
+          if (!claimed) await delay(100);
         } catch (error) {
           if (signal?.aborted) break;
           console.error("hive edge iteration failed", safeEdgeErrorCode(error));
           await delay(100);
         }
       }
+      // Shutdown: give in-flight dispatches the chance to record their
+      // disposition (systemd's stop timeout is the outer bound; anything cut
+      // off mid-turn is recovered by recoverInterruptedDispatches on reboot).
+      await Promise.allSettled([...this.inFlight]);
     } finally {
       this.running = false;
     }
@@ -79,21 +106,52 @@ export class EdgeService {
     return recovered;
   }
 
+  /**
+   * Claim one delivery and run its dispatch to a disposition, fully awaited.
+   * The run() loop uses {@link claimNext} instead so co-tenant actors' turns
+   * overlap; this awaited form is the deterministic surface tests drive.
+   */
   async processOne(waitMs = 0): Promise<boolean> {
-    const delivery = await this.broker.claim(this.after, waitMs);
-    if (!delivery) return false;
+    const claimed = await this.claimNext(waitMs);
+    if (!claimed) return false;
+    await claimed.done;
+    return true;
+  }
+
+  /**
+   * Claim one delivery; if one was claimed, start its dispatch in the
+   * background (tracked in {@link inFlight}) and return its `done` promise —
+   * BOXED in an object, because `await` flattens a bare returned promise and
+   * the run() loop must be able to observe the claim without awaiting the
+   * dispatch. Returns null when the long-poll came back empty. `done` never
+   * rejects — every failure path inside dispatch records a disposition.
+   */
+  private async claimNext(waitMs: number): Promise<{ done: Promise<void> } | null> {
+    const delivery = await this.broker.claim(this.after, waitMs, [...this.busyActors]);
+    if (!delivery) return null;
     this.after = Math.max(this.after, delivery.id);
     const generation = delivery.leaseGeneration;
     if (generation === null) {
       console.error("hive edge delivery rejected", "claimed_delivery_missing_generation");
-      return true;
+      return { done: Promise.resolve() };
     }
+    this.busyActors.add(delivery.actor);
+    const tracked: Promise<void> = this.dispatchClaimed(delivery, generation)
+      .finally(() => {
+        this.inFlight.delete(tracked);
+        this.busyActors.delete(delivery.actor);
+      });
+    this.inFlight.add(tracked);
+    return { done: tracked };
+  }
 
+  /** The full post-claim delivery lifecycle; never throws — all failures land in recordDeliveryFailure. */
+  private async dispatchClaimed(delivery: Delivery, generation: number): Promise<void> {
     let current = delivery;
     let providerStarted = false;
     try {
       const existing = this.store.receive(delivery, generation);
-      if (["dispatched", "processed"].includes(existing.status)) return true;
+      if (["dispatched", "processed"].includes(existing.status)) return;
 
       current = await this.broker.accept(delivery);
       const replay = await this.broker.replay(current);
@@ -121,7 +179,7 @@ export class EdgeService {
           outcome: dispatch.outcome,
         });
         this.store.setStatus(current.id, generation, "processed", dispatch.receipt);
-        return true;
+        return;
       }
       // A non-completion-tracked live delivery (currently Claude inbox write)
       // is durable but the agent has not answered yet. The delivery stays
@@ -129,10 +187,8 @@ export class EdgeService {
       // outcome ever arrives, the broker sweep requeues it after the
       // dispatched-outcome grace and exhaustion becomes a visible `failed` —
       // never a silent `processed` with no answer.
-      return true;
     } catch (error) {
       await this.recordDeliveryFailure(current, generation, providerStarted, error);
-      return true;
     }
   }
 
@@ -149,8 +205,12 @@ export class EdgeService {
     error: unknown,
   ): Promise<void> {
     const reason = classifyDeliveryFailure(error, providerStarted);
-    const deterministic = error instanceof ProviderPreDispatchError
-      || (error instanceof PreDispatchError && !providerStarted);
+    // A spawn-rate rejection is transient — the window passes — so it releases
+    // for redelivery instead of terminalizing (2026-08-11: four queued wakes
+    // burned undeliverable in one burst after an edge restart).
+    const deterministic = (error instanceof ProviderPreDispatchError
+      || (error instanceof PreDispatchError && !providerStarted))
+      && reason.code !== "spawn_rate_limited";
     console.error("hive edge delivery failed", delivery.id, generation, reason.code);
     try {
       if (deterministic) {
