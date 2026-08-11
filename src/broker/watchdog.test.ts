@@ -78,11 +78,11 @@ test("watchdog forces a reconnect on the first deaf cycle", async () => {
   assert.ok(state.logs.some((line) => line.includes("forcing a Socket Mode reconnect")));
 });
 
-test("a reconnect that re-establishes the transport but stays silent does NOT exit — it reconnects again", async () => {
-  // The regression the review caught: because start() re-stamps *connection*
-  // liveness, the old watchdog read every reconnect as fresh activity and could
-  // never reach exit. Now the reconnect stamps only the connect clock, the event
-  // clock stays stale, and the escalation is decided on falsifiable evidence.
+test("an up-but-deaf link gets one more reconnect, then exits when still silent (2026-08-11 escalation)", async () => {
+  // Incident 2026-08-11: in-process reconnects never recovered a deaf stream
+  // (8+ consecutive deaf cycles); only a process restart did, three for three.
+  // The watchdog therefore spends a bounded reconnect budget and then exits(1)
+  // for the supervisor instead of self-healing forever.
   const { port, state } = makePort({
     lastEventMs: 1_000_000 - (STALE_MS + 1_000),
     restartOutcome: "reconnects",
@@ -92,9 +92,15 @@ test("a reconnect that re-establishes the transport but stays silent does NOT ex
   // A full window later the reconnect took (connected is fresh) but no event ever came.
   state.nowMs += STALE_MS;
   assert.equal(await watchdog.check(), "reconnected_still_deaf");
-  assert.deepEqual(state.exits, [], "an up-but-deaf link is not exited — that would crash-loop a quiet broker");
-  assert.equal(state.restarts, 2, "it self-heals with another reconnect instead");
+  assert.deepEqual(state.exits, [], "budget not yet spent — one retry remains");
+  assert.equal(state.restarts, 2);
   assert.ok(state.logs.some((line) => line.includes("up-but-deaf")));
+  // Another full window and the second reconnect also brought no events: exit.
+  state.nowMs += STALE_MS;
+  assert.equal(await watchdog.check(), "exited");
+  assert.deepEqual(state.exits, [1], "reconnect budget exhausted — escalate to supervisor restart");
+  assert.equal(state.restarts, 2, "no third reconnect once we escalate to exit");
+  assert.ok(state.logs.some((line) => line.includes("reconnects are exhausted")));
 });
 
 test("watchdog exits when a forced reconnect fails to re-establish the transport", async () => {

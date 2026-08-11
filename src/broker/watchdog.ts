@@ -18,13 +18,23 @@
  *     since the restart), the socket is wedged — exit(1) so the supervisor
  *     (systemd) restarts the whole process.
  *   - If the reconnect DID re-establish but events still aren't flowing, the
- *     link is up-but-deaf. Without an end-to-end canary this is indistinguishable
- *     from a genuinely quiet-but-healthy channel (Slack fans each event to one of
- *     an app's open connections, so a stolen stream leaves ours perfectly
- *     connected). Exiting here would crash-loop a quiet broker and would not
- *     evict the thief anyway, so we keep self-healing: log loudly and reconnect
- *     again. Sound quiet-vs-stolen discrimination needs the D15 canary
- *     (docs/adr/0002 §D15, KRA-906) and is deliberately out of this watchdog's scope.
+ *     link is up-but-deaf. One more in-process reconnect is attempted; if the
+ *     stream is STILL silent a full window after that, the process exits(1) for
+ *     a supervisor restart.
+ *
+ * Incident 2026-08-11 (three deaf windows in one afternoon) settled the
+ * up-but-deaf escalation empirically: in-process reconnects never recovered the
+ * stream (8+ consecutive deaf cycles observed), while a process restart cured it
+ * immediately, three out of three times — and Slack redelivered recent unacked
+ * events after each restart. The old fear ("exiting would crash-loop a quiet
+ * broker") priced the wrong side: restarting a genuinely quiet-but-healthy
+ * broker loses nothing (there are no events to drop, and anything arriving
+ * mid-restart is redelivered), whereas staying alive deaf silently drops wakes.
+ * Without an end-to-end canary, quiet-vs-stolen still can't be told apart
+ * (docs/adr/0002 §D15, KRA-906 remains the sound *detection* fix) — so the
+ * watchdog now treats sustained silence under live subscriptions as
+ * restart-worthy after a bounded reconnect budget, accepting the occasional
+ * harmless restart of a quiet broker.
  *
  * Every step logs loudly — the original incident cost an hour precisely because
  * the old broker logged nothing.
@@ -52,6 +62,15 @@ export type WatchdogAction =
   | "restarted"
   | "reconnected_still_deaf"
   | "exited";
+
+/**
+ * In-process reconnect attempts allowed against an up-but-deaf link before the
+ * watchdog escalates to exit(1). Two attempts = the streak-1 reconnect plus one
+ * retry; empirically (2026-08-11) even one is optimistic — in-process reconnects
+ * never recovered a deaf stream — but the second attempt keeps a margin against
+ * exiting a genuinely quiet channel on a single silent window.
+ */
+const MAX_DEAF_RECONNECTS = 2;
 
 export class SlackDeafnessWatchdog {
   private staleStreak = 0;
@@ -93,27 +112,38 @@ export class SlackDeafnessWatchdog {
       const restartedAt = this.lastRestartMs;
       const connectedAt = this.port.lastConnectAt();
       const reconnected = restartedAt !== null && connectedAt !== null && connectedAt >= restartedAt;
-      if (reconnected) {
-        // Up-but-deaf: the socket re-established yet the stream is silent. Can't
-        // be told apart from a quiet-healthy channel without a canary, and exit
-        // would neither help nor be safe — keep reconnecting instead.
+      if (!reconnected) {
+        // The forced reconnect never took — the transport is wedged. A full
+        // process restart is the sound recovery.
         this.port.log(
-          `[watchdog] Slack link re-established but STILL silent (idle ${idleLabel} ≥ ${staleLabel}, streak ${this.staleStreak}) `
-          + "— up-but-deaf (half-open recovered, or a second consumer is stealing the stream); reconnecting again "
+          `[watchdog] forced reconnect did not re-establish the Slack transport (idle ${idleLabel} ≥ ${staleLabel}, `
+          + `streak ${this.staleStreak}) — exiting(1) for supervisor restart`,
+        );
+        this.port.exit(1);
+        return "exited";
+      }
+      if (this.staleStreak > MAX_DEAF_RECONNECTS) {
+        // Up-but-deaf and the in-process reconnect budget is spent. Empirically
+        // (2026-08-11) only a process restart recovers this state — exit for the
+        // supervisor, and Slack redelivers recent unacked events on reconnect.
+        this.port.log(
+          `[watchdog] Slack link re-established but STILL silent after ${MAX_DEAF_RECONNECTS} reconnects `
+          + `(idle ${idleLabel} ≥ ${staleLabel}, streak ${this.staleStreak}) — up-but-deaf; in-process reconnects `
+          + "are exhausted (they never recover this state) — exiting(1) for supervisor restart "
           + "(sound quiet-vs-stolen detection needs the D15 canary — KRA-906)",
         );
-        this.lastRestartMs = this.port.now();
-        await this.port.restart();
-        return "reconnected_still_deaf";
+        this.port.exit(1);
+        return "exited";
       }
-      // The forced reconnect never took — the transport is wedged. A full
-      // process restart is the sound recovery.
+      // Up-but-deaf with reconnect budget remaining: one more in-process attempt.
       this.port.log(
-        `[watchdog] forced reconnect did not re-establish the Slack transport (idle ${idleLabel} ≥ ${staleLabel}, `
-        + `streak ${this.staleStreak}) — exiting(1) for supervisor restart`,
+        `[watchdog] Slack link re-established but STILL silent (idle ${idleLabel} ≥ ${staleLabel}, streak ${this.staleStreak}) `
+        + "— up-but-deaf (half-open recovered, or a second consumer is stealing the stream); reconnecting again "
+        + `(attempt ${this.staleStreak} of ${MAX_DEAF_RECONNECTS} before exit)`,
       );
-      this.port.exit(1);
-      return "exited";
+      this.lastRestartMs = this.port.now();
+      await this.port.restart();
+      return "reconnected_still_deaf";
     }
 
     this.port.log(
