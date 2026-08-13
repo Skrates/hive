@@ -3,6 +3,14 @@ import { chmod, lstat, mkdir, readFile, rename, rm, writeFile } from "node:fs/pr
 import { dirname } from "node:path";
 import { CodexThreadCatalog } from "./discovery.js";
 
+/**
+ * A replacement attachment can arrive while the supervisor is still waiting
+ * for the stale task's Desktop follower attempt to time out. Keep the CLI's
+ * confirmation window long enough for that attempt and the replacement attempt
+ * to settle before rolling the new revision back.
+ */
+export const CODEX_ATTACHMENT_CONFIRMATION_TIMEOUT_MS = 40_000;
+
 export interface CodexForegroundBinding {
   actor: string;
   sessionId: string;
