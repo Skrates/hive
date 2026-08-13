@@ -1,0 +1,46 @@
+# The bus's own gate. Every wake in the Weave flows through this repo, and its
+# failures are invisible to every other repo's CI — including failures that would
+# stop review findings from ever reaching a seat.
+#
+# Actions are commit-pinned, never tag-pinned (weave-doctrine#31): a mutable tag
+# lets the action's owner change what executes here.
+#
+# Tool versions are in lockstep with weave-doctrine's mise.toml, the single
+# version authority. That repo is private and unreadable from a GitHub-hosted
+# runner, so the pins are duplicated here deliberately — same reasoning as
+# morphe's ci.yml. Change them only alongside that file.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  check:
+    name: check (mcp import boundary · build · tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.11
+
+      - name: Install (locked)
+        run: bun install --frozen-lockfile
+
+      # `check` = check:mcp-imports && build && test. The build is not incidental:
+      # the edge and broker both run from dist/, which is not committed, so a repo
+      # that fails to compile is a bus that cannot start.
+      - name: Check
+        run: bun run check
+
+      # The install refuses a group- or other-writable skill source, and mkdir
+      # takes its mode from the umask. GitHub-hosted runners use 022, so a test
+      # that leaked the umask into its fixtures would pass here and fail on a
+      # workstation with 002 — which is exactly what main was doing. Re-running
+      # the suite under a permissive umask keeps that asymmetry from returning.
+      - name: Tests are hermetic under a permissive umask
+        run: umask 002 && bun run test
