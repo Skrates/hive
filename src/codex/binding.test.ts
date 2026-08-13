@@ -14,8 +14,8 @@ import {
 } from "./binding.js";
 import { DEFAULT_REQUEST_TIMEOUT_MS } from "./desktop-ipc.js";
 
-test("attachment confirmation outlives a stale follower and its replacement", () => {
-  assert.ok(CODEX_ATTACHMENT_CONFIRMATION_TIMEOUT_MS > DEFAULT_REQUEST_TIMEOUT_MS * 2);
+test("attachment confirmation outlives initialization, a stale follower, and its replacement", () => {
+  assert.ok(CODEX_ATTACHMENT_CONFIRMATION_TIMEOUT_MS > DEFAULT_REQUEST_TIMEOUT_MS * 3);
 });
 
 test("attachment is exact-cwd, primary-task verified, atomic, and owner-only", async (t) => {
