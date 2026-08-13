@@ -1,4 +1,4 @@
-# Edge: runpod — seat talos (Grok 4.5 via Grok Build, subscription auth)
+# Edge: runpod — seat talos (Grok 4.6 via Grok Build, subscription auth)
 
 The hive's actuator: primarily Sovereign development and local-model testing for the capability
 registry, occasionally the diffusion pipeline (LoRA training). The seat rides a cheap always-on
