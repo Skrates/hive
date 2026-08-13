@@ -8,7 +8,7 @@ const INITIAL_CLIENT_ID = "initializing-client";
 // Desktop itself accepts 256 MiB. Hive keeps a lower defensive ceiling while
 // leaving room for a long task's initial thread snapshot.
 const MAX_FRAME_BYTES = 64 * 1024 * 1024;
-const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
+export const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 
 type ThreadFollowerMethod =
   | "thread-follower-load-complete-history"

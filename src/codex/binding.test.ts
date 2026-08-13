@@ -6,11 +6,17 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   assertCodexAttachmentActor,
+  CODEX_ATTACHMENT_CONFIRMATION_TIMEOUT_MS,
   createCodexForegroundBinding,
   readCodexForegroundBinding,
   removeCodexForegroundBinding,
   restoreCodexForegroundBinding,
 } from "./binding.js";
+import { DEFAULT_REQUEST_TIMEOUT_MS } from "./desktop-ipc.js";
+
+test("attachment confirmation outlives initialization, a stale follower, and its replacement", () => {
+  assert.ok(CODEX_ATTACHMENT_CONFIRMATION_TIMEOUT_MS > DEFAULT_REQUEST_TIMEOUT_MS * 3);
+});
 
 test("attachment is exact-cwd, primary-task verified, atomic, and owner-only", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "hive-codex-binding-"));

@@ -23,6 +23,7 @@ import { EdgeStore } from "./edge/store.js";
 import { udsRequestJson } from "./local/uds.js";
 import {
   assertCodexAttachmentActor,
+  CODEX_ATTACHMENT_CONFIRMATION_TIMEOUT_MS,
   createCodexForegroundBinding,
   readCodexForegroundBinding,
   removeCodexForegroundBinding,
@@ -307,7 +308,7 @@ function codexAttachmentPaths(actor: string): {
 async function waitForBinding(
   surfaceSocket: string,
   accepted: (status: BindingStatus) => boolean,
-  timeoutMs = 10_000,
+  timeoutMs = CODEX_ATTACHMENT_CONFIRMATION_TIMEOUT_MS,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   let last = "surface unavailable";
