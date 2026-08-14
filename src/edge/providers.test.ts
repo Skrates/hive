@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -8,7 +8,7 @@ import type { Delivery, Subscription } from "../domain.js";
 import { prepareSocketPath } from "../local/uds.js";
 import type { LiveIngress } from "./live-registry.js";
 import { delimiter, dirname } from "node:path";
-import { ClaudeProvider, codexPermissionArgs, CodexProvider, composeChildEnv, GrokProvider, grokPermissionArgs, prependPathEntry, ProviderPreDispatchError, requireAccountProfile } from "./providers.js";
+import { ClaudeProvider, claudePromptSlotArgs, codexPermissionArgs, CodexProvider, composeChildEnv, GrokProvider, grokPermissionArgs, prependPathEntry, ProviderPreDispatchError, requireAccountProfile } from "./providers.js";
 
 function subscription(overrides: Partial<Subscription> = {}): Subscription {
   return {
@@ -111,6 +111,26 @@ test("Grok Build maps all three Hive profiles onto --permission-mode; unknowns f
     () => grok.preflight(subscription({ provider: "grok", permissionProfile: "yolo", accountProfile: directory })),
     (error: unknown) => error instanceof ProviderPreDispatchError && error.code === "provider_permission_profile_invalid",
   );
+});
+
+test("Claude prompt-slot flags compose exactly when the rendered artifact exists", () => {
+  const dir = mkdtempSync(join(tmpdir(), "hive-prompt-slot-"));
+  try {
+    // No rendered artifact → the spawn stays byte-identical to today's.
+    assert.deepEqual(claudePromptSlotArgs(dir), []);
+
+    // weave-doctrine install.py rendered the seat's doctrine into the slot
+    // artifact → the edge composes append + exclude, and nothing else.
+    const appendFile = join(dir, "system-prompt-append.md");
+    writeFileSync(appendFile, "doctrine\n");
+    assert.deepEqual(claudePromptSlotArgs(dir), [
+      "--append-system-prompt-file",
+      appendFile,
+      "--exclude-dynamic-system-prompt-sections",
+    ]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("Grok Build live delivery terminalizes loudly; resume without a session id is a hard error", async () => {
