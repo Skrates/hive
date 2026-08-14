@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { closeSync, fsyncSync, mkdirSync, openSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import type { Delivery, Provider, Subscription } from "../domain.js";
@@ -235,24 +235,42 @@ export class ClaudeProvider implements ProviderAdapter {
 
   resume(subscription: Subscription, cwd: string, framed: string): Promise<ProviderDispatch> {
     if (!subscription.sessionId) throw new Error("resume target missing");
+    const profile = requireAccountProfile(subscription);
     return runHeadless(
       process.env.HIVE_CLAUDE_COMMAND ?? "claude",
-      ["-p", "--resume", subscription.sessionId, "--output-format", "stream-json", "--verbose", ...claudePermissionArgs(subscription.permissionProfile), framed],
+      ["-p", "--resume", subscription.sessionId, "--output-format", "stream-json", "--verbose", ...claudePermissionArgs(subscription.permissionProfile), ...claudePromptSlotArgs(profile), framed],
       cwd,
       null,
-      { CLAUDE_CONFIG_DIR: requireAccountProfile(subscription) },
+      { CLAUDE_CONFIG_DIR: profile },
     );
   }
 
   spawn(subscription: Subscription, cwd: string, framed: string): Promise<ProviderDispatch> {
+    const profile = requireAccountProfile(subscription);
     return runHeadless(
       process.env.HIVE_CLAUDE_COMMAND ?? "claude",
-      ["-p", "--output-format", "stream-json", "--verbose", ...claudePermissionArgs(subscription.permissionProfile), framed],
+      ["-p", "--output-format", "stream-json", "--verbose", ...claudePermissionArgs(subscription.permissionProfile), ...claudePromptSlotArgs(profile), framed],
       cwd,
       null,
-      { CLAUDE_CONFIG_DIR: requireAccountProfile(subscription) },
+      { CLAUDE_CONFIG_DIR: profile },
     );
   }
+}
+
+/**
+ * Role-aware system-prompt delivery (weave-doctrine seats `system_prompt_slot`):
+ * when the seat's profile carries a rendered `system-prompt-append.md`, the
+ * doctrine rides the literal system-prompt slot — appended, never replacing the
+ * default prompt (the seats' own ruling: all of wholesale replacement's token
+ * savings sit exactly where its silent-degradation risk lives), with the
+ * per-machine dynamic sections moved to the first user message for prompt-cache
+ * reuse. File presence is the whole switch so rollout stays a doctrine-render
+ * decision, attested by install.py — never edge configuration.
+ */
+export function claudePromptSlotArgs(accountProfile: string): string[] {
+  const appendFile = join(accountProfile, "system-prompt-append.md");
+  if (!existsSync(appendFile)) return [];
+  return ["--append-system-prompt-file", appendFile, "--exclude-dynamic-system-prompt-sections"];
 }
 
 /**
