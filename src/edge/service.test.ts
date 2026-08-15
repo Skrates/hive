@@ -172,6 +172,7 @@ class StubAdapter implements ProviderAdapter {
   readonly resumes: string[] = [];
   readonly liveDeliveries: number[] = [];
   readonly liveFrames: string[] = [];
+  readonly liveSockets: string[] = [];
 
   constructor(
     private readonly behavior: {
@@ -186,10 +187,11 @@ class StubAdapter implements ProviderAdapter {
     if (this.behavior.preflightError) throw this.behavior.preflightError;
   }
 
-  async deliverLive(_ingress: LiveIngress, value: Delivery, framed: string): Promise<ProviderDispatch> {
+  async deliverLive(ingress: LiveIngress, value: Delivery, framed: string): Promise<ProviderDispatch> {
     if (this.behavior.dispatchError) throw this.behavior.dispatchError;
     this.liveDeliveries.push(value.id);
     this.liveFrames.push(framed);
+    this.liveSockets.push(ingress.socketPath);
     return this.behavior.liveResult ?? { receipt: `live:${value.id}`, processed: false };
   }
 
@@ -606,5 +608,147 @@ test("a wake run from another seat's profile records the mismatch on the deliver
   const row = store.get(1)!;
   assert.equal(row.attestation_absence, "attestation_actor_mismatch");
   assert.equal(row.attestation_id, "sha256:" + "b".repeat(64));
+  store.close();
+});
+
+class MutatingAcceptBroker extends FakeBroker {
+  constructor(queue: Delivery[], private readonly mutate: () => void) {
+    super(queue);
+  }
+
+  override async accept(value: Delivery): Promise<Delivery> {
+    this.mutate();
+    return super.accept(value);
+  }
+}
+
+test("dispatch keeps the live route captured at claim when the registry is replaced mid-accept", async () => {
+  // accept/replay/beginDispatch are awaited after the binding is written.
+  // A replacement there must not re-select: the receipt belongs to the
+  // surface whose attestation is already on the row.
+  const live = new LiveIngressRegistry();
+  live.register({
+    actor: "ariadne",
+    provider: "codex",
+    socketPath: "/tmp/claimed.sock",
+    sessionId: "thread-1",
+    surfaceVersion: "test",
+    runtimeAttestation: {
+      ok: true,
+      attestation: {
+        attestationId: "sha256:" + "a".repeat(64),
+        doctrineCommit: "1".repeat(40),
+        actor: "ariadne",
+      },
+    },
+  }, 60_000);
+
+  const broker = new MutatingAcceptBroker(
+    [delivery(1, { subscription: subscription({ wakePolicy: "live_only" }) })],
+    () => {
+      live.deregister("ariadne", "codex");
+      live.register({
+        actor: "ariadne",
+        provider: "codex",
+        socketPath: "/tmp/replacement.sock",
+        sessionId: "thread-2",
+        surfaceVersion: "test",
+        runtimeAttestation: {
+          ok: true,
+          attestation: {
+            attestationId: "sha256:" + "b".repeat(64),
+            doctrineCommit: "2".repeat(40),
+            actor: "ariadne",
+          },
+        },
+      }, 60_000);
+    },
+  );
+  const store = new EdgeStore(":memory:");
+  const adapter = new StubAdapter({
+    liveResult: { receipt: "live:1", outcome: "ok", processed: true },
+  });
+  const edge = new EdgeService(asBrokerClient(broker), store, live, [adapter]);
+
+  assert.equal(await edge.processOne(), true);
+  assert.deepEqual(adapter.liveSockets, ["/tmp/claimed.sock"]);
+  assert.equal(adapter.spawns.length + adapter.resumes.length, 0);
+  assert.equal(store.get(1)!.attestation_id, "sha256:" + "a".repeat(64));
+  store.close();
+});
+
+test("a live route that expires after claim still dispatches to that surface, not headless", async () => {
+  const live = new LiveIngressRegistry();
+  live.register({
+    actor: "ariadne",
+    provider: "codex",
+    socketPath: "/tmp/claimed.sock",
+    sessionId: "thread-1",
+    surfaceVersion: "test",
+    runtimeAttestation: {
+      ok: true,
+      attestation: {
+        attestationId: "sha256:" + "a".repeat(64),
+        doctrineCommit: "1".repeat(40),
+        actor: "ariadne",
+      },
+    },
+  }, 60_000);
+
+  const broker = new MutatingAcceptBroker(
+    [delivery(1)],
+    () => { live.deregister("ariadne", "codex"); },
+  );
+  const store = new EdgeStore(":memory:");
+  const adapter = new StubAdapter({
+    liveResult: { receipt: "live:1", outcome: "ok", processed: true },
+  });
+  const edge = new EdgeService(asBrokerClient(broker), store, live, [adapter]);
+
+  assert.equal(await edge.processOne(), true);
+  assert.deepEqual(adapter.liveSockets, ["/tmp/claimed.sock"]);
+  assert.equal(adapter.spawns.length + adapter.resumes.length, 0);
+  assert.equal(store.get(1)!.attestation_id, "sha256:" + "a".repeat(64));
+  store.close();
+});
+
+test("a live surface that appears after claim does not steal a headless dispatch", async () => {
+  const pinned = mkdtempSync(join(tmpdir(), "weave-pinned-late-"));
+  writeFileSync(join(pinned, ATTESTATION_FILENAME), JSON.stringify({
+    schema: "weave.attestation/1",
+    attestation_id: "sha256:" + "c".repeat(64),
+    actor: "ariadne",
+    doctrine: { remote: "RationallyPrime/weave-doctrine", commit: "3".repeat(40) },
+  }));
+
+  const live = new LiveIngressRegistry();
+  const broker = new MutatingAcceptBroker(
+    [delivery(1, { subscription: subscription({ accountProfile: pinned }) })],
+    () => {
+      live.register({
+        actor: "ariadne",
+        provider: "codex",
+        socketPath: "/tmp/late.sock",
+        sessionId: "desktop-task",
+        surfaceVersion: "test",
+        runtimeAttestation: {
+          ok: true,
+          attestation: {
+            attestationId: "sha256:" + "d".repeat(64),
+            doctrineCommit: "4".repeat(40),
+            actor: "ariadne",
+          },
+        },
+      }, 60_000);
+    },
+  );
+  const store = new EdgeStore(":memory:");
+  const adapter = new StubAdapter();
+  const edge = new EdgeService(asBrokerClient(broker), store, live, [adapter]);
+
+  assert.equal(await edge.processOne(), true);
+  assert.equal(adapter.liveDeliveries.length, 0);
+  assert.equal(adapter.resumes.length, 1);
+  assert.equal(store.get(1)!.attestation_id, "sha256:" + "c".repeat(64));
   store.close();
 });

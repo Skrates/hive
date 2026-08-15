@@ -1,6 +1,6 @@
 import { frameWakeInstruction, type Delivery, type Provider, type Reason, type ReplaySnapshot } from "../domain.js";
 import { BrokerClient } from "./broker-client.js";
-import { LiveIngressRegistry } from "./live-registry.js";
+import { LiveIngressRegistry, type LiveIngress } from "./live-registry.js";
 import {
   ProviderPreDispatchError,
   type ProviderAdapter,
@@ -155,7 +155,10 @@ export class EdgeService {
       // outcome must resolve to the artifacts installed when the turn started
       // (KRA-1077). Reading the record can never fail the wake — an absent or
       // unreadable one is stored as a named absence, never as silence.
-      const binding = bindingFor(attestationForDelivery(this.live, delivery), delivery.actor);
+      // Capture the live route once so attestation and dispatch name the same
+      // surface. A later expiry, deregister, or replacement must not re-select.
+      const live = this.live.get(delivery.actor, delivery.subscription.provider);
+      const binding = bindingFor(attestationForDelivery(live, delivery), delivery.actor);
       const existing = this.store.receive(delivery, generation, binding);
       if (["dispatched", "processed"].includes(existing.status)) return;
 
@@ -166,7 +169,7 @@ export class EdgeService {
 
       const dispatch = await this.withLeaseHeartbeat(
         current,
-        () => this.dispatch(current, replay, () => { providerStarted = true; }),
+        () => this.dispatch(current, replay, live, () => { providerStarted = true; }),
       );
       current = await this.broker.markDispatched(current);
       this.store.setStatus(current.id, generation, "dispatched", dispatch.receipt);
@@ -307,6 +310,7 @@ export class EdgeService {
   private async dispatch(
     delivery: Delivery,
     replay: ReplaySnapshot | null,
+    live: LiveIngress | null,
     onProviderStart: () => void,
   ): Promise<ProviderDispatch> {
     const subscription = delivery.subscription;
@@ -314,7 +318,6 @@ export class EdgeService {
     if (!adapter) throw new PreDispatchError("provider_adapter_missing");
     adapter.preflight?.(subscription);
 
-    const live = this.live.get(delivery.actor, subscription.provider);
     if (live) {
       onProviderStart();
       // Codex live delivery waits for the exact app-server turn and lets the
@@ -410,8 +413,8 @@ function safeEdgeErrorCode(error: unknown): string {
  * ≠ pinned profile) injects into Desktop; only that home's attestation names
  * the artifacts the turn actually used.
  */
-function attestationForDelivery(live: LiveIngressRegistry, delivery: Delivery): AttestationRead {
-  return live.get(delivery.actor, delivery.subscription.provider)?.runtimeAttestation
+function attestationForDelivery(live: LiveIngress | null, delivery: Delivery): AttestationRead {
+  return live?.runtimeAttestation
     ?? readWakeAttestation(delivery.subscription.accountProfile);
 }
 
