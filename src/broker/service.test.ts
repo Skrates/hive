@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { ReplaySnapshot } from "../domain.js";
 import { BrokerService, type SlackTransport } from "./service.js";
-import { BrokerStore } from "./store.js";
+import { BrokerStore, SeatWakeRefusedError } from "./store.js";
 
 test("overlapping outbox drains share one healthy in-process pass", async (t) => {
   const store = new BrokerStore(":memory:");
@@ -166,4 +166,105 @@ test("a hung reactions call never stalls the serialized drain that claim() waits
   // The drain resolves without the stamp: the wake-delivery path stays live.
   assert.equal(await broker.drainOutbox(), 1);
   assert.deepEqual(store.listUnsentOutbox(), []);
+});
+
+test("mint proves an alternate thread against Slack before the ledger commits", async (t) => {
+  const store = new BrokerStore(":memory:");
+  t.after(() => store.close());
+  store.createEdge("mac");
+  store.createEdge("dev");
+  store.upsertSubscription({
+    actor: "ariadne",
+    provider: "codex",
+    providerSurface: "app-server",
+    providerVersion: "0.144.0-alpha.4",
+    sessionId: null,
+    homeEdge: "mac",
+    workspace: "taxis",
+    edgeWorkspaces: [{ edgeId: "mac", cwd: "/work/taxis", worktree: null }],
+    wakePolicy: "spawn",
+    permissionProfile: "read-only",
+    accountProfile: "/home/user/.codex-hive",
+    leaseTtlMs: 1_000,
+    deliveryTtlMs: 60_000,
+    homeGraceMs: 2_000,
+    spawnRateLimit: 1,
+    maxAttempts: 3,
+    expiresAt: null,
+  });
+  store.upsertSubscription({
+    actor: "gnomon",
+    provider: "claude",
+    providerSurface: "app-server",
+    providerVersion: "0.144.0-alpha.4",
+    sessionId: null,
+    homeEdge: "dev",
+    workspace: "taxis",
+    edgeWorkspaces: [{ edgeId: "dev", cwd: "/srv/taxis", worktree: null }],
+    wakePolicy: "spawn",
+    permissionProfile: "read-only",
+    accountProfile: "/home/hive/.hive/profiles/gnomon",
+    leaseTtlMs: 1_000,
+    deliveryTtlMs: 60_000,
+    homeGraceMs: 2_000,
+    spawnRateLimit: 1,
+    maxAttempts: 3,
+    expiresAt: null,
+  });
+  store.ingestEvent({
+    eventId: "Ev1",
+    workspaceId: "T1",
+    channelId: "C1",
+    threadTs: "100.1",
+    messageTs: "100.2",
+    senderId: "U1",
+    senderKind: "user",
+    actor: "ariadne",
+    text: "WAKE: ariadne | test",
+    raw: { type: "message" },
+    receivedAt: "2026-07-12T00:00:00.000Z",
+  });
+  const source = store.claimNext("mac", 0)!;
+  const seen: Array<{ channelId: string; threadTs: string }> = [];
+  const slack: SlackTransport = {
+    async replay(channelId, threadTs): Promise<ReplaySnapshot> {
+      seen.push({ channelId, threadTs });
+      if (threadTs === "200.1") {
+        return { channelId, threadTs, fetchedAt: "2026-07-12T00:00:00.000Z", cursor: null, messages: [{ ts: threadTs }] };
+      }
+      throw new Error("thread_not_found");
+    },
+    async reply(): Promise<string> { throw new Error("not used"); },
+    async react(): Promise<void> {},
+  };
+  const broker = new BrokerService(store, slack);
+
+  const receipt = await broker.mintSeatWake({
+    sourceDeliveryId: source.id,
+    actor: "gnomon",
+    text: "land it here",
+    threadTs: "200.1",
+  }, "mac");
+  assert.equal(receipt.threadTs, "200.1");
+  assert.deepEqual(seen, [{ channelId: "C1", threadTs: "200.1" }]);
+
+  // The source thread is already known — Slack is not asked again.
+  const same = await broker.mintSeatWake({
+    sourceDeliveryId: source.id,
+    actor: "gnomon",
+    text: "stay put",
+    threadTs: "100.1",
+  }, "mac");
+  assert.equal(same.threadTs, "100.1");
+  assert.equal(seen.length, 1);
+
+  await assert.rejects(
+    () => broker.mintSeatWake({
+      sourceDeliveryId: source.id,
+      actor: "gnomon",
+      text: "nowhere",
+      threadTs: "999.1",
+    }, "mac"),
+    (error: unknown) => error instanceof SeatWakeRefusedError && error.code === "invalid_thread",
+  );
 });
