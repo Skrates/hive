@@ -92,6 +92,27 @@ test("a redelivery rebinds to the attestation live at the new claim", () => {
   store.close();
 });
 
+test("a redelivery keeps the prior attempt's attestation and receipt", () => {
+  // At-least-once means the uncertain first attempt may have produced effects.
+  // Rebinding the current columns must not erase that earlier self-identifying try.
+  const store = new EdgeStore(":memory:");
+  store.receive(delivery(1, 1), 1, { attestationId: "sha256:old", doctrineCommit: "a".repeat(40), absence: null });
+  store.setStatus(1, 1, "released", "receipt-a");
+  const row = store.receive(delivery(1, 2), 1, { attestationId: "sha256:new", doctrineCommit: "c".repeat(40), absence: null });
+  assert.equal(row.attestation_id, "sha256:new");
+  assert.equal(row.provider_receipt, null);
+  const history = JSON.parse(row.attestation_history ?? "[]") as Array<{
+    attempt: number;
+    attestationId: string | null;
+    receipt: string | null;
+  }>;
+  assert.equal(history.length, 1);
+  assert.equal(history[0]?.attempt, 1);
+  assert.equal(history[0]?.attestationId, "sha256:old");
+  assert.equal(history[0]?.receipt, "receipt-a");
+  store.close();
+});
+
 test("an unattested delivery records why, never a bare null", () => {
   const store = new EdgeStore(":memory:");
   const row = store.receive(delivery(1), 1, {

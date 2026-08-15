@@ -177,8 +177,11 @@ The edge records; it does not verify and it does not refuse.
   an unknown schema, or one installed for a different actor all dispatch normally and record a
   named `attestation_absence` beside the delivery. A misbound seat now leaves evidence at wake
   time instead of needing git forensics afterwards.
-- **A redelivery rebinds.** A seat reinstalled between attempts ran the second attempt under
-  different artifacts; carrying the first attempt's id forward would be a false trace.
+- **A redelivery rebinds the current columns.** A seat reinstalled between attempts ran the
+  second attempt under different artifacts; the live columns must name that new claim. The
+  replaced attempt's binding and receipt are appended to `attestation_history` so an uncertain
+  first try — which at-least-once delivery may already have produced effects under — stays
+  traceable beside the later one.
 
 ## Scheduled wakes
 

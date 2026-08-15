@@ -42,6 +42,12 @@ interface LocalRow {
   attestation_id: string | null;
   doctrine_commit: string | null;
   attestation_absence: string | null;
+  /**
+   * Prior attempts' bindings and receipts, oldest first. The current attempt
+   * lives in the columns above; this array is only the ones a redelivery
+   * replaced. Null until the first redelivery.
+   */
+  attestation_history: string | null;
   delivery_json: string;
   updated_at: string;
 }
@@ -56,6 +62,7 @@ const LEDGER_COLUMNS: ReadonlyArray<readonly [string, string]> = [
   ["attestation_id", "TEXT"],
   ["doctrine_commit", "TEXT"],
   ["attestation_absence", "TEXT"],
+  ["attestation_history", "TEXT"],
 ];
 
 export class EdgeStore {
@@ -73,6 +80,7 @@ export class EdgeStore {
         attestation_id TEXT,
         doctrine_commit TEXT,
         attestation_absence TEXT,
+        attestation_history TEXT,
         delivery_json TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
@@ -96,11 +104,12 @@ export class EdgeStore {
    */
   receive(delivery: Delivery, generation: number, binding: AttestationBinding): LocalRow {
     const now = new Date().toISOString();
+    const history = historyAfterReceive(this.get(delivery.id), generation, delivery.attempts);
     this.db.prepare(`
       INSERT INTO local_deliveries(
-        delivery_id, generation, status, attestation_id, doctrine_commit, attestation_absence, delivery_json, updated_at
+        delivery_id, generation, status, attestation_id, doctrine_commit, attestation_absence, attestation_history, delivery_json, updated_at
       )
-      VALUES (?, ?, 'received', ?, ?, ?, ?, ?)
+      VALUES (?, ?, 'received', ?, ?, ?, ?, ?, ?)
       ON CONFLICT(delivery_id) DO UPDATE SET
         generation=excluded.generation,
         status='received',
@@ -108,6 +117,7 @@ export class EdgeStore {
         attestation_id=excluded.attestation_id,
         doctrine_commit=excluded.doctrine_commit,
         attestation_absence=excluded.attestation_absence,
+        attestation_history=excluded.attestation_history,
         delivery_json=excluded.delivery_json,
         updated_at=excluded.updated_at
       WHERE excluded.generation > local_deliveries.generation
@@ -122,6 +132,7 @@ export class EdgeStore {
       binding.attestationId,
       binding.doctrineCommit,
       binding.absence,
+      history,
       JSON.stringify(delivery),
       now,
     );
@@ -150,4 +161,53 @@ export class EdgeStore {
     const row = this.get(deliveryId);
     return row ? JSON.parse(row.delivery_json) as Delivery : null;
   }
+}
+
+interface AttestationAttemptRecord {
+  attempt: number;
+  attestationId: string | null;
+  doctrineCommit: string | null;
+  absence: string | null;
+  receipt: string | null;
+}
+
+function attemptOf(row: LocalRow): number {
+  try {
+    const parsed = JSON.parse(row.delivery_json) as { attempts?: unknown };
+    return typeof parsed.attempts === "number" ? parsed.attempts : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function parseHistory(raw: string | null): AttestationAttemptRecord[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return Array.isArray(parsed) ? parsed as AttestationAttemptRecord[] : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * At-least-once delivery may have produced effects under the previous
+ * attempt's attestation. The current columns rebind to the new claim; the
+ * replaced attempt is appended so the earlier self-identifying try stays
+ * traceable.
+ */
+function historyAfterReceive(existing: LocalRow | null, generation: number, nextAttempts: number): string | null {
+  if (!existing) return null;
+  const advances = generation > existing.generation
+    || (generation === existing.generation && nextAttempts > attemptOf(existing));
+  if (!advances) return existing.attestation_history;
+  const prior = parseHistory(existing.attestation_history);
+  prior.push({
+    attempt: attemptOf(existing),
+    attestationId: existing.attestation_id,
+    doctrineCommit: existing.doctrine_commit,
+    absence: existing.attestation_absence,
+    receipt: existing.provider_receipt,
+  });
+  return JSON.stringify(prior);
 }
