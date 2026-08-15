@@ -17,7 +17,7 @@ import { BrokerClient } from "./edge/broker-client.js";
 import { EdgeControlServer } from "./edge/control.js";
 import { LiveIngressRegistry } from "./edge/live-registry.js";
 import { ProxyAgent, setGlobalDispatcher } from "undici";
-import { ClaudeProvider, CodexProvider, GrokProvider } from "./edge/providers.js";
+import { CHILD_KILL_GRACE_MS, ClaudeProvider, CodexProvider, GrokProvider } from "./edge/providers.js";
 import { EdgeService } from "./edge/service.js";
 import { EdgeStore } from "./edge/store.js";
 import { EdgeLivenessWatchdog } from "./edge/watchdog.js";
@@ -133,7 +133,14 @@ program.command("edge")
     const watchdog = new EdgeLivenessWatchdog({
       lastPollAt: () => edge.lastPollAt(),
       saturated: () => edge.saturated(),
-      exit: (code) => process.exit(code),
+      exit: (code) => {
+        // process.exit() would skip every per-dispatch abort controller.
+        // Headless turns now run as detached process groups, so they would
+        // survive the supervisor restart and race the recovered retry.
+        controller.abort();
+        edge.abortActiveDispatches();
+        setTimeout(() => process.exit(code), CHILD_KILL_GRACE_MS + 500);
+      },
       now: () => Date.now(),
       log: (message) => console.error(message),
     }, config.HIVE_EDGE_WATCHDOG_STALE_MS);

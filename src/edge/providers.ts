@@ -330,7 +330,7 @@ const STDERR_TAIL_CHARS = 2_000;
  */
 const MAX_STREAM_LINE_CHARS = 1_000_000;
 /** Grace between SIGTERM and SIGKILL when the edge's dispatch deadline aborts a turn. */
-const CHILD_KILL_GRACE_MS = 5_000;
+export const CHILD_KILL_GRACE_MS = 5_000;
 
 const dispatchDeadlines = new WeakMap<AbortSignal, number>();
 

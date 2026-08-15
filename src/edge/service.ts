@@ -79,6 +79,8 @@ export class EdgeService {
   private pollCompletedAt: number | null = null;
   /** Live background dispatches; each promise settles (never rejects) when its delivery reaches a disposition. */
   private readonly inFlight = new Set<Promise<void>>();
+  /** Per-dispatch abort controllers — the watchdog must abort these before process.exit so detached provider groups die. */
+  private readonly dispatchControllers = new Set<AbortController>();
   /** Actors with a dispatch currently running — declared to the broker on claim so it never hands out a second concurrent turn for the same actor. */
   private readonly busyActors = new Set<string>();
 
@@ -107,6 +109,15 @@ export class EdgeService {
   /** True when every dispatch slot is occupied, so the loop is legitimately not polling. */
   saturated(): boolean {
     return this.inFlight.size >= MAX_CONCURRENT_DISPATCHES;
+  }
+
+  /**
+   * Abort every in-flight dispatch. Detached provider process groups listen
+   * on these signals; the liveness watchdog must fire them before exiting
+   * or those children survive the supervisor restart and race the retry.
+   */
+  abortActiveDispatches(): void {
+    for (const controller of [...this.dispatchControllers]) controller.abort();
   }
 
   async run(signal?: AbortSignal): Promise<void> {
@@ -356,26 +367,42 @@ export class EdgeService {
     const controller = new AbortController();
     const startedAt = this.timers.now();
     stampDispatchDeadline(controller.signal, startedAt + MAX_DISPATCH_MS);
+    this.dispatchControllers.add(controller);
     return new Promise<T>((resolve, reject) => {
-      const timer = this.timers.set(() => {
+      let settled = false;
+      let timer: unknown = null;
+      const onAbort = (): void => {
+        failDeadline();
+      };
+      const settle = (finish: () => void): void => {
+        if (settled) return;
+        settled = true;
+        if (timer !== null) this.timers.clear(timer);
+        controller.signal.removeEventListener("abort", onAbort);
+        this.dispatchControllers.delete(controller);
+        finish();
+      };
+      const failDeadline = (): void => {
+        if (!controller.signal.aborted) controller.abort();
+        settle(() => reject(new DispatchDeadlineError(delivery.id, this.timers.now() - startedAt)));
+      };
+      timer = this.timers.set(() => {
         console.error(
           "hive edge dispatch deadline elapsed",
           delivery.id,
           delivery.actor,
           `${MAX_DISPATCH_MS}ms`,
         );
-        controller.abort();
-        reject(new DispatchDeadlineError(delivery.id, this.timers.now() - startedAt));
+        failDeadline();
       }, MAX_DISPATCH_MS);
+      if (controller.signal.aborted) {
+        failDeadline();
+        return;
+      }
+      controller.signal.addEventListener("abort", onAbort, { once: true });
       operation(controller.signal).then(
-        (value) => {
-          this.timers.clear(timer);
-          resolve(value);
-        },
-        (error: unknown) => {
-          this.timers.clear(timer);
-          reject(error);
-        },
+        (value) => settle(() => resolve(value)),
+        (error: unknown) => settle(() => reject(error)),
       );
     });
   }

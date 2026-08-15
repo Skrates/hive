@@ -620,6 +620,41 @@ test("with every dispatch slot hung, a newly published delivery is still claimed
 /** One capacity park plus a margin — long enough to prove the loop re-parked rather than progressed. */
 const CAPACITY_PARK_PROBE_MS = 90_000;
 
+test("abortActiveDispatches tears down in-flight turns before a watchdog exit would kill the process", async () => {
+  // One to three headless turns can be running while the loop is still
+  // considered unsaturated. process.exit() used to skip their abort
+  // controllers, leaving detached process groups behind the restart.
+  const timers = new FakeTimers();
+  const broker = new FakeBroker([
+    hangingDelivery(70, "gnomon"),
+    hangingDelivery(71, "theoros"),
+  ]);
+  const store = new EdgeStore(":memory:");
+  const adapter = new HangingAdapter();
+  const edge = new EdgeService(asBrokerClient(broker), store, new LiveIngressRegistry(), [adapter], timers);
+
+  const controller = new AbortController();
+  const run = edge.run(controller.signal);
+  await flush();
+  assert.equal(adapter.signals.length, 2);
+  assert.equal(adapter.signals.every((signal) => signal?.aborted === false), true);
+
+  edge.abortActiveDispatches();
+  assert.equal(adapter.signals.every((signal) => signal?.aborted === true), true);
+
+  const released = await timers.advanceUntil(
+    () => broker.releases.length === 2,
+    60_000,
+  );
+  assert.ok(released, "aborted dispatches reach a release disposition");
+  assert.equal(broker.releases.every((item) => item.reason.code === "dispatch_deadline_exceeded"), true);
+
+  controller.abort();
+  await timers.advanceUntil(() => false, 60_000);
+  await run;
+  store.close();
+});
+
 test("a healthy long dispatch keeps the loop polling, so the watchdog reads healthy throughout", async () => {
   // The regression guard on the watchdog: one slow turn with slots still free
   // must never look like a wedge. The loop keeps claiming, so `lastPollAt`
