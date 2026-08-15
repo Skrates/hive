@@ -64,6 +64,7 @@ test("a completed live turn returns its final text separately from the diagnosti
       budgets.push(timeoutMs);
       return { status: "completed" as const, assistantText: "  Outcome closed automatically.  " };
     },
+    async interrupt() {},
   };
   const now = Date.parse("2026-08-06T11:26:45.000Z");
   const result = await completeCodexDelivery(client, "thread-1", delivery(now), "wake", () => now);
@@ -84,6 +85,7 @@ test("a failed live turn never becomes a processed outcome", async () => {
   const client = {
     async deliver() { return { turnId: "turn-failed", mode: "steer" as const }; },
     async waitForCompletion() { return { status: "failed" as const, assistantText: null }; },
+    async interrupt() {},
   };
   const now = Date.parse("2026-08-06T11:26:45.000Z");
   await assert.rejects(
@@ -100,6 +102,7 @@ test("a completed Desktop turn returns its final text separately from the diagno
     async waitForDeliveryOutcome() {
       return { turnId: "desktop-turn-41", status: "completed" as const, assistantText: "  Foreground reply.  " };
     },
+    async interrupt() {},
   };
   const now = Date.parse("2026-08-06T11:26:45.000Z");
   const result = await completeDesktopDelivery(client, "foreground-task", delivery(now), "wake", () => now);
@@ -123,6 +126,7 @@ test("a long Desktop outcome remains verbatim within the live outcome budget", a
     async waitForDeliveryOutcome() {
       return { turnId: "desktop-turn-long", status: "completed" as const, assistantText: answer };
     },
+    async interrupt() {},
   };
   const now = Date.parse("2026-08-06T11:26:45.000Z");
   const result = await completeDesktopDelivery(client, "foreground-task", delivery(now), "wake", () => now);
@@ -139,6 +143,7 @@ test("a Desktop outcome truncates only above the 30,000 character live budget", 
     async waitForDeliveryOutcome() {
       return { turnId: "desktop-turn-bounded", status: "completed" as const, assistantText: answer };
     },
+    async interrupt() {},
   };
   const now = Date.parse("2026-08-06T11:26:45.000Z");
   const result = await completeDesktopDelivery(client, "foreground-task", delivery(now), "wake", () => now);
@@ -154,6 +159,7 @@ test("an interrupted Desktop turn never becomes a processed outcome", async () =
     async waitForDeliveryOutcome() {
       return { turnId: "desktop-turn-42", status: "interrupted" as const, assistantText: null };
     },
+    async interrupt() {},
   };
   const now = Date.parse("2026-08-06T11:26:45.000Z");
   await assert.rejects(
@@ -173,6 +179,7 @@ test("the edge dispatch deadline caps the live turn below the subscription TTL",
       budgets.push(timeoutMs);
       return { status: "completed" as const, assistantText: "Capped." };
     },
+    async interrupt() {},
   };
   const desktopBudgets: number[] = [];
   const desktopClient = {
@@ -184,6 +191,7 @@ test("the edge dispatch deadline caps the live turn below the subscription TTL",
       desktopBudgets.push(timeoutMs);
       return { turnId: "turn-capped", status: "completed" as const, assistantText: "Capped." };
     },
+    async interrupt() {},
   };
   const now = Date.parse("2026-08-06T11:26:45.000Z");
   // Subscription TTL is 60s; the edge will release at 5s.
@@ -193,6 +201,60 @@ test("the edge dispatch deadline caps the live turn below the subscription TTL",
   });
   assert.deepEqual(budgets, [5_000, 5_000]);
   assert.deepEqual(desktopBudgets, [5_000, 5_000]);
+});
+
+test("aborting after accept interrupts the exact accepted turn on both surfaces", async () => {
+  const interrupted: string[] = [];
+  const controller = new AbortController();
+  let waiting = 0;
+  const client = {
+    async deliver() { return { turnId: "turn-live", mode: "start" as const }; },
+    async waitForCompletion(_threadId: string, _turnId: string, _timeoutMs: number, signal?: AbortSignal) {
+      waiting += 1;
+      await new Promise<void>((_resolve, reject) => {
+        signal?.addEventListener("abort", () => reject(new Error("Codex live delivery aborted")), { once: true });
+      });
+      return { status: "completed" as const, assistantText: "too late" };
+    },
+    async interrupt(_threadId: string, turnId: string) { interrupted.push(`app:${turnId}`); },
+  };
+  const desktopClient = {
+    async deliver() {
+      return { turnId: "turn-desktop", clientUserMessageId: "k", mode: "steer" as const };
+    },
+    async waitForDeliveryOutcome(
+      _sessionId: string,
+      _accepted: unknown,
+      _timeoutMs: number,
+      signal?: AbortSignal,
+    ) {
+      waiting += 1;
+      await new Promise<void>((_resolve, reject) => {
+        signal?.addEventListener("abort", () => reject(new Error("Codex live delivery aborted")), { once: true });
+      });
+      return { turnId: "turn-desktop", status: "completed" as const, assistantText: "too late" };
+    },
+    async interrupt(_sessionId: string, turnId: string) { interrupted.push(`desktop:${turnId}`); },
+  };
+  const now = Date.parse("2026-08-06T11:26:45.000Z");
+  const app = completeCodexDelivery(client, "thread-1", delivery(now), "wake", () => now, {
+    signal: controller.signal,
+  });
+  const desktop = completeDesktopDelivery(
+    desktopClient,
+    "foreground-task",
+    delivery(now),
+    "wake",
+    () => now,
+    { signal: controller.signal },
+  );
+  const deadline = Date.now() + 1_000;
+  while (waiting < 2 && Date.now() < deadline) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(waiting, 2, "both surfaces accepted a turn before abort");
+  controller.abort();
+  await assert.rejects(() => app, /aborted/);
+  await assert.rejects(() => desktop, /aborted/);
+  assert.deepEqual(interrupted, ["app:turn-live", "desktop:turn-desktop"]);
 });
 
 test("an already-aborted live bound fails before a provider turn is started", async () => {
@@ -205,6 +267,7 @@ test("an already-aborted live bound fails before a provider turn is started", as
     async waitForCompletion() {
       return { status: "completed" as const, assistantText: "too late" };
     },
+    async interrupt() {},
   };
   const now = Date.parse("2026-08-06T11:26:45.000Z");
   const controller = new AbortController();
@@ -290,6 +353,7 @@ test("a late-claimed delivery gets a full post-claim turn budget", async () => {
       budgets.push(timeoutMs);
       return { status: "completed" as const, assistantText: "Answered." };
     },
+    async interrupt() {},
   };
   const desktopBudgets: number[] = [];
   const desktopClient = {
@@ -301,6 +365,7 @@ test("a late-claimed delivery gets a full post-claim turn budget", async () => {
       desktopBudgets.push(timeoutMs);
       return { turnId: "turn-late", status: "completed" as const, assistantText: "Answered." };
     },
+    async interrupt() {},
   };
   const now = Date.parse("2026-08-06T11:26:45.000Z");
   // Claimed 59s into a 60s pre-claim TTL — anchoring on `createdAt` would leave

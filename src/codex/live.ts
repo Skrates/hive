@@ -342,7 +342,7 @@ function sendJson(response: ServerResponse, status: number, value: unknown): voi
  * together without parsing receipt text.
  */
 export async function completeCodexDelivery(
-  client: Pick<CodexAppServerClient, "deliver" | "waitForCompletion">,
+  client: Pick<CodexAppServerClient, "deliver" | "waitForCompletion" | "interrupt">,
   threadId: string,
   delivery: Delivery,
   framed: string,
@@ -358,35 +358,40 @@ export async function completeCodexDelivery(
     remainingBefore(deadline, now),
   );
   throwIfAborted(bound.signal);
-  const completion = await client.waitForCompletion(
-    threadId,
-    accepted.turnId,
-    remainingBefore(deadline, now),
-    bound.signal,
-  );
-  if (completion.status !== "completed") {
-    throw new Error(`Codex app-server turn ${accepted.turnId} ${completion.status}`);
+  try {
+    const completion = await client.waitForCompletion(
+      threadId,
+      accepted.turnId,
+      remainingBefore(deadline, now),
+      bound.signal,
+    );
+    if (completion.status !== "completed") {
+      throw new Error(`Codex app-server turn ${accepted.turnId} ${completion.status}`);
+    }
+    const text = boundedLiveOutcome(
+      completion.assistantText?.trim()
+        || `Codex ${accepted.mode} turn ${accepted.turnId} completed without a textual final message.`,
+    );
+    return {
+      receipt: JSON.stringify({
+        type: "hive.live.completed",
+        surface: "app-server",
+        turnId: accepted.turnId,
+        mode: accepted.mode,
+        deliveryId: delivery.id,
+        status: completion.status,
+      }),
+      outcome: text,
+      processed: true,
+    };
+  } catch (error) {
+    await interruptAcceptedTurn(client, threadId, accepted.turnId);
+    throw error;
   }
-  const text = boundedLiveOutcome(
-    completion.assistantText?.trim()
-      || `Codex ${accepted.mode} turn ${accepted.turnId} completed without a textual final message.`,
-  );
-  return {
-    receipt: JSON.stringify({
-      type: "hive.live.completed",
-      surface: "app-server",
-      turnId: accepted.turnId,
-      mode: accepted.mode,
-      deliveryId: delivery.id,
-      status: completion.status,
-    }),
-    outcome: text,
-    processed: true,
-  };
 }
 
 export async function completeDesktopDelivery(
-  client: Pick<CodexDesktopIpcClient, "deliver" | "waitForDeliveryOutcome">,
+  client: Pick<CodexDesktopIpcClient, "deliver" | "waitForDeliveryOutcome" | "interrupt">,
   sessionId: string,
   delivery: Delivery,
   framed: string,
@@ -402,31 +407,52 @@ export async function completeDesktopDelivery(
     remainingBefore(deadline, now),
   );
   throwIfAborted(bound.signal);
-  const completion = await client.waitForDeliveryOutcome(
-    sessionId,
-    accepted,
-    remainingBefore(deadline, now),
-    bound.signal,
-  );
-  if (completion.status !== "completed") {
-    throw new Error(`Codex Desktop turn ${accepted.turnId} ${completion.status}`);
+  try {
+    const completion = await client.waitForDeliveryOutcome(
+      sessionId,
+      accepted,
+      remainingBefore(deadline, now),
+      bound.signal,
+    );
+    if (completion.status !== "completed") {
+      throw new Error(`Codex Desktop turn ${accepted.turnId} ${completion.status}`);
+    }
+    const text = boundedLiveOutcome(
+      completion.assistantText?.trim()
+        || `Codex Desktop ${accepted.mode} turn ${accepted.turnId} completed without a textual final message.`,
+    );
+    return {
+      receipt: JSON.stringify({
+        type: "hive.live.completed",
+        surface: "desktop",
+        turnId: accepted.turnId,
+        mode: accepted.mode,
+        deliveryId: delivery.id,
+        status: completion.status,
+      }),
+      outcome: text,
+      processed: true,
+    };
+  } catch (error) {
+    await interruptAcceptedTurn(client, sessionId, accepted.turnId);
+    throw error;
   }
-  const text = boundedLiveOutcome(
-    completion.assistantText?.trim()
-      || `Codex Desktop ${accepted.mode} turn ${accepted.turnId} completed without a textual final message.`,
-  );
-  return {
-    receipt: JSON.stringify({
-      type: "hive.live.completed",
-      surface: "desktop",
-      turnId: accepted.turnId,
-      mode: accepted.mode,
-      deliveryId: delivery.id,
-      status: completion.status,
-    }),
-    outcome: text,
-    processed: true,
-  };
+}
+
+async function interruptAcceptedTurn(
+  client: { interrupt(targetId: string, turnId: string): Promise<void> },
+  targetId: string,
+  turnId: string,
+): Promise<void> {
+  try {
+    await client.interrupt(targetId, turnId);
+  } catch (error) {
+    console.error(
+      "Hive Codex accepted-turn interrupt failed",
+      turnId,
+      error instanceof Error ? error.message : String(error),
+    );
+  }
 }
 
 function boundedLiveOutcome(text: string): string {

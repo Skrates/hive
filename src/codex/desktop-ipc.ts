@@ -13,7 +13,8 @@ export const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 type ThreadFollowerMethod =
   | "thread-follower-load-complete-history"
   | "thread-follower-start-turn"
-  | "thread-follower-steer-turn";
+  | "thread-follower-steer-turn"
+  | "thread-follower-interrupt-turn";
 
 // These are the protocol versions advertised by the Codex Desktop IPC router.
 // Unknown methods are intentionally not accepted: this is a private, versioned seam.
@@ -22,6 +23,7 @@ const REQUEST_VERSIONS: Readonly<Record<"initialize" | ThreadFollowerMethod, num
   "thread-follower-load-complete-history": 1,
   "thread-follower-start-turn": 1,
   "thread-follower-steer-turn": 1,
+  "thread-follower-interrupt-turn": 1,
 };
 
 interface IpcResponse {
@@ -234,6 +236,15 @@ export class CodexDesktopIpcClient {
       clientUserMessageId,
       mode: "start",
     };
+  }
+
+  async interrupt(
+    conversationId: string,
+    turnId: string,
+    timeoutMs = this.requestTimeoutMs,
+  ): Promise<void> {
+    await this.connect();
+    await this.request("thread-follower-interrupt-turn", { conversationId, turnId }, timeoutMs);
   }
 
   private async open(): Promise<void> {
