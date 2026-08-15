@@ -56,15 +56,29 @@ export class BrokerService {
     return this.store.freezeAffinityTargets(rawEventId, channelId, threadTs);
   }
 
-  async claim(edgeId: string, after: number, waitMs: number, busyActors: readonly string[] = []): Promise<Delivery | null> {
-    const deadline = Date.now() + Math.min(Math.max(waitMs, 0), 30_000);
+  async claim(
+    edgeId: string,
+    after: number,
+    waitMs: number,
+    busyActors: readonly string[] = [],
+    signal?: AbortSignal,
+  ): Promise<Delivery | null> {
+    const boundedWait = Math.min(Math.max(waitMs, 0), 30_000);
+    const deadline = Date.now() + boundedWait;
     do {
+      if (signal?.aborted) return null;
       this.store.requeueExpiredLeases();
       await this.drainOutbox();
+      // Drain is shared single-flight work and may outlive this caller. A
+      // disconnected edge or an elapsed long-poll window must not take a
+      // lease afterwards — the client will never see the response, and a
+      // retry would leave that delivery silent until lease expiry.
+      if (signal?.aborted) return null;
+      if (boundedWait > 0 && Date.now() >= deadline) return null;
       const delivery = this.store.claimNext(edgeId, after, busyActors);
       if (delivery) return delivery;
       if (Date.now() >= deadline) return null;
-      await delay(Math.min(250, deadline - Date.now()));
+      await delay(Math.min(250, deadline - Date.now()), signal);
     } while (true);
   }
 
@@ -168,6 +182,20 @@ export class BrokerService {
   }
 }
 
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
+function delay(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal?.aborted) {
+      resolve();
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, Math.max(0, ms));
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      resolve();
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }

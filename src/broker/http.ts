@@ -88,7 +88,13 @@ export class BrokerHttpServer {
       const waitMs = integerParam(url.searchParams.get("wait_ms"), 0);
       const busy = url.searchParams.get("busy");
       const busyActors = busy ? busy.split(",").filter((item) => item.length > 0) : [];
-      const delivery = await this.broker.claim(edgeId, after, waitMs, busyActors);
+      const delivery = await this.broker.claim(
+        edgeId,
+        after,
+        waitMs,
+        busyActors,
+        requestAbortSignal(request, response),
+      );
       return delivery ? json(response, 200, delivery) : json(response, 204, null);
     }
 
@@ -205,6 +211,26 @@ function constantTimeEqual(left: string, right: string): boolean {
   let result = 0;
   for (let i = 0; i < left.length; i += 1) result |= left.charCodeAt(i) ^ right.charCodeAt(i);
   return result === 0;
+}
+
+/**
+ * Abort the claim when the edge hangs up. Aborting the fetch only closes the
+ * client socket; without this signal, a stalled `drainOutbox()` would resume
+ * into `claimNext()` and lease work to an edge that will never read it.
+ */
+function requestAbortSignal(request: IncomingMessage, response: ServerResponse): AbortSignal {
+  const controller = new AbortController();
+  const socket = request.socket;
+  const onClose = (): void => {
+    if (!response.writableEnded) controller.abort();
+  };
+  if (socket.destroyed && !response.writableEnded) {
+    controller.abort();
+    return controller.signal;
+  }
+  socket.once("close", onClose);
+  response.once("finish", () => socket.off("close", onClose));
+  return controller.signal;
 }
 
 function json(response: ServerResponse, status: number, value: unknown): void {
