@@ -112,7 +112,7 @@ test("POST /v1/wakes mints a seat wake, and refuses one that cannot be delivered
   });
   const source = store.claimNext("dev", 0)!;
 
-  const post = (body: unknown, token = edgeToken): Promise<{ status: number; body: string }> =>
+  const post = (body: unknown, token = edgeToken, edge = "dev"): Promise<{ status: number; body: string }> =>
     new Promise((resolve, reject) => {
       const payload = JSON.stringify(body);
       const request = http.request({
@@ -121,7 +121,7 @@ test("POST /v1/wakes mints a seat wake, and refuses one that cannot be delivered
         method: "POST",
         path: "/v1/wakes",
         headers: {
-          "x-hive-edge": "dev",
+          "x-hive-edge": edge,
           authorization: `Bearer ${token}`,
           "content-type": "application/json",
           "content-length": Buffer.byteLength(payload),
@@ -153,6 +153,32 @@ test("POST /v1/wakes mints a seat wake, and refuses one that cannot be delivered
   const error = JSON.parse(refused.body) as { error: string; detail: string };
   assert.equal(error.error, "unroutable_actor");
   assert.match(error.detail, /no live subscription/);
+
+  // Another authenticated edge cannot mint from this delivery.
+  const otherToken = store.createEdge("other");
+  const stolen = await post({ sourceDeliveryId: source.id, actor: "gnomon", text: "steal" }, otherToken, "other");
+  assert.equal(stolen.status, 422);
+  assert.equal((JSON.parse(stolen.body) as { error: string }).error, "source_not_held");
+
+  // A malformed --thread is refused before Slack is asked.
+  const badThread = await post({
+    sourceDeliveryId: source.id,
+    actor: "gnomon",
+    text: "wrong thread",
+    threadTs: "not-a-thread",
+  });
+  assert.equal(badThread.status, 422);
+  assert.equal((JSON.parse(badThread.body) as { error: string }).error, "invalid_thread");
+
+  // An alternate thread Slack does not know is refused (the default mock throws).
+  const missingThread = await post({
+    sourceDeliveryId: source.id,
+    actor: "gnomon",
+    text: "missing thread",
+    threadTs: "200.1",
+  });
+  assert.equal(missingThread.status, 422);
+  assert.equal((JSON.parse(missingThread.body) as { error: string }).error, "invalid_thread");
 
   // A body that cannot even name a mint is a validation failure, not a refusal.
   const invalid = await post({ sourceDeliveryId: source.id, actor: "gnomon", text: "" });

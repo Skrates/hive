@@ -73,7 +73,7 @@ export class BrokerHttpServer {
         return json(response, 200, this.broker.upsertSubscription(input));
       }
       if (request.method === "DELETE" && url.pathname.startsWith("/v1/admin/subscriptions/")) {
-        const actor = decodeURIComponent(url.pathname.slice("/v1/admin/subscriptions/".length));
+        const actor = decodeURIComponent(url.pathname.slice("/v1/admin/subscriptions/".length)).toLowerCase();
         return json(response, 200, { actor, deleted: this.broker.deleteSubscription(actor) });
       }
       if (request.method === "GET" && url.pathname === "/v1/admin/deliveries") {
@@ -94,11 +94,12 @@ export class BrokerHttpServer {
 
     // KRA-1097: a seat mints a wake for a peer. Edge-authenticated like every
     // other seat act — the machine-local socket is the seat's authentication,
-    // and the sender is resolved from the source delivery, never from the body.
+    // the source must be this edge's current fenced delivery, and the sender
+    // is resolved from that ledger row, never from the body.
     if (request.method === "POST" && url.pathname === "/v1/wakes") {
       const body = await readJson(request);
       const input = SeatWakeInputSchema.parse(body);
-      return json(response, 201, this.broker.mintSeatWake(input));
+      return json(response, 201, await this.broker.mintSeatWake(input, edgeId));
     }
 
     const outcome = /^\/v1\/deliveries\/(\d+)\/outcome$/.exec(url.pathname);
