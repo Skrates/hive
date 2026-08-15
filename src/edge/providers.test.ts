@@ -212,6 +212,27 @@ test("Codex permission arguments grant only the Hive edge socket on spawn and re
   assert.deepEqual(codexPermissionArgs("danger-full-access"), ["--dangerously-bypass-approvals-and-sandbox"]);
 });
 
+test("Codex socket grant and child env share resolveEdgeSocketPath, including HIVE_HOME", (t) => {
+  const previousSocket = process.env.HIVE_EDGE_SOCKET;
+  const previousHome = process.env.HIVE_HOME;
+  delete process.env.HIVE_EDGE_SOCKET;
+  process.env.HIVE_HOME = "/var/lib/hive";
+  t.after(() => {
+    if (previousSocket === undefined) delete process.env.HIVE_EDGE_SOCKET;
+    else process.env.HIVE_EDGE_SOCKET = previousSocket;
+    if (previousHome === undefined) delete process.env.HIVE_HOME;
+    else process.env.HIVE_HOME = previousHome;
+  });
+
+  const expected = resolveEdgeSocketPath();
+  assert.equal(expected, join("/var/lib/hive", "edge.sock"));
+  assert.notEqual(expected, join(homedir(), ".hive", "edge.sock"));
+  assert.equal(composeChildEnv({}, { deliveryId: 1 }).HIVE_EDGE_SOCKET, expected);
+
+  const grant = codexPermissionArgs("read-only").find((arg) => arg.includes("unix_sockets="));
+  assert.ok(grant?.includes(JSON.stringify(expected)), grant);
+});
+
 test("a missing account profile is a hard pre-dispatch failure, never a fallback (ADR-0003 R-5)", (t) => {
   const directory = mkdtempSync(join(tmpdir(), "hive-profile-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
