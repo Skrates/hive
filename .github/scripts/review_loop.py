@@ -841,6 +841,23 @@ def finding_blocks(
     return blocks
 
 
+def wake_envelope_line(text: str) -> str:
+    """First WAKE:/NEXT line — the envelope Hive's ``parseAddressedWake`` binds.
+
+    That parser scans every line (``src/addressing.ts``), so a continuation
+    that starts with only a label lets an embedded finding line such as
+    ``WAKE: talos`` or ``NEXT fable`` become the routing envelope and steal
+    the chunk from the intended seat.
+    """
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.upper().startswith("WAKE:") or stripped.upper().startswith(
+            "NEXT "
+        ):
+            return stripped
+    return ""
+
+
 def chunk_digest(
     header: str,
     blocks: Sequence[str],
@@ -851,6 +868,7 @@ def chunk_digest(
     """Split a digest across Slack messages; ``label`` names it in continuations."""
     if not blocks:
         return [f"{header}(no {label} entries)"]
+    envelope = wake_envelope_line(header)
     messages: list[str] = []
     prefix = header
     current: list[str] = []
@@ -859,7 +877,8 @@ def chunk_digest(
         separator = 1 if current else 0
         if current and used + separator + len(block) > budget:
             messages.append(prefix + "\n".join(current))
-            prefix = f"({label} continued — part {len(messages) + 1})\n\n"
+            continued = f"({label} continued — part {len(messages) + 1})\n\n"
+            prefix = f"{envelope}\n\n{continued}" if envelope else continued
             current = [block]
             used = len(prefix) + len(block)
         else:
@@ -1517,14 +1536,14 @@ def standing_findings(
     reviews: Sequence[Mapping[str, Any]],
     codex_login: str,
 ) -> list[dict[str, Any]]:
-    """Every inline finding still standing on one unchanged head.
+    """Inline findings belonging to the supplied reviews.
 
-    Reading only the newest review undercounts: a re-review of unchanged bytes
-    emits a second review whose inline set can be disjoint from the first.  On a
-    head that has not moved, nothing has resolved either set — only a push
-    resolves a finding, and a push changes the head — so the standing set is the
-    union.  Each inline comment belongs to exactly one review, so the union is a
-    concatenation with no deduplication to do.  The comment list is fetched once
+    The caller chooses the review set.  Redelivery passes only the latest
+    same-head review: ``latest_result_kind_by_head`` and ``round_history``
+    treat a later verdict on the same SHA as authoritative, so concatenating
+    every earlier review would re-wake Talos to burn superseded comments.
+    Each inline comment belongs to exactly one review, so the result is a
+    concatenation with no deduplication.  The comment list is fetched once
     and filtered per review, matching ``review_findings``'s contract.
     """
     review_comments = list(github.paginate(f"pulls/{pr_number}/comments"))
@@ -1534,6 +1553,20 @@ def standing_findings(
             review_findings(review_comments, int(review["id"]), codex_login)
         )
     return findings
+
+
+def latest_exact_head_review(
+    reviews: Sequence[Mapping[str, Any]], head_sha: str, codex_login: str
+) -> Mapping[str, Any] | None:
+    """The latest Codex review submitted against this exact head."""
+    exact = exact_head_codex_reviews(reviews, head_sha, codex_login)
+    if not exact:
+        return None
+    indexed = list(enumerate(exact))
+    return max(
+        indexed,
+        key=lambda item: (result_event_time(item[1].get("submitted_at")), item[0]),
+    )[1]
 
 
 def redeliver_standing_wake(
@@ -1581,23 +1614,37 @@ def redeliver_standing_wake(
         return False
     verdict_stamp = verdict_at.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    exact_reviews = exact_head_codex_reviews(reviews, head_sha, codex_login)
-    # No exact-head review means the verdict came from a clean comment, which
-    # carries no inline findings by construction — so this costs no API call.
-    findings = (
-        standing_findings(github, pr_number, exact_reviews, codex_login)
-        if exact_reviews
-        else []
-    )
+    # The later same-head verdict is authoritative — a findings review followed
+    # by CLEAN (or a newer findings review) must not resurrect superseded
+    # comments.  Zero retrievable inlines is not CLEAN; only a clean-comment
+    # verdict enters that branch.
+    result_events = codex_result_events(github, reviews, comments, codex_login)
+    latest_kind = latest_result_kind_by_head(result_events).get(head_sha)
+    latest_review = latest_exact_head_review(reviews, head_sha, codex_login)
+    clean_verdict = latest_kind == "clean"
+    if clean_verdict:
+        findings = []
+    elif latest_kind == "findings" and latest_review is not None:
+        findings = standing_findings(github, pr_number, [latest_review], codex_login)
+    else:
+        print(
+            f"no authoritative same-head verdict for {repository}#{pr_number} "
+            f"(head={head_sha}); nothing to re-deliver"
+        )
+        return False
     listed_labels = {
         str(label.get("name"))
         for label in pull_request.get("labels", [])
         if isinstance(label, Mapping)
     }
-    if not findings and "merge-on-green" not in listed_labels:
+    if clean_verdict and "merge-on-green" not in listed_labels:
         # Cost pre-filter on the listed PR, re-checked authoritatively below: a
         # plain CLEAN head is parked at ready-for-review forever, and paying two
         # lookups per scan for a state that never redelivers is pure waste.
+        return False
+    if not clean_verdict and not findings:
+        # A findings review whose inline comments are gone is not evidence of
+        # CLEAN, and there is no digest to re-deliver.
         return False
     if findings and len(reviewed_heads) >= MAX_REVIEW_ROUNDS:
         # Defence behind the exhaustion marker above, for a head whose gate
@@ -1629,20 +1676,36 @@ def redeliver_standing_wake(
         if isinstance(label, Mapping)
     }
     has_merge_on_green = "merge-on-green" in labels
-    if not findings and not has_merge_on_green:
+    if clean_verdict and not has_merge_on_green:
         # The live label, not the listed one: ready-for-review is a correct
         # parked state, and only merge-on-green CLEAN carries a standing
         # mechanical action to re-deliver.
+        return False
+    if not clean_verdict and not findings:
         return False
     branch = str(refreshed_head["ref"])
     pr_url = str(pr_state.get("html_url") or f"{repository}#{pr_number}")
     review_round = result_round_for_head(reviewed_heads, head_sha)
     word = merge_word(has_merge_on_green)
 
-    if findings:
+    if clean_verdict:
+        messages = [
+            clean_wake_message(
+                author_actor=author_actor,
+                author=author,
+                head_sha=head_sha,
+                review_round=review_round,
+                review_state="clean-comment",
+                word=word,
+                pr_url=pr_url,
+                branch=branch,
+            )
+        ]
+    else:
+        assert latest_review is not None
         messages = build_burn_messages(
             findings=findings,
-            review_state=str(exact_reviews[-1].get("state") or "unknown"),
+            review_state=str(latest_review.get("state") or "unknown"),
             word=word,
             pr_url=pr_url,
             branch=branch,
@@ -1653,23 +1716,6 @@ def redeliver_standing_wake(
             has_merge_on_green=has_merge_on_green,
             review_round=review_round,
         )
-    else:
-        messages = [
-            clean_wake_message(
-                author_actor=author_actor,
-                author=author,
-                head_sha=head_sha,
-                review_round=review_round,
-                review_state=(
-                    str(exact_reviews[-1].get("state") or "unknown")
-                    if exact_reviews
-                    else "clean-comment"
-                ),
-                word=word,
-                pr_url=pr_url,
-                branch=branch,
-            )
-        ]
     messages[0] = f"{redelivery_notice(verdict_stamp)}\n\n{messages[0]}"
 
     slack = SlackApi(required_env("HIVE_BOT_TOKEN"), required_env("HIVE_CHANNEL"))
