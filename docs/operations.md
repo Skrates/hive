@@ -149,6 +149,30 @@ when the corresponding outbox row drains: :eyes: once the delivery is dispatched
 when an outcome closes it, :x: on any terminal failure. Reactions are annotation, not contract —
 the thread posts above remain the durable record, and a failed stamp is logged and dropped.
 
+## Wake attestation binding (KRA-1077)
+
+Every delivery the edge claims is bound, before dispatch, to the attestation of the account
+profile it will execute under. The edge reads `.weave-attestation.json` from the subscription's
+`accountProfile` — the record `weave-doctrine`'s installer persists — and stores its
+`attestation_id` and doctrine commit in the same `local_deliveries` row as the provider receipt.
+That row is the trace: delivery id → attestation id → the exact instruction, settings, and skill
+corpus hashes the seat was installed with. `weave doctor` resolves the other end.
+
+The edge records; it does not verify and it does not refuse.
+
+- **Verification lives in one implementation.** `weave doctor` rehashes the record and rejects one
+  whose id does not match its own bytes. Re-deriving the content address here would mean a second
+  canonical-JSON encoder in another language, and two encoders that disagreed by one escape
+  sequence would reject every honest wake. What the edge stores is what the profile *claims*, bound
+  immutably to the delivery; whether the claim is true is the doctor's verdict on the same id.
+- **An absent record never fails a wake.** Attestation is evidence, not authority — KRA-1074's D1
+  ruled the surface first and enforcement after. A profile with no attestation, an unreadable one,
+  an unknown schema, or one installed for a different actor all dispatch normally and record a
+  named `attestation_absence` beside the delivery. A misbound seat now leaves evidence at wake
+  time instead of needing git forensics afterwards.
+- **A redelivery rebinds.** A seat reinstalled between attempts ran the second attempt under
+  different artifacts; carrying the first attempt's id forward would be a false trace.
+
 ## Scheduled wakes
 
 A Slack message scheduled with the native **Send later** posts as the scheduling user at the

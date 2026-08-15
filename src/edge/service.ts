@@ -6,7 +6,8 @@ import {
   type ProviderAdapter,
   type ProviderDispatch,
 } from "./providers.js";
-import { EdgeStore } from "./store.js";
+import { readWakeAttestation } from "./attestation.js";
+import { EdgeStore, bindingFor } from "./store.js";
 
 export interface EdgeTimers {
   set(callback: () => void, delayMs: number): unknown;
@@ -150,7 +151,15 @@ export class EdgeService {
     let current = delivery;
     let providerStarted = false;
     try {
-      const existing = this.store.receive(delivery, generation);
+      // Bind the wake to the seat attestation BEFORE dispatch: a delivery's
+      // outcome must resolve to the artifacts installed when the turn started
+      // (KRA-1077). Reading the record can never fail the wake — an absent or
+      // unreadable one is stored as a named absence, never as silence.
+      const binding = bindingFor(
+        readWakeAttestation(delivery.subscription.accountProfile),
+        delivery.actor,
+      );
+      const existing = this.store.receive(delivery, generation, binding);
       if (["dispatched", "processed"].includes(existing.status)) return;
 
       current = await this.broker.accept(delivery);
