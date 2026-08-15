@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { ATTESTATION_FILENAME, readWakeAttestation } from "./attestation.js";
+import { ATTESTATION_FILENAME, MAX_ATTESTATION_BYTES, readWakeAttestation } from "./attestation.js";
 import { bindingFor } from "./store.js";
 
 function profileWith(record: unknown | string): string {
@@ -79,9 +80,27 @@ test("a profile installed for another seat keeps its evidence and flags the mism
 });
 
 test("reading an attestation never throws into the dispatch path", () => {
-  // A directory where the file should be: readFileSync raises EISDIR, not ENOENT.
+  // A directory where the file should be: open/fstat refuses it as unreadable.
   const dir = mkdtempSync(join(tmpdir(), "weave-eisdir-"));
   mkdirSync(join(dir, ATTESTATION_FILENAME));
+  const read = readWakeAttestation(dir);
+  assert.equal(read.ok, false);
+  assert.equal(bindingFor(read, "gnomon").absence, "attestation_unreadable");
+});
+
+test("a FIFO attestation is unreadable instead of blocking the edge loop", { timeout: 1_000 }, () => {
+  // dispatchClaimed reads this before its first await; a blocking FIFO would
+  // stall every co-tenant delivery on the edge.
+  const dir = mkdtempSync(join(tmpdir(), "weave-fifo-"));
+  execFileSync("mkfifo", [join(dir, ATTESTATION_FILENAME)]);
+  const read = readWakeAttestation(dir);
+  assert.equal(read.ok, false);
+  assert.equal(bindingFor(read, "gnomon").absence, "attestation_unreadable");
+});
+
+test("an oversized attestation is unreadable instead of an unbounded read", () => {
+  const dir = mkdtempSync(join(tmpdir(), "weave-huge-"));
+  writeFileSync(join(dir, ATTESTATION_FILENAME), "x".repeat(MAX_ATTESTATION_BYTES + 1));
   const read = readWakeAttestation(dir);
   assert.equal(read.ok, false);
   assert.equal(bindingFor(read, "gnomon").absence, "attestation_unreadable");

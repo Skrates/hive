@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { closeSync, constants, fstatSync, openSync, readSync } from "node:fs";
 import { join } from "node:path";
 
 /**
@@ -9,6 +9,8 @@ import { join } from "node:path";
  */
 export const ATTESTATION_FILENAME = ".weave-attestation.json";
 const ATTESTATION_SCHEMA = "weave.attestation/1";
+/** Honest records are a few kilobytes of hashes. Anything larger is malformed. */
+export const MAX_ATTESTATION_BYTES = 65_536;
 
 /**
  * Why a delivery has no attestation reference. An absent or unreadable record
@@ -46,13 +48,9 @@ export type AttestationRead =
  * doctor's verdict, on the same id.
  */
 export function readWakeAttestation(accountProfile: string): AttestationRead {
-  let raw: string;
-  try {
-    raw = readFileSync(join(accountProfile, ATTESTATION_FILENAME), "utf8");
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    return { ok: false, absence: code === "ENOENT" ? "no_attestation_file" : "attestation_unreadable" };
-  }
+  const opened = openAttestationFile(join(accountProfile, ATTESTATION_FILENAME));
+  if (!opened.ok) return opened;
+  const raw = opened.raw;
   let record: unknown;
   try {
     record = JSON.parse(raw);
@@ -74,5 +72,37 @@ export function readWakeAttestation(accountProfile: string): AttestationRead {
     return { ok: false, absence: "attestation_incomplete" };
   }
   return { ok: true, attestation: { attestationId, doctrineCommit, actor } };
+}
+
+/**
+ * Open-and-read that cannot stall the edge loop. `dispatchClaimed` calls this
+ * before its first `await`, so a FIFO or device left at the attestation path
+ * would otherwise block every co-tenant delivery on this edge. Non-blocking
+ * open + `fstat` + a bounded read turns those into `attestation_unreadable`.
+ */
+function openAttestationFile(path: string): { ok: true; raw: string } | { ok: false; absence: AttestationAbsence } {
+  let fd: number;
+  try {
+    fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    return { ok: false, absence: code === "ENOENT" ? "no_attestation_file" : "attestation_unreadable" };
+  }
+  try {
+    const info = fstatSync(fd);
+    if (!info.isFile() || info.size < 0 || info.size > MAX_ATTESTATION_BYTES) {
+      return { ok: false, absence: "attestation_unreadable" };
+    }
+    const buf = Buffer.alloc(info.size);
+    const n = readSync(fd, buf, 0, buf.length, 0);
+    if (n < 0 || n > MAX_ATTESTATION_BYTES) {
+      return { ok: false, absence: "attestation_unreadable" };
+    }
+    return { ok: true, raw: buf.subarray(0, n).toString("utf8") };
+  } catch {
+    return { ok: false, absence: "attestation_unreadable" };
+  } finally {
+    closeSync(fd);
+  }
 }
 
