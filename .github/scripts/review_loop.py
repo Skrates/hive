@@ -125,6 +125,12 @@ class GitHubApi(JsonApi):
     def repo_path(self, suffix: str) -> str:
         return f"repos/{self.repository}/{suffix.lstrip('/')}"
 
+    def authenticated_login(self) -> str:
+        user = self.request("GET", "user")
+        if not isinstance(user, Mapping) or not str(user.get("login") or "").strip():
+            raise RuntimeError("GitHub authenticated-user lookup returned no login")
+        return str(user["login"])
+
     def get(self, suffix: str, *, query: Mapping[str, Any] | None = None) -> Any:
         return self.request("GET", self.repo_path(suffix), query=query)
 
@@ -408,16 +414,34 @@ def ensure_comment_at_head(
     return "posted"
 
 
+def trusted_control_logins() -> frozenset[str]:
+    """Identities whose control markers are authoritative for deduplication.
+
+    Two identities write control markers. The workflow itself posts exhaustion
+    gates on the event path; the scheduled path authenticates as the
+    Codex-connected account (KRA-1032) and posts both nudges and gates. They are
+    one trust domain, so a marker written by either must suppress the other.
+
+    Splitting them is the defect: whichever path does not recognise the other's
+    marker re-posts it, giving one head two nudges or two exhaustion gates. Both
+    halves therefore read this one set rather than each naming its own author.
+    """
+    logins = [os.environ.get("WORKFLOW_LOGIN", WORKFLOW_LOGIN)]
+    author = os.environ.get("CODEX_REVIEW_AUTHOR")
+    if author:
+        logins.append(author)
+    return frozenset(login for login in logins if login)
+
+
 def marker_comment_exists(
     comments: Sequence[Mapping[str, Any]],
     marker: str,
-    workflow_login: str | None = None,
 ) -> bool:
-    """Trust a control marker only when the workflow identity authored it."""
-    expected_login = workflow_login or os.environ.get("WORKFLOW_LOGIN", WORKFLOW_LOGIN)
+    """Trust a control marker only when a trusted control identity authored it."""
+    trusted = trusted_control_logins()
     for comment in comments:
         user = comment.get("user")
-        if not isinstance(user, Mapping) or user.get("login") != expected_login:
+        if not isinstance(user, Mapping) or user.get("login") not in trusted:
             continue
         if marker in str(comment.get("body") or ""):
             return True
@@ -856,22 +880,28 @@ def review_stall_anchor(
 def bare_nudge_covers_head(
     comments: Sequence[Mapping[str, Any]],
     head_sha: str,
-    workflow_login: str | None = None,
 ) -> bool:
-    """True when a prior workflow nudge already targeted this exact head SHA.
+    """True when a prior control-identity nudge already targeted this exact head.
 
     Timestamps are not used: a force-push or reset onto an older commit can make
     an earlier head's nudge ``created_at`` fall after the restored head's
     committer date, which would falsely suppress re-nudges for the current SHA.
-    Marker text alone is not enough — only workflow-authored comments count.
+    Marker text alone is not enough — only a trusted control identity counts.
     """
-    return marker_comment_exists(comments, nudge_marker(head_sha), workflow_login)
+    return marker_comment_exists(comments, nudge_marker(head_sha))
 
 
 def nudge_stalled_reviews() -> None:
     repository = required_env("GITHUB_REPOSITORY")
     codex_login = os.environ.get("CODEX_LOGIN", CODEX_LOGIN)
     github = GitHubApi(required_env("GITHUB_TOKEN"), repository)
+    expected_login = required_env("CODEX_REVIEW_AUTHOR")
+    authenticated_login = github.authenticated_login()
+    if authenticated_login != expected_login:
+        raise RuntimeError(
+            "Codex review credential authenticates as "
+            f"{authenticated_login}, expected {expected_login}"
+        )
     now = datetime.now(timezone.utc)
     nudged = 0
     for pull_request in github.paginate("pulls", query={"state": "open"}):
