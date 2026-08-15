@@ -71,4 +71,7 @@ jobs:
           # Codex refuses summons authored by github-actions[bot]. This narrowly
           # scoped PAT belongs to the GitHub user connected to Codex cloud.
           GITHUB_TOKEN: ${{ secrets.CODEX_REVIEW_PAT }}
+          # The scheduled leg also re-delivers standing verdicts, so it needs a
+          # Slack credential. Without it this job cannot reach Hive at all.
+          HIVE_BOT_TOKEN: ${{ secrets.HIVE_BOT_TOKEN }}
         run: python3 .github/scripts/review_loop.py nudge
