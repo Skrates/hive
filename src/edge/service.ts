@@ -3,6 +3,7 @@ import { BROKER_REQUEST_TIMEOUT_CODE, BrokerClient } from "./broker-client.js";
 import { LiveIngressRegistry } from "./live-registry.js";
 import {
   ProviderPreDispatchError,
+  stampDispatchDeadline,
   type ProviderAdapter,
   type ProviderDispatch,
 } from "./providers.js";
@@ -354,6 +355,7 @@ export class EdgeService {
   ): Promise<T> {
     const controller = new AbortController();
     const startedAt = this.timers.now();
+    stampDispatchDeadline(controller.signal, startedAt + MAX_DISPATCH_MS);
     return new Promise<T>((resolve, reject) => {
       const timer = this.timers.set(() => {
         console.error(

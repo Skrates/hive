@@ -163,6 +163,7 @@ export class CodexDesktopIpcClient {
     conversationId: string,
     delivery: DesktopDelivery,
     timeoutMs: number,
+    signal?: AbortSignal,
   ): Promise<DesktopTurnCompletion> {
     const follower = this.followers.get(conversationId);
     if (!follower) {
@@ -172,7 +173,7 @@ export class CodexDesktopIpcClient {
         "not_following",
       ));
     }
-    return follower.waitForDeliveryOutcome(delivery, timeoutMs);
+    return follower.waitForDeliveryOutcome(delivery, timeoutMs, signal);
   }
 
   async deliver(
@@ -584,8 +585,13 @@ class ThreadFollower {
     return locateDelivery(this.state, clientUserMessageId);
   }
 
-  waitForDeliveryOutcome(delivery: DesktopDelivery, timeoutMs: number): Promise<DesktopTurnCompletion> {
+  waitForDeliveryOutcome(
+    delivery: DesktopDelivery,
+    timeoutMs: number,
+    signal?: AbortSignal,
+  ): Promise<DesktopTurnCompletion> {
     if (this.terminalError) return Promise.reject(this.terminalError);
+    if (signal?.aborted) return Promise.reject(new Error("Codex live delivery aborted"));
     const current = findDeliveryOutcome(this.state, delivery);
     if (current) return Promise.resolve(current);
     return new Promise((resolve, reject) => {
@@ -607,6 +613,12 @@ class ThreadFollower {
         }, timeoutMs),
       };
       this.waiters.add(waiter);
+      signal?.addEventListener("abort", () => {
+        if (!this.waiters.has(waiter)) return;
+        clearTimeout(waiter.timer);
+        this.waiters.delete(waiter);
+        reject(new Error("Codex live delivery aborted"));
+      }, { once: true });
     });
   }
 

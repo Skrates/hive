@@ -4,6 +4,7 @@ import type { Delivery, DeliveryResultInput, Reason, ReplaySnapshot, Subscriptio
 import type { BrokerClient } from "./broker-client.js";
 import { LiveIngressRegistry, type LiveIngress } from "./live-registry.js";
 import {
+  dispatchDeadlineAt,
   ProviderPreDispatchError,
   type ProviderAdapter,
   type ProviderDispatch,
@@ -554,6 +555,7 @@ test("a dispatch that outlives the wall-clock deadline is force-settled, aborted
   await flush();
   assert.equal(adapter.signals.length, 1, "the dispatch started");
   assert.equal(adapter.signals[0]?.aborted, false, "and is not aborted before its deadline");
+  assert.equal(dispatchDeadlineAt(adapter.signals[0]), 1_000_000 + THREE_HOURS_MS);
 
   // Just short of the bound, the turn is still running and untouched.
   await timers.advance(THREE_HOURS_MS - 1_000);

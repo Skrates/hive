@@ -143,18 +143,18 @@ export async function runCodexLive(config: Config): Promise<void> {
 
   prepareSocketPath(config.surfaceSocket);
   const http = createServer((request, response) => {
-    void handle(request, response, () => bindingStatus(config.actor, target), async (delivery, framed) => {
+    void handleCodexLiveRequest(request, response, () => bindingStatus(config.actor, target), async (delivery, framed, bound) => {
       const acceptedTarget = target;
       if (!acceptedTarget) throw new Error("Codex explicit foreground attachment is unavailable");
       if (acceptedTarget.kind === "dedicated") {
-        return completeCodexDelivery(appClient, acceptedTarget.sessionId, delivery, framed);
+        return completeCodexDelivery(appClient, acceptedTarget.sessionId, delivery, framed, Date.now, bound);
       }
       // Acquire the follower lease before the first await. A binding switch
       // may happen while account validation or the provider turn is running;
       // the old stream stays followed until this exact delivery settles.
       return desktopRetirement.whileInUse(acceptedTarget.sessionId, async () => {
         await assertPinnedDesktopAccount(config.desktopHome, delivery.subscription.accountProfile);
-        return completeDesktopDelivery(desktopClient, acceptedTarget.sessionId, delivery, framed);
+        return completeDesktopDelivery(desktopClient, acceptedTarget.sessionId, delivery, framed, Date.now, bound);
       });
     })
       .catch((error: unknown) => {
@@ -261,11 +261,20 @@ class SurfaceError extends Error {
   }
 }
 
-async function handle(
+export interface LiveDeliveryBound {
+  signal: AbortSignal;
+  deadlineAt?: number;
+}
+
+/**
+ * HTTP entry for the Codex live surface. Exported so the disconnect/deadline
+ * wiring can be tested without standing up the full attachment supervisor.
+ */
+export async function handleCodexLiveRequest(
   request: IncomingMessage,
   response: ServerResponse,
   status: () => BindingStatus,
-  deliver: (delivery: Delivery, framed: string) => Promise<CompletedLiveDelivery>,
+  deliver: (delivery: Delivery, framed: string, bound: LiveDeliveryBound) => Promise<CompletedLiveDelivery>,
 ): Promise<void> {
   if (request.method === "GET" && request.url === "/binding") {
     return sendJson(response, 200, status());
@@ -280,8 +289,32 @@ async function handle(
     throw new SurfaceError("live_delivery_invalid");
   }
   const payload = parseLiveDeliveryPayload(body);
-  const result = await deliver(payload.delivery, payload.framed);
+  const result = await deliver(payload.delivery, payload.framed, {
+    signal: clientDisconnectSignal(request, response),
+    ...(payload.deadlineAt === undefined ? {} : { deadlineAt: payload.deadlineAt }),
+  });
   sendJson(response, 200, result);
+}
+
+/**
+ * Abort the in-flight provider wait when the edge hangs up. Aborting the UDS
+ * client only closes this HTTP request; without this signal, complete*Delivery
+ * would keep waiting on the subscription TTL (24h in the shipped Codex
+ * subscription) after the edge had already released and retried the delivery.
+ */
+export function clientDisconnectSignal(request: IncomingMessage, response: ServerResponse): AbortSignal {
+  const controller = new AbortController();
+  const socket = request.socket;
+  const onClose = (): void => {
+    if (!response.writableEnded) controller.abort();
+  };
+  if (socket.destroyed && !response.writableEnded) {
+    controller.abort();
+    return controller.signal;
+  }
+  socket.once("close", onClose);
+  response.once("finish", () => socket.off("close", onClose));
+  return controller.signal;
 }
 
 export type BindingStatus =
@@ -314,18 +347,22 @@ export async function completeCodexDelivery(
   delivery: Delivery,
   framed: string,
   now: () => number = Date.now,
+  bound: Omit<LiveDeliveryBound, "signal"> & { signal?: AbortSignal } = {},
 ): Promise<CompletedLiveDelivery> {
-  const deadline = turnDeadline(delivery, now);
+  const deadline = turnDeadline(delivery, now, bound.deadlineAt);
+  throwIfAborted(bound.signal);
   const accepted = await client.deliver(
     threadId,
     framed,
     delivery.id,
     remainingBefore(deadline, now),
   );
+  throwIfAborted(bound.signal);
   const completion = await client.waitForCompletion(
     threadId,
     accepted.turnId,
     remainingBefore(deadline, now),
+    bound.signal,
   );
   if (completion.status !== "completed") {
     throw new Error(`Codex app-server turn ${accepted.turnId} ${completion.status}`);
@@ -354,18 +391,22 @@ export async function completeDesktopDelivery(
   delivery: Delivery,
   framed: string,
   now: () => number = Date.now,
+  bound: Omit<LiveDeliveryBound, "signal"> & { signal?: AbortSignal } = {},
 ): Promise<CompletedLiveDelivery> {
-  const deadline = turnDeadline(delivery, now);
+  const deadline = turnDeadline(delivery, now, bound.deadlineAt);
+  throwIfAborted(bound.signal);
   const accepted = await client.deliver(
     sessionId,
     framed,
     desktopDeliveryKey(delivery),
     remainingBefore(deadline, now),
   );
+  throwIfAborted(bound.signal);
   const completion = await client.waitForDeliveryOutcome(
     sessionId,
     accepted,
     remainingBefore(deadline, now),
+    bound.signal,
   );
   if (completion.status !== "completed") {
     throw new Error(`Codex Desktop turn ${accepted.turnId} ${completion.status}`);
@@ -397,6 +438,7 @@ function boundedLiveOutcome(text: string): string {
 interface LiveDeliveryPayload {
   readonly delivery: Delivery;
   readonly framed: string;
+  readonly deadlineAt?: number;
 }
 
 export function parseLiveDeliveryPayload(value: unknown): LiveDeliveryPayload {
@@ -413,9 +455,17 @@ export function parseLiveDeliveryPayload(value: unknown): LiveDeliveryPayload {
   ) {
     throw new SurfaceError("live_delivery_invalid");
   }
+  let deadlineAt: number | undefined;
+  if (value.deadlineAt !== undefined) {
+    if (typeof value.deadlineAt !== "number" || !Number.isFinite(value.deadlineAt)) {
+      throw new SurfaceError("live_delivery_invalid");
+    }
+    deadlineAt = value.deadlineAt;
+  }
   return {
     delivery: value.delivery as unknown as Delivery,
     framed: value.framed,
+    ...(deadlineAt === undefined ? {} : { deadlineAt }),
   };
 }
 
@@ -429,6 +479,10 @@ function remainingBefore(deadline: number, now: () => number): number {
   return remaining;
 }
 
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new Error("Codex live delivery aborted");
+}
+
 /**
  * The execution budget for a live turn starts at the claim, not at delivery
  * creation. `deliveryTtlMs` is the broker's *pre-claim* window — it decides
@@ -438,9 +492,15 @@ function remainingBefore(deadline: number, now: () => number): number {
  * uncertainty while still executing, and the released delivery would then
  * expire on its next claim — losing the outcome and skipping retry exhaustion.
  * The live surface is only reached after the claim, so the budget starts here.
+ *
+ * When the edge also sends `deadlineAt` (its dispatch wall-clock), this turn
+ * cannot outlive that bound. The shipped Codex subscription TTL is 24 hours;
+ * the edge releases at three. Without the min, aborting the UDS client would
+ * leave this handler waiting for another 21 hours while a retry starts.
  */
-function turnDeadline(delivery: Delivery, now: () => number): number {
-  return now() + delivery.subscription.deliveryTtlMs;
+function turnDeadline(delivery: Delivery, now: () => number, deadlineAt?: number): number {
+  const subscriptionDeadline = now() + delivery.subscription.deliveryTtlMs;
+  return deadlineAt === undefined ? subscriptionDeadline : Math.min(subscriptionDeadline, deadlineAt);
 }
 
 /**

@@ -1,15 +1,20 @@
 import assert from "node:assert/strict";
+import { request as httpRequest } from "node:http";
+import { createServer } from "node:http";
 import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { Delivery, Subscription } from "../domain.js";
+import { prepareSocketPath } from "../local/uds.js";
 import {
   assertPinnedDesktopAccount,
   completeCodexDelivery,
   completeDesktopDelivery,
   DesktopFollowerRetirement,
   desktopDeliveryKey,
+  handleCodexLiveRequest,
+  parseLiveDeliveryPayload,
 } from "./live.js";
 
 test("an obsolete Desktop follower is retired only after its in-flight delivery settles", async () => {
@@ -155,6 +160,123 @@ test("an interrupted Desktop turn never becomes a processed outcome", async () =
     () => completeDesktopDelivery(client, "foreground-task", delivery(now), "wake", () => now),
     /desktop-turn-42 interrupted/,
   );
+});
+
+test("the edge dispatch deadline caps the live turn below the subscription TTL", async () => {
+  const budgets: number[] = [];
+  const client = {
+    async deliver(_threadId: string, _framed: string, _deliveryId: number, timeoutMs?: number) {
+      budgets.push(timeoutMs ?? 0);
+      return { turnId: "turn-capped", mode: "start" as const };
+    },
+    async waitForCompletion(_threadId: string, _turnId: string, timeoutMs: number) {
+      budgets.push(timeoutMs);
+      return { status: "completed" as const, assistantText: "Capped." };
+    },
+  };
+  const desktopBudgets: number[] = [];
+  const desktopClient = {
+    async deliver(_sessionId: string, _framed: string, _key: string, timeoutMs?: number) {
+      desktopBudgets.push(timeoutMs ?? 0);
+      return { turnId: "turn-capped", clientUserMessageId: "k", mode: "steer" as const };
+    },
+    async waitForDeliveryOutcome(_sessionId: string, _accepted: unknown, timeoutMs: number) {
+      desktopBudgets.push(timeoutMs);
+      return { turnId: "turn-capped", status: "completed" as const, assistantText: "Capped." };
+    },
+  };
+  const now = Date.parse("2026-08-06T11:26:45.000Z");
+  // Subscription TTL is 60s; the edge will release at 5s.
+  await completeCodexDelivery(client, "thread-1", delivery(now), "wake", () => now, { deadlineAt: now + 5_000 });
+  await completeDesktopDelivery(desktopClient, "foreground-task", delivery(now), "wake", () => now, {
+    deadlineAt: now + 5_000,
+  });
+  assert.deepEqual(budgets, [5_000, 5_000]);
+  assert.deepEqual(desktopBudgets, [5_000, 5_000]);
+});
+
+test("an already-aborted live bound fails before a provider turn is started", async () => {
+  let started = false;
+  const client = {
+    async deliver() {
+      started = true;
+      return { turnId: "turn-aborted", mode: "start" as const };
+    },
+    async waitForCompletion() {
+      return { status: "completed" as const, assistantText: "too late" };
+    },
+  };
+  const now = Date.parse("2026-08-06T11:26:45.000Z");
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(
+    () => completeCodexDelivery(client, "thread-1", delivery(now), "wake", () => now, { signal: controller.signal }),
+    /aborted/,
+  );
+  assert.equal(started, false);
+});
+
+test("parseLiveDeliveryPayload accepts an optional finite deadlineAt", () => {
+  const now = Date.parse("2026-08-06T11:26:45.000Z");
+  const parsed = parseLiveDeliveryPayload({
+    delivery: delivery(now),
+    framed: "wake",
+    deadlineAt: now + 5_000,
+  });
+  assert.equal(parsed.deadlineAt, now + 5_000);
+  assert.equal(parseLiveDeliveryPayload({ delivery: delivery(now), framed: "wake" }).deadlineAt, undefined);
+  assert.throws(
+    () => parseLiveDeliveryPayload({ delivery: delivery(now), framed: "wake", deadlineAt: "soon" }),
+    /live_delivery_invalid/,
+  );
+});
+
+test("closing the live HTTP client aborts the in-flight provider wait", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "hive-live-disconnect-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const socketPath = join(root, "live.sock");
+  prepareSocketPath(socketPath);
+
+  let seenSignal: AbortSignal | undefined;
+  const server = createServer((request, response) => {
+    void handleCodexLiveRequest(
+      request,
+      response,
+      () => ({ actor: "ariadne", mode: "dedicated" }),
+      async (_delivery, _framed, bound) => {
+        seenSignal = bound.signal;
+        await new Promise(() => {});
+        return { receipt: "x", outcome: "y", processed: true };
+      },
+    ).catch(() => {});
+  });
+  await new Promise<void>((resolve) => server.listen({ path: socketPath }, resolve));
+  t.after(() => server.close());
+
+  const now = Date.parse("2026-08-06T11:26:45.000Z");
+  const payload = JSON.stringify({ delivery: delivery(now), framed: "wake", deadlineAt: now + 5_000 });
+  const client = httpRequest({
+    socketPath,
+    method: "POST",
+    path: "/deliver",
+    headers: { "content-type": "application/json", "content-length": Buffer.byteLength(payload) },
+  });
+  client.on("error", () => {});
+  client.end(payload);
+
+  const waitStarted = Date.now();
+  while (seenSignal === undefined && Date.now() - waitStarted < 2_000) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.ok(seenSignal, "the live handler accepted the delivery");
+  assert.equal(seenSignal!.aborted, false);
+
+  client.destroy();
+  const waitAborted = Date.now();
+  while (!seenSignal!.aborted && Date.now() - waitAborted < 2_000) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.equal(seenSignal!.aborted, true);
 });
 
 test("a late-claimed delivery gets a full post-claim turn budget", async () => {

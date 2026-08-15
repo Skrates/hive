@@ -116,9 +116,11 @@ export class CodexAppServerClient {
     threadId: string,
     turnId: string,
     timeoutMs: number,
+    signal?: AbortSignal,
   ): Promise<{ status: "completed" | "failed" | "interrupted"; assistantText: string | null }> {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
+      if (signal?.aborted) throw new Error("Codex live delivery aborted");
       await this.connect();
       const result = await this.request(
         "thread/read",
@@ -132,7 +134,7 @@ export class CodexAppServerClient {
           && typeof item.text === "string");
         return { status: turn.status, assistantText: assistant?.text ?? null };
       }
-      await delay(Math.min(500, Math.max(1, deadline - Date.now())));
+      await delay(Math.min(500, Math.max(1, deadline - Date.now())), signal);
     }
     throw new Error(`Timed out waiting for Codex app-server turn ${turnId}`);
   }
@@ -202,8 +204,18 @@ export class CodexAppServerClient {
   }
 }
 
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function delay(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new Error("Codex live delivery aborted"));
+      return;
+    }
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener("abort", () => {
+      clearTimeout(timer);
+      reject(new Error("Codex live delivery aborted"));
+    }, { once: true });
+  });
 }
 
 function remaining(deadline: number): number {
