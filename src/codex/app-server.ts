@@ -112,6 +112,11 @@ export class CodexAppServerClient {
     throw new Error(`Codex thread is not live: ${thread.status.type}`);
   }
 
+  async interrupt(threadId: string, turnId: string, timeoutMs = 10_000): Promise<void> {
+    await this.connect();
+    await this.request("turn/interrupt", { threadId, turnId }, timeoutMs);
+  }
+
   async waitForCompletion(
     threadId: string,
     turnId: string,
@@ -204,17 +209,21 @@ export class CodexAppServerClient {
   }
 }
 
-function delay(ms: number, signal?: AbortSignal): Promise<void> {
+export function delay(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
       reject(new Error("Codex live delivery aborted"));
       return;
     }
-    const timer = setTimeout(resolve, ms);
-    signal?.addEventListener("abort", () => {
+    const onAbort = (): void => {
       clearTimeout(timer);
       reject(new Error("Codex live delivery aborted"));
-    }, { once: true });
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
   });
 }
 
