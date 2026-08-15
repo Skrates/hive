@@ -59,7 +59,37 @@ deliveries keep succeeding. The edge serves its control plane on an owner-only U
 
 - live surfaces and hooks renew their liveness registration there (the TTL is the heartbeat);
 - `hive reply <delivery-id> "<summary>"` relays an agent's outcome to the broker — not lease-fenced,
-  safe to run long after the wake.
+  safe to run long after the wake;
+- `hive wake <actor> "<text>"` mints a wake for a peer seat (see below).
+
+### Seat-to-seat wakes
+
+A seat's outcome cannot address another seat. Every Hive post carries `hive_*` message metadata and
+admission drops those before the envelope is parsed, so a quoted `WAKE:` line in an outcome or a
+digest can never mint a delivery. That drop is deliberate and total, and it stays that way.
+
+Deliberate address is therefore an explicit act, never inferred from where text sits:
+
+```sh
+hive wake theoros "verify the KRA-1056 gate set on PR #1072"
+hive wake theoros --from 486 --thread 1786809717.355459 "…"
+```
+
+- **The minting seat is named by the delivery it is executing.** Headless turns export
+  `HIVE_DELIVERY_ID`; a live-delivered wake passes `--from <delivery-id>` from its envelope. The
+  broker resolves the sender from that delivery's ledger row, so attribution is never a client claim.
+- **The wake lands in the minting seat's thread** unless `--thread` names another thread in the same
+  channel. The receiver's outcome relays there, which is what makes a handoff answerable where it
+  was asked.
+- **The ledger commits before the commons render.** The delivery and its `🐝 wake minted by …` post
+  are one transaction; the post goes out through the ordinary `hive_*`-stamped outbox, so humans see
+  the handoff and admission ignores it.
+- **A mint that cannot be delivered exits non-zero with the reason** (`unroutable_actor`,
+  `unknown_source_delivery`, `self_mint_forbidden`, `broadcast_forbidden`) — never rendered-and-gone.
+- **A seat cannot broadcast or wake itself.** `everyone` stays a human-sender act, and a
+  self-directed mint is an unbounded loop with no operator in it.
+- **Replaying the identical mint is a no-op** that names the original delivery, so a lost CLI
+  response cannot double-wake a peer.
 
 Every subscription pins an `accountProfile` — the absolute path of the agent's login profile
 (`CLAUDE_CONFIG_DIR` for Claude Code, `CODEX_HOME` for Codex) on its home edge. A missing profile

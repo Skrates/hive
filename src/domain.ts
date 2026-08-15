@@ -106,13 +106,68 @@ export const SlackEventInputSchema = z.object({
   threadTs: z.string().min(1),
   messageTs: z.string().min(1),
   senderId: z.string().min(1),
-  senderKind: z.enum(["user", "app"]),
+  /**
+   * `user`/`app` are Slack-admitted senders. `seat` is the one origin that never
+   * came from Slack: a broker-minted seat wake (`hive wake`), whose sender id is
+   * the minting actor and whose `messageTs` is a `mint:` pseudo-ts because the
+   * commons render does not exist yet when the ledger row commits. Slack
+   * admission (`isAdmitted`) is deliberately NOT widened to know this kind —
+   * a minted event is authoritative in the ledger and is never ingested from
+   * Slack text.
+   */
+  senderKind: z.enum(["user", "app", "seat"]),
   actor: z.string().min(1),
   text: z.string(),
   raw: z.unknown(),
   receivedAt: z.string().datetime(),
 });
 export type SlackEventInput = z.infer<typeof SlackEventInputSchema>;
+
+/**
+ * True for a real Slack message timestamp (`<seconds>.<microseconds>`).
+ *
+ * A seat-minted wake's ledger row carries a `mint:` pseudo-ts: the delivery is
+ * authoritative before the commons render exists, so there is no Slack message
+ * to name yet. Emoji lifecycle stamps must therefore target only real Slack
+ * messages — stamping a pseudo-ts would be a guaranteed `reactions.add` failure
+ * against a message that does not exist.
+ */
+export function isSlackMessageTs(ts: string): boolean {
+  return /^\d+\.\d+$/.test(ts);
+}
+
+/** Upper bound on the body of one `hive wake` mint. Over this the mint is refused, never truncated. */
+export const MAX_SEAT_WAKE_TEXT = 8_000;
+
+/**
+ * KRA-1097: a seat's deliberate address to a peer. The minting seat is named by
+ * the delivery it is executing — the broker resolves the sender from its own
+ * ledger, so attribution is never a client claim — and the wake lands in that
+ * delivery's thread unless another thread in the same channel is chosen.
+ */
+export const SeatWakeInputSchema = z.object({
+  sourceDeliveryId: z.number().int().positive(),
+  actor: z.string().min(1).transform((value) => value.toLowerCase()),
+  text: z.string().min(1).max(MAX_SEAT_WAKE_TEXT),
+  threadTs: z.string().min(1).nullable().default(null),
+});
+export type SeatWakeInput = z.infer<typeof SeatWakeInputSchema>;
+
+export interface SeatWakeReceipt {
+  deliveryId: number;
+  /** The actor woken. */
+  actor: string;
+  /** The minting seat, resolved from the source delivery's ledger row. */
+  from: string;
+  channelId: string;
+  threadTs: string;
+  /**
+   * False when this exact mint (same source delivery, target, thread and text)
+   * was already durable — a replayed command is a no-op that names the original
+   * delivery rather than waking the peer twice.
+   */
+  created: boolean;
+}
 
 /** A trusted message folded into an existing pending delivery for the same actor/thread. */
 export interface CoalescedMessage {
@@ -202,8 +257,15 @@ export function frameWakeInstruction(
   outcomeReporter: "agent" | "edge" = "agent",
 ): string {
   const key = dedupeKey(delivery);
+  // A seat-minted wake names its sender as a seat. That is attribution, not a
+  // caveat: R-1 forbids mistrust language, and the authority ceiling is the
+  // receiving harness either way. The receiver simply gets to know whether the
+  // instruction came from an operator or from a peer that was itself woken.
+  const sender = delivery.event.senderKind === "seat"
+    ? `seat ${delivery.event.senderId}`
+    : delivery.event.senderId;
   const lines = [
-    `Message from ${delivery.event.senderId} in Slack thread ${delivery.event.channelId}/${delivery.event.threadTs}`,
+    `Message from ${sender} in Slack thread ${delivery.event.channelId}/${delivery.event.threadTs}`,
     `(delivery ${delivery.id}, attempt ${delivery.attempts}, dedupe ${key} — a repeated dedupe key means this is a redelivery of a message you may have already handled):`,
     "",
     delivery.event.text,

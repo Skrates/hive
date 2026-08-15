@@ -1,8 +1,8 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { URL } from "node:url";
-import { DeliveryResultInputSchema, ReasonSchema, SubscriptionInputSchema } from "../domain.js";
+import { DeliveryResultInputSchema, ReasonSchema, SeatWakeInputSchema, SubscriptionInputSchema } from "../domain.js";
 import { BrokerService } from "./service.js";
-import { InvalidTransitionError, StaleLeaseError } from "./store.js";
+import { InvalidTransitionError, SeatWakeRefusedError, StaleLeaseError } from "./store.js";
 
 export interface BrokerHttpConfig {
   host: string;
@@ -92,6 +92,15 @@ export class BrokerHttpServer {
       return delivery ? json(response, 200, delivery) : json(response, 204, null);
     }
 
+    // KRA-1097: a seat mints a wake for a peer. Edge-authenticated like every
+    // other seat act — the machine-local socket is the seat's authentication,
+    // and the sender is resolved from the source delivery, never from the body.
+    if (request.method === "POST" && url.pathname === "/v1/wakes") {
+      const body = await readJson(request);
+      const input = SeatWakeInputSchema.parse(body);
+      return json(response, 201, this.broker.mintSeatWake(input));
+    }
+
     const outcome = /^\/v1\/deliveries\/(\d+)\/outcome$/.exec(url.pathname);
     if (request.method === "POST" && outcome?.[1]) {
       const body = await readJson(request);
@@ -153,6 +162,9 @@ export class BrokerHttpServer {
       return;
     }
     if (error instanceof HttpError) return json(response, error.status, { error: error.message });
+    // R-3: a refused mint answers with its code AND its reason, so the minting
+    // seat's CLI can exit non-zero saying exactly what could not be delivered.
+    if (error instanceof SeatWakeRefusedError) return json(response, 422, { error: error.code, detail: error.message });
     if (error instanceof StaleLeaseError) return json(response, 409, { error: "stale_lease" });
     if (error instanceof InvalidTransitionError) return json(response, 409, { error: "invalid_transition", detail: error.message });
     if (error instanceof SyntaxError) return json(response, 400, { error: "invalid_json" });

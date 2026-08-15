@@ -6,12 +6,14 @@ import type {
   DeliveryStatus,
   EdgeWorkspace,
   Reason,
+  SeatWakeInput,
+  SeatWakeReceipt,
   SlackEventInput,
   Subscription,
   SubscriptionInput,
   TerminalDeliveryStatus,
 } from "../domain.js";
-import { retryBackoffMs } from "../domain.js";
+import { EVERYONE, isSlackMessageTs, retryBackoffMs } from "../domain.js";
 import type { Clock } from "../time.js";
 import { iso, systemClock } from "../time.js";
 
@@ -48,6 +50,24 @@ export const OUTBOX_MAX_ATTEMPTS = 50;
 export class StaleLeaseError extends Error {}
 export class InvalidTransitionError extends Error {}
 export class LegacyDatabaseError extends Error {}
+
+/**
+ * KRA-1097 / ADR-0003 R-3: a seat's deliberate address that cannot be delivered
+ * fails loudly back to the minting seat. The refusal carries a stable code so
+ * the CLI can exit non-zero with the reason instead of rendering and vanishing.
+ */
+export class SeatWakeRefusedError extends Error {
+  constructor(readonly code: SeatWakeRefusalCode, detail: string) {
+    super(detail);
+    this.name = "SeatWakeRefusedError";
+  }
+}
+
+export type SeatWakeRefusalCode =
+  | "unknown_source_delivery"
+  | "unroutable_actor"
+  | "self_mint_forbidden"
+  | "broadcast_forbidden";
 
 export interface OutboxEntry {
   outboxId: number;
@@ -551,6 +571,115 @@ export class BrokerStore {
     })();
   }
 
+  /**
+   * KRA-1097: mint a wake from one seat to another as a first-class act.
+   *
+   * Slack admission drops every `hive_*`-stamped message before the envelope is
+   * parsed, so a completing seat's outcome — human-visible in the thread — can
+   * never address a peer. That drop stays total; deliberate address lives here
+   * instead, where intent is an explicit act rather than the position of text.
+   *
+   * Three properties this transaction is responsible for:
+   *
+   * - **Attribution is ledger-derived.** The minting seat is whoever owns the
+   *   source delivery, read from this store. A caller cannot name a sender.
+   * - **INV-48 spirit: the ledger commits before any Slack render.** The
+   *   delivery row and the commons post are one transaction, and the post is
+   *   an outbox row stamped `hive_*` on the way out — visible to humans,
+   *   ignored by admission, never re-ingested as a wake.
+   * - **R-3: an undeliverable mint throws.** No silent dead-letter; the CLI
+   *   turns the refusal into a non-zero exit.
+   *
+   * The mint is idempotent over (source delivery, target, thread, text): a
+   * replayed command returns the original delivery and posts nothing new.
+   */
+  mintSeatWake(input: SeatWakeInput): SeatWakeReceipt {
+    return this.db.transaction(() => {
+      const sourceRow = this.db.prepare("SELECT delivery_id FROM deliveries WHERE delivery_id=?")
+        .get(input.sourceDeliveryId) as Row | undefined;
+      if (!sourceRow) {
+        throw new SeatWakeRefusedError(
+          "unknown_source_delivery",
+          `delivery ${input.sourceDeliveryId} is not in the broker ledger, so no minting seat can be resolved`,
+        );
+      }
+      const source = this.getDelivery(input.sourceDeliveryId);
+      const from = source.actor;
+      const target = input.actor;
+      // A seat never fans out: `everyone` expansion is reserved for a human
+      // sender (the same rule that keeps a quoted "WAKE: everyone" in an agent
+      // reply from chain-waking the fleet).
+      if (target === EVERYONE) {
+        throw new SeatWakeRefusedError(
+          "broadcast_forbidden",
+          "`everyone` is a human-only broadcast target; a seat addresses peers by name",
+        );
+      }
+      // A seat that can wake itself can wake itself forever: each minted run is
+      // free to mint again, with no operator in the loop. That is precisely the
+      // recursion the admission drop exists to prevent, so it is refused here
+      // rather than bounded by a depth counter.
+      if (target === from) {
+        throw new SeatWakeRefusedError(
+          "self_mint_forbidden",
+          `${from} cannot mint a wake to itself — a self-directed mint is an unbounded loop`,
+        );
+      }
+      const subscription = this.getSubscription(target);
+      if (!subscription || isExpired(subscription.expiresAt, this.clock.now())) {
+        throw new SeatWakeRefusedError(
+          "unroutable_actor",
+          `no live subscription for actor \`${target}\` — this wake would reach no one`,
+        );
+      }
+
+      const channelId = source.event.channelId;
+      const threadTs = input.threadTs ?? source.event.threadTs;
+      const digest = createHash("sha256")
+        .update([input.sourceDeliveryId, from, target, channelId, threadTs, input.text].join("\n"))
+        .digest("hex")
+        .slice(0, 16);
+      const eventId = `mint:${input.sourceDeliveryId}:${digest}`;
+      const ingest = this.ingestEvent({
+        eventId,
+        workspaceId: source.event.workspaceId,
+        channelId,
+        threadTs,
+        // No Slack message exists yet — the commons render is enqueued below and
+        // learns its `ts` only when the outbox drains. See isSlackMessageTs.
+        messageTs: `mint:${digest}`,
+        senderId: from,
+        senderKind: "seat",
+        actor: target,
+        text: input.text,
+        raw: { type: "seat_wake", sourceDeliveryId: input.sourceDeliveryId, from },
+        receivedAt: iso(this.clock),
+      });
+      const deliveryId = ingest.deliveryId ?? this.deliveryIdForEvent(eventId);
+      if (deliveryId === null) {
+        // The subscription check above already proved the actor routable, so
+        // reaching here means the ledger disagreed with itself mid-transaction.
+        // Throwing rolls the whole mint back — the event row included.
+        throw new SeatWakeRefusedError(
+          "unroutable_actor",
+          `mint for \`${target}\` produced no delivery`,
+        );
+      }
+      const delivery = this.getDelivery(deliveryId);
+      if (ingest.created) {
+        this.enqueueOutbox(delivery, seatWakeRender(from, target, deliveryId, input.text));
+      }
+      return { deliveryId, actor: target, from, channelId, threadTs, created: ingest.created };
+    })();
+  }
+
+  /** The delivery an event belongs to, whether it opened one or coalesced into one. */
+  private deliveryIdForEvent(eventId: string): number | null {
+    const row = this.db.prepare("SELECT delivery_id FROM delivery_events WHERE event_id=?")
+      .get(eventId) as Row | undefined;
+    return row ? Number(row.delivery_id) : null;
+  }
+
   claimNext(edgeId: string, _after: number, busyActors: readonly string[] = []): Delivery | null {
     return this.db.transaction(() => {
       // `after` remains a v1 compatibility hint only: broker-side eligibility
@@ -885,13 +1014,17 @@ export class BrokerStore {
 
   enqueueOutbox(delivery: Delivery, text: string, reaction: string | null = null): void {
     // A coalesced delivery answers several wake messages at once; the stamp
-    // must land on every one of them, not only the primary event's.
-    const targets = reaction === null
-      ? null
-      : JSON.stringify([...new Set([
-          delivery.event.messageTs,
-          ...delivery.coalescedMessages.map((message) => message.messageTs),
-        ])]);
+    // must land on every one of them, not only the primary event's. A
+    // seat-minted wake contributes no stampable message — its ledger row
+    // predates the commons render — so it is filtered out rather than sent to
+    // Slack as a `ts` that names nothing. A delivery left with no stampable
+    // message drops the reaction entirely: the text post is the durable event.
+    const stampable = [...new Set([
+      delivery.event.messageTs,
+      ...delivery.coalescedMessages.map((message) => message.messageTs),
+    ])].filter(isSlackMessageTs);
+    const effectiveReaction = reaction !== null && stampable.length > 0 ? reaction : null;
+    const targets = effectiveReaction === null ? null : JSON.stringify(stampable);
     this.db.prepare(`
       INSERT INTO outbox(delivery_id, channel_id, thread_ts, text, reaction, reaction_targets_json, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -900,7 +1033,7 @@ export class BrokerStore {
       delivery.event.channelId,
       delivery.event.threadTs,
       text,
-      reaction,
+      effectiveReaction,
       targets,
       iso(this.clock),
     );
@@ -1015,6 +1148,15 @@ export class BrokerStore {
 }
 
 /** ADR-0003 R-6: the thread-visible outcome format — self-identifying via delivery id, dedupe key, and actor. */
+/**
+ * The commons render of a seat-minted wake. Humans see who addressed whom and
+ * with what; Slack admission ignores it (the outbox stamps every post `hive_*`)
+ * and the ledger — not this text — is what delivers.
+ */
+function seatWakeRender(from: string, target: string, deliveryId: number, text: string): string {
+  return `🐝 wake minted by ${from} → ${target} (delivery ${deliveryId})\n\n${text}`;
+}
+
 function outcomePost(delivery: Delivery, text: string): string {
   return `${text}\n\n[delivery ${delivery.id} · dedupe ${delivery.event.messageTs}:${delivery.id} · ${delivery.actor}]`;
 }

@@ -1,4 +1,13 @@
-import type { Delivery, DeliveryResultInput, Reason, ReplaySnapshot, SlackEventInput, SubscriptionInput } from "../domain.js";
+import type {
+  Delivery,
+  DeliveryResultInput,
+  Reason,
+  ReplaySnapshot,
+  SeatWakeInput,
+  SeatWakeReceipt,
+  SlackEventInput,
+  SubscriptionInput,
+} from "../domain.js";
 import { BrokerStore } from "./store.js";
 
 export interface SlackTransport {
@@ -31,6 +40,16 @@ export class BrokerService {
 
   ingest(event: SlackEventInput, initialSnapshot: unknown | null = null) {
     return this.store.ingestEvent(event, initialSnapshot);
+  }
+
+  /**
+   * KRA-1097: a seat's explicit address to a peer. The ledger row and the
+   * commons render commit together; the render goes out through the ordinary
+   * `hive_*`-stamped outbox, so Slack admission ignores it exactly as it
+   * ignores every other Hive post. An undeliverable mint throws (R-3).
+   */
+  mintSeatWake(input: SeatWakeInput): SeatWakeReceipt {
+    return this.store.mintSeatWake(input);
   }
 
   /** True if any subscription is live — the deafness watchdog's arming gate. */

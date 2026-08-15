@@ -80,13 +80,37 @@ test("prependPathEntry puts the runtime dir first and never duplicates it", () =
 
 test("composeChildEnv prepends the running runtime's directory to the child PATH", () => {
   const runtimeDir = dirname(process.execPath);
-  const env = composeChildEnv({ CLAUDE_CONFIG_DIR: "/profiles/ariadne" });
+  const env = composeChildEnv({ CLAUDE_CONFIG_DIR: "/profiles/ariadne" }, { deliveryId: 512 });
   assert.ok(env.PATH, "composed env carries a PATH");
   assert.ok(env.PATH!.startsWith(`${runtimeDir}${delimiter}`) || env.PATH === runtimeDir, "PATH starts with the runtime dir");
   // The pinned profile env is preserved alongside the PATH fix.
   assert.equal(env.CLAUDE_CONFIG_DIR, "/profiles/ariadne");
   // The runtime dir appears exactly once even if it was already on the inherited PATH.
   assert.equal(env.PATH!.split(delimiter).filter((part) => part === runtimeDir).length, 1);
+});
+
+test("a headless child carries its delivery id, and never the actor's live-ingress identity", (t) => {
+  // An edge started from a seat's own shell inherits that seat's HIVE_ACTOR.
+  const previous = process.env.HIVE_ACTOR;
+  process.env.HIVE_ACTOR = "gnomon";
+  t.after(() => {
+    if (previous === undefined) delete process.env.HIVE_ACTOR;
+    else process.env.HIVE_ACTOR = previous;
+  });
+  const env = composeChildEnv({ CLAUDE_CONFIG_DIR: "/profiles/gnomon" }, { deliveryId: 512 });
+
+  // KRA-1097: `hive wake` reads this to name the minting seat's delivery, so a
+  // completing seat can address a peer without re-typing an id it was handed.
+  assert.equal(env.HIVE_DELIVERY_ID, "512");
+
+  // HIVE_ACTOR must NOT ride along, even when the edge inherited one. The Claude
+  // session hook registers whatever actor it finds in the environment as that
+  // actor's LIVE ingress; letting it through would point the actor's live
+  // registration at a process that exits moments later, sending the next wake to
+  // an inbox no session drains.
+  assert.equal(env.HIVE_ACTOR, undefined);
+  // The pinned profile still decides which seat the turn runs as (R-5).
+  assert.equal(env.CLAUDE_CONFIG_DIR, "/profiles/gnomon");
 });
 
 test("an invalid permission profile is a deterministic pre-dispatch failure", () => {
@@ -137,7 +161,7 @@ test("Grok Build live delivery terminalizes loudly; resume without a session id 
   const grok = new GrokProvider();
   await assert.rejects(grok.deliverLive(), /no live-ingress surface/);
   await assert.rejects(
-    async () => grok.resume(subscription({ provider: "grok", sessionId: null }), "/tmp", "framed"),
+    async () => grok.resume(subscription({ provider: "grok", sessionId: null }), "/tmp", "framed", { deliveryId: 512 }),
     /resume target missing/,
   );
 });
