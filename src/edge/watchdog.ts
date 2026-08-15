@@ -81,7 +81,13 @@ export class EdgeLivenessWatchdog {
    */
   check(): EdgeWatchdogAction {
     const last = this.port.lastPollAt();
-    if (pollHasAdvanced(this.seenPollAt, last)) this.staleStreak = 0;
+    const idleMs = last === null ? Number.POSITIVE_INFINITY : this.port.now() - last;
+    // Reset before the saturated early return. A poll that filled the last
+    // slot is recovery, not silence: leaving the streak intact here used to
+    // exit a recovered edge the moment a slot freed mid-long-poll.
+    if (pollHasAdvanced(this.seenPollAt, last) || idleMs < this.staleMs) {
+      this.staleStreak = 0;
+    }
     this.seenPollAt = last;
 
     if (this.port.saturated()) {
@@ -89,9 +95,7 @@ export class EdgeLivenessWatchdog {
       return "saturated";
     }
 
-    const idleMs = last === null ? Number.POSITIVE_INFINITY : this.port.now() - last;
     if (idleMs < this.staleMs) {
-      this.staleStreak = 0;
       return "healthy";
     }
 

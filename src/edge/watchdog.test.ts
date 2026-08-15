@@ -124,6 +124,31 @@ test("a poll that recovered before the slots filled resets the streak even while
   assert.deepEqual(h.exits, []);
 });
 
+test("a still-fresh poll timestamp resets the streak on a saturated check even without advancement", () => {
+  // The first observation of lastPollAt used to skip the reset (seenPollAt is
+  // undefined). A stale cycle, then a check that sees the same fresh stamp
+  // while saturated, must not keep streak=1 for the next free-slot window.
+  const h = harness();
+  const watchdog = new EdgeLivenessWatchdog(h.port, STALE_MS);
+  h.advance(STALE_MS);
+  assert.equal(watchdog.check(), "stale");
+
+  const recoveredAt = h.port.now() + 1_000;
+  h.advance(1_000);
+  h.setPoll(recoveredAt);
+  h.setSaturated(true);
+  assert.equal(watchdog.check(), "saturated");
+  // Same lastPollAt as the saturated observation — no advancement — but still
+  // inside the window. The next desaturated check must start a fresh budget.
+  h.advance(1);
+  assert.equal(watchdog.check(), "saturated");
+
+  h.advance(STALE_MS);
+  h.setSaturated(false);
+  assert.equal(watchdog.check(), "stale");
+  assert.deepEqual(h.exits, []);
+});
+
 test("an edge that has never completed a poll since boot is stale, not healthy", () => {
   // The wedge shape: the very first claim never returns. Treating "no evidence"
   // as health is exactly the mistake that kept the cx53 edge alive and deaf.
