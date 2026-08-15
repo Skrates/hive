@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -8,7 +8,7 @@ import type { Delivery, Subscription } from "../domain.js";
 import { prepareSocketPath } from "../local/uds.js";
 import type { LiveIngress } from "./live-registry.js";
 import { delimiter, dirname } from "node:path";
-import { ClaudeProvider, claudePromptSlotArgs, codexPermissionArgs, CodexProvider, composeChildEnv, GrokProvider, grokPermissionArgs, prependPathEntry, ProviderPreDispatchError, requireAccountProfile } from "./providers.js";
+import { ClaudeProvider, claudePromptSlotArgs, codexPermissionArgs, CodexProvider, composeChildEnv, dispatchDeadlineAt, GrokProvider, grokPermissionArgs, prependPathEntry, ProviderPreDispatchError, requireAccountProfile, stampDispatchDeadline } from "./providers.js";
 
 function subscription(overrides: Partial<Subscription> = {}): Subscription {
   return {
@@ -247,10 +247,117 @@ test("Codex live delivery travels over the surface's owner-only UDS socket", asy
   assert.match(result.receipt, /hive\.live\.completed/);
   assert.equal(result.outcome, longOutcome);
   assert.equal(result.processed, true);
-  const payload = seen[0] as { delivery: { id: number }; framed: string };
+  const payload = seen[0] as { delivery: { id: number }; framed: string; deadlineAt?: number };
   assert.equal(payload.delivery.id, 11);
   assert.equal(payload.framed, "framed body");
+  assert.equal(payload.deadlineAt, undefined);
 });
+
+test("Codex live delivery forwards the stamped dispatch deadline to the live server", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "hive-uds-deadline-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const socketPath = join(root, "surface.sock");
+  prepareSocketPath(socketPath);
+
+  const seen: unknown[] = [];
+  const server = createServer((request, response) => {
+    const chunks: Buffer[] = [];
+    request.on("data", (chunk: Buffer) => chunks.push(chunk));
+    request.on("end", () => {
+      seen.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({
+        receipt: JSON.stringify({ type: "hive.live.completed", surface: "app-server", turnId: "turn-deadline" }),
+        outcome: "done",
+        processed: true,
+      }));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen({ path: socketPath }, resolve));
+  t.after(() => server.close());
+
+  const controller = new AbortController();
+  stampDispatchDeadline(controller.signal, 1_700_000_000_000);
+  assert.equal(dispatchDeadlineAt(controller.signal), 1_700_000_000_000);
+
+  const codex = new CodexProvider();
+  const ingress: LiveIngress = {
+    actor: "ariadne",
+    provider: "codex",
+    socketPath,
+    sessionId: "thread-1",
+    surfaceVersion: "test",
+    expiresAt: Date.now() + 60_000,
+  };
+  await codex.deliverLive(ingress, delivery(11), "framed body", controller.signal);
+  const payload = seen[0] as { deadlineAt?: number };
+  assert.equal(payload.deadlineAt, 1_700_000_000_000);
+});
+
+test("dispatch abort kills the provider process group, including SIGTERM-immune descendants", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "hive-pgid-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const profile = join(root, "profile");
+  mkdirSync(profile);
+  const marker = join(root, "grandchild.pid");
+  const cli = join(root, "cli.mjs");
+  writeFileSync(cli, `#!/usr/bin/env node
+import { spawn } from "node:child_process";
+import { writeFileSync } from "node:fs";
+spawn(process.execPath, ["-e", ${JSON.stringify(`
+  process.on("SIGTERM", () => {});
+  require("fs").writeFileSync(${JSON.stringify(marker)}, String(process.pid));
+  setInterval(() => {}, 1000);
+`)}], { stdio: "ignore" });
+setInterval(() => {}, 1000);
+`, { mode: 0o755 });
+
+  const previous = process.env.HIVE_CLAUDE_COMMAND;
+  process.env.HIVE_CLAUDE_COMMAND = cli;
+  t.after(() => {
+    if (previous === undefined) delete process.env.HIVE_CLAUDE_COMMAND;
+    else process.env.HIVE_CLAUDE_COMMAND = previous;
+  });
+
+  const claude = new ClaudeProvider({ ingressRoot: join(root, "inbox") });
+  const controller = new AbortController();
+  const turn = claude.spawn(
+    subscription({ provider: "claude", accountProfile: profile, sessionId: null }),
+    root,
+    "framed",
+    controller.signal,
+  );
+
+  const started = Date.now();
+  while (!existsSync(marker) && Date.now() - started < 5_000) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.ok(existsSync(marker), "grandchild published its pid");
+  const grandchildPid = Number(readFileSync(marker, "utf8"));
+  t.after(() => {
+    try { process.kill(grandchildPid, "SIGKILL"); } catch { /* already gone */ }
+  });
+  assert.equal(processAlive(grandchildPid), true);
+
+  controller.abort();
+  await assert.rejects(turn, /exited|deadline/);
+
+  const killDeadline = Date.now() + 8_000;
+  while (processAlive(grandchildPid) && Date.now() < killDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.equal(processAlive(grandchildPid), false, "the descendant must die with the group, not outlive the CLI");
+});
+
+function processAlive(pid: number): boolean {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const state = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0];
+    return state !== undefined && state !== "Z";
+  } catch {
+    return false;
+  }
+}
 
 test("an oversized live receipt is rejected", async (t) => {
   const root = mkdtempSync(join(tmpdir(), "hive-uds-bad-"));

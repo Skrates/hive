@@ -85,8 +85,15 @@ export class CodexProvider implements ProviderAdapter {
 
   async deliverLive(ingress: LiveIngress, delivery: Delivery, framed: string, signal?: AbortSignal): Promise<ProviderDispatch> {
     let result: { receipt?: unknown; outcome?: unknown; processed?: unknown };
+    const deadlineAt = dispatchDeadlineAt(signal);
     try {
-      result = await udsRequestJson(ingress.socketPath, "POST", "/deliver", { delivery, framed }, signal);
+      result = await udsRequestJson(
+        ingress.socketPath,
+        "POST",
+        "/deliver",
+        deadlineAt === undefined ? { delivery, framed } : { delivery, framed, deadlineAt },
+        signal,
+      );
     } catch (error) {
       if (error instanceof UdsHttpError && surfaceErrorCode(error.responseBody) === "account_profile_mismatch") {
         throw new ProviderPreDispatchError("account_profile_mismatch");
@@ -325,6 +332,36 @@ const MAX_STREAM_LINE_CHARS = 1_000_000;
 /** Grace between SIGTERM and SIGKILL when the edge's dispatch deadline aborts a turn. */
 const CHILD_KILL_GRACE_MS = 5_000;
 
+const dispatchDeadlines = new WeakMap<AbortSignal, number>();
+
+/** Stamp the edge's wall-clock dispatch deadline onto the abort signal it hands adapters. */
+export function stampDispatchDeadline(signal: AbortSignal, deadlineAt: number): void {
+  dispatchDeadlines.set(signal, deadlineAt);
+}
+
+/** Absolute epoch-ms the edge will wait; undefined when the signal was not stamped. */
+export function dispatchDeadlineAt(signal: AbortSignal | undefined): number | undefined {
+  return signal === undefined ? undefined : dispatchDeadlines.get(signal);
+}
+
+/**
+ * Signal every process in the headless turn's group. `child.kill()` only hits
+ * the CLI PID; a descendant that outlives the CLI keeps writing the workspace
+ * after the edge has already released the delivery and may start a retry.
+ */
+export function signalProcessGroup(pid: number | undefined, signal: NodeJS.Signals): void {
+  if (pid === undefined) return;
+  try {
+    process.kill(-pid, signal);
+  } catch {
+    try {
+      process.kill(pid, signal);
+    } catch {
+      // The group (or CLI) is already gone.
+    }
+  }
+}
+
 /**
  * Incremental reader over a headless provider's JSONL stdout.
  *
@@ -449,6 +486,10 @@ async function runHeadless(
     cwd,
     stdio: ["pipe", "pipe", "pipe"],
     env: composeChildEnv(profileEnv),
+    // Own process group so deadline teardown can signal the CLI *and* every
+    // tool/shell descendant it spawned. Without this, SIGTERM on the CLI PID
+    // leaves orphans writing the workspace after the edge has released.
+    detached: true,
   });
   if (stdin !== null) child.stdin.end(stdin); else child.stdin.end();
   const stdout = new HeadlessStreamReader(RECEIPT_TAIL_CHARS);
@@ -457,12 +498,15 @@ async function runHeadless(
   child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
 
   // The edge frees this dispatch's slot the moment its deadline fires, so the
-  // child must not outlive the signal: SIGTERM first, SIGKILL after a grace.
+  // whole process group must not outlive the signal: SIGTERM first, SIGKILL
+  // after a grace. The SIGKILL stays armed if the CLI exits first — a
+  // descendant that ignored SIGTERM is why the grace exists.
   let killTimer: ReturnType<typeof setTimeout> | null = null;
   const onAbort = (): void => {
-    console.error("hive edge provider turn aborted at the dispatch deadline", command, child.pid ?? "no-pid");
-    child.kill("SIGTERM");
-    killTimer = setTimeout(() => child.kill("SIGKILL"), CHILD_KILL_GRACE_MS);
+    const pid = child.pid;
+    console.error("hive edge provider turn aborted at the dispatch deadline", command, pid ?? "no-pid");
+    signalProcessGroup(pid, "SIGTERM");
+    killTimer = setTimeout(() => signalProcessGroup(pid, "SIGKILL"), CHILD_KILL_GRACE_MS);
     killTimer.unref();
   };
   signal?.addEventListener("abort", onAbort, { once: true });
@@ -475,7 +519,7 @@ async function runHeadless(
     });
   } finally {
     signal?.removeEventListener("abort", onAbort);
-    if (killTimer !== null) clearTimeout(killTimer);
+    if (killTimer !== null && !signal?.aborted) clearTimeout(killTimer);
   }
   stdout.finish();
   stderr.finish();
