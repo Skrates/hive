@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import type { Delivery, Provider, Subscription } from "../domain.js";
 import { UdsHttpError, udsRequestJson } from "../local/uds.js";
 import type { LiveIngress } from "./live-registry.js";
@@ -46,12 +47,18 @@ export class ProviderPreDispatchError extends Error {
   }
 }
 
+/**
+ * Every dispatch carries the edge's wall-clock deadline as an abort signal. An
+ * adapter that owns a child process MUST kill it on abort: the edge frees the
+ * dispatch slot the moment the deadline fires, so a child that outlives the
+ * signal is an orphan holding a provider session nobody is waiting for.
+ */
 export interface ProviderAdapter {
   provider: Provider;
   preflight?(subscription: Subscription): void;
-  deliverLive(ingress: LiveIngress, delivery: Delivery, framed: string): Promise<ProviderDispatch>;
-  resume(subscription: Subscription, cwd: string, framed: string): Promise<ProviderDispatch>;
-  spawn(subscription: Subscription, cwd: string, framed: string): Promise<ProviderDispatch>;
+  deliverLive(ingress: LiveIngress, delivery: Delivery, framed: string, signal?: AbortSignal): Promise<ProviderDispatch>;
+  resume(subscription: Subscription, cwd: string, framed: string, signal?: AbortSignal): Promise<ProviderDispatch>;
+  spawn(subscription: Subscription, cwd: string, framed: string, signal?: AbortSignal): Promise<ProviderDispatch>;
 }
 
 /**
@@ -76,10 +83,10 @@ export class CodexProvider implements ProviderAdapter {
     requireAccountProfile(subscription);
   }
 
-  async deliverLive(ingress: LiveIngress, delivery: Delivery, framed: string): Promise<ProviderDispatch> {
+  async deliverLive(ingress: LiveIngress, delivery: Delivery, framed: string, signal?: AbortSignal): Promise<ProviderDispatch> {
     let result: { receipt?: unknown; outcome?: unknown; processed?: unknown };
     try {
-      result = await udsRequestJson(ingress.socketPath, "POST", "/deliver", { delivery, framed });
+      result = await udsRequestJson(ingress.socketPath, "POST", "/deliver", { delivery, framed }, signal);
     } catch (error) {
       if (error instanceof UdsHttpError && surfaceErrorCode(error.responseBody) === "account_profile_mismatch") {
         throw new ProviderPreDispatchError("account_profile_mismatch");
@@ -100,7 +107,7 @@ export class CodexProvider implements ProviderAdapter {
     return { receipt, outcome, processed: true };
   }
 
-  resume(subscription: Subscription, cwd: string, framed: string): Promise<ProviderDispatch> {
+  resume(subscription: Subscription, cwd: string, framed: string, signal?: AbortSignal): Promise<ProviderDispatch> {
     if (!subscription.sessionId) throw new Error("resume target missing");
     return runHeadless(
       "codex",
@@ -108,16 +115,18 @@ export class CodexProvider implements ProviderAdapter {
       cwd,
       framed,
       { CODEX_HOME: requireAccountProfile(subscription) },
+      signal,
     );
   }
 
-  spawn(subscription: Subscription, cwd: string, framed: string): Promise<ProviderDispatch> {
+  spawn(subscription: Subscription, cwd: string, framed: string, signal?: AbortSignal): Promise<ProviderDispatch> {
     return runHeadless(
       "codex",
       ["exec", "--cd", cwd, "--json", ...codexPermissionArgs(subscription.permissionProfile), "-"],
       cwd,
       framed,
       { CODEX_HOME: requireAccountProfile(subscription) },
+      signal,
     );
   }
 }
@@ -159,7 +168,7 @@ export class GrokProvider implements ProviderAdapter {
     return Promise.reject(new Error("Grok Build has no live-ingress surface; deliveries fall through to spawn"));
   }
 
-  resume(subscription: Subscription, cwd: string, framed: string): Promise<ProviderDispatch> {
+  resume(subscription: Subscription, cwd: string, framed: string, signal?: AbortSignal): Promise<ProviderDispatch> {
     if (!subscription.sessionId) throw new Error("resume target missing");
     return runHeadless(
       process.env.HIVE_GROK_COMMAND ?? "grok",
@@ -167,16 +176,18 @@ export class GrokProvider implements ProviderAdapter {
       cwd,
       null,
       { HOME: requireAccountProfile(subscription) },
+      signal,
     );
   }
 
-  spawn(subscription: Subscription, cwd: string, framed: string): Promise<ProviderDispatch> {
+  spawn(subscription: Subscription, cwd: string, framed: string, signal?: AbortSignal): Promise<ProviderDispatch> {
     return runHeadless(
       process.env.HIVE_GROK_COMMAND ?? "grok",
       ["--output-format", "streaming-messages-json", ...grokPermissionArgs(subscription.permissionProfile), "-p", framed],
       cwd,
       null,
       { HOME: requireAccountProfile(subscription) },
+      signal,
     );
   }
 }
@@ -233,7 +244,7 @@ export class ClaudeProvider implements ProviderAdapter {
     return `claude-inbox:${finalPath}`;
   }
 
-  resume(subscription: Subscription, cwd: string, framed: string): Promise<ProviderDispatch> {
+  resume(subscription: Subscription, cwd: string, framed: string, signal?: AbortSignal): Promise<ProviderDispatch> {
     if (!subscription.sessionId) throw new Error("resume target missing");
     const profile = requireAccountProfile(subscription);
     return runHeadless(
@@ -242,10 +253,11 @@ export class ClaudeProvider implements ProviderAdapter {
       cwd,
       null,
       { CLAUDE_CONFIG_DIR: profile },
+      signal,
     );
   }
 
-  spawn(subscription: Subscription, cwd: string, framed: string): Promise<ProviderDispatch> {
+  spawn(subscription: Subscription, cwd: string, framed: string, signal?: AbortSignal): Promise<ProviderDispatch> {
     const profile = requireAccountProfile(subscription);
     return runHeadless(
       process.env.HIVE_CLAUDE_COMMAND ?? "claude",
@@ -253,6 +265,7 @@ export class ClaudeProvider implements ProviderAdapter {
       cwd,
       null,
       { CLAUDE_CONFIG_DIR: profile },
+      signal,
     );
   }
 }
@@ -298,30 +311,179 @@ export function composeChildEnv(profileEnv: Record<string, string>): NodeJS.Proc
   };
 }
 
+/** Diagnostic tail retained from a provider's stdout — the ledger receipt, never a parse source. */
+const RECEIPT_TAIL_CHARS = 4_000;
+/** Diagnostic tail retained from a provider's stderr — quoted in the non-zero-exit error. */
+const STDERR_TAIL_CHARS = 2_000;
+/**
+ * A single JSONL line longer than this is dropped rather than buffered. The
+ * agent-text lines this reader is looking for are bounded by the model's own
+ * output; an unbounded line is a tool-result dump, and holding one hostage is
+ * how a stream reader reintroduces the very growth it exists to bound.
+ */
+const MAX_STREAM_LINE_CHARS = 1_000_000;
+/** Grace between SIGTERM and SIGKILL when the edge's dispatch deadline aborts a turn. */
+const CHILD_KILL_GRACE_MS = 5_000;
+
+/**
+ * Incremental reader over a headless provider's JSONL stdout.
+ *
+ * The 2026-08-15 cx53 edge reached a 15.1G RSS on a process that idles in the
+ * tens of MB: `runHeadless` accumulated every chunk of every child's stdout for
+ * the whole turn and then kept the last 4 000 characters. A 77-minute Claude
+ * turn under `--output-format stream-json --verbose` echoes every tool result
+ * into that stream, so the buffer grew without any bound but the turn's length.
+ *
+ * This reader keeps O(1) state instead: the bounded receipt tail, the current
+ * partial line, and the three extraction candidates. It is also the ONLY
+ * extraction path — {@link headlessAcknowledgement} runs the same reader over a
+ * complete string, so the streaming and whole-string shapes cannot drift.
+ */
+export class HeadlessStreamReader {
+  private readonly decoder = new StringDecoder("utf8");
+  private pending = "";
+  private pendingOverflowed = false;
+  private tail = "";
+  private resultText: string | null = null;
+  private agentMessageText: string | null = null;
+  private lastAssistantText: string | null = null;
+  /** Lines dropped for exceeding {@link MAX_STREAM_LINE_CHARS} — surfaced, never silent (R-3). */
+  droppedLines = 0;
+
+  constructor(private readonly tailChars: number) {}
+
+  push(chunk: Buffer): void {
+    this.write(this.decoder.write(chunk));
+  }
+
+  write(text: string): void {
+    if (text.length === 0) return;
+    this.tail = (this.tail + text).slice(-this.tailChars);
+    let rest = text;
+    for (;;) {
+      const newline = rest.indexOf("\n");
+      if (newline === -1) break;
+      this.appendPending(rest.slice(0, newline));
+      this.consumeLine();
+      rest = rest.slice(newline + 1);
+    }
+    this.appendPending(rest);
+  }
+
+  /** Flush the decoder and the trailing partial line. Idempotent. */
+  finish(): void {
+    this.write(this.decoder.end());
+    this.consumeLine();
+  }
+
+  receipt(): string {
+    return this.tail;
+  }
+
+  /**
+   * Characters currently retained. This is the bound the class exists to hold:
+   * it must stay within the receipt tail plus one in-progress line no matter
+   * how much stream has passed through, which is exactly what the old
+   * accumulate-everything reader could not promise.
+   */
+  retainedChars(): number {
+    return this.tail.length + this.pending.length;
+  }
+
+  outcome(): string {
+    const best = this.resultText ?? this.agentMessageText ?? this.lastAssistantText
+      ?? "Headless provider turn completed successfully.";
+    return best.length <= 2_500 ? best : `${best.slice(0, 2_497)}…`;
+  }
+
+  private appendPending(text: string): void {
+    if (text.length === 0) return;
+    if (this.pendingOverflowed) return;
+    if (this.pending.length + text.length > MAX_STREAM_LINE_CHARS) {
+      this.pending = "";
+      this.pendingOverflowed = true;
+      return;
+    }
+    this.pending += text;
+  }
+
+  private consumeLine(): void {
+    const line = this.pending;
+    const overflowed = this.pendingOverflowed;
+    this.pending = "";
+    this.pendingOverflowed = false;
+    if (overflowed) {
+      this.droppedLines += 1;
+      return;
+    }
+    if (line.length === 0) return;
+    try {
+      const value = JSON.parse(line) as Record<string, unknown>;
+      if (value.type === "result" && typeof value.result === "string" && value.result.length > 0) {
+        this.resultText = value.result;
+      }
+      const item = value.item as Record<string, unknown> | undefined;
+      if (value.type === "item.completed" && item?.type === "agent_message" && typeof item.text === "string") {
+        this.agentMessageText = item.text;
+      }
+      if (value.type === "assistant") {
+        const text = assistantMessageText(value.message);
+        if (text) this.lastAssistantText = text;
+      }
+    } catch {
+      // Provider outputs are JSONL on supported surfaces; non-JSON diagnostics are ignored.
+    }
+  }
+}
+
 async function runHeadless(
   command: string,
   args: string[],
   cwd: string,
   stdin: string | null,
   profileEnv: Record<string, string>,
+  signal?: AbortSignal,
 ): Promise<ProviderDispatch> {
+  if (signal?.aborted) throw new Error(`${command} dispatch deadline elapsed before the turn was spawned`);
   const child = spawn(command, args, {
     cwd,
     stdio: ["pipe", "pipe", "pipe"],
     env: composeChildEnv(profileEnv),
   });
   if (stdin !== null) child.stdin.end(stdin); else child.stdin.end();
-  const stdout: Buffer[] = [];
-  const stderr: Buffer[] = [];
+  const stdout = new HeadlessStreamReader(RECEIPT_TAIL_CHARS);
+  const stderr = new HeadlessStreamReader(STDERR_TAIL_CHARS);
   child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
   child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
-  const code = await new Promise<number | null>((resolve, reject) => {
-    child.once("error", reject);
-    child.once("close", resolve);
-  });
-  if (code !== 0) throw new Error(`${command} exited ${code}: ${Buffer.concat(stderr).toString("utf8").slice(-2_000)}`);
-  const output = Buffer.concat(stdout).toString("utf8");
-  return { receipt: output.slice(-4_000), outcome: headlessAcknowledgement(output), processed: true };
+
+  // The edge frees this dispatch's slot the moment its deadline fires, so the
+  // child must not outlive the signal: SIGTERM first, SIGKILL after a grace.
+  let killTimer: ReturnType<typeof setTimeout> | null = null;
+  const onAbort = (): void => {
+    console.error("hive edge provider turn aborted at the dispatch deadline", command, child.pid ?? "no-pid");
+    child.kill("SIGTERM");
+    killTimer = setTimeout(() => child.kill("SIGKILL"), CHILD_KILL_GRACE_MS);
+    killTimer.unref();
+  };
+  signal?.addEventListener("abort", onAbort, { once: true });
+
+  let code: number | null;
+  try {
+    code = await new Promise<number | null>((resolve, reject) => {
+      child.once("error", reject);
+      child.once("close", resolve);
+    });
+  } finally {
+    signal?.removeEventListener("abort", onAbort);
+    if (killTimer !== null) clearTimeout(killTimer);
+  }
+  stdout.finish();
+  stderr.finish();
+  if (stdout.droppedLines > 0) {
+    console.error("hive edge provider stream dropped overlong lines", command, stdout.droppedLines);
+  }
+  if (code !== 0) throw new Error(`${command} exited ${code}: ${stderr.receipt()}`);
+  return { receipt: stdout.receipt(), outcome: stdout.outcome(), processed: true };
 }
 
 /**
@@ -333,29 +495,10 @@ async function runHeadless(
  * stream — never on a truncated receipt.
  */
 export function headlessAcknowledgement(output: string): string {
-  let resultText: string | null = null;
-  let agentMessageText: string | null = null;
-  let lastAssistantText: string | null = null;
-  for (const line of output.split("\n")) {
-    try {
-      const value = JSON.parse(line) as Record<string, unknown>;
-      if (value.type === "result" && typeof value.result === "string" && value.result.length > 0) {
-        resultText = value.result;
-      }
-      const item = value.item as Record<string, unknown> | undefined;
-      if (value.type === "item.completed" && item?.type === "agent_message" && typeof item.text === "string") {
-        agentMessageText = item.text;
-      }
-      if (value.type === "assistant") {
-        const text = assistantMessageText(value.message);
-        if (text) lastAssistantText = text;
-      }
-    } catch {
-      // Provider outputs are JSONL on supported surfaces; non-JSON diagnostics are ignored.
-    }
-  }
-  const best = resultText ?? agentMessageText ?? lastAssistantText ?? "Headless provider turn completed successfully.";
-  return best.length <= 2_500 ? best : `${best.slice(0, 2_497)}…`;
+  const reader = new HeadlessStreamReader(RECEIPT_TAIL_CHARS);
+  reader.write(output);
+  reader.finish();
+  return reader.outcome();
 }
 
 /** Concatenate the text blocks of an `assistant` wire message (Claude/Grok shape). */

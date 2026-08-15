@@ -1,15 +1,38 @@
 import type { Delivery, DeliveryResultInput, Reason, ReplaySnapshot, SubscriptionInput } from "../domain.js";
 
+/**
+ * Wall-clock bound on every broker call the run loop makes.
+ *
+ * Node's `fetch` has no default timeout. A half-open TCP connection to the
+ * broker — the exact failure the broker's own Slack watchdog exists for, one
+ * hop down — yields a request that neither resolves nor rejects. On 2026-08-15
+ * that parked the cx53 edge inside a single `claim()` for 58 minutes: the loop
+ * never returned to poll, five deliveries were never claimed, and `systemctl`
+ * reported the unit active throughout. An unbounded wait inside the loop is
+ * indistinguishable from a healthy long-poll, so the bound has to be here.
+ */
+const BROKER_REQUEST_TIMEOUT_MS = 20_000;
+
+/** Marker text kept in the message so the edge's error classifier can name this failure. */
+export const BROKER_REQUEST_TIMEOUT_CODE = "broker_request_timeout";
+
 export class BrokerClient {
   constructor(
     private readonly baseUrl: string,
     readonly edgeId: string,
     private readonly token: string,
+    private readonly timeoutMs = BROKER_REQUEST_TIMEOUT_MS,
   ) {}
 
   async claim(after: number, waitMs = 25_000, busyActors: readonly string[] = []): Promise<Delivery | null> {
     const busy = busyActors.length > 0 ? `&busy=${encodeURIComponent(busyActors.join(","))}` : "";
-    const response = await this.request(`/v1/deliveries?after=${after}&wait_ms=${waitMs}${busy}`, { method: "GET" });
+    // The long-poll is expected to hold open for `waitMs`; only the margin past
+    // its own declared window is evidence of a wedged connection.
+    const response = await this.request(
+      `/v1/deliveries?after=${after}&wait_ms=${waitMs}${busy}`,
+      { method: "GET" },
+      waitMs + this.timeoutMs,
+    );
     if (response.status === 204) return null;
     return this.json<Delivery>(response);
   }
@@ -115,15 +138,27 @@ export class BrokerClient {
     return this.json<Delivery>(response);
   }
 
-  private request(path: string, init: RequestInit): Promise<Response> {
-    return fetch(`${this.baseUrl}${path}`, {
-      ...init,
-      headers: {
-        authorization: `Bearer ${this.token}`,
-        "x-hive-edge": this.edgeId,
-        ...(init.body ? { "content-type": "application/json" } : {}),
-      },
-    });
+  private async request(path: string, init: RequestInit, timeoutMs = this.timeoutMs): Promise<Response> {
+    try {
+      return await fetch(`${this.baseUrl}${path}`, {
+        ...init,
+        signal: AbortSignal.timeout(timeoutMs),
+        headers: {
+          authorization: `Bearer ${this.token}`,
+          "x-hive-edge": this.edgeId,
+          ...(init.body ? { "content-type": "application/json" } : {}),
+        },
+      });
+    } catch (error) {
+      // A timeout is ordinary uncertainty, not a distinct protocol outcome: the
+      // caller's own failure path releases the delivery and the loop polls
+      // again. Naming it keeps the journal legible instead of collapsing to the
+      // opaque `edge_iteration_failed` that hid the 2026-08-15 wedge.
+      if (error instanceof Error && error.name === "TimeoutError") {
+        throw new Error(`${BROKER_REQUEST_TIMEOUT_CODE}: ${init.method ?? "GET"} ${path} exceeded ${timeoutMs}ms`);
+      }
+      throw error;
+    }
   }
 
   private async json<T>(response: Response): Promise<T> {
