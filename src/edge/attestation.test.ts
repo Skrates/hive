@@ -4,7 +4,13 @@ import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { ATTESTATION_FILENAME, MAX_ATTESTATION_BYTES, readWakeAttestation } from "./attestation.js";
+import {
+  ATTESTATION_FILENAME,
+  MAX_ATTESTATION_BYTES,
+  attestationWire,
+  parseAttestationWire,
+  readWakeAttestation,
+} from "./attestation.js";
 import { bindingFor } from "./store.js";
 
 function profileWith(record: unknown | string): string {
@@ -96,6 +102,17 @@ test("a FIFO attestation is unreadable instead of blocking the edge loop", { tim
   const read = readWakeAttestation(dir);
   assert.equal(read.ok, false);
   assert.equal(bindingFor(read, "gnomon").absence, "attestation_unreadable");
+});
+
+test("the live-register wire form round-trips a successful read", () => {
+  const read = readWakeAttestation(profileWith(record()));
+  const parsed = parseAttestationWire(attestationWire(read));
+  assert.deepEqual(parsed, read);
+});
+
+test("a missing live-register attestation is treated as unset, not unreadable", () => {
+  assert.equal(parseAttestationWire(undefined), undefined);
+  assert.equal(parseAttestationWire(null), undefined);
 });
 
 test("an oversized attestation is unreadable instead of an unbounded read", () => {

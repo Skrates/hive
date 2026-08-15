@@ -74,6 +74,57 @@ export function readWakeAttestation(accountProfile: string): AttestationRead {
   return { ok: true, attestation: { attestationId, doctrineCommit, actor } };
 }
 
+/** Flattened wire form a live surface puts on `/live/register`. */
+export type AttestationWire =
+  | { ok: true; attestationId: string; doctrineCommit: string; actor: string }
+  | { ok: false; absence: Exclude<AttestationAbsence, "attestation_actor_mismatch"> };
+
+export function attestationWire(read: AttestationRead): AttestationWire {
+  if (read.ok) {
+    return {
+      ok: true,
+      attestationId: read.attestation.attestationId,
+      doctrineCommit: read.attestation.doctrineCommit,
+      actor: read.attestation.actor,
+    };
+  }
+  // Actor mismatch is computed at bind time against the delivery, never sent
+  // by a surface as a claimed absence.
+  if (read.absence === "attestation_actor_mismatch") {
+    return { ok: false, absence: "attestation_unreadable" };
+  }
+  return { ok: false, absence: read.absence };
+}
+
+export function parseAttestationWire(value: unknown): AttestationRead | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "object" || Array.isArray(value)) throw new Error("invalid attestation");
+  const rec = value as Record<string, unknown>;
+  if (rec.ok === true) {
+    const { attestationId, doctrineCommit, actor } = rec;
+    if (typeof attestationId !== "string" || typeof doctrineCommit !== "string" || typeof actor !== "string") {
+      throw new Error("invalid attestation");
+    }
+    if (attestationId.length === 0 || doctrineCommit.length === 0 || actor.length === 0) {
+      throw new Error("invalid attestation");
+    }
+    return { ok: true, attestation: { attestationId, doctrineCommit, actor } };
+  }
+  if (rec.ok === false) {
+    const absence = rec.absence;
+    if (
+      absence !== "no_attestation_file"
+      && absence !== "attestation_unreadable"
+      && absence !== "attestation_unknown_schema"
+      && absence !== "attestation_incomplete"
+    ) {
+      throw new Error("invalid attestation");
+    }
+    return { ok: false, absence };
+  }
+  throw new Error("invalid attestation");
+}
+
 /**
  * Open-and-read that cannot stall the edge loop. `dispatchClaimed` calls this
  * before its first `await`, so a FIFO or device left at the attestation path

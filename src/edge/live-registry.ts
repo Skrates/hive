@@ -1,3 +1,4 @@
+import type { AttestationRead } from "./attestation.js";
 import type { Provider } from "../domain.js";
 
 /**
@@ -14,6 +15,13 @@ export interface LiveIngressRegistration {
   readonly socketPath: string;
   readonly sessionId: string | null;
   readonly surfaceVersion: string;
+  /**
+   * Attestation of the home this surface actually loaded — Desktop state
+   * home for a foreground Codex attachment, the pinned profile otherwise.
+   * Captured by the surface so the edge does not bind a split-state
+   * delivery to artifacts the turn never used.
+   */
+  readonly runtimeAttestation?: AttestationRead;
 }
 
 export interface LiveIngress extends LiveIngressRegistration {

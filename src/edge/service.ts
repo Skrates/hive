@@ -6,7 +6,7 @@ import {
   type ProviderAdapter,
   type ProviderDispatch,
 } from "./providers.js";
-import { readWakeAttestation } from "./attestation.js";
+import { readWakeAttestation, type AttestationRead } from "./attestation.js";
 import { EdgeStore, bindingFor } from "./store.js";
 
 export interface EdgeTimers {
@@ -155,10 +155,7 @@ export class EdgeService {
       // outcome must resolve to the artifacts installed when the turn started
       // (KRA-1077). Reading the record can never fail the wake — an absent or
       // unreadable one is stored as a named absence, never as silence.
-      const binding = bindingFor(
-        readWakeAttestation(delivery.subscription.accountProfile),
-        delivery.actor,
-      );
+      const binding = bindingFor(attestationForDelivery(this.live, delivery), delivery.actor);
       const existing = this.store.receive(delivery, generation, binding);
       if (["dispatched", "processed"].includes(existing.status)) return;
 
@@ -405,6 +402,17 @@ function safeEdgeErrorCode(error: unknown): string {
     "account_profile_mismatch",
     "stale lease",
   ].find((code) => message.includes(code)) ?? "edge_iteration_failed";
+}
+
+/**
+ * A live surface that announced a runtime home wins over a fresh read of the
+ * pinned `accountProfile`. Foreground Codex split-state (`HIVE_CODEX_DESKTOP_HOME`
+ * ≠ pinned profile) injects into Desktop; only that home's attestation names
+ * the artifacts the turn actually used.
+ */
+function attestationForDelivery(live: LiveIngressRegistry, delivery: Delivery): AttestationRead {
+  return live.get(delivery.actor, delivery.subscription.provider)?.runtimeAttestation
+    ?? readWakeAttestation(delivery.subscription.accountProfile);
 }
 
 function delay(ms: number): Promise<void> {

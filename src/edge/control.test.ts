@@ -54,6 +54,36 @@ test("the control plane binds an owner-only UDS socket and registers liveness", 
   assert.equal(live.get("claude-1", "codex"), null);
 });
 
+test("a live register carries the surface's runtime attestation", async (t) => {
+  const { root, socketPath, live, server } = fixture();
+  t.after(async () => {
+    await server.stop();
+    rmSync(root, { recursive: true, force: true });
+  });
+  await server.start();
+
+  await udsRequestJson(socketPath, "POST", "/live/register", {
+    actor: "codex-1",
+    provider: "codex",
+    socketPath: join(root, "codex-live.sock"),
+    sessionId: "desktop-task",
+    surfaceVersion: "hive-codex-live",
+    ttlMs: 120_000,
+    attestation: {
+      ok: true,
+      attestationId: "sha256:" + "d".repeat(64),
+      doctrineCommit: "2".repeat(40),
+      actor: "codex-1",
+    },
+  });
+  const ingress = live.get("codex-1", "codex");
+  assert.ok(ingress);
+  assert.equal(ingress.runtimeAttestation?.ok, true);
+  if (ingress.runtimeAttestation?.ok) {
+    assert.equal(ingress.runtimeAttestation.attestation.attestationId, "sha256:" + "d".repeat(64));
+  }
+});
+
 test("the control plane relays agent outcomes to the broker without a lease fence", async (t) => {
   const { root, socketPath, outcomes, server } = fixture();
   t.after(async () => {

@@ -496,6 +496,49 @@ test("a seat with no attestation still wakes, and the delivery says why it is un
   store.close();
 });
 
+test("a live Desktop delivery binds to the surface's runtime home, not the pinned profile", async () => {
+  // Split-state: HIVE_CODEX_DESKTOP_HOME ≠ accountProfile. Injection uses
+  // Desktop; only that home's attestation names the artifacts the turn used.
+  const pinned = mkdtempSync(join(tmpdir(), "weave-pinned-"));
+  writeFileSync(join(pinned, ATTESTATION_FILENAME), JSON.stringify({
+    schema: "weave.attestation/1",
+    attestation_id: "sha256:" + "c".repeat(64),
+    actor: "ariadne",
+    doctrine: { remote: "RationallyPrime/weave-doctrine", commit: "1".repeat(40) },
+  }));
+
+  const live = new LiveIngressRegistry();
+  live.register({
+    actor: "ariadne",
+    provider: "codex",
+    socketPath: "/tmp/x.sock",
+    sessionId: "desktop-task",
+    surfaceVersion: "test",
+    runtimeAttestation: {
+      ok: true,
+      attestation: {
+        attestationId: "sha256:" + "d".repeat(64),
+        doctrineCommit: "2".repeat(40),
+        actor: "ariadne",
+      },
+    },
+  }, 60_000);
+
+  const broker = new FakeBroker([delivery(1, {
+    subscription: subscription({ accountProfile: pinned, wakePolicy: "live_only" }),
+  })]);
+  const store = new EdgeStore(":memory:");
+  const edge = new EdgeService(asBrokerClient(broker), store, live, [new StubAdapter({
+    liveResult: { receipt: "live:1", outcome: "ok", processed: true },
+  })]);
+
+  assert.equal(await edge.processOne(), true);
+  const row = store.get(1)!;
+  assert.equal(row.attestation_id, "sha256:" + "d".repeat(64));
+  assert.equal(row.doctrine_commit, "2".repeat(40));
+  store.close();
+});
+
 test("a wake run from another seat's profile records the mismatch on the delivery", async () => {
   // The 2026-08-15 misbound-seat scar, now leaving evidence at wake time
   // rather than needing git forensics afterwards.

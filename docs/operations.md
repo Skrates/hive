@@ -151,12 +151,14 @@ the thread posts above remain the durable record, and a failed stamp is logged a
 
 ## Wake attestation binding (KRA-1077)
 
-Every delivery the edge claims is bound, before dispatch, to the attestation of the account
-profile it will execute under. The edge reads `.weave-attestation.json` from the subscription's
-`accountProfile` — the record `weave-doctrine`'s installer persists — and stores its
-`attestation_id` and doctrine commit in the same `local_deliveries` row as the provider receipt.
-That row is the trace: delivery id → attestation id → the exact instruction, settings, and skill
-corpus hashes the seat was installed with. `weave doctor` resolves the other end.
+Every delivery the edge claims is bound, before dispatch, to the attestation of the home the
+turn will actually execute under. Headless spawn/resume reads `.weave-attestation.json` from the
+subscription's `accountProfile`. A live surface that has registered a runtime attestation wins
+instead — a foreground Codex Desktop attachment (`HIVE_CODEX_DESKTOP_HOME` ≠ pinned profile)
+injects into Desktop and must be bound to Desktop's record, not the pinned profile's. The
+`attestation_id` and doctrine commit sit in the same `local_deliveries` row as the provider
+receipt. That row is the trace: delivery id → attestation id → the exact instruction, settings,
+and skill corpus hashes the seat was installed with. `weave doctor` resolves the other end.
 
 The edge records; it does not verify and it does not refuse.
 

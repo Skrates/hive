@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { ProviderSchema } from "../domain.js";
 import { prepareSocketPath } from "../local/uds.js";
+import { parseAttestationWire } from "./attestation.js";
 import { LiveIngressRegistryError } from "./live-registry.js";
 import type { EdgeService } from "./service.js";
 
@@ -64,12 +65,14 @@ export class EdgeControlServer {
         : requiredString(body.sessionId, "sessionId");
       const ttlMs = Number(body.ttlMs ?? 30_000);
       if (!Number.isInteger(ttlMs) || ttlMs < 1_000 || ttlMs > 600_000) throw new Error("invalid ttlMs");
+      const runtimeAttestation = parseAttestationWire(body.attestation);
       const ingress = this.edge.live.register({
         actor,
         provider: parsedProvider.data,
         socketPath,
         sessionId,
         surfaceVersion,
+        ...(runtimeAttestation !== undefined ? { runtimeAttestation } : {}),
       }, ttlMs);
       return json(response, 200, ingress);
     }
@@ -122,6 +125,7 @@ function safeControlError(error: unknown): string {
     || message === "invalid provider"
     || message === "invalid ttlMs"
     || message === "invalid deliveryId"
+    || message === "invalid attestation"
     || message.startsWith("missing ")
   ) return message;
   return "edge_request_failed";
