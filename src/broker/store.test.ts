@@ -728,13 +728,17 @@ function mintFixture() {
   }));
   store.ingestEvent(event());
   const source = store.claimNext("mac", 0)!;
-  return { store, clock, sourceId: source.id };
+  const mint = (
+    input: { sourceDeliveryId: number; actor: string; text: string; threadTs: string | null },
+    edgeId = "mac",
+  ) => store.mintSeatWake(input, edgeId);
+  return { store, clock, sourceId: source.id, mint };
 }
 
 test("a seat mint commits the delivery and its commons render in one transaction", () => {
-  const { store, sourceId } = mintFixture();
+  const { store, sourceId, mint } = mintFixture();
 
-  const receipt = store.mintSeatWake({
+  const receipt = mint({
     sourceDeliveryId: sourceId,
     actor: "gnomon",
     text: "please verify the KRA-1056 gate set",
@@ -771,8 +775,8 @@ test("a seat mint commits the delivery and its commons render in one transaction
 });
 
 test("a minted wake frames its sender as a seat, not as an operator", () => {
-  const { store, sourceId } = mintFixture();
-  const receipt = store.mintSeatWake({
+  const { store, sourceId, mint } = mintFixture();
+  const receipt = mint({
     sourceDeliveryId: sourceId,
     actor: "gnomon",
     text: "burn the findings on #1069",
@@ -788,11 +792,11 @@ test("a minted wake frames its sender as a seat, not as an operator", () => {
 });
 
 test("a replayed mint is a no-op that names the original delivery", () => {
-  const { store, sourceId } = mintFixture();
+  const { store, sourceId, mint } = mintFixture();
   const input = { sourceDeliveryId: sourceId, actor: "gnomon", text: "same text", threadTs: null };
 
-  const first = store.mintSeatWake(input);
-  const second = store.mintSeatWake(input);
+  const first = mint(input);
+  const second = mint(input);
 
   assert.equal(second.deliveryId, first.deliveryId);
   assert.equal(second.created, false);
@@ -802,7 +806,7 @@ test("a replayed mint is a no-op that names the original delivery", () => {
 
   // Different text from the same source is a genuinely new wake, and coalesces
   // into the still-pending delivery exactly as a second Slack wake would.
-  const third = store.mintSeatWake({ ...input, text: "different text" });
+  const third = mint({ ...input, text: "different text" });
   assert.equal(third.created, true);
   assert.equal(third.deliveryId, first.deliveryId);
   assert.equal(store.listUnsentOutbox().filter((entry) => /wake minted by/.test(entry.text)).length, 2);
@@ -810,12 +814,12 @@ test("a replayed mint is a no-op that names the original delivery", () => {
 });
 
 test("an undeliverable mint throws and leaves no trace of itself", () => {
-  const { store, sourceId } = mintFixture();
+  const { store, sourceId, mint } = mintFixture();
 
   // R-3: no live subscription means this wake would reach no one. It fails to
   // the minting seat instead of dead-lettering as a notice nobody is waiting on.
   assert.throws(
-    () => store.mintSeatWake({ sourceDeliveryId: sourceId, actor: "theoros", text: "hi", threadTs: null }),
+    () => mint({ sourceDeliveryId: sourceId, actor: "theoros", text: "hi", threadTs: null }),
     (error: unknown) => error instanceof SeatWakeRefusedError && error.code === "unroutable_actor",
   );
   // The whole transaction rolled back: a refused mint never leaves an orphan
@@ -829,26 +833,31 @@ test("an undeliverable mint throws and leaves no trace of itself", () => {
 
   // A seat cannot broadcast: `everyone` expansion stays a human-sender act.
   assert.throws(
-    () => store.mintSeatWake({ sourceDeliveryId: sourceId, actor: "everyone", text: "all hands", threadTs: null }),
+    () => mint({ sourceDeliveryId: sourceId, actor: "everyone", text: "all hands", threadTs: null }),
     (error: unknown) => error instanceof SeatWakeRefusedError && error.code === "broadcast_forbidden",
   );
   // A seat cannot wake itself: each minted run could mint again, forever, with
   // no operator in the loop.
   assert.throws(
-    () => store.mintSeatWake({ sourceDeliveryId: sourceId, actor: "ariadne", text: "again", threadTs: null }),
+    () => mint({ sourceDeliveryId: sourceId, actor: "ariadne", text: "again", threadTs: null }),
     (error: unknown) => error instanceof SeatWakeRefusedError && error.code === "self_mint_forbidden",
   );
   // A source delivery that is not in the ledger resolves no minting seat.
   assert.throws(
-    () => store.mintSeatWake({ sourceDeliveryId: 9_999, actor: "gnomon", text: "hi", threadTs: null }),
+    () => mint({ sourceDeliveryId: 9_999, actor: "gnomon", text: "hi", threadTs: null }),
     (error: unknown) => error instanceof SeatWakeRefusedError && error.code === "unknown_source_delivery",
+  );
+  // A malformed --thread is refused here, before Slack is asked.
+  assert.throws(
+    () => mint({ sourceDeliveryId: sourceId, actor: "gnomon", text: "hi", threadTs: "not-a-thread" }),
+    (error: unknown) => error instanceof SeatWakeRefusedError && error.code === "invalid_thread",
   );
   store.close();
 });
 
 test("a minted delivery stamps no reaction, but still stamps a real message it absorbs", () => {
-  const { store, sourceId } = mintFixture();
-  const receipt = store.mintSeatWake({
+  const { store, sourceId, mint } = mintFixture();
+  const receipt = mint({
     sourceDeliveryId: sourceId,
     actor: "gnomon",
     text: "take KRA-1099",
@@ -879,8 +888,8 @@ test("a minted delivery stamps no reaction, but still stamps a real message it a
 });
 
 test("a real Slack message coalesced into a minted delivery is still stamped", () => {
-  const { store, sourceId } = mintFixture();
-  const receipt = store.mintSeatWake({
+  const { store, sourceId, mint } = mintFixture();
+  const receipt = mint({
     sourceDeliveryId: sourceId,
     actor: "gnomon",
     text: "take KRA-1099",
@@ -903,8 +912,8 @@ test("a real Slack message coalesced into a minted delivery is still stamped", (
 });
 
 test("a mint can target another thread in the same channel", () => {
-  const { store, sourceId } = mintFixture();
-  const receipt = store.mintSeatWake({
+  const { store, sourceId, mint } = mintFixture();
+  const receipt = mint({
     sourceDeliveryId: sourceId,
     actor: "gnomon",
     text: "picking this up over here",
@@ -920,5 +929,60 @@ test("a mint can target another thread in the same channel", () => {
   assert.equal(render.threadTs, "200.1");
   // Thread affinity now routes follow-ups in that thread to the woken seat.
   assert.deepEqual(store.actorsBoundToThread("C1", "200.1"), ["gnomon"]);
+  store.close();
+});
+
+test("a mint binds the source delivery to the calling edge's current fence", () => {
+  const { store, sourceId, mint } = mintFixture();
+  const input = { sourceDeliveryId: sourceId, actor: "gnomon", text: "from this fence", threadTs: null };
+
+  // Another authenticated edge cannot mint from this delivery, even though
+  // the id is in the ledger — attribution would otherwise be stolen.
+  assert.throws(
+    () => mint(input, "dev"),
+    (error: unknown) => error instanceof SeatWakeRefusedError && error.code === "source_not_held",
+  );
+
+  // An unclaimed delivery is not a fenced execution.
+  store.ingestEvent(event({ eventId: "Ev-pending", messageTs: "100.8", text: "WAKE: ariadne | later" }));
+  const pendingId = store.listDeliveries().find((delivery) => delivery.status === "pending")!.id;
+  assert.throws(
+    () => mint({ ...input, sourceDeliveryId: pendingId }),
+    (error: unknown) => error instanceof SeatWakeRefusedError && error.code === "source_not_held",
+  );
+
+  // A terminal delivery can no longer name a minting seat.
+  const source = store.getDelivery(sourceId);
+  store.transition(sourceId, "mac", source.leaseGeneration!, "claimed", "accepted_local");
+  store.transition(sourceId, "mac", source.leaseGeneration!, "accepted_local", "dispatching");
+  store.markDispatched(sourceId, "mac", source.leaseGeneration!);
+  store.finish(sourceId, "mac", source.leaseGeneration!, "processed", []);
+  assert.throws(
+    () => mint(input),
+    (error: unknown) => error instanceof SeatWakeRefusedError && error.code === "source_not_held",
+  );
+  store.close();
+});
+
+test("subscription actors are stored under the same canonical key wake targets use", () => {
+  const parsed = SubscriptionInputSchema.parse(subscription({ actor: "Gnomon" }));
+  assert.equal(parsed.actor, "gnomon");
+
+  const { store, sourceId, mint } = mintFixture();
+  store.upsertSubscription(SubscriptionInputSchema.parse(subscription({
+    actor: "Theoros",
+    provider: "claude",
+    homeEdge: "dev",
+    sessionId: null,
+    wakePolicy: "spawn",
+    accountProfile: "/home/hive/.hive/profiles/theoros",
+  })));
+  const receipt = mint({
+    sourceDeliveryId: sourceId,
+    actor: "Theoros",
+    text: "mixed-case target must resolve",
+    threadTs: null,
+  });
+  assert.equal(receipt.actor, "theoros");
   store.close();
 });

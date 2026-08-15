@@ -65,9 +65,19 @@ export class SeatWakeRefusedError extends Error {
 
 export type SeatWakeRefusalCode =
   | "unknown_source_delivery"
+  | "source_not_held"
+  | "invalid_thread"
   | "unroutable_actor"
   | "self_mint_forbidden"
   | "broadcast_forbidden";
+
+/** Statuses in which an edge still holds the single-claimant fence. */
+const FENCED = new Set<DeliveryStatus>([
+  "claimed",
+  "accepted_local",
+  "dispatching",
+  "dispatched",
+]);
 
 export interface OutboxEntry {
   outboxId: number;
@@ -583,6 +593,8 @@ export class BrokerStore {
    *
    * - **Attribution is ledger-derived.** The minting seat is whoever owns the
    *   source delivery, read from this store. A caller cannot name a sender.
+   *   The source must be the calling edge's current fenced delivery — an
+   *   authenticated edge cannot mint from another seat's (or a terminal) row.
    * - **INV-48 spirit: the ledger commits before any Slack render.** The
    *   delivery row and the commons post are one transaction, and the post is
    *   an outbox row stamped `hive_*` on the way out — visible to humans,
@@ -593,7 +605,7 @@ export class BrokerStore {
    * The mint is idempotent over (source delivery, target, thread, text): a
    * replayed command returns the original delivery and posts nothing new.
    */
-  mintSeatWake(input: SeatWakeInput): SeatWakeReceipt {
+  mintSeatWake(input: SeatWakeInput, edgeId: string): SeatWakeReceipt {
     return this.db.transaction(() => {
       const sourceRow = this.db.prepare("SELECT delivery_id FROM deliveries WHERE delivery_id=?")
         .get(input.sourceDeliveryId) as Row | undefined;
@@ -604,8 +616,28 @@ export class BrokerStore {
         );
       }
       const source = this.getDelivery(input.sourceDeliveryId);
+      if (TERMINAL.has(source.status)) {
+        throw new SeatWakeRefusedError(
+          "source_not_held",
+          `delivery ${input.sourceDeliveryId} is ${source.status} and can no longer mint a wake`,
+        );
+      }
+      if (source.claimedBy !== edgeId || !FENCED.has(source.status)) {
+        throw new SeatWakeRefusedError(
+          "source_not_held",
+          source.claimedBy === null
+            ? `delivery ${input.sourceDeliveryId} is not currently fenced on any edge`
+            : `delivery ${input.sourceDeliveryId} is held by edge \`${source.claimedBy}\`, not this caller`,
+        );
+      }
+      if (input.threadTs !== null && !isSlackMessageTs(input.threadTs)) {
+        throw new SeatWakeRefusedError(
+          "invalid_thread",
+          `thread coordinate \`${input.threadTs}\` is not a Slack message timestamp`,
+        );
+      }
       const from = source.actor;
-      const target = input.actor;
+      const target = input.actor.toLowerCase();
       // A seat never fans out: `everyone` expansion is reserved for a human
       // sender (the same rule that keeps a quoted "WAKE: everyone" in an agent
       // reply from chain-waking the fleet).
