@@ -351,14 +351,16 @@ export async function completeCodexDelivery(
 ): Promise<CompletedLiveDelivery> {
   const deadline = turnDeadline(delivery, now, bound.deadlineAt);
   throwIfAborted(bound.signal);
-  const accepted = await client.deliver(
-    threadId,
-    framed,
-    delivery.id,
-    remainingBefore(deadline, now),
-  );
-  throwIfAborted(bound.signal);
+  let acceptedTurnId: string | undefined;
   try {
+    const accepted = await client.deliver(
+      threadId,
+      framed,
+      delivery.id,
+      remainingBefore(deadline, now),
+    );
+    acceptedTurnId = accepted.turnId;
+    throwIfAborted(bound.signal);
     const completion = await client.waitForCompletion(
       threadId,
       accepted.turnId,
@@ -385,7 +387,7 @@ export async function completeCodexDelivery(
       processed: true,
     };
   } catch (error) {
-    await interruptAcceptedTurn(client, threadId, accepted.turnId);
+    if (acceptedTurnId !== undefined) await interruptAcceptedTurn(client, threadId, acceptedTurnId);
     throw error;
   }
 }
@@ -400,14 +402,16 @@ export async function completeDesktopDelivery(
 ): Promise<CompletedLiveDelivery> {
   const deadline = turnDeadline(delivery, now, bound.deadlineAt);
   throwIfAborted(bound.signal);
-  const accepted = await client.deliver(
-    sessionId,
-    framed,
-    desktopDeliveryKey(delivery),
-    remainingBefore(deadline, now),
-  );
-  throwIfAborted(bound.signal);
+  let acceptedTurnId: string | undefined;
   try {
+    const accepted = await client.deliver(
+      sessionId,
+      framed,
+      desktopDeliveryKey(delivery),
+      remainingBefore(deadline, now),
+    );
+    acceptedTurnId = accepted.turnId;
+    throwIfAborted(bound.signal);
     const completion = await client.waitForDeliveryOutcome(
       sessionId,
       accepted,
@@ -434,7 +438,7 @@ export async function completeDesktopDelivery(
       processed: true,
     };
   } catch (error) {
-    await interruptAcceptedTurn(client, sessionId, accepted.turnId);
+    if (acceptedTurnId !== undefined) await interruptAcceptedTurn(client, sessionId, acceptedTurnId);
     throw error;
   }
 }

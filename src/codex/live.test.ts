@@ -257,6 +257,53 @@ test("aborting after accept interrupts the exact accepted turn on both surfaces"
   assert.deepEqual(interrupted, ["app:turn-live", "desktop:turn-desktop"]);
 });
 
+test("an abort that arrives while deliver() is accepting still interrupts the acquired turn", async () => {
+  const interrupted: string[] = [];
+  const controller = new AbortController();
+  let finishApp!: (value: { turnId: string; mode: "start" }) => void;
+  let finishDesktop!: (value: { turnId: string; clientUserMessageId: string; mode: "steer" }) => void;
+  let accepting = 0;
+  const client = {
+    async deliver() {
+      accepting += 1;
+      return await new Promise<{ turnId: string; mode: "start" }>((resolve) => { finishApp = resolve; });
+    },
+    async waitForCompletion() { throw new Error("should not wait after a late abort"); },
+    async interrupt(_threadId: string, turnId: string) { interrupted.push(`app:${turnId}`); },
+  };
+  const desktopClient = {
+    async deliver() {
+      accepting += 1;
+      return await new Promise<{ turnId: string; clientUserMessageId: string; mode: "steer" }>((resolve) => {
+        finishDesktop = resolve;
+      });
+    },
+    async waitForDeliveryOutcome() { throw new Error("should not wait after a late abort"); },
+    async interrupt(_sessionId: string, turnId: string) { interrupted.push(`desktop:${turnId}`); },
+  };
+  const now = Date.parse("2026-08-06T11:26:45.000Z");
+  const app = completeCodexDelivery(client, "thread-1", delivery(now), "wake", () => now, {
+    signal: controller.signal,
+  });
+  const desktop = completeDesktopDelivery(
+    desktopClient,
+    "foreground-task",
+    delivery(now),
+    "wake",
+    () => now,
+    { signal: controller.signal },
+  );
+  const deadline = Date.now() + 1_000;
+  while (accepting < 2 && Date.now() < deadline) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(accepting, 2, "both surfaces are awaiting provider acceptance");
+  controller.abort();
+  finishApp({ turnId: "turn-late-accept", mode: "start" });
+  finishDesktop({ turnId: "turn-desktop-late", clientUserMessageId: "k", mode: "steer" });
+  await assert.rejects(() => app, /aborted/);
+  await assert.rejects(() => desktop, /aborted/);
+  assert.deepEqual(interrupted, ["app:turn-late-accept", "desktop:turn-desktop-late"]);
+});
+
 test("an already-aborted live bound fails before a provider turn is started", async () => {
   let started = false;
   const client = {
