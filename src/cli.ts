@@ -11,7 +11,7 @@ import { BrokerService } from "./broker/service.js";
 import { SlackSocketIngress, SlackWebTransport } from "./broker/slack.js";
 import { BrokerStore } from "./broker/store.js";
 import { SlackDeafnessWatchdog } from "./broker/watchdog.js";
-import { SubscriptionInputSchema, type Delivery } from "./domain.js";
+import { SubscriptionInputSchema, type Delivery, type SeatWakeReceipt } from "./domain.js";
 import { ensureEdgeStateDirs } from "./edge/bootstrap.js";
 import { BrokerClient } from "./edge/broker-client.js";
 import { EdgeControlServer } from "./edge/control.js";
@@ -20,7 +20,7 @@ import { ProxyAgent, setGlobalDispatcher } from "undici";
 import { ClaudeProvider, CodexProvider, GrokProvider } from "./edge/providers.js";
 import { EdgeService } from "./edge/service.js";
 import { EdgeStore } from "./edge/store.js";
-import { udsRequestJson } from "./local/uds.js";
+import { udsRequestJson, UdsHttpError } from "./local/uds.js";
 import {
   assertCodexAttachmentActor,
   CODEX_ATTACHMENT_CONFIRMATION_TIMEOUT_MS,
@@ -142,6 +142,48 @@ program.command("reply")
     const socketPath = process.env.HIVE_EDGE_SOCKET ?? join(hiveHome(), "edge.sock");
     await udsRequestJson(socketPath, "POST", "/outcome", { deliveryId: id, text: text.join(" ") });
     process.stdout.write(`outcome recorded for delivery ${id}\n`);
+  });
+
+program.command("wake")
+  .argument("<actor>", "the peer seat to wake")
+  .argument("<text...>", "the instruction to deliver")
+  .option("--from <delivery-id>", "the delivery this seat is executing (default: $HIVE_DELIVERY_ID)")
+  .option("--thread <thread-ts>", "target thread in the source delivery's channel (default: that delivery's thread)")
+  .description("mint a wake for a peer seat (KRA-1097)")
+  .action(async (actor: string, text: string[], options: { from?: string; thread?: string }) => {
+    // The minting seat is named by the delivery it is executing: the broker
+    // resolves the sender from its own ledger, so a seat can neither forge an
+    // attribution nor lose one. A headless wake exports HIVE_DELIVERY_ID; a
+    // live-delivered wake carries the id in its envelope, for `--from`.
+    const source = options.from ?? process.env.HIVE_DELIVERY_ID;
+    if (!source) {
+      throw new Error(
+        "no source delivery: pass --from <delivery-id> (the delivery named in your wake envelope) "
+        + "or run inside a headless wake, which exports HIVE_DELIVERY_ID",
+      );
+    }
+    const sourceDeliveryId = Number(source);
+    if (!Number.isInteger(sourceDeliveryId) || sourceDeliveryId < 1) {
+      throw new Error("--from must be a positive integer delivery id");
+    }
+    const socketPath = process.env.HIVE_EDGE_SOCKET ?? join(hiveHome(), "edge.sock");
+    let receipt: SeatWakeReceipt;
+    try {
+      receipt = await udsRequestJson<SeatWakeReceipt>(socketPath, "POST", "/wake", {
+        sourceDeliveryId,
+        actor,
+        text: text.join(" "),
+        threadTs: options.thread ?? null,
+      });
+    } catch (error) {
+      // R-3: a mint that could not be delivered says so, loudly and non-zero.
+      // Never "posted" with nothing behind it.
+      if (error instanceof UdsHttpError) throw new Error(`hive wake refused: ${refusalDetail(error.responseBody)}`);
+      throw error;
+    }
+    process.stdout.write(receipt.created
+      ? `minted delivery ${receipt.deliveryId}: ${receipt.from} → ${receipt.actor} in ${receipt.channelId}/${receipt.threadTs}\n`
+      : `already minted as delivery ${receipt.deliveryId}: ${receipt.from} → ${receipt.actor} (identical text, nothing re-sent)\n`);
   });
 
 program.command("attach")
@@ -279,6 +321,23 @@ const EdgeConfig = z.object({
    */
   HIVE_BROKER_PROXY: z.string().url().optional(),
 });
+
+/**
+ * The reason a mint was refused, taken from the edge's relayed error envelope.
+ * A body that is not that envelope is surfaced raw rather than guessed at — the
+ * seat must always be able to see what actually happened.
+ */
+function refusalDetail(body: string): string {
+  try {
+    const value = JSON.parse(body) as { error?: unknown; detail?: unknown };
+    if (typeof value.error === "string") {
+      return typeof value.detail === "string" ? `${value.error} — ${value.detail}` : value.error;
+    }
+  } catch {
+    // fall through to the raw body below
+  }
+  return body.slice(0, 500);
+}
 
 function requiredEnv(name: string): string {
   const value = process.env[name];

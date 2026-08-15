@@ -46,12 +46,31 @@ export class ProviderPreDispatchError extends Error {
   }
 }
 
+/**
+ * The delivery a headless turn is executing, carried into the child process.
+ *
+ * KRA-1097: `hive wake` names its minting seat by the delivery being executed,
+ * and the broker resolves the sender from that delivery's ledger row. Exporting
+ * the id means a completing seat can address a peer with one act rather than
+ * re-typing an id it was already handed in its envelope.
+ *
+ * `HIVE_ACTOR` is deliberately NOT exported alongside it. The Claude session
+ * hook reads `HIVE_ACTOR` and registers that session as the actor's LIVE
+ * ingress; exporting it into an ephemeral headless run would point the actor's
+ * live registration at a process that exits moments later, diverting the next
+ * wake into an inbox no session drains. The mint needs no actor env anyway —
+ * attribution comes from the ledger, never from the child's environment.
+ */
+export interface HeadlessDispatch {
+  deliveryId: number;
+}
+
 export interface ProviderAdapter {
   provider: Provider;
   preflight?(subscription: Subscription): void;
   deliverLive(ingress: LiveIngress, delivery: Delivery, framed: string): Promise<ProviderDispatch>;
-  resume(subscription: Subscription, cwd: string, framed: string): Promise<ProviderDispatch>;
-  spawn(subscription: Subscription, cwd: string, framed: string): Promise<ProviderDispatch>;
+  resume(subscription: Subscription, cwd: string, framed: string, context: HeadlessDispatch): Promise<ProviderDispatch>;
+  spawn(subscription: Subscription, cwd: string, framed: string, context: HeadlessDispatch): Promise<ProviderDispatch>;
 }
 
 /**
@@ -100,7 +119,7 @@ export class CodexProvider implements ProviderAdapter {
     return { receipt, outcome, processed: true };
   }
 
-  resume(subscription: Subscription, cwd: string, framed: string): Promise<ProviderDispatch> {
+  resume(subscription: Subscription, cwd: string, framed: string, context: HeadlessDispatch): Promise<ProviderDispatch> {
     if (!subscription.sessionId) throw new Error("resume target missing");
     return runHeadless(
       "codex",
@@ -108,16 +127,18 @@ export class CodexProvider implements ProviderAdapter {
       cwd,
       framed,
       { CODEX_HOME: requireAccountProfile(subscription) },
+      context,
     );
   }
 
-  spawn(subscription: Subscription, cwd: string, framed: string): Promise<ProviderDispatch> {
+  spawn(subscription: Subscription, cwd: string, framed: string, context: HeadlessDispatch): Promise<ProviderDispatch> {
     return runHeadless(
       "codex",
       ["exec", "--cd", cwd, "--json", ...codexPermissionArgs(subscription.permissionProfile), "-"],
       cwd,
       framed,
       { CODEX_HOME: requireAccountProfile(subscription) },
+      context,
     );
   }
 }
@@ -159,7 +180,7 @@ export class GrokProvider implements ProviderAdapter {
     return Promise.reject(new Error("Grok Build has no live-ingress surface; deliveries fall through to spawn"));
   }
 
-  resume(subscription: Subscription, cwd: string, framed: string): Promise<ProviderDispatch> {
+  resume(subscription: Subscription, cwd: string, framed: string, context: HeadlessDispatch): Promise<ProviderDispatch> {
     if (!subscription.sessionId) throw new Error("resume target missing");
     return runHeadless(
       process.env.HIVE_GROK_COMMAND ?? "grok",
@@ -167,16 +188,18 @@ export class GrokProvider implements ProviderAdapter {
       cwd,
       null,
       { HOME: requireAccountProfile(subscription) },
+      context,
     );
   }
 
-  spawn(subscription: Subscription, cwd: string, framed: string): Promise<ProviderDispatch> {
+  spawn(subscription: Subscription, cwd: string, framed: string, context: HeadlessDispatch): Promise<ProviderDispatch> {
     return runHeadless(
       process.env.HIVE_GROK_COMMAND ?? "grok",
       ["--output-format", "streaming-messages-json", ...grokPermissionArgs(subscription.permissionProfile), "-p", framed],
       cwd,
       null,
       { HOME: requireAccountProfile(subscription) },
+      context,
     );
   }
 }
@@ -233,7 +256,7 @@ export class ClaudeProvider implements ProviderAdapter {
     return `claude-inbox:${finalPath}`;
   }
 
-  resume(subscription: Subscription, cwd: string, framed: string): Promise<ProviderDispatch> {
+  resume(subscription: Subscription, cwd: string, framed: string, context: HeadlessDispatch): Promise<ProviderDispatch> {
     if (!subscription.sessionId) throw new Error("resume target missing");
     const profile = requireAccountProfile(subscription);
     return runHeadless(
@@ -242,10 +265,11 @@ export class ClaudeProvider implements ProviderAdapter {
       cwd,
       null,
       { CLAUDE_CONFIG_DIR: profile },
+      context,
     );
   }
 
-  spawn(subscription: Subscription, cwd: string, framed: string): Promise<ProviderDispatch> {
+  spawn(subscription: Subscription, cwd: string, framed: string, context: HeadlessDispatch): Promise<ProviderDispatch> {
     const profile = requireAccountProfile(subscription);
     return runHeadless(
       process.env.HIVE_CLAUDE_COMMAND ?? "claude",
@@ -253,6 +277,7 @@ export class ClaudeProvider implements ProviderAdapter {
       cwd,
       null,
       { CLAUDE_CONFIG_DIR: profile },
+      context,
     );
   }
 }
@@ -290,12 +315,27 @@ export function prependPathEntry(pathValue: string | undefined, entry: string): 
  * without node on PATH they exit 127 and a seat improvises a shim mid-wake.
  * Guarantee the running runtime's directory is first on the child's PATH.
  */
-export function composeChildEnv(profileEnv: Record<string, string>): NodeJS.ProcessEnv {
-  return {
+export function composeChildEnv(
+  profileEnv: Record<string, string>,
+  context: HeadlessDispatch,
+): NodeJS.ProcessEnv {
+  const composed: NodeJS.ProcessEnv = {
     ...process.env,
     ...profileEnv,
+    // Every headless turn carries its delivery id, so `hive wake` works bare
+    // inside a wake. Set after profileEnv so an adapter can never shadow it,
+    // and set here — not per adapter — so no dispatch path can forget it.
+    HIVE_DELIVERY_ID: String(context.deliveryId),
     PATH: prependPathEntry(process.env.PATH, dirname(process.execPath)),
   };
+  // An inherited HIVE_ACTOR is a live-ingress misbinding waiting to happen: the
+  // Claude session hook registers whatever actor it finds as that actor's LIVE
+  // ingress, so an edge started from a seat's own shell would make every
+  // headless child claim that seat's live route and then exit — sending the
+  // next wake to an inbox no session drains. A headless run is never a live
+  // session, so the variable is stripped rather than merely left unset.
+  delete composed.HIVE_ACTOR;
+  return composed;
 }
 
 async function runHeadless(
@@ -304,11 +344,12 @@ async function runHeadless(
   cwd: string,
   stdin: string | null,
   profileEnv: Record<string, string>,
+  context: HeadlessDispatch,
 ): Promise<ProviderDispatch> {
   const child = spawn(command, args, {
     cwd,
     stdio: ["pipe", "pipe", "pipe"],
-    env: composeChildEnv(profileEnv),
+    env: composeChildEnv(profileEnv, context),
   });
   if (stdin !== null) child.stdin.end(stdin); else child.stdin.end();
   const stdout: Buffer[] = [];

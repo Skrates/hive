@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import http from "node:http";
 import test from "node:test";
-import type { ReplaySnapshot } from "../domain.js";
+import { SubscriptionInputSchema, type ReplaySnapshot, type SubscriptionInput } from "../domain.js";
 import { BrokerHttpServer } from "./http.js";
 import { BrokerService, type SlackTransport } from "./service.js";
 import { BrokerStore } from "./store.js";
@@ -71,4 +71,90 @@ test("stop() force-closes an in-flight long-poll instead of hanging on it", { ti
 
   assert.ok(elapsedMs < 2_000, `stop() still completed promptly, in ${elapsedMs}ms`);
   assert.equal(await longPollSettled, "aborted", "the in-flight long-poll was force-closed, not left to finish");
+});
+
+test("POST /v1/wakes mints a seat wake, and refuses one that cannot be delivered", async (t) => {
+  const store = new BrokerStore(":memory:");
+  t.after(() => store.close());
+  const edgeToken = store.createEdge("dev");
+  const broker = new BrokerService(store, slack);
+  const server = new BrokerHttpServer(broker, { host: "127.0.0.1", port: 0, adminToken: "x".repeat(32) });
+  const { port } = await server.start();
+  t.after(() => server.stop());
+
+  const base: SubscriptionInput = SubscriptionInputSchema.parse({
+    actor: "ariadne",
+    provider: "codex",
+    providerSurface: "app-server",
+    providerVersion: "0.144.0",
+    sessionId: "thread-1",
+    homeEdge: "dev",
+    workspace: "taxis",
+    edgeWorkspaces: [{ edgeId: "dev", cwd: "/srv/taxis", worktree: null }],
+    wakePolicy: "spawn",
+    permissionProfile: "read-only",
+    accountProfile: "/home/user/.codex-hive",
+  });
+  store.upsertSubscription(base);
+  store.upsertSubscription({ ...base, actor: "gnomon", provider: "claude", sessionId: null });
+  store.ingestEvent({
+    eventId: "Ev1",
+    workspaceId: "T1",
+    channelId: "C1",
+    threadTs: "100.1",
+    messageTs: "100.2",
+    senderId: "U1",
+    senderKind: "user",
+    actor: "ariadne",
+    text: "WAKE: ariadne | go",
+    raw: {},
+    receivedAt: "2026-08-15T00:00:00.000Z",
+  });
+  const source = store.claimNext("dev", 0)!;
+
+  const post = (body: unknown, token = edgeToken): Promise<{ status: number; body: string }> =>
+    new Promise((resolve, reject) => {
+      const payload = JSON.stringify(body);
+      const request = http.request({
+        host: "127.0.0.1",
+        port,
+        method: "POST",
+        path: "/v1/wakes",
+        headers: {
+          "x-hive-edge": "dev",
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+          "content-length": Buffer.byteLength(payload),
+        },
+      }, (response) => {
+        const chunks: Buffer[] = [];
+        response.on("data", (chunk: Buffer) => chunks.push(chunk));
+        response.on("end", () => resolve({ status: response.statusCode ?? 0, body: Buffer.concat(chunks).toString("utf8") }));
+        response.on("error", reject);
+      });
+      request.on("error", reject);
+      request.end(payload);
+    });
+
+  // The mint is an edge-authenticated act like every other seat act.
+  const unauthorized = await post({ sourceDeliveryId: source.id, actor: "gnomon", text: "go" }, "wrong-token");
+  assert.equal(unauthorized.status, 401);
+
+  const minted = await post({ sourceDeliveryId: source.id, actor: "gnomon", text: "please verify the gate set" });
+  assert.equal(minted.status, 201);
+  const receipt = JSON.parse(minted.body) as { deliveryId: number; from: string; actor: string };
+  assert.equal(receipt.from, "ariadne");
+  assert.equal(receipt.actor, "gnomon");
+  assert.equal(store.getDelivery(receipt.deliveryId).actor, "gnomon");
+
+  // R-3: a refusal answers with its code AND its reason, never a bare 400.
+  const refused = await post({ sourceDeliveryId: source.id, actor: "theoros", text: "hello" });
+  assert.equal(refused.status, 422);
+  const error = JSON.parse(refused.body) as { error: string; detail: string };
+  assert.equal(error.error, "unroutable_actor");
+  assert.match(error.detail, /no live subscription/);
+
+  // A body that cannot even name a mint is a validation failure, not a refusal.
+  const invalid = await post({ sourceDeliveryId: source.id, actor: "gnomon", text: "" });
+  assert.equal(invalid.status, 400);
 });
