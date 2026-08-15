@@ -1,14 +1,14 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { Delivery, Subscription } from "../domain.js";
 import { prepareSocketPath } from "../local/uds.js";
 import type { LiveIngress } from "./live-registry.js";
 import { delimiter, dirname } from "node:path";
-import { ClaudeProvider, claudePromptSlotArgs, codexPermissionArgs, CodexProvider, composeChildEnv, GrokProvider, grokPermissionArgs, prependPathEntry, ProviderPreDispatchError, requireAccountProfile } from "./providers.js";
+import { ClaudeProvider, claudePromptSlotArgs, codexPermissionArgs, CodexProvider, composeChildEnv, GrokProvider, grokPermissionArgs, prependPathEntry, ProviderPreDispatchError, requireAccountProfile, resolveEdgeSocketPath } from "./providers.js";
 
 function subscription(overrides: Partial<Subscription> = {}): Subscription {
   return {
@@ -102,6 +102,9 @@ test("a headless child carries its delivery id, and never the actor's live-ingre
   // KRA-1097: `hive wake` reads this to name the minting seat's delivery, so a
   // completing seat can address a peer without re-typing an id it was handed.
   assert.equal(env.HIVE_DELIVERY_ID, "512");
+  // The owner-local socket rides along so a Grok child whose HOME is the
+  // account profile still dials the edge, not `<profile>/.hive/edge.sock`.
+  assert.equal(env.HIVE_EDGE_SOCKET, resolveEdgeSocketPath());
 
   // HIVE_ACTOR must NOT ride along, even when the edge inherited one. The Claude
   // session hook registers whatever actor it finds in the environment as that
@@ -111,6 +114,28 @@ test("a headless child carries its delivery id, and never the actor's live-ingre
   assert.equal(env.HIVE_ACTOR, undefined);
   // The pinned profile still decides which seat the turn runs as (R-5).
   assert.equal(env.CLAUDE_CONFIG_DIR, "/profiles/gnomon");
+});
+
+test("composeChildEnv exports the owner-local edge socket, not the child's pinned home", (t) => {
+  const previousSocket = process.env.HIVE_EDGE_SOCKET;
+  const previousHome = process.env.HIVE_HOME;
+  delete process.env.HIVE_EDGE_SOCKET;
+  delete process.env.HIVE_HOME;
+  t.after(() => {
+    if (previousSocket === undefined) delete process.env.HIVE_EDGE_SOCKET;
+    else process.env.HIVE_EDGE_SOCKET = previousSocket;
+    if (previousHome === undefined) delete process.env.HIVE_HOME;
+    else process.env.HIVE_HOME = previousHome;
+  });
+
+  const env = composeChildEnv({ HOME: "/profiles/grok-seat" }, { deliveryId: 7 });
+  assert.equal(env.HOME, "/profiles/grok-seat");
+  assert.equal(env.HIVE_EDGE_SOCKET, join(homedir(), ".hive", "edge.sock"));
+  assert.notEqual(env.HIVE_EDGE_SOCKET, join("/profiles/grok-seat", ".hive", "edge.sock"));
+
+  process.env.HIVE_EDGE_SOCKET = "/run/hive/edge.sock";
+  const pinned = composeChildEnv({ HOME: "/profiles/grok-seat" }, { deliveryId: 7 });
+  assert.equal(pinned.HIVE_EDGE_SOCKET, "/run/hive/edge.sock");
 });
 
 test("an invalid permission profile is a deterministic pre-dispatch failure", () => {

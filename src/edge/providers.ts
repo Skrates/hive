@@ -309,6 +309,17 @@ export function prependPathEntry(pathValue: string | undefined, entry: string): 
 }
 
 /**
+ * The owner-local edge socket, resolved in the edge process — not in a provider
+ * child whose `HOME` may have been pinned to an account profile.
+ */
+export function resolveEdgeSocketPath(
+  env: NodeJS.ProcessEnv = process.env,
+  home: string = homedir(),
+): string {
+  return env.HIVE_EDGE_SOCKET ?? join(env.HIVE_HOME ?? join(home, ".hive"), "edge.sock");
+}
+
+/**
  * The edge process is launched from an absolute node path (systemd ExecStart /
  * launchd), so a spawned provider child can inherit a PATH with no JS runtime on
  * it. The `hive` and `hive-claude-hook` CLIs are `#!/usr/bin/env node` scripts:
@@ -326,6 +337,11 @@ export function composeChildEnv(
     // inside a wake. Set after profileEnv so an adapter can never shadow it,
     // and set here — not per adapter — so no dispatch path can forget it.
     HIVE_DELIVERY_ID: String(context.deliveryId),
+    // Grok pins HOME to the account profile (R-5). `hive wake` falls back to
+    // `homedir()/.hive/edge.sock` when this is unset, which would then resolve
+    // inside that profile instead of the edge's owner-local socket. Export the
+    // path the parent edge is actually listening on.
+    HIVE_EDGE_SOCKET: resolveEdgeSocketPath(),
     PATH: prependPathEntry(process.env.PATH, dirname(process.execPath)),
   };
   // An inherited HIVE_ACTOR is a live-ingress misbinding waiting to happen: the
