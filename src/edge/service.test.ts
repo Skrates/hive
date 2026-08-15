@@ -496,6 +496,54 @@ test("a seat with no attestation still wakes, and the delivery says why it is un
   store.close();
 });
 
+test("a live session keeps the attestation it started with across a reinstall", async () => {
+  // The profile on disk can change while the session stays registered; the
+  // outcome still belongs to the artifacts loaded when the session started.
+  const live = new LiveIngressRegistry();
+  live.register({
+    actor: "ariadne",
+    provider: "codex",
+    socketPath: "/tmp/x.sock",
+    sessionId: "thread-1",
+    surfaceVersion: "test",
+    runtimeAttestation: {
+      ok: true,
+      attestation: {
+        attestationId: "sha256:" + "a".repeat(64),
+        doctrineCommit: "1".repeat(40),
+        actor: "ariadne",
+      },
+    },
+  }, 60_000);
+  live.register({
+    actor: "ariadne",
+    provider: "codex",
+    socketPath: "/tmp/x.sock",
+    sessionId: "thread-1",
+    surfaceVersion: "test",
+    runtimeAttestation: {
+      ok: true,
+      attestation: {
+        attestationId: "sha256:" + "b".repeat(64),
+        doctrineCommit: "2".repeat(40),
+        actor: "ariadne",
+      },
+    },
+  }, 60_000);
+
+  const broker = new FakeBroker([delivery(1, {
+    subscription: subscription({ wakePolicy: "live_only" }),
+  })]);
+  const store = new EdgeStore(":memory:");
+  const edge = new EdgeService(asBrokerClient(broker), store, live, [new StubAdapter({
+    liveResult: { receipt: "live:1", outcome: "ok", processed: true },
+  })]);
+
+  assert.equal(await edge.processOne(), true);
+  assert.equal(store.get(1)!.attestation_id, "sha256:" + "a".repeat(64));
+  store.close();
+});
+
 test("a live Desktop delivery binds to the surface's runtime home, not the pinned profile", async () => {
   // Split-state: HIVE_CODEX_DESKTOP_HOME ≠ accountProfile. Injection uses
   // Desktop; only that home's attestation names the artifacts the turn used.

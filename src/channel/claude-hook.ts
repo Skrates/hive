@@ -2,6 +2,7 @@
 import { mkdirSync, readdirSync, readFileSync, renameSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { attestationWire, readWakeAttestation } from "../edge/attestation.js";
 import { udsRequestJson } from "../local/uds.js";
 
 /**
@@ -118,6 +119,7 @@ async function main(): Promise<void> {
 
   try {
     if (shouldMaintainHeartbeat(eventName, messages.length)) {
+      const configDir = process.env.CLAUDE_CONFIG_DIR;
       await udsRequestJson(edgeSocket, "POST", "/live/register", {
         actor,
         provider: "claude",
@@ -125,6 +127,10 @@ async function main(): Promise<void> {
         sessionId: input.session_id ?? null,
         surfaceVersion: "claude-hook",
         ttlMs: REGISTRATION_TTL_MS,
+        // The hook is a new process each boundary; the edge freezes the first
+        // snapshot for this sessionId so a mid-session reinstall cannot
+        // reattribute the still-running turn.
+        ...(configDir ? { attestation: attestationWire(readWakeAttestation(configDir)) } : {}),
       });
     } else {
       await udsRequestJson(edgeSocket, "POST", "/live/deregister", {

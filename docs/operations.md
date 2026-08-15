@@ -160,6 +160,11 @@ injects into Desktop and must be bound to Desktop's record, not the pinned profi
 receipt. That row is the trace: delivery id → attestation id → the exact instruction, settings,
 and skill corpus hashes the seat was installed with. `weave doctor` resolves the other end.
 
+A live registration freezes the runtime attestation captured when that `sessionId` first
+registered. A reinstall while the session remains live cannot reattribute a turn that loaded
+the previous installation's prompt and settings. A new session id, or a lapsed heartbeat,
+takes a fresh snapshot.
+
 The edge records; it does not verify and it does not refuse.
 
 - **Verification lives in one implementation.** `weave doctor` rehashes the record and rejects one

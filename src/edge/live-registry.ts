@@ -47,8 +47,22 @@ export class LiveIngressRegistry {
     if (!Number.isSafeInteger(ttlMs) || ttlMs <= 0) {
       throw new LiveIngressRegistryError("live_binding_invalid_ttl");
     }
-    const entry: LiveIngress = Object.freeze({ ...input, expiresAt: this.now() + ttlMs });
-    this.entries.set(key(input.actor, input.provider), entry);
+    const bindingKey = key(input.actor, input.provider);
+    const previous = this.entries.get(bindingKey);
+    // A reinstall must not reattribute an already-running session. Keep the
+    // snapshot captured when this sessionId first registered; a new session
+    // (or a lapsed heartbeat) takes whatever the surface just sent.
+    const keepPrior = previous !== undefined
+      && previous.expiresAt > this.now()
+      && previous.sessionId === input.sessionId
+      && previous.runtimeAttestation !== undefined;
+    const runtimeAttestation = keepPrior ? previous.runtimeAttestation : input.runtimeAttestation;
+    const entry: LiveIngress = Object.freeze({
+      ...input,
+      ...(runtimeAttestation !== undefined ? { runtimeAttestation } : {}),
+      expiresAt: this.now() + ttlMs,
+    });
+    this.entries.set(bindingKey, entry);
     return entry;
   }
 
