@@ -450,7 +450,7 @@ function assistantMessageText(message: unknown): string | null {
  */
 export function codexPermissionArgs(
   profile: string,
-  edgeSocketPath = process.env.HIVE_EDGE_SOCKET ?? join(homedir(), ".hive", "edge.sock"),
+  edgeSocketPath = resolveEdgeSocketPath(),
 ): string[] {
   switch (profile) {
     case "read-only": return codexSocketPermissionProfile("hive-read-only", ":read-only", edgeSocketPath);
