@@ -55,6 +55,8 @@ const MAX_STALE_CYCLES = 2;
 
 export class EdgeLivenessWatchdog {
   private staleStreak = 0;
+  /** Last `lastPollAt` this watchdog observed; `undefined` until the first check. */
+  private seenPollAt: number | null | undefined = undefined;
 
   constructor(
     private readonly port: EdgeWatchdogPort,
@@ -71,17 +73,22 @@ export class EdgeLivenessWatchdog {
    * window finite is the dispatch deadline in `EdgeService` — without it, a
    * permanently saturated edge would be a permanent blind spot here, and this
    * watchdog would be a check that cannot fail for its reason.
+   *
+   * Saturation does not forgive silence it covered. A completed poll that
+   * landed *before* the slots filled is recovery, not silence: that
+   * advancement resets the streak even on a saturated check, so a later
+   * desaturated window starts a fresh budget.
    */
   check(): EdgeWatchdogAction {
+    const last = this.port.lastPollAt();
+    if (pollHasAdvanced(this.seenPollAt, last)) this.staleStreak = 0;
+    this.seenPollAt = last;
+
     if (this.port.saturated()) {
-      // Deliberately does NOT reset the streak: the polls genuinely did not
-      // happen, and if the first poll after desaturation also fails to land,
-      // that window still counts toward the wedge.
       this.port.log("[edge-watchdog] every dispatch slot is busy — not polling, and not judging liveness this cycle");
       return "saturated";
     }
 
-    const last = this.port.lastPollAt();
     const idleMs = last === null ? Number.POSITIVE_INFINITY : this.port.now() - last;
     if (idleMs < this.staleMs) {
       this.staleStreak = 0;
@@ -107,4 +114,10 @@ export class EdgeLivenessWatchdog {
     );
     return "stale";
   }
+}
+
+function pollHasAdvanced(previous: number | null | undefined, last: number | null): boolean {
+  if (previous === undefined || last === null) return false;
+  if (previous === null) return true;
+  return last > previous;
 }

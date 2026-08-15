@@ -103,6 +103,27 @@ test("saturation does not forgive the windows it covered — a still-deaf edge a
   assert.deepEqual(h.exits, [1]);
 });
 
+test("a poll that recovered before the slots filled resets the streak even while saturated", () => {
+  // Stale once, then the broker comes back and the edge fills every slot
+  // before the next check. The early saturated return used to skip lastPollAt
+  // and keep streak=1; the first free-slot check then exited a recovered edge
+  // before its next long-poll could complete.
+  const h = harness();
+  const watchdog = new EdgeLivenessWatchdog(h.port, STALE_MS);
+  h.advance(STALE_MS);
+  assert.equal(watchdog.check(), "stale");
+
+  h.advance(1_000);
+  h.setPoll(h.port.now());
+  h.setSaturated(true);
+  assert.equal(watchdog.check(), "saturated");
+
+  h.advance(STALE_MS);
+  h.setSaturated(false);
+  assert.equal(watchdog.check(), "stale");
+  assert.deepEqual(h.exits, []);
+});
+
 test("an edge that has never completed a poll since boot is stale, not healthy", () => {
   // The wedge shape: the very first claim never returns. Treating "no evidence"
   // as health is exactly the mistake that kept the cx53 edge alive and deaf.
