@@ -64,9 +64,11 @@ export const EdgeWorkspaceSchema = z.object({
 export type EdgeWorkspace = z.infer<typeof EdgeWorkspaceSchema>;
 
 export const SubscriptionInputSchema = z.object({
-  actor: z.string().min(1).refine((value) => value.toLowerCase() !== EVERYONE, {
-    message: "`everyone` is a reserved broadcast keyword and cannot be a subscription actor name",
-  }),
+  actor: z.string().min(1)
+    .refine((value) => value.toLowerCase() !== EVERYONE, {
+      message: "`everyone` is a reserved broadcast keyword and cannot be a subscription actor name",
+    })
+    .transform((value) => value.toLowerCase()),
   provider: ProviderSchema,
   providerSurface: z.string().min(1),
   providerVersion: z.string().min(1),
