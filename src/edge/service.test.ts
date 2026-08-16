@@ -907,3 +907,21 @@ test("a subscription upsert between claim and dispatch neither re-routes nor re-
   assert.equal(row.attestation_absence, null);
   store.close();
 });
+
+test("a mixed-case live registration is found under the canonical actor key", () => {
+  // The broker canonicalizes actor keys; a surface exporting HIVE_ACTOR=Gnomon
+  // must still be reachable by the delivery's lowercase actor — a registration
+  // no delivery can find is a live route that silently never fires.
+  const live = new LiveIngressRegistry();
+  live.register({
+    actor: "Gnomon",
+    provider: "claude",
+    socketPath: "/tmp/g.sock",
+    sessionId: "s1",
+    surfaceVersion: "test",
+    runtimeAttestation: { ok: false, absence: "attestation_unreported" },
+  }, 60_000);
+  assert.ok(live.get("gnomon", "claude"), "canonical lookup finds the mixed-case registration");
+  live.deregister("GNOMON", "claude");
+  assert.equal(live.get("gnomon", "claude"), null);
+});

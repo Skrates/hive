@@ -168,9 +168,8 @@ test("a hung reactions call never stalls the serialized drain that claim() waits
   assert.deepEqual(store.listUnsentOutbox(), []);
 });
 
-test("mint proves an alternate thread against Slack before the ledger commits", async (t) => {
+function mintServiceFixture(): BrokerStore {
   const store = new BrokerStore(":memory:");
-  t.after(() => store.close());
   store.createEdge("mac");
   store.createEdge("dev");
   store.upsertSubscription({
@@ -224,6 +223,12 @@ test("mint proves an alternate thread against Slack before the ledger commits", 
     raw: { type: "message" },
     receivedAt: "2026-07-12T00:00:00.000Z",
   });
+  return store;
+}
+
+test("mint proves an alternate thread against Slack before the ledger commits", async (t) => {
+  const store = mintServiceFixture();
+  t.after(() => store.close());
   const source = store.claimNext("mac", 0)!;
   const seen: Array<{ channelId: string; threadTs: string }> = [];
   const slack: SlackTransport = {
@@ -270,4 +275,41 @@ test("mint proves an alternate thread against Slack before the ledger commits", 
     }, "mac"),
     (error: unknown) => error instanceof SeatWakeRefusedError && error.code === "invalid_thread",
   );
+});
+
+
+test("a replayed alternate-thread mint answers from the ledger while Slack is down", async () => {
+  const store = mintServiceFixture();
+  const source = store.claimNext("mac", 0)!;
+  const okSlack: SlackTransport = {
+    async replay(channelId, threadTs): Promise<ReplaySnapshot> {
+      return { channelId, threadTs, fetchedAt: "2026-07-12T00:00:00.000Z", cursor: null, messages: [{ ts: threadTs }] };
+    },
+    async reply(): Promise<string> { throw new Error("not used"); },
+    async react(): Promise<void> {},
+  };
+  const first = await new BrokerService(store, okSlack).mintSeatWake({
+    sourceDeliveryId: source.id,
+    generation: source.leaseGeneration!,
+    actor: "gnomon",
+    text: "land it here",
+    threadTs: "200.1",
+  }, "mac");
+
+  // The retry arrives after a lost response — and Slack is now unreachable.
+  const downSlack: SlackTransport = {
+    async replay(): Promise<ReplaySnapshot> { throw new Error("slack is down"); },
+    async reply(): Promise<string> { throw new Error("not used"); },
+    async react(): Promise<void> {},
+  };
+  const retry = await new BrokerService(store, downSlack).mintSeatWake({
+    sourceDeliveryId: source.id,
+    generation: source.leaseGeneration!,
+    actor: "gnomon",
+    text: "land it here",
+    threadTs: "200.1",
+  }, "mac");
+  assert.equal(retry.deliveryId, first.deliveryId);
+  assert.equal(retry.created, false);
+  store.close();
 });
