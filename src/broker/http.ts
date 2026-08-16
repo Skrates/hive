@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { URL } from "node:url";
-import { DeliveryResultInputSchema, ReasonSchema, SeatWakeInputSchema, SubscriptionInputSchema } from "../domain.js";
+import { canonicalActor, DeliveryResultInputSchema, ReasonSchema, SeatWakeMintSchema, SubscriptionInputSchema } from "../domain.js";
 import { BrokerService } from "./service.js";
 import { InvalidTransitionError, SeatWakeRefusedError, StaleLeaseError } from "./store.js";
 
@@ -73,7 +73,7 @@ export class BrokerHttpServer {
         return json(response, 200, this.broker.upsertSubscription(input));
       }
       if (request.method === "DELETE" && url.pathname.startsWith("/v1/admin/subscriptions/")) {
-        const actor = decodeURIComponent(url.pathname.slice("/v1/admin/subscriptions/".length)).toLowerCase();
+        const actor = canonicalActor(decodeURIComponent(url.pathname.slice("/v1/admin/subscriptions/".length)));
         return json(response, 200, { actor, deleted: this.broker.deleteSubscription(actor) });
       }
       if (request.method === "GET" && url.pathname === "/v1/admin/deliveries") {
@@ -98,7 +98,7 @@ export class BrokerHttpServer {
     // is resolved from that ledger row, never from the body.
     if (request.method === "POST" && url.pathname === "/v1/wakes") {
       const body = await readJson(request);
-      const input = SeatWakeInputSchema.parse(body);
+      const input = SeatWakeMintSchema.parse(body);
       return json(response, 201, await this.broker.mintSeatWake(input, edgeId));
     }
 

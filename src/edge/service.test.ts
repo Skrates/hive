@@ -162,6 +162,37 @@ class FakeBroker {
   }
 }
 
+test("a turn's mint capability exists only while that turn runs", async () => {
+  const broker = new FakeBroker([delivery(41, { subscription: subscription({ sessionId: null }) })]);
+  const store = new EdgeStore(":memory:");
+
+  // Interrogate the edge from inside the turn — the only window in which
+  // minting is legitimate — with exactly what the child would present.
+  let observed: { token: string; resolved: { deliveryId: number; generation: number } | null } | null = null;
+  const adapter: ProviderAdapter = {
+    provider: "codex",
+    async deliverLive() { throw new Error("not live"); },
+    async resume() { throw new Error("not resumed"); },
+    async spawn(_subscription, _cwd, _framed, context) {
+      observed = { token: context.token, resolved: service.resolveMintSource(context.token) };
+      return { receipt: "{}", outcome: "done", processed: true };
+    },
+  };
+  const service = new EdgeService(asBrokerClient(broker), store, new LiveIngressRegistry(), [adapter]);
+  assert.equal(await service.processOne(), true);
+
+  const seen = observed as unknown as { token: string; resolved: { deliveryId: number; generation: number } | null };
+  assert.ok(seen, "the dispatch never reached the provider");
+  // Inside the turn the capability names this delivery and the generation the
+  // edge holds it at — the broker then fences the mint on exactly that pair.
+  assert.deepEqual(seen.resolved, { deliveryId: 41, generation: 1 });
+  // After the turn settles the token is nothing. A child that outlives its
+  // dispatch (or a peer that copied the token) mints from no delivery at all,
+  // rather than from whatever the ledger now holds under that id.
+  assert.equal(service.resolveMintSource(seen.token), null);
+  store.close();
+});
+
 function asBrokerClient(fake: FakeBroker): BrokerClient {
   return fake as unknown as BrokerClient;
 }

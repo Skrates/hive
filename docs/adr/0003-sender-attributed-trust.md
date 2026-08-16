@@ -133,7 +133,11 @@ that are acted on when they arrive.
   carry `hive_*` metadata and are dropped at admission before any envelope is parsed, so a
   quoted `WAKE:` line in an outcome can never mint a delivery — and consequently neither can a
   completing seat's outcome, however deliberate. That drop stays total. A seat instead mints
-  through the machine-local edge socket: the broker resolves the sender from the source
+  through the machine-local edge socket, presenting the capability its own turn was issued
+  rather than naming a delivery — one edge runs turns for many actors, so the socket
+  authenticates the machine and the machine is not the seat. The edge resolves the delivery and
+  its lease generation, the broker fences the mint on that pair through the same custody
+  primitive every delivery act uses, resolves the sender from the source
   delivery's ledger row (attribution is never a client claim), commits the delivery and its
   commons render in one transaction (the render is an ordinary `hive_*` outbox post, seen by
   humans and ignored by admission), and refuses loudly (R-3) when the target has no live

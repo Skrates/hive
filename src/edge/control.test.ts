@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
-import type { SeatWakeInput, SeatWakeReceipt } from "../domain.js";
+import type { SeatWakeMint, SeatWakeReceipt } from "../domain.js";
 import { udsRequest, udsRequestJson } from "../local/uds.js";
 import { BrokerHttpError } from "./broker-client.js";
 import { EdgeControlServer } from "./control.js";
@@ -12,20 +12,25 @@ import type { EdgeService } from "./service.js";
 
 interface OutcomeRecord { deliveryId: number; text: string }
 
-function fixture(mintWake?: (input: SeatWakeInput) => Promise<SeatWakeReceipt>) {
+function fixture(mintWake?: (input: SeatWakeMint) => Promise<SeatWakeReceipt>) {
   const root = mkdtempSync(join(tmpdir(), "hive-control-"));
   const socketPath = join(root, "sockets", "edge.sock");
   const live = new LiveIngressRegistry();
   const outcomes: OutcomeRecord[] = [];
-  const mints: SeatWakeInput[] = [];
+  const mints: SeatWakeMint[] = [];
+  // The one dispatch this fake edge is running, and the token it issued for it.
+  const dispatches = new Map([["token-of-the-running-turn", { deliveryId: 512, generation: 3 }]]);
   const edge = {
     live,
+    resolveMintSource(token: string) {
+      return dispatches.get(token) ?? null;
+    },
     broker: {
       async outcome(deliveryId: number, text: string) {
         outcomes.push({ deliveryId, text });
         return {};
       },
-      async mintWake(input: SeatWakeInput): Promise<SeatWakeReceipt> {
+      async mintWake(input: SeatWakeMint): Promise<SeatWakeReceipt> {
         mints.push(input);
         if (mintWake) return mintWake(input);
         return { deliveryId: 77, actor: input.actor, from: "ariadne", channelId: "C1", threadTs: "100.1", created: true };
@@ -214,21 +219,58 @@ test("the control plane relays a seat's wake mint to the broker", async (t) => {
   await server.start();
 
   const receipt = await udsRequestJson<SeatWakeReceipt>(socketPath, "POST", "/wake", {
-    sourceDeliveryId: 512,
+    token: "token-of-the-running-turn",
     actor: "GNOMON",
     text: "please verify the gate set",
     threadTs: null,
   });
 
   assert.equal(receipt.deliveryId, 77);
-  // The edge carries intent only: the source delivery goes up verbatim and the
-  // broker resolves the sender from its own ledger.
+  // The edge carries intent only, and it — not the caller — names the source:
+  // the delivery and generation come from the edge's own dispatch state, and
+  // the broker then resolves the sender from its own ledger.
   assert.deepEqual(mints, [{
     sourceDeliveryId: 512,
+    generation: 3,
     actor: "gnomon",
     text: "please verify the gate set",
     threadTs: null,
   }]);
+});
+
+test("a mint that names a delivery instead of its own turn reaches no broker", async (t) => {
+  const { root, socketPath, mints, server } = fixture();
+  t.after(async () => {
+    await server.stop();
+    rmSync(root, { recursive: true, force: true });
+  });
+  await server.start();
+
+  // The co-tenant case that `claimed_by === edgeId` could not see: several
+  // seats share one edge and one owner-only socket, so a body naming a peer's
+  // delivery id would mint under that peer's attribution. The id is not a
+  // field any more, and the capability of a turn this edge is not running
+  // resolves to nothing.
+  const named = await udsRequest(socketPath, "POST", "/wake", {
+    sourceDeliveryId: 512,
+    actor: "gnomon",
+    text: "minted as my co-tenant",
+    threadTs: null,
+  });
+  assert.equal(named.status, 400);
+  assert.equal((JSON.parse(named.body) as { error: string }).error, "invalid_wake");
+
+  const foreign = await udsRequest(socketPath, "POST", "/wake", {
+    token: "a-token-this-edge-never-issued",
+    actor: "gnomon",
+    text: "minted from a turn that is not mine",
+    threadTs: null,
+  });
+  assert.equal(foreign.status, 403);
+  assert.equal((JSON.parse(foreign.body) as { error: string }).error, "unknown_dispatch_token");
+
+  // Neither reached the broker at all — no mint was attempted under anyone.
+  assert.deepEqual(mints, []);
 });
 
 test("a refused mint reaches the seat with the broker's own reason (R-3)", async (t) => {
@@ -245,7 +287,7 @@ test("a refused mint reaches the seat with the broker's own reason (R-3)", async
   await server.start();
 
   const response = await udsRequest(socketPath, "POST", "/wake", {
-    sourceDeliveryId: 512,
+    token: "token-of-the-running-turn",
     actor: "theoros",
     text: "hello",
     threadTs: null,
@@ -259,7 +301,7 @@ test("a refused mint reaches the seat with the broker's own reason (R-3)", async
   assert.match(body.detail, /no live subscription for actor `theoros`/);
 
   // A malformed mint is refused before the broker is ever asked.
-  const invalid = await udsRequest(socketPath, "POST", "/wake", { sourceDeliveryId: 0, actor: "", text: "" });
+  const invalid = await udsRequest(socketPath, "POST", "/wake", { token: "", actor: "", text: "" });
   assert.equal(invalid.status, 400);
   assert.equal((JSON.parse(invalid.body) as { error: string }).error, "invalid_wake");
 });

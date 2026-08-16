@@ -241,6 +241,7 @@ test("mint proves an alternate thread against Slack before the ledger commits", 
 
   const receipt = await broker.mintSeatWake({
     sourceDeliveryId: source.id,
+    generation: source.leaseGeneration!,
     actor: "gnomon",
     text: "land it here",
     threadTs: "200.1",
@@ -251,6 +252,7 @@ test("mint proves an alternate thread against Slack before the ledger commits", 
   // The source thread is already known — Slack is not asked again.
   const same = await broker.mintSeatWake({
     sourceDeliveryId: source.id,
+    generation: source.leaseGeneration!,
     actor: "gnomon",
     text: "stay put",
     threadTs: "100.1",
@@ -261,6 +263,7 @@ test("mint proves an alternate thread against Slack before the ledger commits", 
   await assert.rejects(
     () => broker.mintSeatWake({
       sourceDeliveryId: source.id,
+      generation: source.leaseGeneration!,
       actor: "gnomon",
       text: "nowhere",
       threadTs: "999.1",

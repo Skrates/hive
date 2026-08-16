@@ -63,12 +63,22 @@ export const EdgeWorkspaceSchema = z.object({
 });
 export type EdgeWorkspace = z.infer<typeof EdgeWorkspaceSchema>;
 
+/**
+ * The one canonical form of an actor id. Enrollment, every lookup, and the
+ * stored-key migration all route through this function — a second `.toLowerCase()`
+ * spelled out somewhere else is how the vocabulary drifts and how a row becomes
+ * unreachable by the name it was enrolled under.
+ */
+export function canonicalActor(actor: string): string {
+  return actor.toLowerCase();
+}
+
 export const SubscriptionInputSchema = z.object({
   actor: z.string().min(1)
-    .refine((value) => value.toLowerCase() !== EVERYONE, {
+    .refine((value) => canonicalActor(value) !== EVERYONE, {
       message: "`everyone` is a reserved broadcast keyword and cannot be a subscription actor name",
     })
-    .transform((value) => value.toLowerCase()),
+    .transform(canonicalActor),
   provider: ProviderSchema,
   providerSurface: z.string().min(1),
   providerVersion: z.string().min(1),
@@ -142,18 +152,48 @@ export function isSlackMessageTs(ts: string): boolean {
 export const MAX_SEAT_WAKE_TEXT = 8_000;
 
 /**
- * KRA-1097: a seat's deliberate address to a peer. The minting seat is named by
- * the delivery it is executing — the broker resolves the sender from its own
- * ledger, so attribution is never a client claim — and the wake lands in that
- * delivery's thread unless another thread in the same channel is chosen.
+ * KRA-1097, CLI → edge: a seat's deliberate address to a peer. The caller names
+ * a target and a text; it does NOT name the delivery it is minting from.
+ *
+ * `token` is the capability the edge issued to this exact dispatch when it
+ * spawned it, and it is the whole of the caller's identity claim. One edge
+ * serves many actors by design, so the machine-local socket proves only the
+ * *machine* — a co-tenant seat's process holds the same socket. Naming a
+ * delivery id would therefore let any seat on the box mint under a peer's
+ * attribution, which is what the ledger-derived sender exists to prevent.
+ *
+ * What this does NOT defend against, stated plainly so no later reader
+ * mistakes its reach: seats on one box run as one Unix user, so a seat that
+ * deliberately reads a peer process's environment can take its token. Nothing
+ * at this layer can close that — the box's user boundary is the boundary. The
+ * property held here is that a mint is attributable to the run that requested
+ * it: a mistyped id, a peer's id, and a stale child's finished dispatch all
+ * fail, rather than minting under someone else's name.
  */
 export const SeatWakeInputSchema = z.object({
-  sourceDeliveryId: z.number().int().positive(),
-  actor: z.string().min(1).transform((value) => value.toLowerCase()),
+  token: z.string().min(1),
+  actor: z.string().min(1).transform(canonicalActor),
   text: z.string().min(1).max(MAX_SEAT_WAKE_TEXT),
   threadTs: z.string().min(1).nullable().default(null),
 });
 export type SeatWakeInput = z.infer<typeof SeatWakeInputSchema>;
+
+/**
+ * KRA-1097, edge → broker: the edge resolves the token against its own
+ * dispatch state and names the delivery *it* is running, fenced by that
+ * dispatch's lease generation. The broker then holds the mint to the same
+ * custody primitive every other delivery act passes through
+ * (`BrokerStore.assertLease`) — `claimed_by` alone authenticates the machine,
+ * and on a multi-actor edge the machine is not the seat.
+ */
+export const SeatWakeMintSchema = z.object({
+  sourceDeliveryId: z.number().int().positive(),
+  generation: z.number().int().positive(),
+  actor: z.string().min(1).transform(canonicalActor),
+  text: z.string().min(1).max(MAX_SEAT_WAKE_TEXT),
+  threadTs: z.string().min(1).nullable().default(null),
+});
+export type SeatWakeMint = z.infer<typeof SeatWakeMintSchema>;
 
 export interface SeatWakeReceipt {
   deliveryId: number;

@@ -147,30 +147,28 @@ program.command("reply")
 program.command("wake")
   .argument("<actor>", "the peer seat to wake")
   .argument("<text...>", "the instruction to deliver")
-  .option("--from <delivery-id>", "the delivery this seat is executing (default: $HIVE_DELIVERY_ID)")
   .option("--thread <thread-ts>", "target thread in the source delivery's channel (default: that delivery's thread)")
   .description("mint a wake for a peer seat (KRA-1097)")
-  .action(async (actor: string, text: string[], options: { from?: string; thread?: string }) => {
-    // The minting seat is named by the delivery it is executing: the broker
-    // resolves the sender from its own ledger, so a seat can neither forge an
-    // attribution nor lose one. A headless wake exports HIVE_DELIVERY_ID; a
-    // live-delivered wake carries the id in its envelope, for `--from`.
-    const source = options.from ?? process.env.HIVE_DELIVERY_ID;
-    if (!source) {
+  .action(async (actor: string, text: string[], options: { thread?: string }) => {
+    // The minting seat is named by the delivery it is executing, and that
+    // delivery is named by the EDGE, not by this command: the turn's capability
+    // is all the caller presents. A seat therefore cannot name a source at all,
+    // so it can neither forge an attribution nor lose one — on a box where
+    // several seats share one edge and one socket, an id in the request would
+    // have been exactly that forgery.
+    const token = process.env.HIVE_DELIVERY_TOKEN;
+    if (!token) {
       throw new Error(
-        "no source delivery: pass --from <delivery-id> (the delivery named in your wake envelope) "
-        + "or run inside a headless wake, which exports HIVE_DELIVERY_ID",
+        "no dispatch token: `hive wake` mints from a turn this edge is running, which exports "
+        + "HIVE_DELIVERY_TOKEN. A live-delivered turn holds no per-dispatch capability and cannot mint "
+        + "(KRA-1118); ask the human in the thread instead.",
       );
-    }
-    const sourceDeliveryId = Number(source);
-    if (!Number.isInteger(sourceDeliveryId) || sourceDeliveryId < 1) {
-      throw new Error("--from must be a positive integer delivery id");
     }
     const socketPath = resolveEdgeSocketPath();
     let receipt: SeatWakeReceipt;
     try {
       receipt = await udsRequestJson<SeatWakeReceipt>(socketPath, "POST", "/wake", {
-        sourceDeliveryId,
+        token,
         actor,
         text: text.join(" "),
         threadTs: options.thread ?? null,

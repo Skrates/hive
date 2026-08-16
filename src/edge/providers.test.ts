@@ -80,7 +80,7 @@ test("prependPathEntry puts the runtime dir first and never duplicates it", () =
 
 test("composeChildEnv prepends the running runtime's directory to the child PATH", () => {
   const runtimeDir = dirname(process.execPath);
-  const env = composeChildEnv({ CLAUDE_CONFIG_DIR: "/profiles/ariadne" }, { deliveryId: 512 });
+  const env = composeChildEnv({ CLAUDE_CONFIG_DIR: "/profiles/ariadne" }, { deliveryId: 512, token: "turn-token" });
   assert.ok(env.PATH, "composed env carries a PATH");
   assert.ok(env.PATH!.startsWith(`${runtimeDir}${delimiter}`) || env.PATH === runtimeDir, "PATH starts with the runtime dir");
   // The pinned profile env is preserved alongside the PATH fix.
@@ -97,11 +97,16 @@ test("a headless child carries its delivery id, and never the actor's live-ingre
     if (previous === undefined) delete process.env.HIVE_ACTOR;
     else process.env.HIVE_ACTOR = previous;
   });
-  const env = composeChildEnv({ CLAUDE_CONFIG_DIR: "/profiles/gnomon" }, { deliveryId: 512 });
+  const env = composeChildEnv({ CLAUDE_CONFIG_DIR: "/profiles/gnomon" }, { deliveryId: 512, token: "turn-token" });
 
   // KRA-1097: `hive wake` reads this to name the minting seat's delivery, so a
   // completing seat can address a peer without re-typing an id it was handed.
   assert.equal(env.HIVE_DELIVERY_ID, "512");
+  // The turn's mint capability. Without it `hive wake` has nothing to present,
+  // and with it the child never has to name a delivery id — which on a
+  // multi-actor edge is the difference between minting as itself and minting
+  // as a co-tenant.
+  assert.equal(env.HIVE_DELIVERY_TOKEN, "turn-token");
   // The owner-local socket rides along so a Grok child whose HOME is the
   // account profile still dials the edge, not `<profile>/.hive/edge.sock`.
   assert.equal(env.HIVE_EDGE_SOCKET, resolveEdgeSocketPath());
@@ -128,13 +133,13 @@ test("composeChildEnv exports the owner-local edge socket, not the child's pinne
     else process.env.HIVE_HOME = previousHome;
   });
 
-  const env = composeChildEnv({ HOME: "/profiles/grok-seat" }, { deliveryId: 7 });
+  const env = composeChildEnv({ HOME: "/profiles/grok-seat" }, { deliveryId: 7, token: "turn-token" });
   assert.equal(env.HOME, "/profiles/grok-seat");
   assert.equal(env.HIVE_EDGE_SOCKET, join(homedir(), ".hive", "edge.sock"));
   assert.notEqual(env.HIVE_EDGE_SOCKET, join("/profiles/grok-seat", ".hive", "edge.sock"));
 
   process.env.HIVE_EDGE_SOCKET = "/run/hive/edge.sock";
-  const pinned = composeChildEnv({ HOME: "/profiles/grok-seat" }, { deliveryId: 7 });
+  const pinned = composeChildEnv({ HOME: "/profiles/grok-seat" }, { deliveryId: 7, token: "turn-token" });
   assert.equal(pinned.HIVE_EDGE_SOCKET, "/run/hive/edge.sock");
 });
 
@@ -186,7 +191,7 @@ test("Grok Build live delivery terminalizes loudly; resume without a session id 
   const grok = new GrokProvider();
   await assert.rejects(grok.deliverLive(), /no live-ingress surface/);
   await assert.rejects(
-    async () => grok.resume(subscription({ provider: "grok", sessionId: null }), "/tmp", "framed", { deliveryId: 512 }),
+    async () => grok.resume(subscription({ provider: "grok", sessionId: null }), "/tmp", "framed", { deliveryId: 512, token: "turn-token" }),
     /resume target missing/,
   );
 });
@@ -227,7 +232,7 @@ test("Codex socket grant and child env share resolveEdgeSocketPath, including HI
   const expected = resolveEdgeSocketPath();
   assert.equal(expected, join("/var/lib/hive", "edge.sock"));
   assert.notEqual(expected, join(homedir(), ".hive", "edge.sock"));
-  assert.equal(composeChildEnv({}, { deliveryId: 1 }).HIVE_EDGE_SOCKET, expected);
+  assert.equal(composeChildEnv({}, { deliveryId: 1, token: "turn-token" }).HIVE_EDGE_SOCKET, expected);
 
   const grant = codexPermissionArgs("read-only").find((arg) => arg.includes("unix_sockets="));
   assert.ok(grant?.includes(JSON.stringify(expected)), grant);

@@ -137,10 +137,10 @@ test("POST /v1/wakes mints a seat wake, and refuses one that cannot be delivered
     });
 
   // The mint is an edge-authenticated act like every other seat act.
-  const unauthorized = await post({ sourceDeliveryId: source.id, actor: "gnomon", text: "go" }, "wrong-token");
+  const unauthorized = await post({ sourceDeliveryId: source.id, generation: source.leaseGeneration!, actor: "gnomon", text: "go" }, "wrong-token");
   assert.equal(unauthorized.status, 401);
 
-  const minted = await post({ sourceDeliveryId: source.id, actor: "gnomon", text: "please verify the gate set" });
+  const minted = await post({ sourceDeliveryId: source.id, generation: source.leaseGeneration!, actor: "gnomon", text: "please verify the gate set" });
   assert.equal(minted.status, 201);
   const receipt = JSON.parse(minted.body) as { deliveryId: number; from: string; actor: string };
   assert.equal(receipt.from, "ariadne");
@@ -148,7 +148,7 @@ test("POST /v1/wakes mints a seat wake, and refuses one that cannot be delivered
   assert.equal(store.getDelivery(receipt.deliveryId).actor, "gnomon");
 
   // R-3: a refusal answers with its code AND its reason, never a bare 400.
-  const refused = await post({ sourceDeliveryId: source.id, actor: "theoros", text: "hello" });
+  const refused = await post({ sourceDeliveryId: source.id, generation: source.leaseGeneration!, actor: "theoros", text: "hello" });
   assert.equal(refused.status, 422);
   const error = JSON.parse(refused.body) as { error: string; detail: string };
   assert.equal(error.error, "unroutable_actor");
@@ -156,13 +156,13 @@ test("POST /v1/wakes mints a seat wake, and refuses one that cannot be delivered
 
   // Another authenticated edge cannot mint from this delivery.
   const otherToken = store.createEdge("other");
-  const stolen = await post({ sourceDeliveryId: source.id, actor: "gnomon", text: "steal" }, otherToken, "other");
+  const stolen = await post({ sourceDeliveryId: source.id, generation: source.leaseGeneration!, actor: "gnomon", text: "steal" }, otherToken, "other");
   assert.equal(stolen.status, 422);
   assert.equal((JSON.parse(stolen.body) as { error: string }).error, "source_not_held");
 
   // A malformed --thread is refused before Slack is asked.
   const badThread = await post({
-    sourceDeliveryId: source.id,
+    sourceDeliveryId: source.id, generation: source.leaseGeneration!,
     actor: "gnomon",
     text: "wrong thread",
     threadTs: "not-a-thread",
@@ -172,7 +172,7 @@ test("POST /v1/wakes mints a seat wake, and refuses one that cannot be delivered
 
   // An alternate thread Slack does not know is refused (the default mock throws).
   const missingThread = await post({
-    sourceDeliveryId: source.id,
+    sourceDeliveryId: source.id, generation: source.leaseGeneration!,
     actor: "gnomon",
     text: "missing thread",
     threadTs: "200.1",
@@ -181,6 +181,6 @@ test("POST /v1/wakes mints a seat wake, and refuses one that cannot be delivered
   assert.equal((JSON.parse(missingThread.body) as { error: string }).error, "invalid_thread");
 
   // A body that cannot even name a mint is a validation failure, not a refusal.
-  const invalid = await post({ sourceDeliveryId: source.id, actor: "gnomon", text: "" });
+  const invalid = await post({ sourceDeliveryId: source.id, generation: source.leaseGeneration!, actor: "gnomon", text: "" });
   assert.equal(invalid.status, 400);
 });
