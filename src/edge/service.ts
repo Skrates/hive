@@ -2,6 +2,9 @@ import { frameWakeInstruction, type Delivery, type Provider, type Reason, type R
 import { BROKER_REQUEST_TIMEOUT_CODE, BrokerClient } from "./broker-client.js";
 import { LiveIngressRegistry } from "./live-registry.js";
 import {
+  CancellationUnconfirmedError,
+  CHILD_KILL_GRACE_MS,
+  LIVE_CANCEL_CONFIRM_MS,
   ProviderPreDispatchError,
   stampDispatchDeadline,
   type ProviderAdapter,
@@ -51,6 +54,23 @@ const MAX_CONCURRENT_DISPATCHES = 4;
  * declaring an outcome — the seat-side dedupe contract is what makes that safe.
  */
 const MAX_DISPATCH_MS = 3 * 60 * 60_000;
+
+/**
+ * Longest the edge holds a delivery's fence waiting for an aborted dispatch to
+ * actually stop. Derived from the two teardown clocks it must outlast — a live
+ * surface's cancellation receipt ({@link LIVE_CANCEL_CONFIRM_MS}) and a headless
+ * turn's SIGTERM→SIGKILL grace ({@link CHILD_KILL_GRACE_MS}) — so the bound
+ * cannot silently fall below a teardown it is supposed to be waiting for.
+ */
+export const CANCEL_CONFIRM_MS = Math.max(LIVE_CANCEL_CONFIRM_MS, CHILD_KILL_GRACE_MS) + 10_000;
+
+/**
+ * Longest a supervisor-bound teardown (watchdog exit, SIGINT/SIGTERM) waits
+ * before forcing the process down. It must exceed {@link CANCEL_CONFIRM_MS}, or
+ * the exit races the very cancellation the teardown just started — the edge
+ * would die mid-interrupt and orphan the turn it was stopping.
+ */
+export const EDGE_TEARDOWN_GRACE_MS = CANCEL_CONFIRM_MS + 5_000;
 
 /**
  * Longest the run loop will park waiting for a slot to free. The park itself is
@@ -354,11 +374,20 @@ export class EdgeService {
   }
 
   /**
-   * Run one dispatch under a wall-clock deadline. On expiry the returned
-   * promise rejects immediately — freeing the slot and letting the delivery
-   * reach a disposition — and the operation is asked to abort so its provider
-   * child does not outlive the turn. A late settlement of the aborted operation
-   * is absorbed here rather than surfacing as an unhandled rejection.
+   * Run one dispatch under a wall-clock deadline. On expiry — or on any other
+   * abort of this dispatch — the operation is asked to stop and this promise
+   * settles only once the operation actually settles, under {@link
+   * CANCEL_CONFIRM_MS}.
+   *
+   * Rejecting the instant the abort was *sent* is what made the fence a lie:
+   * the caller releases the delivery on that rejection, the broker's first
+   * retry is eligible 5s later, and a provider interrupt takes 10-15s — so the
+   * retry could start against a session whose original turn was still running.
+   * Propagating an abort down every hop cannot fix that; only ordering the
+   * release after the cancellation can. The wait is bounded because an
+   * unbounded one would rebuild the park this whole change exists to remove:
+   * when the bound expires the delivery is still released, with a reason that
+   * says the cancellation was never confirmed.
    */
   private withDispatchDeadline<T>(
     delivery: Delivery,
@@ -370,21 +399,39 @@ export class EdgeService {
     this.dispatchControllers.add(controller);
     return new Promise<T>((resolve, reject) => {
       let settled = false;
+      let cancelling = false;
       let timer: unknown = null;
+      let graceTimer: unknown = null;
       const onAbort = (): void => {
-        failDeadline();
+        beginCancellation();
       };
       const settle = (finish: () => void): void => {
         if (settled) return;
         settled = true;
         if (timer !== null) this.timers.clear(timer);
+        if (graceTimer !== null) this.timers.clear(graceTimer);
         controller.signal.removeEventListener("abort", onAbort);
         this.dispatchControllers.delete(controller);
         finish();
       };
-      const failDeadline = (): void => {
+      const deadlineError = (): DispatchDeadlineError =>
+        new DispatchDeadlineError(delivery.id, this.timers.now() - startedAt);
+      const beginCancellation = (): void => {
+        if (cancelling) return;
+        cancelling = true;
         if (!controller.signal.aborted) controller.abort();
-        settle(() => reject(new DispatchDeadlineError(delivery.id, this.timers.now() - startedAt)));
+        graceTimer = this.timers.set(() => {
+          console.error(
+            "hive edge dispatch cancellation unconfirmed",
+            delivery.id,
+            delivery.actor,
+            `${CANCEL_CONFIRM_MS}ms`,
+          );
+          settle(() => reject(new CancellationUnconfirmedError(
+            delivery.id,
+            `the provider did not stop within ${CANCEL_CONFIRM_MS}ms of the edge's abort`,
+          )));
+        }, CANCEL_CONFIRM_MS);
       };
       timer = this.timers.set(() => {
         console.error(
@@ -393,16 +440,24 @@ export class EdgeService {
           delivery.actor,
           `${MAX_DISPATCH_MS}ms`,
         );
-        failDeadline();
+        beginCancellation();
       }, MAX_DISPATCH_MS);
       if (controller.signal.aborted) {
-        failDeadline();
+        // Pre-aborted: no operation ever ran, so there is nothing to wait for
+        // and nothing left running to be uncertain about.
+        cancelling = true;
+        settle(() => reject(deadlineError()));
         return;
       }
       controller.signal.addEventListener("abort", onAbort, { once: true });
       operation(controller.signal).then(
-        (value) => settle(() => resolve(value)),
-        (error: unknown) => settle(() => reject(error)),
+        (value) => settle(() => (cancelling ? reject(deadlineError()) : resolve(value))),
+        (error: unknown) => settle(() => reject(
+          // An operation that reports its own unconfirmed cancellation keeps
+          // that diagnosis; anything else settling under an abort is the bound
+          // this edge enforced, not a provider failure.
+          cancelling && !(error instanceof CancellationUnconfirmedError) ? deadlineError() : error,
+        )),
       );
     });
   }
@@ -526,6 +581,15 @@ function classifyDeliveryFailure(error: unknown, providerStarted: boolean): Reas
   if (error instanceof ProviderPreDispatchError) {
     return { code: error.code, detail: preDispatchDetail(error.code) };
   }
+  if (error instanceof CancellationUnconfirmedError) {
+    // Worse than a clean deadline and it must not be filed as one: the edge
+    // ended this turn's bookkeeping without evidence that the turn ended, so
+    // the retry this release triggers may run beside it (R-3).
+    return {
+      code: "dispatch_cancellation_unconfirmed",
+      detail: `the edge stopped waiting for this turn but could not confirm it stopped — ${error.detail}`,
+    };
+  }
   if (error instanceof DispatchDeadlineError) {
     // Distinct from `provider_dispatch_unknown`: the edge did not lose track of
     // this turn, it ended it. Naming that in the thread notice is the whole
@@ -569,6 +633,7 @@ function safeEdgeErrorCode(error: unknown): string {
   if (error instanceof ProviderPreDispatchError) return error.code;
   if (error instanceof PreDispatchError) return error.code;
   if (error instanceof DispatchDeadlineError) return "dispatch_deadline_exceeded";
+  if (error instanceof CancellationUnconfirmedError) return "dispatch_cancellation_unconfirmed";
   const message = error instanceof Error ? error.message : String(error);
   return [
     BROKER_REQUEST_TIMEOUT_CODE,

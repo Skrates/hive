@@ -48,6 +48,21 @@ export class ProviderPreDispatchError extends Error {
 }
 
 /**
+ * The edge asked a provider to stop an in-flight turn and got no confirmation
+ * that it stopped. The delivery is still released — holding a fence on an
+ * unanswering peer forever is the wedge this whole change removes — but the
+ * disposition names the uncertainty instead of reporting a clean teardown, so a
+ * retry landing beside a still-running turn is explained rather than mysterious
+ * (ADR-0003 R-3).
+ */
+export class CancellationUnconfirmedError extends Error {
+  constructor(readonly deliveryId: number, readonly detail: string) {
+    super(`cancellation of delivery ${deliveryId} was not confirmed: ${detail}`);
+    this.name = "CancellationUnconfirmedError";
+  }
+}
+
+/**
  * Every dispatch carries the edge's wall-clock deadline as an abort signal. An
  * adapter that owns a child process MUST kill it on abort: the edge frees the
  * dispatch slot the moment the deadline fires, so a child that outlives the
@@ -86,19 +101,48 @@ export class CodexProvider implements ProviderAdapter {
   async deliverLive(ingress: LiveIngress, delivery: Delivery, framed: string, signal?: AbortSignal): Promise<ProviderDispatch> {
     let result: { receipt?: unknown; outcome?: unknown; processed?: unknown };
     const deadlineAt = dispatchDeadlineAt(signal);
+    // The dispatch abort must NOT simply tear this request down. Destroying the
+    // socket tells the surface to stop but says nothing about whether it did,
+    // and the edge releases the delivery's fence on that send — the interrupt
+    // takes 10-15s, the first retry is eligible after 5s. So the abort asks for
+    // cancellation over a second request and waits for the surface's answer;
+    // that answer is the receipt. The transport controller is the hard bound on
+    // the wait, so an unanswering surface still cannot park this dispatch.
+    const transport = new AbortController();
+    let cancellation: Promise<LiveCancellation> | null = null;
+    // Read through a function: the assignment happens in the abort listener, so
+    // control-flow narrowing at the catch would otherwise call it unreachable.
+    const pendingCancellation = (): Promise<LiveCancellation> | null => cancellation;
+    let transportTimer: ReturnType<typeof setTimeout> | null = null;
+    const onAbort = (): void => {
+      cancellation = requestLiveCancel(ingress.socketPath, delivery.id);
+      transportTimer = setTimeout(() => transport.abort(), LIVE_CANCEL_CONFIRM_MS);
+      transportTimer.unref();
+    };
+    if (signal?.aborted) onAbort();
+    else signal?.addEventListener("abort", onAbort, { once: true });
     try {
       result = await udsRequestJson(
         ingress.socketPath,
         "POST",
         "/deliver",
         deadlineAt === undefined ? { delivery, framed } : { delivery, framed, deadlineAt },
-        signal,
+        transport.signal,
       );
     } catch (error) {
+      const pending = pendingCancellation();
+      if (pending !== null) {
+        const outcome = await pending;
+        if (!outcome.confirmed) throw new CancellationUnconfirmedError(delivery.id, outcome.detail);
+        throw new Error(`Codex live turn for delivery ${delivery.id} was cancelled at the edge's dispatch bound`);
+      }
       if (error instanceof UdsHttpError && surfaceErrorCode(error.responseBody) === "account_profile_mismatch") {
         throw new ProviderPreDispatchError("account_profile_mismatch");
       }
       throw error;
+    } finally {
+      signal?.removeEventListener("abort", onAbort);
+      if (transportTimer !== null) clearTimeout(transportTimer);
     }
     const receipt = result.receipt;
     if (typeof receipt !== "string" || receipt.length === 0
@@ -331,6 +375,47 @@ const STDERR_TAIL_CHARS = 2_000;
 const MAX_STREAM_LINE_CHARS = 1_000_000;
 /** Grace between SIGTERM and SIGKILL when the edge's dispatch deadline aborts a turn. */
 export const CHILD_KILL_GRACE_MS = 5_000;
+/**
+ * Longest the edge waits for a live surface to confirm that an aborted turn
+ * stopped. Must exceed the far side's own interrupt timeouts — 10s on the Codex
+ * app-server, 15s on the Desktop IPC client — or the receipt would time out
+ * while the interrupt it reports on is still legitimately running.
+ */
+export const LIVE_CANCEL_CONFIRM_MS = 20_000;
+
+interface LiveCancellation {
+  /** The surface reported the turn as stopped (or as never accepted). */
+  confirmed: boolean;
+  detail: string;
+}
+
+/**
+ * Ask a live surface to stop one delivery and report what it answered. Every
+ * failure mode — an unreachable socket, a timeout, a surface that could not
+ * interrupt its accepted turn — is an UNconfirmed cancellation, never a silent
+ * success: this result is the edge's only evidence that a released delivery is
+ * safe to retry.
+ */
+async function requestLiveCancel(socketPath: string, deliveryId: number): Promise<LiveCancellation> {
+  try {
+    const result = await udsRequestJson<{ cancelled?: unknown; interrupted?: unknown }>(
+      socketPath,
+      "POST",
+      "/cancel",
+      { deliveryId },
+      AbortSignal.timeout(LIVE_CANCEL_CONFIRM_MS),
+    );
+    if (result.interrupted === false) {
+      return { confirmed: false, detail: "the live surface could not interrupt the accepted turn" };
+    }
+    return { confirmed: true, detail: "the live surface confirmed the turn stopped" };
+  } catch (error) {
+    return {
+      confirmed: false,
+      detail: `the live surface did not answer the cancel request: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+}
 
 const dispatchDeadlines = new WeakMap<AbortSignal, number>();
 

@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { Delivery, Subscription } from "../domain.js";
-import { prepareSocketPath } from "../local/uds.js";
+import { prepareSocketPath, udsRequestJson } from "../local/uds.js";
 import {
   assertPinnedDesktopAccount,
   completeCodexDelivery,
@@ -14,6 +14,8 @@ import {
   DesktopFollowerRetirement,
   desktopDeliveryKey,
   handleCodexLiveRequest,
+  LiveDeliveryCancellations,
+  parseLiveCancelPayload,
   parseLiveDeliveryPayload,
 } from "./live.js";
 
@@ -237,8 +239,10 @@ test("aborting after accept interrupts the exact accepted turn on both surfaces"
     async interrupt(_sessionId: string, turnId: string) { interrupted.push(`desktop:${turnId}`); },
   };
   const now = Date.parse("2026-08-06T11:26:45.000Z");
+  const reported: boolean[] = [];
   const app = completeCodexDelivery(client, "thread-1", delivery(now), "wake", () => now, {
     signal: controller.signal,
+    onInterrupt: (confirmed) => reported.push(confirmed),
   });
   const desktop = completeDesktopDelivery(
     desktopClient,
@@ -246,7 +250,7 @@ test("aborting after accept interrupts the exact accepted turn on both surfaces"
     delivery(now),
     "wake",
     () => now,
-    { signal: controller.signal },
+    { signal: controller.signal, onInterrupt: (confirmed) => reported.push(confirmed) },
   );
   const deadline = Date.now() + 1_000;
   while (waiting < 2 && Date.now() < deadline) await new Promise((resolve) => setImmediate(resolve));
@@ -255,6 +259,9 @@ test("aborting after accept interrupts the exact accepted turn on both surfaces"
   await assert.rejects(() => app, /aborted/);
   await assert.rejects(() => desktop, /aborted/);
   assert.deepEqual(interrupted, ["app:turn-live", "desktop:turn-desktop"]);
+  // Both surfaces report the interrupt, not only the one a finding happened to
+  // cite: the cancel receipt is a property of the class.
+  assert.deepEqual(reported, [true, true]);
 });
 
 test("an abort that arrives while deliver() is accepting still interrupts the acquired turn", async () => {
@@ -358,6 +365,7 @@ test("closing the live HTTP client aborts the in-flight provider wait", async (t
         await new Promise(() => {});
         return { receipt: "x", outcome: "y", processed: true };
       },
+      new LiveDeliveryCancellations(),
     ).catch(() => {});
   });
   await new Promise<void>((resolve) => server.listen({ path: socketPath }, resolve));
@@ -387,6 +395,110 @@ test("closing the live HTTP client aborts the in-flight provider wait", async (t
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
   assert.equal(seenSignal!.aborted, true);
+});
+
+test("the cancel answer waits for the tracked delivery to stop, and reports the interrupt", async () => {
+  // Aborting the UDS client is a send, not a receipt. The edge releases the
+  // delivery's broker fence on this answer and the first retry is 5s behind it,
+  // so the answer may not arrive until the accepted turn has actually stopped.
+  const cancellations = new LiveDeliveryCancellations();
+  const client = new AbortController();
+  const order: string[] = [];
+  const tracked = cancellations.track(77, client.signal, async (bound) => {
+    await new Promise<void>((resolve) => {
+      bound.signal.addEventListener("abort", () => resolve(), { once: true });
+    });
+    // The far side takes its time interrupting; the answer must not overtake it.
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    bound.onInterrupt?.(true);
+    order.push("stopped");
+    throw new Error("Codex live delivery aborted");
+  });
+  tracked.catch(() => {});
+
+  const answer = await cancellations.cancel(77);
+  order.push("answered");
+  assert.deepEqual(order, ["stopped", "answered"]);
+  assert.deepEqual(answer, { cancelled: true, interrupted: true });
+  assert.deepEqual(
+    await cancellations.cancel(77),
+    { cancelled: false, interrupted: null },
+    "a delivery that already settled is not in flight, and cancelling it again is a no-op",
+  );
+});
+
+test("a failed interrupt reaches the cancel answer, not only the log", async () => {
+  // The interrupt is the only thing that stops an accepted turn. Swallowing its
+  // failure into console.error told the edge the turn was gone when it was not.
+  const cancellations = new LiveDeliveryCancellations();
+  const client = {
+    async deliver() { return { turnId: "turn-stuck", mode: "start" as const }; },
+    async waitForCompletion(_threadId: string, _turnId: string, _timeoutMs: number, signal?: AbortSignal) {
+      await new Promise<never>((_resolve, reject) => {
+        signal?.addEventListener("abort", () => reject(new Error("Codex live delivery aborted")), { once: true });
+      });
+      return { status: "completed" as const, assistantText: "unreachable" };
+    },
+    async interrupt() { throw new Error("app-server connection is gone"); },
+  };
+  const now = Date.parse("2026-08-06T11:26:45.000Z");
+  const clientSignal = new AbortController();
+  const tracked = cancellations.track(78, clientSignal.signal, (bound) =>
+    completeCodexDelivery(client, "thread-1", delivery(now), "wake", () => now, bound));
+  tracked.catch(() => {});
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(await cancellations.cancel(78), { cancelled: true, interrupted: false });
+});
+
+test("the live surface answers /cancel over its own socket", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "hive-live-cancel-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const socketPath = join(root, "live.sock");
+  prepareSocketPath(socketPath);
+
+  const cancellations = new LiveDeliveryCancellations();
+  let accepted: ((value: unknown) => void) | null = null;
+  const server = createServer((request, response) => {
+    void handleCodexLiveRequest(
+      request,
+      response,
+      () => ({ actor: "ariadne", mode: "dedicated" }),
+      async (_delivery, _framed, bound) => {
+        await new Promise((resolve) => { accepted = resolve; bound.signal.addEventListener("abort", () => resolve(null), { once: true }); });
+        bound.onInterrupt?.(true);
+        throw new Error("Codex live delivery aborted");
+      },
+      cancellations,
+    ).catch(() => {
+      // The real surface answers a failed delivery with its error body; a test
+      // server that stayed silent would leave the client hanging instead.
+      const body = JSON.stringify({ error: "live_delivery_failed" });
+      response.writeHead(500, { "content-type": "application/json", "content-length": Buffer.byteLength(body) });
+      response.end(body);
+    });
+  });
+  await new Promise<void>((resolve) => server.listen({ path: socketPath }, resolve));
+  t.after(() => server.close());
+
+  const now = Date.parse("2026-08-06T11:26:45.000Z");
+  const inFlight = udsRequestJson(socketPath, "POST", "/deliver", { delivery: delivery(now), framed: "wake" })
+    .catch(() => null);
+  const started = Date.now();
+  while (accepted === null && Date.now() - started < 2_000) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.ok(accepted, "the delivery is in flight on the surface");
+
+  const answer = await udsRequestJson<{ cancelled: boolean; interrupted: boolean | null }>(
+    socketPath,
+    "POST",
+    "/cancel",
+    { deliveryId: delivery(now).id },
+  );
+  assert.deepEqual(answer, { cancelled: true, interrupted: true });
+  await inFlight;
+  assert.throws(() => parseLiveCancelPayload({ deliveryId: 0 }), /live_delivery_invalid/);
 });
 
 test("a late-claimed delivery gets a full post-claim turn budget", async () => {

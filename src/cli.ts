@@ -17,8 +17,8 @@ import { BrokerClient } from "./edge/broker-client.js";
 import { EdgeControlServer } from "./edge/control.js";
 import { LiveIngressRegistry } from "./edge/live-registry.js";
 import { ProxyAgent, setGlobalDispatcher } from "undici";
-import { CHILD_KILL_GRACE_MS, ClaudeProvider, CodexProvider, GrokProvider } from "./edge/providers.js";
-import { EdgeService } from "./edge/service.js";
+import { ClaudeProvider, CodexProvider, GrokProvider } from "./edge/providers.js";
+import { EDGE_TEARDOWN_GRACE_MS, EdgeService } from "./edge/service.js";
 import { EdgeStore } from "./edge/store.js";
 import { EdgeLivenessWatchdog } from "./edge/watchdog.js";
 import { udsRequestJson } from "./local/uds.js";
@@ -139,7 +139,11 @@ program.command("edge")
         // survive the supervisor restart and race the recovered retry.
         controller.abort();
         edge.abortActiveDispatches();
-        setTimeout(() => process.exit(code), CHILD_KILL_GRACE_MS + 500);
+        // The teardown grace must outlast the cancellation the abort just
+        // started (a live-surface interrupt runs 10-15s). At the old
+        // CHILD_KILL_GRACE_MS + 500 this exit fired first and orphaned the very
+        // turn it was stopping — the wedge, one hop further out.
+        setTimeout(() => process.exit(code), EDGE_TEARDOWN_GRACE_MS);
       },
       now: () => Date.now(),
       log: (message) => console.error(message),

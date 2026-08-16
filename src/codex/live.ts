@@ -142,6 +142,7 @@ export async function runCodexLive(config: Config): Promise<void> {
   }
 
   prepareSocketPath(config.surfaceSocket);
+  const cancellations = new LiveDeliveryCancellations();
   const http = createServer((request, response) => {
     void handleCodexLiveRequest(request, response, () => bindingStatus(config.actor, target), async (delivery, framed, bound) => {
       const acceptedTarget = target;
@@ -156,7 +157,7 @@ export async function runCodexLive(config: Config): Promise<void> {
         await assertPinnedDesktopAccount(config.desktopHome, delivery.subscription.accountProfile);
         return completeDesktopDelivery(desktopClient, acceptedTarget.sessionId, delivery, framed, Date.now, bound);
       });
-    })
+    }, cancellations)
       .catch((error: unknown) => {
         const code = error instanceof SurfaceError ? error.code : "live_delivery_failed";
         const body = JSON.stringify({ error: code });
@@ -264,6 +265,86 @@ class SurfaceError extends Error {
 export interface LiveDeliveryBound {
   signal: AbortSignal;
   deadlineAt?: number;
+  /**
+   * Reports whether the provider confirmed the interrupt of an accepted turn.
+   * `true` means the far side acknowledged; `false` means the interrupt itself
+   * failed and the turn may still be running. Never called when no turn was
+   * accepted — nothing was left to stop.
+   */
+  onInterrupt?: (confirmed: boolean) => void;
+}
+
+/** The `/cancel` answer: what this surface knows about the turn it was asked to stop. */
+export interface LiveCancelResult {
+  /** A delivery was in flight here and has now left the provider path. */
+  cancelled: boolean;
+  /**
+   * `true` — the provider acknowledged the interrupt; `null` — no turn had been
+   * accepted, so there was nothing to interrupt; `false` — the interrupt failed
+   * and the turn may still be executing.
+   */
+  interrupted: boolean | null;
+}
+
+/**
+ * In-flight live deliveries, keyed by delivery id, so the edge can ask this
+ * surface to stop an accepted turn and be told *when it actually stopped*.
+ *
+ * Destroying the UDS client is only a send. The edge used to release the
+ * delivery's broker fence on that send, while an app-server/Desktop interrupt
+ * takes 10-15s and the first retry is eligible after 5s — so the retry could
+ * start against the same session while the original turn was still executing.
+ * The `/cancel` response is the receipt that closes that window.
+ */
+export class LiveDeliveryCancellations {
+  private readonly inFlight = new Map<number, {
+    controller: AbortController;
+    stopped: Promise<void>;
+    interrupted: () => boolean | null;
+  }>();
+
+  /** Run one delivery under a registration the `/cancel` route can reach. */
+  async track<T>(
+    deliveryId: number,
+    clientSignal: AbortSignal,
+    operation: (bound: LiveDeliveryBound) => Promise<T>,
+    deadlineAt?: number,
+  ): Promise<T> {
+    const controller = new AbortController();
+    const onClientAbort = (): void => controller.abort();
+    if (clientSignal.aborted) controller.abort();
+    else clientSignal.addEventListener("abort", onClientAbort, { once: true });
+    let interrupted: boolean | null = null;
+    let release!: () => void;
+    const stopped = new Promise<void>((resolve) => { release = resolve; });
+    this.inFlight.set(deliveryId, { controller, stopped, interrupted: () => interrupted });
+    try {
+      return await operation({
+        signal: controller.signal,
+        ...(deadlineAt === undefined ? {} : { deadlineAt }),
+        onInterrupt: (confirmed) => { interrupted = confirmed; },
+      });
+    } finally {
+      clientSignal.removeEventListener("abort", onClientAbort);
+      this.inFlight.delete(deliveryId);
+      // Ordered after the delete: a `/cancel` waiter that wakes here must never
+      // observe this delivery as still in flight.
+      release();
+    }
+  }
+
+  /**
+   * Stop the named delivery and answer only once its provider path has settled.
+   * An unknown delivery is the idempotent case — it already settled — and is
+   * reported as a stop nobody had to make.
+   */
+  async cancel(deliveryId: number): Promise<LiveCancelResult> {
+    const entry = this.inFlight.get(deliveryId);
+    if (!entry) return { cancelled: false, interrupted: null };
+    entry.controller.abort();
+    await entry.stopped;
+    return { cancelled: true, interrupted: entry.interrupted() };
+  }
 }
 
 /**
@@ -275,11 +356,14 @@ export async function handleCodexLiveRequest(
   response: ServerResponse,
   status: () => BindingStatus,
   deliver: (delivery: Delivery, framed: string, bound: LiveDeliveryBound) => Promise<CompletedLiveDelivery>,
+  cancellations: LiveDeliveryCancellations,
 ): Promise<void> {
   if (request.method === "GET" && request.url === "/binding") {
     return sendJson(response, 200, status());
   }
-  if (request.method !== "POST" || request.url !== "/deliver") throw new SurfaceError("not_found");
+  if (request.method !== "POST" || (request.url !== "/deliver" && request.url !== "/cancel")) {
+    throw new SurfaceError("not_found");
+  }
   const chunks: Buffer[] = [];
   for await (const chunk of request) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
   let body: unknown;
@@ -288,11 +372,16 @@ export async function handleCodexLiveRequest(
   } catch {
     throw new SurfaceError("live_delivery_invalid");
   }
+  if (request.url === "/cancel") {
+    return sendJson(response, 200, await cancellations.cancel(parseLiveCancelPayload(body)));
+  }
   const payload = parseLiveDeliveryPayload(body);
-  const result = await deliver(payload.delivery, payload.framed, {
-    signal: clientDisconnectSignal(request, response),
-    ...(payload.deadlineAt === undefined ? {} : { deadlineAt: payload.deadlineAt }),
-  });
+  const result = await cancellations.track(
+    payload.delivery.id,
+    clientDisconnectSignal(request, response),
+    (bound) => deliver(payload.delivery, payload.framed, bound),
+    payload.deadlineAt,
+  );
   sendJson(response, 200, result);
 }
 
@@ -387,7 +476,9 @@ export async function completeCodexDelivery(
       processed: true,
     };
   } catch (error) {
-    if (acceptedTurnId !== undefined) await interruptAcceptedTurn(client, threadId, acceptedTurnId);
+    if (acceptedTurnId !== undefined) {
+      await interruptAcceptedTurn(client, threadId, acceptedTurnId, bound.onInterrupt);
+    }
     throw error;
   }
 }
@@ -438,19 +529,31 @@ export async function completeDesktopDelivery(
       processed: true,
     };
   } catch (error) {
-    if (acceptedTurnId !== undefined) await interruptAcceptedTurn(client, sessionId, acceptedTurnId);
+    if (acceptedTurnId !== undefined) {
+      await interruptAcceptedTurn(client, sessionId, acceptedTurnId, bound.onInterrupt);
+    }
     throw error;
   }
 }
 
+/**
+ * Interrupting is the only thing that stops an accepted turn, so a failed
+ * interrupt is not a logging matter: the edge is about to release this
+ * delivery's fence and retry it. `report` carries that fact back to the
+ * `/cancel` answer; the throw is still swallowed so a failed interrupt cannot
+ * replace the diagnosis of the error that triggered the cancellation.
+ */
 async function interruptAcceptedTurn(
   client: { interrupt(targetId: string, turnId: string): Promise<void> },
   targetId: string,
   turnId: string,
+  report?: (confirmed: boolean) => void,
 ): Promise<void> {
   try {
     await client.interrupt(targetId, turnId);
+    report?.(true);
   } catch (error) {
+    report?.(false);
     console.error(
       "Hive Codex accepted-turn interrupt failed",
       turnId,
@@ -497,6 +600,13 @@ export function parseLiveDeliveryPayload(value: unknown): LiveDeliveryPayload {
     framed: value.framed,
     ...(deadlineAt === undefined ? {} : { deadlineAt }),
   };
+}
+
+export function parseLiveCancelPayload(value: unknown): number {
+  if (!isRecord(value) || !Number.isSafeInteger(value.deliveryId) || Number(value.deliveryId) < 1) {
+    throw new SurfaceError("live_delivery_invalid");
+  }
+  return Number(value.deliveryId);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

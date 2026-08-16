@@ -1,16 +1,20 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import test from "node:test";
 import type { Delivery, DeliveryResultInput, Reason, ReplaySnapshot, Subscription } from "../domain.js";
 import type { BrokerClient } from "./broker-client.js";
 import { LiveIngressRegistry, type LiveIngress } from "./live-registry.js";
 import {
+  CHILD_KILL_GRACE_MS,
   dispatchDeadlineAt,
+  LIVE_CANCEL_CONFIRM_MS,
   ProviderPreDispatchError,
   type ProviderAdapter,
   type ProviderDispatch,
 } from "./providers.js";
 import { headlessAcknowledgement, HeadlessStreamReader } from "./providers.js";
-import { EdgeService, type EdgeTimers } from "./service.js";
+import { CANCEL_CONFIRM_MS, EDGE_TEARDOWN_GRACE_MS, EdgeService, type EdgeTimers } from "./service.js";
 import { EdgeStore } from "./store.js";
 import { EdgeLivenessWatchdog } from "./watchdog.js";
 
@@ -518,15 +522,35 @@ const THREE_HOURS_MS = 3 * 60 * 60_000;
 class HangingAdapter extends StubAdapter {
   readonly signals: Array<AbortSignal | undefined> = [];
 
-  constructor(private readonly hangsFor: (actor: string) => boolean = () => true) {
+  /**
+   * `stopAfterMs` is how long the provider takes to ACTUALLY stop once the edge
+   * aborts it — a live-surface interrupt is 10-15s of real work, a process
+   * group takes its SIGTERM grace. `null` models a provider that never stops,
+   * which is what the edge's cancellation bound has to survive. Timers are the
+   * virtual clock, so these delays cost no wall time.
+   */
+  constructor(
+    private readonly hangsFor: (actor: string) => boolean = () => true,
+    private readonly stopAfterMs: number | null = 0,
+    private readonly timers?: EdgeTimers,
+  ) {
     super();
   }
 
   override spawn(sub: Subscription, cwd: string, framed: string, signal?: AbortSignal): Promise<ProviderDispatch> {
     if (!this.hangsFor(sub.actor)) return super.spawn(sub, cwd, framed, signal);
     this.signals.push(signal);
-    return new Promise<ProviderDispatch>(() => {
-      // Never settles: the whole point. Only the edge's deadline can end it.
+    return new Promise<ProviderDispatch>((_resolve, reject) => {
+      // Never settles on its own: the whole point. Only the edge's deadline can
+      // end it — and then only after this provider has finished stopping.
+      if (this.stopAfterMs === null) return;
+      const stopAfterMs = this.stopAfterMs;
+      const timers = this.timers;
+      const stop = (): void => { reject(new Error("provider turn stopped at the edge's abort")); };
+      signal?.addEventListener("abort", () => {
+        if (stopAfterMs === 0 || timers === undefined) stop();
+        else timers.set(stop, stopAfterMs);
+      }, { once: true });
     });
   }
 }
@@ -539,14 +563,19 @@ function hangingDelivery(id: number, actor: string): Delivery {
   });
 }
 
-test("a dispatch that outlives the wall-clock deadline is force-settled, aborted, and released", async () => {
+test("a dispatch that outlives the wall-clock deadline is aborted, and released only once it has stopped", async () => {
   // The 2026-08-15 wedge in miniature: a provider turn that neither exits nor
   // errors held its slot forever while the lease heartbeat renewed the broker's
   // fence underneath it, so nothing anywhere could reclaim the delivery.
+  //
+  // This turn takes 8s to actually stop after the abort — the cost of a real
+  // interrupt. The fence must be held for those 8s: releasing on the abort
+  // itself makes the delivery eligible for retry (5s backoff) while the
+  // original turn is still executing.
   const timers = new FakeTimers();
   const broker = new FakeBroker([hangingDelivery(40, "gnomon")]);
   const store = new EdgeStore(":memory:");
-  const adapter = new HangingAdapter();
+  const adapter = new HangingAdapter(() => true, 8_000, timers);
   const edge = new EdgeService(asBrokerClient(broker), store, new LiveIngressRegistry(), [adapter], timers);
 
   const done = edge.processOne();
@@ -563,13 +592,67 @@ test("a dispatch that outlives the wall-clock deadline is force-settled, aborted
   assert.equal(broker.releases.length, 0);
 
   await timers.advance(2_000);
-  assert.equal(await done, true);
   assert.equal(adapter.signals[0]?.aborted, true, "the provider is asked to kill its child");
+  assert.equal(settled, false, "the dispatch is still held while the provider stops");
+  assert.equal(broker.releases.length, 0, "the fence outlives the abort, not just the send");
+
+  await timers.advance(8_000);
+  assert.equal(await done, true);
   assert.equal(broker.releases.length, 1);
   assert.equal(broker.releases[0]?.reason.code, "dispatch_deadline_exceeded");
   assert.equal(broker.finishes.length, 0, "uncertainty releases; it never declares an outcome");
   assert.equal(store.get(40)?.status, "released");
   store.close();
+});
+
+test("a provider that never stops releases as an UNCONFIRMED cancellation, once the bound expires", async () => {
+  // The other half of the ordering contract: waiting for the stop must itself
+  // be bounded, or the fence-hold rebuilds the park this whole change removes.
+  // What the bound may not do is call the result clean — the turn may still be
+  // running, and the reason has to say so (R-3).
+  const timers = new FakeTimers();
+  const broker = new FakeBroker([hangingDelivery(41, "gnomon")]);
+  const store = new EdgeStore(":memory:");
+  const adapter = new HangingAdapter(() => true, null);
+  const edge = new EdgeService(asBrokerClient(broker), store, new LiveIngressRegistry(), [adapter], timers);
+
+  const done = edge.processOne();
+  await flush();
+  await timers.advance(THREE_HOURS_MS + 1_000);
+  assert.equal(adapter.signals[0]?.aborted, true);
+  assert.equal(broker.releases.length, 0, "an unanswering provider still holds the fence inside the bound");
+
+  await timers.advance(CANCEL_CONFIRM_MS);
+  assert.equal(await done, true);
+  assert.equal(broker.releases.length, 1);
+  assert.equal(broker.releases[0]?.reason.code, "dispatch_cancellation_unconfirmed");
+  assert.match(broker.releases[0]?.reason.detail ?? "", /could not confirm it stopped/);
+  assert.equal(store.get(41)?.status, "released");
+  store.close();
+});
+
+test("the teardown clocks are ordered: exit grace > cancellation bound > every far-side stop", () => {
+  // Each of these bounds waits for the one below it. A grace that slipped under
+  // the stop it waits for is a check that cannot fire for its reason: the exit
+  // would kill the edge mid-interrupt and orphan the turn it was stopping.
+  assert.ok(EDGE_TEARDOWN_GRACE_MS > CANCEL_CONFIRM_MS, "the supervisor exit outlasts the cancellation bound");
+  assert.ok(CANCEL_CONFIRM_MS > LIVE_CANCEL_CONFIRM_MS, "the cancellation bound outlasts a live-surface receipt");
+  assert.ok(CANCEL_CONFIRM_MS > CHILD_KILL_GRACE_MS, "and outlasts a headless SIGTERM grace");
+  // The live receipt in turn outlasts the far side's own interrupt timeouts:
+  // 10s on the Codex app-server, 15s on the Desktop IPC client.
+  assert.ok(LIVE_CANCEL_CONFIRM_MS > 15_000, "the receipt outlasts the slowest provider interrupt");
+});
+
+test("the edge command's supervisor teardown uses the ordered grace, not the child-kill grace", () => {
+  // The watchdog exit path is wired in the CLI, where no unit test reaches the
+  // timer. Assert the wiring at the source: a default or a stale constant here
+  // is exactly how this bound silently reverted to 5.5s.
+  const cli = readFileSync(join(process.cwd(), "src", "cli.ts"), "utf8");
+  assert.match(cli, /setTimeout\(\(\) => process\.exit\(code\), EDGE_TEARDOWN_GRACE_MS\)/);
+  // Strip comments first: the prose ABOVE that wiring names the old constant,
+  // and an absence assertion that matches its own documentation proves nothing.
+  const code = cli.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
+  assert.doesNotMatch(code, /CHILD_KILL_GRACE_MS \+ 500/);
 });
 
 test("with every dispatch slot hung, a newly published delivery is still claimed once the bound elapses", async () => {
