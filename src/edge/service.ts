@@ -92,6 +92,18 @@ export class DispatchDeadlineError extends Error {
   }
 }
 
+/**
+ * A dispatch the edge itself cancelled before its deadline — shutdown, or the
+ * liveness watchdog. Filed distinctly: "the provider exceeded 180 minutes" is
+ * a false diagnosis for a turn the edge stopped at minute two.
+ */
+export class DispatchCancelledError extends Error {
+  constructor(readonly deliveryId: number, readonly elapsedMs: number) {
+    super(`dispatch for delivery ${deliveryId} cancelled by the edge after ${elapsedMs}ms`);
+    this.name = "DispatchCancelledError";
+  }
+}
+
 export class EdgeService {
   private after = 0;
   private running = false;
@@ -400,10 +412,11 @@ export class EdgeService {
     return new Promise<T>((resolve, reject) => {
       let settled = false;
       let cancelling = false;
+      let cancelCause: "deadline" | "external" | null = null;
       let timer: unknown = null;
       let graceTimer: unknown = null;
       const onAbort = (): void => {
-        beginCancellation();
+        beginCancellation("external");
       };
       const settle = (finish: () => void): void => {
         if (settled) return;
@@ -416,9 +429,14 @@ export class EdgeService {
       };
       const deadlineError = (): DispatchDeadlineError =>
         new DispatchDeadlineError(delivery.id, this.timers.now() - startedAt);
-      const beginCancellation = (): void => {
+      const cancelError = (): Error =>
+        cancelCause === "external"
+          ? new DispatchCancelledError(delivery.id, this.timers.now() - startedAt)
+          : deadlineError();
+      const beginCancellation = (cause: "deadline" | "external"): void => {
         if (cancelling) return;
         cancelling = true;
+        cancelCause = cause;
         if (!controller.signal.aborted) controller.abort();
         graceTimer = this.timers.set(() => {
           console.error(
@@ -440,23 +458,24 @@ export class EdgeService {
           delivery.actor,
           `${MAX_DISPATCH_MS}ms`,
         );
-        beginCancellation();
+        beginCancellation("deadline");
       }, MAX_DISPATCH_MS);
       if (controller.signal.aborted) {
         // Pre-aborted: no operation ever ran, so there is nothing to wait for
         // and nothing left running to be uncertain about.
         cancelling = true;
-        settle(() => reject(deadlineError()));
+        cancelCause = "external";
+        settle(() => reject(cancelError()));
         return;
       }
       controller.signal.addEventListener("abort", onAbort, { once: true });
       operation(controller.signal).then(
-        (value) => settle(() => (cancelling ? reject(deadlineError()) : resolve(value))),
+        (value) => settle(() => (cancelling ? reject(cancelError()) : resolve(value))),
         (error: unknown) => settle(() => reject(
           // An operation that reports its own unconfirmed cancellation keeps
           // that diagnosis; anything else settling under an abort is the bound
           // this edge enforced, not a provider failure.
-          cancelling && !(error instanceof CancellationUnconfirmedError) ? deadlineError() : error,
+          cancelling && !(error instanceof CancellationUnconfirmedError) ? cancelError() : error,
         )),
       );
     });
@@ -588,6 +607,15 @@ function classifyDeliveryFailure(error: unknown, providerStarted: boolean): Reas
     return {
       code: "dispatch_cancellation_unconfirmed",
       detail: `the edge stopped waiting for this turn but could not confirm it stopped — ${error.detail}`,
+    };
+  }
+  if (error instanceof DispatchCancelledError) {
+    // The edge stopped this turn deliberately (shutdown or the watchdog),
+    // possibly minutes in. Filing it as a deadline would post a false
+    // "exceeded 180 minutes" diagnosis to the thread.
+    return {
+      code: "dispatch_cancelled_by_edge",
+      detail: "the edge cancelled this turn (shutdown or watchdog) before its deadline; it is released for redelivery",
     };
   }
   if (error instanceof DispatchDeadlineError) {

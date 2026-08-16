@@ -317,7 +317,12 @@ export class LiveDeliveryCancellations {
     let interrupted: boolean | null = null;
     let release!: () => void;
     const stopped = new Promise<void>((resolve) => { release = resolve; });
-    this.inFlight.set(deliveryId, { controller, stopped, interrupted: () => interrupted });
+    const entry = { controller, stopped, interrupted: () => interrupted };
+    // A broker retry reuses the delivery id. The superseded attempt is aborted
+    // (one delivery, one live attempt), and the delete below is entry-guarded
+    // so the old attempt's settle can never deregister this one.
+    this.inFlight.get(deliveryId)?.controller.abort();
+    this.inFlight.set(deliveryId, entry);
     try {
       return await operation({
         signal: controller.signal,
@@ -326,7 +331,7 @@ export class LiveDeliveryCancellations {
       });
     } finally {
       clientSignal.removeEventListener("abort", onClientAbort);
-      this.inFlight.delete(deliveryId);
+      if (this.inFlight.get(deliveryId) === entry) this.inFlight.delete(deliveryId);
       // Ordered after the delete: a `/cancel` waiter that wakes here must never
       // observe this delivery as still in flight.
       release();

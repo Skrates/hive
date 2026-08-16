@@ -127,10 +127,18 @@ export class CodexAppServerClient {
     while (Date.now() < deadline) {
       if (signal?.aborted) throw new Error("Codex live delivery aborted");
       await this.connect();
-      const result = await this.request(
-        "thread/read",
-        { threadId, includeTurns: true },
-        Math.min(10_000, remaining(deadline)),
+      // The read itself races the abort: a poll that has just started its
+      // 10-second window would otherwise serialize in front of the 10-second
+      // interrupt, doubling the cancellation bound. The read continues on the
+      // wire — it is read-only — but this waiter stops immediately.
+      const result = await raceAbort(
+        this.request(
+          "thread/read",
+          { threadId, includeTurns: true },
+          Math.min(10_000, remaining(deadline)),
+        ),
+        signal,
+        "Codex live delivery aborted",
       ) as { thread: CodexThread };
       const turn = result.thread.turns.find((candidate) => candidate.id === turnId);
       if (turn && turn.status !== "inProgress") {
@@ -229,4 +237,18 @@ export function delay(ms: number, signal?: AbortSignal): Promise<void> {
 
 function remaining(deadline: number): number {
   return Math.max(1, deadline - Date.now());
+}
+
+/** Resolve with the promise, or reject as soon as the signal aborts. */
+function raceAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined, message: string): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(new Error(message));
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(new Error(message));
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => { signal.removeEventListener("abort", onAbort); resolve(value); },
+      (error: unknown) => { signal.removeEventListener("abort", onAbort); reject(error); },
+    );
+  });
 }

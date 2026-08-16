@@ -730,7 +730,9 @@ test("abortActiveDispatches tears down in-flight turns before a watchdog exit wo
     60_000,
   );
   assert.ok(released, "aborted dispatches reach a release disposition");
-  assert.equal(broker.releases.every((item) => item.reason.code === "dispatch_deadline_exceeded"), true);
+  // A watchdog/shutdown abort is the edge's own cancellation, not a deadline:
+  // the thread notice must not claim the provider exceeded 180 minutes.
+  assert.equal(broker.releases.every((item) => item.reason.code === "dispatch_cancelled_by_edge"), true);
 
   controller.abort();
   await timers.advanceUntil(() => false, 60_000);

@@ -132,7 +132,14 @@ export class CodexProvider implements ProviderAdapter {
     } catch (error) {
       const pending = pendingCancellation();
       if (pending !== null) {
-        const outcome = await pending;
+        let outcome = await pending;
+        if (outcome.confirmed && !outcome.sawDelivery) {
+          // The cancel raced the still-arriving /deliver: an unknown-delivery
+          // answer given before the delivery request settled proves nothing.
+          // Now that /deliver HAS settled, one re-ask is authoritative —
+          // either the registration landed (and is stopped) or it never will.
+          outcome = await requestLiveCancel(ingress.socketPath, delivery.id);
+        }
         if (!outcome.confirmed) throw new CancellationUnconfirmedError(delivery.id, outcome.detail);
         throw new Error(`Codex live turn for delivery ${delivery.id} was cancelled at the edge's dispatch bound`);
       }
@@ -386,6 +393,13 @@ export const LIVE_CANCEL_CONFIRM_MS = 20_000;
 interface LiveCancellation {
   /** The surface reported the turn as stopped (or as never accepted). */
   confirmed: boolean;
+  /**
+   * The surface actually observed this delivery. An unknown-delivery answer
+   * (`cancelled: false, interrupted: null`) while the `/deliver` request is
+   * still in flight is a race, not a settlement — it must be re-asked once
+   * the delivery request itself has settled.
+   */
+  sawDelivery: boolean;
   detail: string;
 }
 
@@ -406,12 +420,20 @@ async function requestLiveCancel(socketPath: string, deliveryId: number): Promis
       AbortSignal.timeout(LIVE_CANCEL_CONFIRM_MS),
     );
     if (result.interrupted === false) {
-      return { confirmed: false, detail: "the live surface could not interrupt the accepted turn" };
+      return { confirmed: false, sawDelivery: true, detail: "the live surface could not interrupt the accepted turn" };
     }
-    return { confirmed: true, detail: "the live surface confirmed the turn stopped" };
+    const sawDelivery = result.cancelled === true || result.interrupted !== null;
+    return {
+      confirmed: true,
+      sawDelivery,
+      detail: sawDelivery
+        ? "the live surface confirmed the turn stopped"
+        : "the live surface never observed this delivery",
+    };
   } catch (error) {
     return {
       confirmed: false,
+      sawDelivery: false,
       detail: `the live surface did not answer the cancel request: ${error instanceof Error ? error.message : String(error)}`,
     };
   }
@@ -434,6 +456,33 @@ export function dispatchDeadlineAt(signal: AbortSignal | undefined): number | un
  * the CLI PID; a descendant that outlives the CLI keeps writing the workspace
  * after the edge has already released the delivery and may start a retry.
  */
+/** True while any process in the group (or the CLI itself) still exists. */
+function processGroupAlive(pid: number | undefined): boolean {
+  if (pid === undefined) return false;
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
+/** Poll until the group is gone, bounded — the SIGKILL timer armed by the abort path is the enforcer. */
+async function waitForProcessGroupExit(pid: number | undefined, boundMs: number): Promise<void> {
+  const deadline = Date.now() + boundMs;
+  while (processGroupAlive(pid) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  if (processGroupAlive(pid)) {
+    console.error("hive edge provider process group survived the kill grace", pid);
+  }
+}
+
 export function signalProcessGroup(pid: number | undefined, signal: NodeJS.Signals): void {
   if (pid === undefined) return;
   try {
@@ -605,6 +654,13 @@ async function runHeadless(
   } finally {
     signal?.removeEventListener("abort", onAbort);
     if (killTimer !== null && !signal?.aborted) clearTimeout(killTimer);
+  }
+  if (signal?.aborted) {
+    // `close` settles when the CLI's stdio ends; a descendant with its own
+    // stdio can outlive both the CLI and SIGTERM. The edge releases the
+    // delivery's fence on this return, so the whole group must be dead first —
+    // otherwise the retry races a survivor still writing the workspace.
+    await waitForProcessGroupExit(child.pid, CHILD_KILL_GRACE_MS + 1_000);
   }
   stdout.finish();
   stderr.finish();
