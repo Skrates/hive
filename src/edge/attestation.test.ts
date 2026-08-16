@@ -74,6 +74,21 @@ test("a record missing the bound fields is incomplete, not partially believed", 
   }
 });
 
+test("empty attestation fields are incomplete, matching the wire parser's strictness", () => {
+  // The tampered/partially-installed shape: present, typed, and empty. The
+  // reader must name the absence — forwarding ok:true would make the strict
+  // wire parser kill the live daemon, turning "does not refuse" into a refusal.
+  for (const broken of [
+    record({ attestation_id: "" }),
+    record({ doctrine: { commit: "" } }),
+    record({ actor: "" }),
+  ]) {
+    const read = readWakeAttestation(profileWith(broken));
+    assert.equal(read.ok, false);
+    assert.equal(bindingFor(read, "gnomon").absence, "attestation_incomplete");
+  }
+});
+
 test("a profile installed for another seat keeps its evidence and flags the mismatch", () => {
   // The 2026-08-15 scar: a seat dispatched from the wrong config dir. The id
   // is exactly what identifies the profile it actually ran, so it must be

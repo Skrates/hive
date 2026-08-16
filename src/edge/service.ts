@@ -169,7 +169,24 @@ export class EdgeService {
 
       const dispatch = await this.withLeaseHeartbeat(
         current,
-        () => this.dispatch(current, replay, live, () => { providerStarted = true; }),
+        () => this.dispatch(current, replay, live, () => {
+          providerStarted = true;
+          // The last uncovered cell of {live, headless} × {claim, provider-start}:
+          // a headless child reads its profile when it spawns, which is several
+          // awaits after the claim-time capture. Re-read at the moment the
+          // provider actually starts and re-point the row, so the recorded
+          // attestation names the artifacts this turn runs under.
+          if (!live) {
+            this.store.rebind(
+              current.id,
+              generation,
+              bindingFor(
+                readWakeAttestation(delivery.subscription.accountProfile),
+                delivery.actor,
+              ),
+            );
+          }
+        }),
       );
       current = await this.broker.markDispatched(current);
       this.store.setStatus(current.id, generation, "dispatched", dispatch.receipt);

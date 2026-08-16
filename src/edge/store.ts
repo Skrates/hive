@@ -102,6 +102,29 @@ export class EdgeStore {
    * artifacts that were installed when it *started*, and a reinstall mid-turn
    * must not be able to rewrite that answer.
    */
+  /**
+   * Re-point the current attempt's attestation at what the provider start
+   * actually read. The capture→use window closes from both ends: claim-time
+   * capture (receive) plus this provider-start re-read — an installer that
+   * replaces the profile between the two no longer leaves the row naming
+   * artifacts the turn never used. Same-generation, pre-terminal only: a
+   * terminal or re-claimed row keeps its own story.
+   */
+  rebind(deliveryId: number, generation: number, binding: AttestationBinding): void {
+    this.db.prepare(`
+      UPDATE local_deliveries
+      SET attestation_id=?, doctrine_commit=?, attestation_absence=?, updated_at=?
+      WHERE delivery_id=? AND generation=? AND status IN ('received', 'dispatching')
+    `).run(
+      binding.attestationId,
+      binding.doctrineCommit,
+      binding.absence,
+      new Date().toISOString(),
+      deliveryId,
+      generation,
+    );
+  }
+
   receive(delivery: Delivery, generation: number, binding: AttestationBinding): LocalRow {
     const now = new Date().toISOString();
     const history = historyAfterReceive(this.get(delivery.id), generation, delivery.attempts);

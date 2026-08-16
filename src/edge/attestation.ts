@@ -71,6 +71,13 @@ export function readWakeAttestation(accountProfile: string): AttestationRead {
   if (typeof attestationId !== "string" || typeof doctrineCommit !== "string" || typeof actor !== "string") {
     return { ok: false, absence: "attestation_incomplete" };
   }
+  // Empty strings are the tampered/partially-installed shape parseAttestationWire
+  // refuses. One strictness on both sides of the wire: the reader names the
+  // absence here, so the strict parser can never turn a bad profile into a
+  // refused wake ("it does not refuse" is the PR's own guarantee).
+  if (attestationId.length === 0 || doctrineCommit.length === 0 || actor.length === 0) {
+    return { ok: false, absence: "attestation_incomplete" };
+  }
   return { ok: true, attestation: { attestationId, doctrineCommit, actor } };
 }
 

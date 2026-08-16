@@ -481,6 +481,36 @@ test("every claimed delivery is bound to the attestation of the profile it runs 
   store.close();
 });
 
+test("a profile replaced between claim and provider start is re-read at start", async () => {
+  // The last cell of {live, headless} × {claim, provider-start}: an installer
+  // can replace the profile in the window between the claim-time capture and
+  // the child actually spawning. The row must name what the turn ran under.
+  const profile = mkdtempSync(join(tmpdir(), "weave-swap-"));
+  const attestation = (id: string) => JSON.stringify({
+    schema: "weave.attestation/1",
+    attestation_id: "sha256:" + id.repeat(64),
+    actor: "ariadne",
+    doctrine: { remote: "RationallyPrime/weave-doctrine", commit: "9".repeat(40) },
+  });
+  writeFileSync(join(profile, ATTESTATION_FILENAME), attestation("a"));
+
+  class SwappingBroker extends FakeBroker {
+    override async accept(value: Delivery): Promise<Delivery> {
+      writeFileSync(join(profile, ATTESTATION_FILENAME), attestation("b"));
+      return super.accept(value);
+    }
+  }
+  const broker = new SwappingBroker([delivery(1, { subscription: subscription({ accountProfile: profile }) })]);
+  const store = new EdgeStore(":memory:");
+  const edge = new EdgeService(asBrokerClient(broker), store, new LiveIngressRegistry(), [new StubAdapter()]);
+
+  assert.equal(await edge.processOne(), true);
+  const row = store.get(1)!;
+  assert.equal(row.status, "processed");
+  assert.equal(row.attestation_id, "sha256:" + "b".repeat(64));
+  store.close();
+});
+
 test("a seat with no attestation still wakes, and the delivery says why it is unbound", async () => {
   // Attestation is evidence, not authority: D1 ruled the surface before any
   // enforcement, so an unattested profile must never turn a wake into an outage.
