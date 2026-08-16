@@ -54,6 +54,11 @@ export class BrokerService {
    * the edge will then fail to replay.
    */
   async mintSeatWake(input: SeatWakeMint, edgeId: string): Promise<SeatWakeReceipt> {
+    // An identical retry answers from the ledger before any Slack probe: the
+    // idempotence guarantee must hold precisely when the response was lost,
+    // and Slack being down at retry time is part of that failure mode.
+    const replayed = this.store.resolveSeatWakeReplay(input);
+    if (replayed) return replayed;
     if (input.threadTs !== null) {
       if (!isSlackMessageTs(input.threadTs)) {
         throw new SeatWakeRefusedError(

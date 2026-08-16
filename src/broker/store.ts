@@ -725,6 +725,32 @@ export class BrokerStore {
    * The mint is idempotent over (source delivery, target, thread, text): a
    * replayed command returns the original delivery and posts nothing new.
    */
+  /**
+   * The receipt for an already-ledgered identical mint, or null.
+   *
+   * Mirrors ``mintSeatWake``'s identity derivation exactly so the service can
+   * answer a replay BEFORE any side-effectful validation (the Slack thread
+   * probe): a lost-response retry must return the original receipt even while
+   * Slack is unreachable.
+   */
+  resolveSeatWakeReplay(input: SeatWakeMint): SeatWakeReceipt | null {
+    const sourceRow = this.db.prepare("SELECT delivery_id FROM deliveries WHERE delivery_id=?")
+      .get(input.sourceDeliveryId) as Row | undefined;
+    if (!sourceRow) return null;
+    const source = this.getDelivery(input.sourceDeliveryId);
+    const from = source.actor;
+    const target = canonicalActor(input.actor);
+    const channelId = source.event.channelId;
+    const threadTs = input.threadTs ?? source.event.threadTs;
+    const digest = createHash("sha256")
+      .update([input.sourceDeliveryId, from, target, channelId, threadTs, input.text].join("\n"))
+      .digest("hex")
+      .slice(0, 16);
+    const replayed = this.deliveryIdForEvent(`mint:${input.sourceDeliveryId}:${digest}`);
+    if (replayed === null) return null;
+    return { deliveryId: replayed, actor: target, from, channelId, threadTs, created: false };
+  }
+
   mintSeatWake(input: SeatWakeMint, edgeId: string): SeatWakeReceipt {
     return this.db.transaction(() => {
       const sourceRow = this.db.prepare("SELECT delivery_id FROM deliveries WHERE delivery_id=?")
