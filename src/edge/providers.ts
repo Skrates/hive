@@ -46,6 +46,25 @@ export class ProviderPreDispatchError extends Error {
   }
 }
 
+/**
+ * Nonzero headless exit. Message is metadata only — never stderr.
+ * Provider stderr can carry prompt text, model output, or credentials; those
+ * must not ride an exception into a Logfire span.
+ */
+export class HeadlessProviderExitError extends Error {
+  readonly provider: string;
+  readonly exitCode: number | null;
+  readonly stderrBytes: number;
+
+  constructor(provider: string, exitCode: number | null, stderrBytes: number) {
+    super(`${provider} exited ${String(exitCode)} (stderr_bytes=${String(stderrBytes)})`);
+    this.name = "HeadlessProviderExitError";
+    this.provider = provider;
+    this.exitCode = exitCode;
+    this.stderrBytes = stderrBytes;
+  }
+}
+
 export interface ProviderAdapter {
   provider: Provider;
   preflight?(subscription: Subscription): void;
@@ -319,7 +338,10 @@ async function runHeadless(
     child.once("error", reject);
     child.once("close", resolve);
   });
-  if (code !== 0) throw new Error(`${command} exited ${code}: ${Buffer.concat(stderr).toString("utf8").slice(-2_000)}`);
+  if (code !== 0) {
+    const stderrBytes = Buffer.concat(stderr).byteLength;
+    throw new HeadlessProviderExitError(command, code, stderrBytes);
+  }
   const output = Buffer.concat(stdout).toString("utf8");
   return { receipt: output.slice(-4_000), outcome: headlessAcknowledgement(output), processed: true };
 }

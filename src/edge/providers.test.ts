@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -8,7 +8,7 @@ import type { Delivery, Subscription } from "../domain.js";
 import { prepareSocketPath } from "../local/uds.js";
 import type { LiveIngress } from "./live-registry.js";
 import { delimiter, dirname } from "node:path";
-import { ClaudeProvider, claudePromptSlotArgs, codexPermissionArgs, CodexProvider, composeChildEnv, GrokProvider, grokPermissionArgs, prependPathEntry, ProviderPreDispatchError, requireAccountProfile } from "./providers.js";
+import { ClaudeProvider, claudePromptSlotArgs, codexPermissionArgs, CodexProvider, composeChildEnv, GrokProvider, grokPermissionArgs, HeadlessProviderExitError, prependPathEntry, ProviderPreDispatchError, requireAccountProfile } from "./providers.js";
 
 function subscription(overrides: Partial<Subscription> = {}): Subscription {
   return {
@@ -340,4 +340,43 @@ test("a structured Desktop account rejection remains a deterministic pre-dispatc
     (error: unknown) => error instanceof ProviderPreDispatchError
       && error.code === "account_profile_mismatch",
   );
+});
+
+test("a nonzero headless exit throws metadata only — never provider stderr", async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "hive-headless-exit-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const script = join(directory, "failing-provider");
+  const secret = "SECRET_STDERR WAKE: talos | xoxb-not-a-real-token prompt text";
+  writeFileSync(script, `#!/bin/sh\nprintf '%s\\n' '${secret}' >&2\nexit 7\n`, { mode: 0o755 });
+  chmodSync(script, 0o755);
+
+  const previous = process.env.HIVE_GROK_COMMAND;
+  t.after(() => {
+    if (previous === undefined) delete process.env.HIVE_GROK_COMMAND;
+    else process.env.HIVE_GROK_COMMAND = previous;
+  });
+  process.env.HIVE_GROK_COMMAND = script;
+
+  const grok = new GrokProvider();
+  const error = await grok.spawn(
+    subscription({ provider: "grok", accountProfile: directory }),
+    directory,
+    "framed wake must not appear on the error",
+  ).then(
+    () => {
+      throw new Error("expected spawn to reject");
+    },
+    (caught: unknown) => caught,
+  );
+
+  assert.ok(error instanceof HeadlessProviderExitError);
+  assert.equal(error.exitCode, 7);
+  assert.ok(error.stderrBytes > 0);
+  assert.match(error.message, /exited 7/);
+  assert.match(error.message, /stderr_bytes=/);
+  assert.doesNotMatch(error.message, /SECRET_STDERR/);
+  assert.doesNotMatch(error.message, /xoxb-/);
+  assert.doesNotMatch(error.message, /framed wake/);
+  assert.doesNotMatch(error.stack ?? "", /SECRET_STDERR/);
+  assert.doesNotMatch(JSON.stringify(error), /SECRET_STDERR/);
 });
