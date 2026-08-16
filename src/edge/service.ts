@@ -29,8 +29,12 @@ const systemEdgeTimers: EdgeTimers = {
  * edge declares its busy actors on every claim and the broker skips their
  * deliveries. This cap therefore bounds how many *distinct* actors run turns
  * simultaneously on one machine.
+ *
+ * Exported because `launchers.test.ts` asserts every repo-owned launcher sizes
+ * `UV_THREADPOOL_SIZE` above this cap; that gate reads the constant rather than
+ * restating the number, so raising the cap here raises the bar there too.
  */
-const MAX_CONCURRENT_DISPATCHES = 4;
+export const MAX_CONCURRENT_DISPATCHES = 4;
 
 export class EdgeService {
   private after = 0;

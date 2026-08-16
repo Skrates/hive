@@ -208,14 +208,24 @@ The edge records; it does not verify and it does not refuse.
   indefinitely, and four of them stop the claim loop for every actor on the edge — the outcome
   the threadpool move was meant to prevent, reached by a different route. The blocked libuv
   thread itself cannot be reclaimed by a timeout, so `UV_THREADPOOL_SIZE` is set above the
-  dispatch cap in **all three** repo-owned launchers — `deploy/systemd/hive-edge.service` (cx53,
-  linux laptop), `deploy/launchd/run-edge.zsh` (macbook), and
-  `deploy/machines/edge-runpod/{Dockerfile,start-edge.sh}` (RunPod) — rather than left at
-  libuv's default of 4, which is exactly the dispatch cap and a default nobody chose. The RunPod
-  entry is the one that matters most, not least: its seat HOME is on `/workspace`, a
-  network-backed volume, so it is the deployment the whole three-guard stack was written for.
-  Adding a launcher without this line reintroduces the exhaustion on that machine alone —
-  `git grep UV_THREADPOOL_SIZE` should return one hit per launcher.
+  dispatch cap in every repo-owned launcher, rather than left at libuv's default of 4, which is
+  exactly the dispatch cap and a default nobody chose. At the time of writing that is
+  `deploy/systemd/hive-edge.service` (cx53, linux laptop), `deploy/launchd/run-edge.zsh`
+  (macbook), and `deploy/machines/edge-runpod/{Dockerfile,start-edge.sh}` (RunPod) — read as
+  orientation, not as the authority; the authority is `src/edge/launchers.test.ts`, and the list
+  here may lag it. The RunPod entry is the one that matters most, not least: its seat HOME is on
+  `/workspace`, a network-backed volume, so it is the deployment the whole three-guard stack was
+  written for.
+
+  **Adding a launcher without this line reintroduces the exhaustion on that machine alone, so the
+  enumeration is derived, not written down.** `src/edge/launchers.test.ts` walks `deploy/`, finds
+  every file whose executable lines launch the edge, and fails if one of them does not set
+  `UV_THREADPOOL_SIZE` above `MAX_CONCURRENT_DISPATCHES`. A fourth launcher joins that set by
+  existing — no doc edit, no allowlist entry. Do **not** verify this with `git grep
+  UV_THREADPOOL_SIZE`: that grep enumerates the launchers which already *have* the line, so the
+  one launcher missing it contributes no hit and the output looks exactly as correct as a clean
+  run. `bun run check` is the check; the gate reads the constant from `src/edge/service.ts`
+  rather than restating `4`, so raising the dispatch cap raises the required pool size with it.
 
   The residual, stated rather than claimed away: **a mount that is slow but working records a
   false `attestation_unreadable`.** That is the deliberate trade — a delivery bounded at two
