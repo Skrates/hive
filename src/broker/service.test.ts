@@ -1,8 +1,63 @@
 import assert from "node:assert/strict";
+import { InMemorySpanExporter, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
+import * as logfire from "@pydantic/logfire-node";
 import test from "node:test";
-import type { ReplaySnapshot } from "../domain.js";
+import type { ReplaySnapshot, SlackEventInput, SubscriptionInput } from "../domain.js";
+import {
+  installObservabilitySdkForTests,
+  peekDeliveryTraceparent,
+  rememberDeliveryTraceparent,
+  resetObservabilityForTests,
+} from "../observability.js";
 import { BrokerService, type SlackTransport } from "./service.js";
 import { BrokerStore } from "./store.js";
+
+const unusedSlack: SlackTransport = {
+  async replay(): Promise<ReplaySnapshot> { throw new Error("not used"); },
+  async reply(): Promise<string> { throw new Error("not used"); },
+  async react(): Promise<void> { throw new Error("not used"); },
+};
+
+function seedDispatchedDelivery(store: BrokerStore): number {
+  store.createEdge("mac");
+  store.upsertSubscription({
+    actor: "ariadne",
+    provider: "codex",
+    providerSurface: "app-server",
+    providerVersion: "test",
+    sessionId: null,
+    homeEdge: "mac",
+    workspace: "hive",
+    edgeWorkspaces: [{ edgeId: "mac", cwd: "/work/hive", worktree: null }],
+    wakePolicy: "spawn",
+    permissionProfile: "read-only",
+    accountProfile: "/profiles/ariadne",
+    leaseTtlMs: 1_000,
+    deliveryTtlMs: 5_000,
+    homeGraceMs: 0,
+    spawnRateLimit: 1,
+    maxAttempts: 5,
+    expiresAt: null,
+  } satisfies SubscriptionInput);
+  store.ingestEvent({
+    eventId: "Ev-outcome",
+    workspaceId: "T1",
+    channelId: "C1",
+    threadTs: "100.1",
+    messageTs: "100.2",
+    senderId: "U1",
+    senderKind: "user",
+    actor: "ariadne",
+    text: "WAKE: ariadne | report via hive reply",
+    raw: {},
+    receivedAt: "2026-08-01T00:00:00.000Z",
+  } satisfies SlackEventInput);
+  const claimed = store.claimNext("mac", 0)!;
+  store.transition(claimed.id, "mac", 1, "claimed", "accepted_local");
+  store.transition(claimed.id, "mac", 1, "accepted_local", "dispatching");
+  store.transition(claimed.id, "mac", 1, "dispatching", "dispatched");
+  return claimed.id;
+}
 
 test("overlapping outbox drains share one healthy in-process pass", async (t) => {
   const store = new BrokerStore(":memory:");
@@ -166,4 +221,37 @@ test("a hung reactions call never stalls the serialized drain that claim() waits
   // The drain resolves without the stamp: the wake-delivery path stays live.
   assert.equal(await broker.drainOutbox(), 1);
   assert.deepEqual(store.listUnsentOutbox(), []);
+});
+
+test("recordOutcome restores the stored delivery context, spans, and forgets the parent", (t) => {
+  resetObservabilityForTests();
+  t.after(() => resetObservabilityForTests());
+
+  const store = new BrokerStore(":memory:");
+  t.after(() => store.close());
+  const deliveryId = seedDispatchedDelivery(store);
+  const parent = `00-${"ab".repeat(16)}-${"cd".repeat(8)}-01`;
+  rememberDeliveryTraceparent(deliveryId, parent);
+
+  const exporter = new InMemorySpanExporter();
+  logfire.configure({
+    serviceName: "hive-test-outcome",
+    sendToLogfire: false,
+    console: false,
+    additionalSpanProcessors: [new SimpleSpanProcessor(exporter)],
+  });
+  installObservabilitySdkForTests(logfire);
+
+  const reported = new BrokerService(store, unusedSlack).recordOutcome(deliveryId, "done: shipped the fix");
+  assert.equal(reported.status, "processed");
+  assert.equal(peekDeliveryTraceparent(deliveryId), undefined);
+
+  const outcome = exporter.getFinishedSpans().find((span) => span.name === "hive.broker.outcome");
+  assert.ok(outcome, "recordOutcome must emit hive.broker.outcome");
+  assert.equal(outcome.spanContext().traceId, "ab".repeat(16));
+  assert.equal(outcome.attributes.delivery_id, deliveryId);
+  assert.equal(outcome.attributes.actor, "ariadne");
+  assert.equal(outcome.attributes.channel_id, "C1");
+  assert.equal(outcome.attributes.thread_ts, "100.1");
+  assert.equal(outcome.attributes.dedupe_key, "Ev-outcome");
 });
