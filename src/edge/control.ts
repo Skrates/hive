@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { ProviderSchema } from "../domain.js";
 import { prepareSocketPath } from "../local/uds.js";
+import { parseAttestationWire } from "./attestation.js";
 import { LiveIngressRegistryError } from "./live-registry.js";
 import type { EdgeService } from "./service.js";
 
@@ -64,12 +65,24 @@ export class EdgeControlServer {
         : requiredString(body.sessionId, "sessionId");
       const ttlMs = Number(body.ttlMs ?? 30_000);
       if (!Number.isInteger(ttlMs) || ttlMs < 1_000 || ttlMs > 600_000) throw new Error("invalid ttlMs");
+      // A surface that sent no attestation field is registered as having
+      // reported exactly that, never as an omission. Dropping the key here
+      // would make `undefined` inside the registry mean two different things —
+      // "no prior registration" and "the prior registration said nothing" —
+      // and `retainedAttestation` cannot recover a distinction the write
+      // already erased: a later report would then be adopted as though it had
+      // been captured when the session started. Minting the absence at the
+      // ingress is the edge computing it about its own input, which is why
+      // `attestationWire` refuses to let a *surface* claim this one.
+      const runtimeAttestation = parseAttestationWire(body.attestation)
+        ?? { ok: false, absence: "attestation_unreported" } as const;
       const ingress = this.edge.live.register({
         actor,
         provider: parsedProvider.data,
         socketPath,
         sessionId,
         surfaceVersion,
+        runtimeAttestation,
       }, ttlMs);
       return json(response, 200, ingress);
     }
@@ -122,6 +135,7 @@ function safeControlError(error: unknown): string {
     || message === "invalid provider"
     || message === "invalid ttlMs"
     || message === "invalid deliveryId"
+    || message === "invalid attestation"
     || message.startsWith("missing ")
   ) return message;
   return "edge_request_failed";

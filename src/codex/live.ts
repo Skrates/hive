@@ -4,6 +4,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { dedupeKey, type Delivery } from "../domain.js";
+import { attestationWire, readWakeAttestation } from "../edge/attestation.js";
 import { prepareSocketPath, udsRequestJson } from "../local/uds.js";
 import { CodexAppServerClient } from "./app-server.js";
 import { readCodexForegroundBinding, type CodexForegroundBinding } from "./binding.js";
@@ -188,6 +189,10 @@ export async function runCodexLive(config: Config): Promise<void> {
       sessionId: current.sessionId,
       surfaceVersion: config.surfaceVersion,
       ttlMs: REGISTRATION_TTL_MS,
+      // Desktop attachments execute under HIVE_CODEX_DESKTOP_HOME, which
+      // need only share auth.json with the pinned profile. Bind the wake
+      // to the home the turn actually loaded.
+      attestation: attestationWire(await readWakeAttestation(liveRuntimeHome(current.kind, config.desktopHome))),
     });
   };
   await register();
@@ -465,6 +470,20 @@ export function desktopDeliveryKey(delivery: Delivery): string {
  * split-state profile. A mismatch is a hard pre-dispatch failure before any
  * turn is injected, with no fallback.
  */
+/**
+ * The home whose instructions/settings/skills a live Codex turn actually
+ * loaded. Dedicated follows `CODEX_HOME` (the pinned profile). A foreground
+ * Desktop attachment follows `HIVE_CODEX_DESKTOP_HOME`, which is allowed to
+ * differ from the pinned profile as long as they share `auth.json`.
+ */
+export function liveRuntimeHome(
+  kind: "desktop" | "dedicated",
+  desktopHome: string,
+  dedicatedHome = process.env.CODEX_HOME ?? join(homedir(), ".codex"),
+): string {
+  return kind === "desktop" ? desktopHome : dedicatedHome;
+}
+
 export async function assertPinnedDesktopAccount(
   desktopHome: string,
   accountProfile: string,

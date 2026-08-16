@@ -241,6 +241,8 @@ test("Codex live delivery travels over the surface's owner-only UDS socket", asy
     socketPath,
     sessionId: "thread-1",
     surfaceVersion: "test",
+    // Required: a registration names its attestation or names its absence.
+    runtimeAttestation: { ok: false, absence: "attestation_unreported" },
     expiresAt: Date.now() + 60_000,
   };
   const result = await codex.deliverLive(ingress, delivery(11), "framed body");
@@ -271,6 +273,8 @@ test("an oversized live receipt is rejected", async (t) => {
     socketPath,
     sessionId: "thread-1",
     surfaceVersion: "test",
+    // Required: a registration names its attestation or names its absence.
+    runtimeAttestation: { ok: false, absence: "attestation_unreported" },
     expiresAt: Date.now() + 60_000,
   };
   await assert.rejects(
@@ -298,6 +302,8 @@ test("a missing live outcome is rejected instead of parsing the diagnostic recei
     socketPath,
     sessionId: "thread-1",
     surfaceVersion: "test",
+    // Required: a registration names its attestation or names its absence.
+    runtimeAttestation: { ok: false, absence: "attestation_unreported" },
     expiresAt: Date.now() + 60_000,
   };
   await assert.rejects(
@@ -325,6 +331,8 @@ test("a structured Desktop account rejection remains a deterministic pre-dispatc
     socketPath,
     sessionId: "thread-1",
     surfaceVersion: "test",
+    // Required: a registration names its attestation or names its absence.
+    runtimeAttestation: { ok: false, absence: "attestation_unreported" },
     expiresAt: Date.now() + 60_000,
   };
   await assert.rejects(

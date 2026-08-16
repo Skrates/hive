@@ -10,6 +10,7 @@ import {
   completeDesktopDelivery,
   DesktopFollowerRetirement,
   desktopDeliveryKey,
+  liveRuntimeHome,
 } from "./live.js";
 
 test("an obsolete Desktop follower is retired only after its in-flight delivery settles", async () => {
@@ -241,6 +242,11 @@ test("a Desktop delivery is refused unless its home is the pinned account profil
     () => assertPinnedDesktopAccount(insecureDesktop, insecurePinned),
     /account_profile_mismatch/,
   );
+});
+
+test("a foreground Desktop attachment binds to the Desktop home, not the pinned profile", () => {
+  assert.equal(liveRuntimeHome("desktop", "/Users/hakon/.codex", "/Users/hakon/.hive/profiles/codex-1"), "/Users/hakon/.codex");
+  assert.equal(liveRuntimeHome("dedicated", "/Users/hakon/.codex", "/Users/hakon/.hive/profiles/codex-1"), "/Users/hakon/.hive/profiles/codex-1");
 });
 
 function delivery(now: number, createdAt: number = now): Delivery {
