@@ -176,6 +176,9 @@ class GitHubApi(JsonApi):
     def post(self, suffix: str, payload: Mapping[str, Any]) -> Any:
         return self.request("POST", self.repo_path(suffix), payload=payload)
 
+    def delete(self, suffix: str) -> Any:
+        return self.request("DELETE", self.repo_path(suffix))
+
     def paginate(
         self, suffix: str, *, query: Mapping[str, Any] | None = None
     ) -> list[Any]:
@@ -798,19 +801,79 @@ def trusted_control_logins() -> frozenset[str]:
     return frozenset(login for login in logins if login)
 
 
-def marker_comment_exists(
+def trusted_marker_comment(
     comments: Sequence[Mapping[str, Any]],
     marker: str,
-) -> bool:
-    """Trust a control marker only when a trusted control identity authored it."""
+) -> Mapping[str, Any] | None:
+    """Return the first trusted-author comment that carries ``marker``."""
     trusted = trusted_control_logins()
     for comment in comments:
         user = comment.get("user")
         if not isinstance(user, Mapping) or user.get("login") not in trusted:
             continue
         if marker in str(comment.get("body") or ""):
-            return True
-    return False
+            return comment
+    return None
+
+
+def marker_comment_exists(
+    comments: Sequence[Mapping[str, Any]],
+    marker: str,
+) -> bool:
+    """Trust a control marker only when a trusted control identity authored it."""
+    return trusted_marker_comment(comments, marker) is not None
+
+
+def exhaustion_gate_is_terminal(
+    comments: Sequence[Mapping[str, Any]],
+    head_sha: str,
+    reviewed_heads: Sequence[str],
+) -> bool:
+    """An exhaustion marker is terminal only while the active cap is still met.
+
+    Raising ``MAX_REVIEW_ROUNDS`` must not leave a pre-raise per-head gate
+    able to suppress redelivery or claim that automation has stopped.
+    """
+    return len(reviewed_heads) >= MAX_REVIEW_ROUNDS and marker_comment_exists(
+        comments, exhaustion_marker(head_sha)
+    )
+
+
+def remove_stale_exhaustion_gate(
+    github: GitHubApi,
+    comments: Sequence[Mapping[str, Any]],
+    *,
+    head_sha: str,
+    reviewed_heads: Sequence[str],
+    pr_number: int,
+    repository: str,
+) -> None:
+    """Drop a pre-cap-raise gate that is no longer terminal.
+
+    Leaving it would keep a false 'automation has stopped' claim on the PR
+    and would suppress a later, accurate gate once the new cap is met.
+    """
+    if exhaustion_gate_is_terminal(comments, head_sha, reviewed_heads):
+        return
+    comment = trusted_marker_comment(comments, exhaustion_marker(head_sha))
+    if comment is None:
+        return
+    comment_id = comment.get("id")
+    if comment_id is None:
+        return
+    try:
+        github.delete(f"issues/comments/{int(comment_id)}")
+    except ApiHttpError as error:
+        print(
+            f"could not remove stale exhaustion gate for "
+            f"{repository}#{pr_number} (head={head_sha}, "
+            f"http={error.status_code})"
+        )
+        return
+    print(
+        f"removed stale exhaustion gate for {repository}#{pr_number} "
+        f"(head={head_sha}, rounds={len(reviewed_heads)}/{MAX_REVIEW_ROUNDS})"
+    )
 
 
 def refresh_pr_at_head(
@@ -1672,12 +1735,22 @@ def redeliver_standing_wake(
     "Acted" is a head change: any push produces a new head and a fresh review
     cycle, so an unchanged head past the window is a stall by definition.
     """
-    if marker_comment_exists(comments, exhaustion_marker(head_sha)):
+    if exhaustion_gate_is_terminal(comments, head_sha, reviewed_heads):
         # An exhaustion gate's terminal action is "stop and hold for the human".
         # That is observationally identical to consumed-without-action, and the
         # attention contract's "silence means stop safely" is load-bearing:
         # re-delivering it would convert a deliberate stop into pressure to act.
+        # A marker left from a lower cap is not that stop — the active limit
+        # has room, so the gate is stale and must not suppress attention.
         return False
+    remove_stale_exhaustion_gate(
+        github,
+        comments,
+        head_sha=head_sha,
+        reviewed_heads=reviewed_heads,
+        pr_number=pr_number,
+        repository=repository,
+    )
 
     verdict_at = standing_verdict_time(github, reviews, comments, head_sha, codex_login)
     if verdict_at is None:
@@ -1894,6 +1967,14 @@ def nudge_stalled_reviews() -> None:
                 github.post(f"issues/{pr_number}/comments", {"body": gate})
                 print(f"exhausted PR #{pr_number}")
             continue
+        remove_stale_exhaustion_gate(
+            github,
+            comments,
+            head_sha=head_sha,
+            reviewed_heads=reviewed_heads,
+            pr_number=pr_number,
+            repository=repository,
+        )
         if bare_nudge_covers_head(comments, head_sha):
             continue
         if (
