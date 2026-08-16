@@ -17,7 +17,7 @@ import { BrokerClient } from "./edge/broker-client.js";
 import { EdgeControlServer } from "./edge/control.js";
 import { LiveIngressRegistry } from "./edge/live-registry.js";
 import { ProxyAgent, setGlobalDispatcher } from "undici";
-import { ClaudeProvider, CodexProvider, GrokProvider } from "./edge/providers.js";
+import { ClaudeProvider, CodexProvider, GrokProvider, resolveEdgeSocketPath } from "./edge/providers.js";
 import { EdgeService } from "./edge/service.js";
 import { EdgeStore } from "./edge/store.js";
 import { udsRequestJson, UdsHttpError } from "./local/uds.js";
@@ -107,7 +107,7 @@ program.command("edge")
     const config = EdgeConfig.parse(process.env);
     if (config.HIVE_BROKER_PROXY) setGlobalDispatcher(new ProxyAgent(config.HIVE_BROKER_PROXY));
     const ingressRoot = config.HIVE_INGRESS_DIR ?? join(hiveHome(), "ingress");
-    const socketPath = config.HIVE_EDGE_SOCKET ?? join(hiveHome(), "edge.sock");
+    const socketPath = resolveEdgeSocketPath();
     // A fresh machine has no ~/.hive/ tree; better-sqlite3 and the control
     // socket both refuse to open into a missing directory. Bootstrap the state
     // dirs before anything opens them.
@@ -139,7 +139,7 @@ program.command("reply")
   .action(async (deliveryId: string, text: string[]) => {
     const id = Number(deliveryId);
     if (!Number.isInteger(id) || id < 1) throw new Error("delivery-id must be a positive integer");
-    const socketPath = process.env.HIVE_EDGE_SOCKET ?? join(hiveHome(), "edge.sock");
+    const socketPath = resolveEdgeSocketPath();
     await udsRequestJson(socketPath, "POST", "/outcome", { deliveryId: id, text: text.join(" ") });
     process.stdout.write(`outcome recorded for delivery ${id}\n`);
   });
@@ -166,7 +166,7 @@ program.command("wake")
     if (!Number.isInteger(sourceDeliveryId) || sourceDeliveryId < 1) {
       throw new Error("--from must be a positive integer delivery id");
     }
-    const socketPath = process.env.HIVE_EDGE_SOCKET ?? join(hiveHome(), "edge.sock");
+    const socketPath = resolveEdgeSocketPath();
     let receipt: SeatWakeReceipt;
     try {
       receipt = await udsRequestJson<SeatWakeReceipt>(socketPath, "POST", "/wake", {

@@ -616,20 +616,6 @@ export class BrokerStore {
         );
       }
       const source = this.getDelivery(input.sourceDeliveryId);
-      if (TERMINAL.has(source.status)) {
-        throw new SeatWakeRefusedError(
-          "source_not_held",
-          `delivery ${input.sourceDeliveryId} is ${source.status} and can no longer mint a wake`,
-        );
-      }
-      if (source.claimedBy !== edgeId || !FENCED.has(source.status)) {
-        throw new SeatWakeRefusedError(
-          "source_not_held",
-          source.claimedBy === null
-            ? `delivery ${input.sourceDeliveryId} is not currently fenced on any edge`
-            : `delivery ${input.sourceDeliveryId} is held by edge \`${source.claimedBy}\`, not this caller`,
-        );
-      }
       if (input.threadTs !== null && !isSlackMessageTs(input.threadTs)) {
         throw new SeatWakeRefusedError(
           "invalid_thread",
@@ -657,6 +643,23 @@ export class BrokerStore {
           `${from} cannot mint a wake to itself — a self-directed mint is an unbounded loop`,
         );
       }
+      const channelId = source.event.channelId;
+      const threadTs = input.threadTs ?? source.event.threadTs;
+      const digest = createHash("sha256")
+        .update([input.sourceDeliveryId, from, target, channelId, threadTs, input.text].join("\n"))
+        .digest("hex")
+        .slice(0, 16);
+      const eventId = `mint:${input.sourceDeliveryId}:${digest}`;
+      // Replay resolution comes before the custody fences: the documented
+      // guarantee ("replaying the identical mint is a no-op that names the
+      // original delivery") exists precisely for the retry that arrives after
+      // a lost CLI response — by which time the source may have terminalized
+      // or the target's subscription lapsed. Time-varying preconditions guard
+      // fresh mints only; an already-ledgered mint answers with its receipt.
+      const replayed = this.deliveryIdForEvent(eventId);
+      if (replayed !== null) {
+        return { deliveryId: replayed, actor: target, from, channelId, threadTs, created: false };
+      }
       const subscription = this.getSubscription(target);
       if (!subscription || isExpired(subscription.expiresAt, this.clock.now())) {
         throw new SeatWakeRefusedError(
@@ -665,13 +668,20 @@ export class BrokerStore {
         );
       }
 
-      const channelId = source.event.channelId;
-      const threadTs = input.threadTs ?? source.event.threadTs;
-      const digest = createHash("sha256")
-        .update([input.sourceDeliveryId, from, target, channelId, threadTs, input.text].join("\n"))
-        .digest("hex")
-        .slice(0, 16);
-      const eventId = `mint:${input.sourceDeliveryId}:${digest}`;
+      if (TERMINAL.has(source.status)) {
+        throw new SeatWakeRefusedError(
+          "source_not_held",
+          `delivery ${input.sourceDeliveryId} is ${source.status} and can no longer mint a wake`,
+        );
+      }
+      if (source.claimedBy !== edgeId || !FENCED.has(source.status)) {
+        throw new SeatWakeRefusedError(
+          "source_not_held",
+          source.claimedBy === null
+            ? `delivery ${input.sourceDeliveryId} is not currently fenced on any edge`
+            : `delivery ${input.sourceDeliveryId} is held by edge \`${source.claimedBy}\`, not this caller`,
+        );
+      }
       const ingest = this.ingestEvent({
         eventId,
         workspaceId: source.event.workspaceId,
@@ -1124,7 +1134,7 @@ export class BrokerStore {
     if (!row) throw new Error(`delivery ${deliveryId} not found`);
     const delivery = deliveryFromRow(row);
     const events = this.db.prepare(`
-      SELECT de.event_id, de.relation, e.sender_id, e.message_ts, e.text
+      SELECT de.event_id, de.relation, e.sender_id, e.sender_kind, e.message_ts, e.text
       FROM delivery_events de JOIN slack_events e ON e.event_id=de.event_id
       WHERE de.delivery_id=? ORDER BY de.rowid
     `).all(deliveryId) as Row[];
@@ -1132,6 +1142,7 @@ export class BrokerStore {
       .filter((event) => String(event.relation) === "coalesced")
       .map((event) => ({
         senderId: String(event.sender_id),
+        senderKind: String(event.sender_kind) as SlackEventInput["senderKind"],
         messageTs: String(event.message_ts),
         text: String(event.text),
       }));
