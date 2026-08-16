@@ -8,7 +8,7 @@ import type { Delivery, Subscription } from "../domain.js";
 import { prepareSocketPath } from "../local/uds.js";
 import type { LiveIngress } from "./live-registry.js";
 import { delimiter, dirname } from "node:path";
-import { CancellationUnconfirmedError, ClaudeProvider, claudePromptSlotArgs, codexPermissionArgs, CodexProvider, composeChildEnv, dispatchDeadlineAt, GrokProvider, grokPermissionArgs, LIVE_CANCEL_OUTCOMES, prependPathEntry, ProviderPreDispatchError, requireAccountProfile, stampDispatchDeadline } from "./providers.js";
+import { CancellationUnconfirmedError, CHILD_KILL_GRACE_MS, ClaudeProvider, claudePromptSlotArgs, codexPermissionArgs, CodexProvider, composeChildEnv, dispatchDeadlineAt, GrokProvider, grokPermissionArgs, LIVE_CANCEL_OUTCOMES, prependPathEntry, ProviderPreDispatchError, requireAccountProfile, stampDispatchDeadline } from "./providers.js";
 
 function subscription(overrides: Partial<Subscription> = {}): Subscription {
   return {
@@ -590,6 +590,72 @@ setInterval(() => {}, 1000);
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   assert.equal(processAlive(grandchildPid), false, "the descendant must die with the group, not outlive the CLI");
+});
+
+test("a confirmed group exit disarms the delayed SIGKILL", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "hive-pgid-disarm-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const profile = join(root, "profile");
+  mkdirSync(profile);
+  const marker = join(root, "cli.pid");
+  const cli = join(root, "cli.mjs");
+  // No SIGTERM handler and no descendants: the whole group is gone well inside
+  // the grace, so the armed SIGKILL can only ever reach a reused identifier.
+  writeFileSync(cli, `#!/usr/bin/env node
+import { writeFileSync } from "node:fs";
+writeFileSync(${JSON.stringify(marker)}, String(process.pid));
+setInterval(() => {}, 1000);
+`, { mode: 0o755 });
+
+  const previous = process.env.HIVE_CLAUDE_COMMAND;
+  process.env.HIVE_CLAUDE_COMMAND = cli;
+  t.after(() => {
+    if (previous === undefined) delete process.env.HIVE_CLAUDE_COMMAND;
+    else process.env.HIVE_CLAUDE_COMMAND = previous;
+  });
+
+  // Every signal the edge aims at this group, recorded at the syscall — a
+  // SIGKILL to a dead group throws and is swallowed, so the attempt is the only
+  // observable that survives.
+  let childPid: number | null = null;
+  const aimed: string[] = [];
+  const realKill = process.kill.bind(process);
+  process.kill = ((pid: number, signal?: NodeJS.Signals | number) => {
+    if (childPid !== null && (pid === childPid || pid === -childPid) && signal !== 0) aimed.push(String(signal));
+    return realKill(pid, signal as NodeJS.Signals);
+  }) as typeof process.kill;
+  t.after(() => { process.kill = realKill; });
+
+  const claude = new ClaudeProvider({ ingressRoot: join(root, "inbox") });
+  const controller = new AbortController();
+  const turn = claude.spawn(
+    subscription({ provider: "claude", accountProfile: profile, sessionId: null }),
+    root,
+    "framed",
+    controller.signal,
+  );
+
+  const started = Date.now();
+  while (!existsSync(marker) && Date.now() - started < 5_000) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.ok(existsSync(marker), "the CLI published its pid");
+  childPid = Number(readFileSync(marker, "utf8"));
+  t.after(() => {
+    try { realKill(childPid as number, "SIGKILL"); } catch { /* already gone */ }
+  });
+
+  controller.abort();
+  await assert.rejects(turn, /exited|deadline/);
+  assert.equal(processAlive(childPid), false, "the dispatch returns only after the group is gone");
+  assert.deepEqual(aimed, ["SIGTERM"], "the abort escalates with SIGTERM first, and nothing else has fired yet");
+
+  await new Promise((resolve) => setTimeout(resolve, CHILD_KILL_GRACE_MS + 500));
+  assert.deepEqual(
+    aimed,
+    ["SIGTERM"],
+    "no SIGKILL may fire at a PID the edge already watched exit — that number belongs to whoever reused it",
+  );
 });
 
 function processAlive(pid: number): boolean {

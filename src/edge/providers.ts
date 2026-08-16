@@ -490,15 +490,22 @@ function processGroupAlive(pid: number | undefined): boolean {
   }
 }
 
-/** Poll until the group is gone, bounded — the SIGKILL timer armed by the abort path is the enforcer. */
-async function waitForProcessGroupExit(pid: number | undefined, boundMs: number): Promise<void> {
+/**
+ * Poll until the group is gone, bounded — the SIGKILL timer armed by the abort
+ * path is the enforcer. Returns whether the group was observed gone: `false`
+ * means the bound elapsed with it still alive, and the caller must keep
+ * treating the PID as the group's live identifier.
+ */
+async function waitForProcessGroupExit(pid: number | undefined, boundMs: number): Promise<boolean> {
   const deadline = Date.now() + boundMs;
   while (processGroupAlive(pid) && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   if (processGroupAlive(pid)) {
     console.error("hive edge provider process group survived the kill grace", pid);
+    return false;
   }
+  return true;
 }
 
 export function signalProcessGroup(pid: number | undefined, signal: NodeJS.Signals): void {
@@ -678,7 +685,12 @@ async function runHeadless(
     // stdio can outlive both the CLI and SIGTERM. The edge releases the
     // delivery's fence on this return, so the whole group must be dead first —
     // otherwise the retry races a survivor still writing the workspace.
-    await waitForProcessGroupExit(child.pid, CHILD_KILL_GRACE_MS + 1_000);
+    const groupExited = await waitForProcessGroupExit(child.pid, CHILD_KILL_GRACE_MS + 1_000);
+    // A pending SIGKILL addresses the group by numeric PGID, and that number is
+    // free for reuse the moment the group is gone. Once the exit is observed the
+    // timer can only reach a stranger, so disarm it; it stays armed only while
+    // the original group may still exist.
+    if (groupExited && killTimer !== null) clearTimeout(killTimer);
   }
   stdout.finish();
   stderr.finish();
