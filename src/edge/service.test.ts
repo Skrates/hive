@@ -481,6 +481,36 @@ test("every claimed delivery is bound to the attestation of the profile it runs 
   store.close();
 });
 
+test("a live surface that omitted its attestation binds as unreported, not the profile's", async () => {
+  // Pre-upgrade hive-codex-live registers without the attestation field. The
+  // profile on disk may attest a home the foreground turn never used
+  // (Desktop split-state), so the row must say "unreported", never substitute.
+  const profile = mkdtempSync(join(tmpdir(), "weave-live-"));
+  writeFileSync(join(profile, ATTESTATION_FILENAME), JSON.stringify({
+    schema: "weave.attestation/1",
+    attestation_id: "sha256:" + "c".repeat(64),
+    actor: "ariadne",
+    doctrine: { remote: "RationallyPrime/weave-doctrine", commit: "9".repeat(40) },
+  }));
+  const broker = new FakeBroker([delivery(1, { subscription: subscription({ accountProfile: profile }) })]);
+  const store = new EdgeStore(":memory:");
+  const live = new LiveIngressRegistry();
+  live.register({
+    actor: "ariadne",
+    provider: "codex",
+    socketPath: "/tmp/x.sock",
+    sessionId: "thread-1",
+    surfaceVersion: "test",
+  }, 60_000);
+  const edge = new EdgeService(asBrokerClient(broker), store, live, [new StubAdapter({ liveResult: { processed: true, receipt: "live", outcome: "done" } })]);
+
+  assert.equal(await edge.processOne(), true);
+  const row = store.get(1)!;
+  assert.equal(row.attestation_id, null);
+  assert.equal(row.attestation_absence, "attestation_unreported");
+  store.close();
+});
+
 test("a profile replaced between claim and provider start is re-read at start", async () => {
   // The last cell of {live, headless} × {claim, provider-start}: an installer
   // can replace the profile in the window between the claim-time capture and

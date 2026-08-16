@@ -444,8 +444,15 @@ function safeEdgeErrorCode(error: unknown): string {
  * the artifacts the turn actually used.
  */
 function attestationForDelivery(live: LiveIngress | null, delivery: Delivery): AttestationRead {
-  return live?.runtimeAttestation
-    ?? readWakeAttestation(delivery.subscription.accountProfile);
+  if (live) {
+    // A live surface that omitted its runtime attestation (pre-upgrade
+    // process, or /live/register without the field) is recorded as exactly
+    // that absence. Substituting a fresh profile read would bind the wake to
+    // a home the turn may never have used — foreground Desktop split-state
+    // (HIVE_CODEX_DESKTOP_HOME ≠ pinned profile) is the counterexample.
+    return live.runtimeAttestation ?? { ok: false, absence: "attestation_unreported" };
+  }
+  return readWakeAttestation(delivery.subscription.accountProfile);
 }
 
 function delay(ms: number): Promise<void> {

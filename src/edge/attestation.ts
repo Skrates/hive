@@ -24,14 +24,18 @@ export type AttestationAbsence =
   | "attestation_unknown_schema"
   | "attestation_incomplete"
   | "attestation_actor_mismatch"
-  | "attestation_ambiguous";
+  | "attestation_ambiguous"
+  | "attestation_unreported";
 
 /**
  * Absences the edge computes about a read, never ones a profile can claim:
  * the actor mismatch is decided against the delivery, and the ambiguity is
  * decided against a second report for the same live session.
  */
-type EdgeComputedAbsence = "attestation_actor_mismatch" | "attestation_ambiguous";
+type EdgeComputedAbsence =
+  | "attestation_actor_mismatch"
+  | "attestation_ambiguous"
+  | "attestation_unreported";
 
 export interface WakeAttestation {
   attestationId: string;
@@ -105,7 +109,11 @@ export function attestationWire(read: AttestationRead): AttestationWire {
   }
   // The edge-computed absences are decided here, against the delivery and
   // against the session's own earlier report; a surface can never claim one.
-  if (read.absence === "attestation_actor_mismatch" || read.absence === "attestation_ambiguous") {
+  if (
+    read.absence === "attestation_actor_mismatch"
+    || read.absence === "attestation_ambiguous"
+    || read.absence === "attestation_unreported"
+  ) {
     return { ok: false, absence: "attestation_unreadable" };
   }
   return { ok: false, absence: read.absence };
@@ -168,7 +176,14 @@ function openAttestationFile(path: string): { ok: true; raw: string } | { ok: fa
   } catch {
     return { ok: false, absence: "attestation_unreadable" };
   } finally {
-    closeSync(fd);
+    // A close error (network-backed profile, I/O fault) raised from finally
+    // would override the read's verdict with an exception; the bytes (or the
+    // named absence) are already decided by the time close runs.
+    try {
+      closeSync(fd);
+    } catch {
+      /* the verdict stands */
+    }
   }
 }
 
