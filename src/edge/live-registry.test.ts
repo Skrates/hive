@@ -19,6 +19,10 @@ function registration(overrides: Partial<Parameters<LiveIngressRegistry["registe
     socketPath: "/tmp/x.sock",
     sessionId: "thread-1",
     surfaceVersion: "test",
+    // Required on a registration: a caller with nothing to report names the
+    // absence rather than omitting the field. This is what `control.ts` mints
+    // for a surface that sent no attestation.
+    runtimeAttestation: { ok: false, absence: "attestation_unreported" } as const,
     ...overrides,
   };
 }
@@ -106,14 +110,6 @@ test("an unreported heartbeat is non-evidence, exactly like an omitted field", (
     registration({ runtimeAttestation: { ok: false, absence: "attestation_unreported" } }),
     60_000,
   );
-  assert.deepEqual(renewed.runtimeAttestation, first);
-});
-
-test("a surface that reports no attestation does not disturb the session's snapshot", () => {
-  // Silence is not a disagreement — a hook with no CLAUDE_CONFIG_DIR sends none.
-  const live = new LiveIngressRegistry();
-  live.register(registration({ runtimeAttestation: first }), 60_000);
-  const renewed = live.register(registration(), 60_000);
   assert.deepEqual(renewed.runtimeAttestation, first);
 });
 

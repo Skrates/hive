@@ -180,7 +180,13 @@ export class EdgeService {
       // (2) `receive`'s upsert is guarded in SQL on (generation, attempts) and
       // is atomic, so a competing writer cannot regress the row; (3) the
       // dedupe read below still precedes every broker transition and the
-      // provider start, which is the ordering it exists to protect.
+      // provider start, which is the ordering it exists to protect; and (4) —
+      // the one that carries the unbounded case, since every other await here
+      // is a bounded broker round-trip — if the read outlives the lease, the
+      // turn terminalizes safely rather than double-dispatching: `transition`
+      // sends the generation, so `accept` is fenced, and `recordDeliveryFailure`
+      // wraps the broker disposition and the local `setStatus` separately, so a
+      // stale-generation edge logs and releases.
       const binding = bindingFor(await attestationForDelivery(live, delivery), delivery.actor);
       const existing = this.store.receive(delivery, generation, binding);
       if (["dispatched", "processed"].includes(existing.status)) return;
@@ -461,11 +467,13 @@ function safeEdgeErrorCode(error: unknown): string {
 async function attestationForDelivery(live: LiveIngress | null, delivery: Delivery): Promise<AttestationRead> {
   if (live) {
     // A live surface that omitted its runtime attestation (pre-upgrade
-    // process, or /live/register without the field) is recorded as exactly
-    // that absence. Substituting a fresh profile read would bind the wake to
-    // a home the turn may never have used — foreground Desktop split-state
-    // (HIVE_CODEX_DESKTOP_HOME ≠ pinned profile) is the counterexample.
-    return live.runtimeAttestation ?? { ok: false, absence: "attestation_unreported" };
+    // process, or /live/register without the field) carries the absence the
+    // ingress minted for it — the field is required on a registration, so
+    // there is nothing to substitute here. Substituting a fresh profile read
+    // would bind the wake to a home the turn may never have used — foreground
+    // Desktop split-state (HIVE_CODEX_DESKTOP_HOME ≠ pinned profile) is the
+    // counterexample.
+    return live.runtimeAttestation;
   }
   return readWakeAttestation(delivery.subscription.accountProfile);
 }

@@ -20,8 +20,16 @@ export interface LiveIngressRegistration {
    * home for a foreground Codex attachment, the pinned profile otherwise.
    * Captured by the surface so the edge does not bind a split-state
    * delivery to artifacts the turn never used.
+   *
+   * Required, and that is the whole guarantee: an optional field made
+   * `undefined` mean both "no prior registration" and "the prior registration
+   * said nothing", which is the collapse that let a later report be adopted as
+   * a session's start snapshot. A caller with nothing to report names it —
+   * `{ ok: false, absence: "attestation_unreported" }`, which the ingress mints
+   * at `control.ts`. Required inputs are validated at the seam, never defaulted
+   * behind it.
    */
-  readonly runtimeAttestation?: AttestationRead;
+  readonly runtimeAttestation: AttestationRead;
 }
 
 export interface LiveIngress extends LiveIngressRegistration {
@@ -57,10 +65,9 @@ export class LiveIngressRegistry {
       && previous.sessionId === input.sessionId
       ? previous.runtimeAttestation
       : undefined;
-    const runtimeAttestation = retainedAttestation(held, input.runtimeAttestation);
     const entry: LiveIngress = Object.freeze({
       ...input,
-      ...(runtimeAttestation !== undefined ? { runtimeAttestation } : {}),
+      runtimeAttestation: retainedAttestation(held, input.runtimeAttestation),
       expiresAt: this.now() + ttlMs,
     });
     this.entries.set(bindingKey, entry);
@@ -110,16 +117,16 @@ function key(actor: string, provider: Provider): string {
  */
 function retainedAttestation(
   previous: AttestationRead | undefined,
-  reported: AttestationRead | undefined,
-): AttestationRead | undefined {
+  reported: AttestationRead,
+): AttestationRead {
+  // `previous` alone stays optional, and now means exactly one thing: no live
+  // registration is held for this key (or its heartbeat lapsed).
   if (previous === undefined) return reported;
-  // A surface that sent nothing added no evidence; that is not a disagreement.
-  // `attestation_unreported` is how the ingress records "this heartbeat carried
-  // no attestation field", so it is the same non-evidence as `undefined` when
-  // it arrives as the NEW report. It is not interchangeable as the PREVIOUS
-  // value: there it means the session's first snapshot was never known, which
-  // is exactly why a later id cannot be adopted as that snapshot.
-  if (reported === undefined) return previous;
+  // A surface that reported nothing added no evidence; that is not a
+  // disagreement. `attestation_unreported` is how the ingress records "this
+  // heartbeat carried no attestation field". It is not interchangeable as the
+  // PREVIOUS value: there it means the session's first snapshot was never
+  // known, which is exactly why a later id cannot be adopted as that snapshot.
   if (!reported.ok && reported.absence === "attestation_unreported") return previous;
   return namesTheSameArtifacts(previous, reported)
     ? previous

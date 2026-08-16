@@ -6,6 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   ATTESTATION_FILENAME,
+  ATTESTATION_READ_TIMEOUT_MS,
   MAX_ATTESTATION_BYTES,
   attestationWire,
   parseAttestationWire,
@@ -120,6 +121,19 @@ test("a FIFO attestation is unreadable instead of blocking the edge loop", { tim
   const read = await readWakeAttestation(dir);
   assert.equal(read.ok, false);
   assert.equal(bindingFor(read, "gnomon").absence, "attestation_unreadable");
+});
+
+test("the bounded read still answers a healthy profile well inside its timeout", async () => {
+  // The timeout's own firing path is NOT unit-tested: nothing in a fixture can
+  // stall a real regular-file read, and a race built inside the test would
+  // assert on the test's own promises rather than on `openAttestationFile`.
+  // What is testable, and what a bad bound would break, is that wrapping the
+  // read in a race did not change the answer or leave the timer holding the
+  // process open — `ATTESTATION_READ_TIMEOUT_MS` is unref'd for that reason.
+  const started = Date.now();
+  const read = await readWakeAttestation(profileWith(record()));
+  assert.equal(read.ok, true);
+  assert.ok(Date.now() - started < ATTESTATION_READ_TIMEOUT_MS);
 });
 
 test("the live-register wire form round-trips a successful read", async () => {

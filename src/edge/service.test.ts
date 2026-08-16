@@ -253,6 +253,8 @@ test("a completion-tracked Codex live injection commits its final response as th
     socketPath: "/tmp/x.sock",
     sessionId: "thread-1",
     surfaceVersion: "test",
+    // Required: a registration names its attestation or names its absence.
+    runtimeAttestation: { ok: false, absence: "attestation_unreported" },
   }, 60_000);
   const edge = new EdgeService(asBrokerClient(broker), store, live, [adapter]);
 
@@ -294,6 +296,8 @@ test("a live Desktop account rejection terminalizes without an uncertainty retry
     socketPath: "/tmp/x.sock",
     sessionId: "thread-1",
     surfaceVersion: "test",
+    // Required: a registration names its attestation or names its absence.
+    runtimeAttestation: { ok: false, absence: "attestation_unreported" },
   }, 60_000);
   const edge = new EdgeService(asBrokerClient(broker), store, live, [adapter]);
 
@@ -501,6 +505,8 @@ test("a live surface that omitted its attestation binds as unreported, not the p
     socketPath: "/tmp/x.sock",
     sessionId: "thread-1",
     surfaceVersion: "test",
+    // Required: a registration names its attestation or names its absence.
+    runtimeAttestation: { ok: false, absence: "attestation_unreported" },
   }, 60_000);
   const edge = new EdgeService(asBrokerClient(broker), store, live, [new StubAdapter({ liveResult: { processed: true, receipt: "live", outcome: "done" } })]);
 

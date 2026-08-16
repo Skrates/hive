@@ -14,6 +14,26 @@ const ATTESTATION_SCHEMA = "weave.attestation/1";
 export const MAX_ATTESTATION_BYTES = 65_536;
 
 /**
+ * Wall-clock bound on the whole open-stat-read. A healthy read is microseconds
+ * from local disk and low milliseconds from a working network mount, so this is
+ * generous by three orders of magnitude — it exists to bound the *delivery*,
+ * not to police latency.
+ *
+ * Moving the syscalls off the event loop bounds the loop; it does not bound the
+ * delivery, and an unbounded read holds one of `MAX_CONCURRENT_DISPATCHES`
+ * dispatch slots while it waits. Enough of those and the edge stops claiming
+ * for every actor — the same outcome the threadpool move was meant to prevent,
+ * reached by a different route. The timeout closes that: a stalled mount costs
+ * one delivery its exact attestation, not the edge its claim loop.
+ *
+ * The residual is deliberate and is documented rather than claimed away: a
+ * mount that is slow but working records `attestation_unreadable` — an honest
+ * "the edge could not read this in time", and the same absence a FIFO already
+ * yields, so this bounds the read without minting a new state.
+ */
+export const ATTESTATION_READ_TIMEOUT_MS = 2_000;
+
+/**
  * Why a delivery has no attestation reference. An absent or unreadable record
  * is never silently rendered as "unattested but fine": the reason is stored
  * beside the delivery so a later reader can tell a seat installed before
@@ -163,10 +183,37 @@ export function parseAttestationWire(value: unknown): AttestationRead | undefine
  *
  * `fs/promises` moves the syscalls onto the libuv threadpool, so a stalled
  * mount costs a threadpool slot instead of the event loop: other actors' claims
- * and the lease heartbeats keep running. Both guards are kept — the threadpool
- * bounds the regular-file stall, `O_NONBLOCK` still bounds FIFOs and devices.
+ * and the lease heartbeats keep running. That bounds the loop but not the
+ * delivery — an unbounded read still holds a dispatch slot, and enough of them
+ * stop the claim loop by the other route — so the read is also bounded in wall
+ * clock by {@link ATTESTATION_READ_TIMEOUT_MS}. Three guards, three failure
+ * modes: `O_NONBLOCK` for FIFOs and devices, the threadpool for the event loop,
+ * the timeout for the delivery and its dispatch slot.
  */
 async function openAttestationFile(
+  path: string,
+): Promise<{ ok: true; raw: string } | { ok: false; absence: AttestationAbsence }> {
+  // The losing side of this race stays pending on its libuv thread until the
+  // mount answers — a timeout cannot reclaim a blocked thread. That is why the
+  // threadpool is sized above the dispatch cap where the edge is launched
+  // (deploy/systemd/hive-edge.service, deploy/launchd/run-edge.zsh): the bound
+  // here frees the *delivery*, the sizing keeps the pool from being consumed.
+  // `readAttestationFile` never rejects and closes its own handle on every
+  // path, so the abandoned read cannot leak a descriptor.
+  const read = readAttestationFile(path);
+  let timer: NodeJS.Timeout | undefined;
+  const bound = new Promise<{ ok: false; absence: AttestationAbsence }>((resolve) => {
+    timer = setTimeout(() => resolve({ ok: false, absence: "attestation_unreadable" }), ATTESTATION_READ_TIMEOUT_MS);
+    timer.unref();
+  });
+  try {
+    return await Promise.race([read, bound]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function readAttestationFile(
   path: string,
 ): Promise<{ ok: true; raw: string } | { ok: false; absence: AttestationAbsence }> {
   let handle: FileHandle;

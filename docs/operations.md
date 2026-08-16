@@ -198,12 +198,25 @@ The edge records; it does not verify and it does not refuse.
   an unknown schema, one installed for a different actor, and a live session the edge cannot
   attribute all dispatch normally and record a named `attestation_absence` beside the delivery. A misbound seat now leaves evidence at wake
   time instead of needing git forensics afterwards.
-- **Nor does it stall.** "Does not refuse" is worth nothing if the read can hang instead: a
-  profile on a network mount is a supported shape, and `O_NONBLOCK` bounds FIFOs and devices but
-  has no effect on a regular file whose mount has stalled. The read runs on the libuv threadpool
-  for that reason, so an unavailable mount costs one threadpool slot and delays that delivery —
-  it does not park the edge's event loop, where it would have frozen every co-tenant actor's
-  claims and every lease heartbeat on the machine.
+- **Nor does it stall — under three separate bounds.** "Does not refuse" is worth nothing if the
+  read can hang instead: a profile on a network mount is a supported shape, and `O_NONBLOCK`
+  bounds FIFOs and devices but has no effect on a regular file whose mount has stalled. So the
+  read carries three guards for three failure modes: `O_NONBLOCK` for FIFOs and devices; the
+  libuv threadpool, so a stalled mount cannot park the event loop; and a wall-clock timeout
+  (`ATTESTATION_READ_TIMEOUT_MS`, 2s), because the threadpool bounds the *loop* and not the
+  *delivery*. Without the third, a stalled read holds one of the four dispatch slots
+  indefinitely, and four of them stop the claim loop for every actor on the edge — the outcome
+  the threadpool move was meant to prevent, reached by a different route. The blocked libuv
+  thread itself cannot be reclaimed by a timeout, so `UV_THREADPOOL_SIZE` is set above the
+  dispatch cap where the edge is launched (`deploy/systemd/hive-edge.service`,
+  `deploy/launchd/run-edge.zsh`) rather than left at libuv's default of 4 — which is exactly the
+  dispatch cap, and a default nobody chose.
+
+  The residual, stated rather than claimed away: **a mount that is slow but working records a
+  false `attestation_unreadable`.** That is the deliberate trade — a delivery bounded at two
+  seconds with an honest "the edge could not read this in time" beats an exact id that arrives
+  after the edge has stopped claiming. It is the same absence a FIFO already yields, so bounding
+  the read mints no new state.
 - **A redelivery rebinds the current columns.** A seat reinstalled between attempts ran the
   second attempt under different artifacts; the live columns must name that new claim. The
   replaced attempt's binding and receipt are appended to `attestation_history` so an uncertain
