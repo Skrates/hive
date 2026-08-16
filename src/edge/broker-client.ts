@@ -1,4 +1,5 @@
 import type { Delivery, DeliveryResultInput, Reason, ReplaySnapshot, SubscriptionInput } from "../domain.js";
+import { injectTraceHeaders, rememberDeliveryTraceparent } from "../observability.js";
 
 export class BrokerClient {
   constructor(
@@ -11,7 +12,10 @@ export class BrokerClient {
     const busy = busyActors.length > 0 ? `&busy=${encodeURIComponent(busyActors.join(","))}` : "";
     const response = await this.request(`/v1/deliveries?after=${after}&wait_ms=${waitMs}${busy}`, { method: "GET" });
     if (response.status === 204) return null;
-    return this.json<Delivery>(response);
+    const delivery = await this.json<Delivery>(response);
+    const traceparent = response.headers.get("traceparent");
+    if (traceparent) rememberDeliveryTraceparent(delivery.id, traceparent);
+    return delivery;
   }
 
   accept(delivery: Delivery): Promise<Delivery> {
@@ -116,13 +120,15 @@ export class BrokerClient {
   }
 
   private request(path: string, init: RequestInit): Promise<Response> {
+    const headers: Record<string, string> = {
+      authorization: `Bearer ${this.token}`,
+      "x-hive-edge": this.edgeId,
+    };
+    if (init.body) headers["content-type"] = "application/json";
+    injectTraceHeaders(headers);
     return fetch(`${this.baseUrl}${path}`, {
       ...init,
-      headers: {
-        authorization: `Bearer ${this.token}`,
-        "x-hive-edge": this.edgeId,
-        ...(init.body ? { "content-type": "application/json" } : {}),
-      },
+      headers,
     });
   }
 

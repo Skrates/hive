@@ -1,4 +1,5 @@
 import type { Delivery, DeliveryResultInput, Reason, ReplaySnapshot, SlackEventInput, SubscriptionInput } from "../domain.js";
+import { forgetDeliveryTraceparent, withSpan } from "../observability.js";
 import { BrokerStore } from "./store.js";
 
 export interface SlackTransport {
@@ -93,7 +94,11 @@ export class BrokerService {
   }
 
   finish(deliveryId: number, edgeId: string, result: DeliveryResultInput): Delivery {
-    return this.store.finish(deliveryId, edgeId, result.generation, result.status, result.reasons, result.outcome);
+    return withSpan("hive.broker.finish", { delivery_id: deliveryId, outcome: result.status }, () => {
+      const delivery = this.store.finish(deliveryId, edgeId, result.generation, result.status, result.reasons, result.outcome);
+      forgetDeliveryTraceparent(deliveryId);
+      return delivery;
+    });
   }
 
   /** ADR-0003 R-3: uncertainty releases the delivery for redelivery instead of declaring an outcome. */
@@ -111,12 +116,14 @@ export class BrokerService {
   }
 
   async reply(deliveryId: number, edgeId: string, generation: number, text: string): Promise<string> {
-    const delivery = this.store.getDelivery(deliveryId);
-    this.store.assertLease(deliveryId, edgeId, generation);
-    const correlated = `${text}\n\n[event_id=${delivery.eventId} delivery_id=${delivery.id}]`;
-    return this.slack.reply(delivery.event.channelId, delivery.event.threadTs, correlated, {
-      event_id: delivery.eventId,
-      delivery_id: String(delivery.id),
+    return withSpan("hive.broker.reply", { delivery_id: deliveryId }, async () => {
+      const delivery = this.store.getDelivery(deliveryId);
+      this.store.assertLease(deliveryId, edgeId, generation);
+      const correlated = `${text}\n\n[event_id=${delivery.eventId} delivery_id=${delivery.id}]`;
+      return this.slack.reply(delivery.event.channelId, delivery.event.threadTs, correlated, {
+        event_id: delivery.eventId,
+        delivery_id: String(delivery.id),
+      });
     });
   }
 

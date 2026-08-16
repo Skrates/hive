@@ -31,6 +31,7 @@ import {
 } from "./codex/binding.js";
 import type { BindingStatus } from "./codex/live.js";
 import { installCodexSkill } from "./codex/skill-install.js";
+import { configureObservability, shutdownObservability } from "./observability.js";
 
 const program = new Command().name("hive").description("Hive broker/edge wake router");
 
@@ -39,6 +40,7 @@ const hiveHome = (): string => process.env.HIVE_HOME ?? join(homedir(), ".hive")
 program.command("broker")
   .description("run the central Slack Socket Mode broker")
   .action(async () => {
+    await configureObservability(process.env.LOGFIRE_SERVICE_NAME ?? "hive-broker");
     const config = BrokerConfig.parse(process.env);
     const policy = AdmissionPolicySchema.parse(JSON.parse(config.HIVE_ADMISSION_POLICY));
     const store = new BrokerStore(config.HIVE_BROKER_DB);
@@ -97,6 +99,7 @@ program.command("broker")
       await withTimeout(slack.stop(), 5_000, "slack.stop");
       await withTimeout(http.stop(), 5_000, "http.stop");
       store.close();
+      await withTimeout(shutdownObservability(), 2_000, "observability.shutdown");
       process.exit(0);
     });
   });
@@ -104,6 +107,7 @@ program.command("broker")
 program.command("edge")
   .description("run a workstation edge")
   .action(async () => {
+    await configureObservability(process.env.LOGFIRE_SERVICE_NAME ?? "hive-edge");
     const config = EdgeConfig.parse(process.env);
     if (config.HIVE_BROKER_PROXY) setGlobalDispatcher(new ProxyAgent(config.HIVE_BROKER_PROXY));
     const ingressRoot = config.HIVE_INGRESS_DIR ?? join(hiveHome(), "ingress");
@@ -129,6 +133,7 @@ program.command("edge")
       await control.stop();
       await run;
       store.close();
+      await shutdownObservability();
     });
   });
 
