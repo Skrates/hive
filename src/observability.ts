@@ -227,6 +227,12 @@ export function resetObservabilityForTests(): void {
   deliveryTraceparents.clear();
 }
 
+/** Test-only: drive `withSpan` against a configured SDK without a write token. */
+export function installObservabilitySdkForTests(module: LogfireNode): void {
+  sdk = module;
+  enabled = true;
+}
+
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
