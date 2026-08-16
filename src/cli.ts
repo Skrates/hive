@@ -154,6 +154,12 @@ program.command("edge")
     await untilSignal(async () => {
       clearInterval(watchdogTimer);
       controller.abort();
+      // The run-loop signal only stops *claiming*; an in-flight provider turn
+      // would keep `run` awaiting until its dispatch deadline (hours), stalling
+      // ordinary service restarts until the supervisor escalates to SIGKILL —
+      // which then orphans the detached provider process groups. Tear down the
+      // dispatches exactly as the watchdog exit does, before awaiting the loop.
+      edge.abortActiveDispatches();
       await control.stop();
       await run;
       store.close();
