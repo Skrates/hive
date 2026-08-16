@@ -100,6 +100,13 @@ COPY --from=build /app/node_modules node_modules/
 COPY --from=build /app/package.json ./
 RUN ln -s /opt/hive/dist/cli.js /usr/local/bin/hive-cli
 
+# Above MAX_CONCURRENT_DISPATCHES: the claim-time attestation read runs on the
+# libuv threadpool, whose default of 4 is exactly the dispatch cap, and a
+# stalled /workspace mount parks a thread no timeout can reclaim. start-edge.sh
+# sets the same default; ENV carries it to a hand-run container that bypasses
+# the entrypoint (docker run … node dist/cli.js edge).
+ENV UV_THREADPOOL_SIZE=16
+
 COPY deploy/machines/edge-runpod/start-edge.sh /usr/local/bin/start-edge.sh
 RUN chmod +x /usr/local/bin/start-edge.sh
 

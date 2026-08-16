@@ -208,9 +208,16 @@ The edge records; it does not verify and it does not refuse.
   indefinitely, and four of them stop the claim loop for every actor on the edge — the outcome
   the threadpool move was meant to prevent, reached by a different route. The blocked libuv
   thread itself cannot be reclaimed by a timeout, so `UV_THREADPOOL_SIZE` is set above the
-  dispatch cap where the edge is launched (`deploy/systemd/hive-edge.service`,
-  `deploy/launchd/run-edge.zsh`) rather than left at libuv's default of 4 — which is exactly the
-  dispatch cap, and a default nobody chose.
+  dispatch cap in **every** repo-owned launcher rather than left at libuv's default of 4 — which
+  is exactly the dispatch cap, and a default nobody chose. There are three:
+  `deploy/systemd/hive-edge.service` (cx53, linux-laptop), `deploy/launchd/run-edge.zsh`
+  (macbook), and `deploy/machines/edge-runpod/start-edge.sh` (RunPod, which also carries `ENV
+  UV_THREADPOOL_SIZE` in its `Dockerfile` for a hand-run container). That list is not maintained
+  by hand: `src/edge/launchers.test.ts` derives it from `deploy/` by finding every file that
+  launches `cli.js edge` and fails if one of them does not set the variable — the prose above
+  once said "both launchers" while three existed, and a fourth launcher must not be able to
+  repeat that. RunPod is the deployment the whole guard was written for, since its seat HOME sits
+  on a network-backed `/workspace` volume.
 
   The residual, stated rather than claimed away: **a mount that is slow but working records a
   false `attestation_unreadable`.** That is the deliberate trade — a delivery bounded at two

@@ -47,6 +47,17 @@ if command -v tailscaled >/dev/null 2>&1; then
   tailscale up --ssh --authkey="${TAILSCALE_AUTHKEY:?set in edge.env}" --hostname=hive-runpod || true
 fi
 
+# libuv's default threadpool is 4, which is exactly MAX_CONCURRENT_DISPATCHES.
+# The claim-time attestation read runs on that pool and can park indefinitely on
+# a stalled network mount, and a timeout cannot reclaim a blocked thread — it
+# frees the dispatch slot and leaves the thread gone. This pod is the shape that
+# guard was written for: the seat's HOME is /workspace/.hive/profiles/<seat>,
+# and /workspace is RunPod's network-backed volume. At the default, four stalled
+# reads consume the whole pool and every later fs/dns job on the edge queues
+# behind them — a loud stall becomes a silent one. Set before either exec, and
+# after the sourced env so an operator's edge.env value survives the default.
+export UV_THREADPOOL_SIZE="${UV_THREADPOOL_SIZE:-16}"
+
 if [[ -f /opt/hive/dist/cli.js ]]; then
   exec node /opt/hive/dist/cli.js edge
 fi

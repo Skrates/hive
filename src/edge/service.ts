@@ -30,7 +30,10 @@ const systemEdgeTimers: EdgeTimers = {
  * deliveries. This cap therefore bounds how many *distinct* actors run turns
  * simultaneously on one machine.
  */
-const MAX_CONCURRENT_DISPATCHES = 4;
+// Exported so `launchers.test.ts` can hold every launcher's UV_THREADPOOL_SIZE
+// above this number rather than restate it — the coincidence that libuv's
+// default pool is also 4 is what made a stalled attestation read dangerous.
+export const MAX_CONCURRENT_DISPATCHES = 4;
 
 export class EdgeService {
   private after = 0;

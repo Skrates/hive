@@ -99,9 +99,11 @@ test("a session whose first registration reported nothing cannot adopt a later i
   assert.deepEqual(renewed.runtimeAttestation, { ok: false, absence: "attestation_ambiguous" });
 });
 
-test("an unreported heartbeat is non-evidence, exactly like an omitted field", () => {
+test("an explicitly unreported heartbeat is non-evidence against a known snapshot", () => {
   // The other side of the same coin: `attestation_unreported` arriving as the
-  // NEW report adds nothing and must not disturb a known snapshot. Asymmetric
+  // NEW report adds nothing and must not disturb a known snapshot. It is now the
+  // only way to say "nothing" — `runtimeAttestation` is required, so the field
+  // cannot be omitted and the ingress mints this value at the boundary. Asymmetric
   // by design — as the PREVIOUS value it means the start snapshot was never
   // known, which is why the test above ends ambiguous and this one does not.
   const live = new LiveIngressRegistry();
