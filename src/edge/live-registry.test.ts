@@ -23,12 +23,66 @@ function registration(overrides: Partial<Parameters<LiveIngressRegistry["registe
   };
 }
 
-test("a live session keeps the attestation captured when it first registered", () => {
+test("a live session keeps its first snapshot while the surface keeps reporting the same artifacts", () => {
+  const live = new LiveIngressRegistry();
+  live.register(registration({ runtimeAttestation: first }), 60_000);
+  const renewed = live.register(registration({ runtimeAttestation: { ...first } }), 60_000);
+  assert.deepEqual(renewed.runtimeAttestation, first);
+  assert.deepEqual(live.get("ariadne", "codex")?.runtimeAttestation, first);
+});
+
+test("a session whose reports disagree is named ambiguous, not guessed", () => {
+  // The hook is a fresh process per boundary: a mid-session reinstall under a
+  // still-running process and a crash-then-resume of the same sessionId under
+  // new artifacts send the identical report sequence. sessionId equality is not
+  // proof the loaded runtime survived, so neither report may be asserted.
   const live = new LiveIngressRegistry();
   live.register(registration({ runtimeAttestation: first }), 60_000);
   const renewed = live.register(registration({ runtimeAttestation: second }), 60_000);
+  assert.deepEqual(renewed.runtimeAttestation, { ok: false, absence: "attestation_ambiguous" });
+});
+
+test("an ambiguous session stays ambiguous when the reports agree again", () => {
+  // A later agreeing report cannot restore knowledge the edge never held.
+  const live = new LiveIngressRegistry();
+  live.register(registration({ runtimeAttestation: first }), 60_000);
+  live.register(registration({ runtimeAttestation: second }), 60_000);
+  const settled = live.register(registration({ runtimeAttestation: second }), 60_000);
+  assert.deepEqual(settled.runtimeAttestation, { ok: false, absence: "attestation_ambiguous" });
+});
+
+test("a session whose reports are both absences keeps the first, more specific one", () => {
+  // Neither report offers an id, so no guess is on the table: the session's
+  // own start evidence is the better record, and "ambiguous" would be a
+  // strictly less informative absence.
+  const live = new LiveIngressRegistry();
+  const missing: AttestationRead = { ok: false, absence: "no_attestation_file" };
+  live.register(registration({ runtimeAttestation: missing }), 60_000);
+  const renewed = live.register(
+    registration({ runtimeAttestation: { ok: false, absence: "attestation_unreadable" } }),
+    60_000,
+  );
+  assert.deepEqual(renewed.runtimeAttestation, missing);
+});
+
+test("an install under a live session that had none is ambiguous, not adopted", () => {
+  // A record appearing mid-session says nothing about what the running process
+  // loaded — that half of the disagreement asserts an id on no evidence.
+  const live = new LiveIngressRegistry();
+  live.register(
+    registration({ runtimeAttestation: { ok: false, absence: "no_attestation_file" } }),
+    60_000,
+  );
+  const renewed = live.register(registration({ runtimeAttestation: second }), 60_000);
+  assert.deepEqual(renewed.runtimeAttestation, { ok: false, absence: "attestation_ambiguous" });
+});
+
+test("a surface that reports no attestation does not disturb the session's snapshot", () => {
+  // Silence is not a disagreement — a hook with no CLAUDE_CONFIG_DIR sends none.
+  const live = new LiveIngressRegistry();
+  live.register(registration({ runtimeAttestation: first }), 60_000);
+  const renewed = live.register(registration(), 60_000);
   assert.deepEqual(renewed.runtimeAttestation, first);
-  assert.deepEqual(live.get("ariadne", "codex")?.runtimeAttestation, first);
 });
 
 test("a new live session replaces the prior session's attestation", () => {

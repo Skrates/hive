@@ -150,6 +150,17 @@ export class EdgeService {
   private async dispatchClaimed(delivery: Delivery, generation: number): Promise<void> {
     let current = delivery;
     let providerStarted = false;
+    // ONE subscription governs the whole turn. Every broker transition rebuilds
+    // its delivery by joining the live `subscriptions` row, so an ordinary
+    // `hive subscribe` re-run landing mid-turn would otherwise let routing and
+    // binding straddle two snapshots: the adapter, workspace and account
+    // profile taken from the new row while the live route and the recorded
+    // attestation came from the claimed one — a Codex registration handed to
+    // the Claude adapter, or a receipt filed under a profile the provider never
+    // loaded. The claim selected this edge, this route and this binding from
+    // `delivery.subscription`; that snapshot is what this turn runs under, and
+    // the next delivery gets the new one.
+    const asClaimed = (value: Delivery): Delivery => ({ ...value, subscription: delivery.subscription });
     try {
       // Bind the wake to the seat attestation BEFORE dispatch: a delivery's
       // outcome must resolve to the artifacts installed when the turn started
@@ -162,9 +173,9 @@ export class EdgeService {
       const existing = this.store.receive(delivery, generation, binding);
       if (["dispatched", "processed"].includes(existing.status)) return;
 
-      current = await this.broker.accept(delivery);
+      current = asClaimed(await this.broker.accept(delivery));
       const replay = await this.broker.replay(current);
-      current = await this.broker.beginDispatch(current);
+      current = asClaimed(await this.broker.beginDispatch(current));
       this.store.setStatus(current.id, generation, "dispatching");
 
       const dispatch = await this.withLeaseHeartbeat(
@@ -181,14 +192,16 @@ export class EdgeService {
               current.id,
               generation,
               bindingFor(
-                readWakeAttestation(delivery.subscription.accountProfile),
-                delivery.actor,
+                // `current.subscription` is the claimed snapshot (asClaimed), so
+                // this re-read and the spawn/resume below name one profile.
+                readWakeAttestation(current.subscription.accountProfile),
+                current.actor,
               ),
             );
           }
         }),
       );
-      current = await this.broker.markDispatched(current);
+      current = asClaimed(await this.broker.markDispatched(current));
       this.store.setStatus(current.id, generation, "dispatched", dispatch.receipt);
       if (dispatch.processed) {
         // A completed provider turn (headless, or a completion-tracked Codex

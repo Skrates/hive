@@ -161,9 +161,22 @@ receipt. That row is the trace: delivery id → attestation id → the exact ins
 and skill corpus hashes the seat was installed with. `weave doctor` resolves the other end.
 
 A live registration freezes the runtime attestation captured when that `sessionId` first
-registered. A reinstall while the session remains live cannot reattribute a turn that loaded
-the previous installation's prompt and settings. A new session id, or a lapsed heartbeat,
-takes a fresh snapshot.
+registered, and holds it while the surface keeps reporting the same record. A new session id,
+or a lapsed heartbeat, takes a fresh snapshot.
+
+When the reports for one live `sessionId` *disagree*, the edge names the ambiguity instead of
+picking a side. A surface reports what its home holds at report time — the Claude hook is a new
+process at every boundary — so a reinstall under a still-running session and a crash-then-`--resume`
+of the same session id under new artifacts send the identical sequence, and `sessionId` equality
+is not proof the loaded runtime survived. The delivery records `attestation_ambiguous` and
+dispatches normally; a wrong id would be worse than a named absence. Two absences are not a
+disagreement — neither offers an id, so the session's first, more specific absence stands.
+
+One subscription snapshot governs a whole turn: the one the delivery was claimed under. Broker
+transitions rebuild their delivery by joining the live `subscriptions` row, so an ordinary
+`hive subscribe` re-run landing mid-turn would otherwise route the dispatch through the new
+snapshot while the row recorded the binding taken from the claimed one. The new snapshot governs
+the next delivery.
 
 The edge records; it does not verify and it does not refuse.
 
@@ -174,8 +187,8 @@ The edge records; it does not verify and it does not refuse.
   immutably to the delivery; whether the claim is true is the doctor's verdict on the same id.
 - **An absent record never fails a wake.** Attestation is evidence, not authority — KRA-1074's D1
   ruled the surface first and enforcement after. A profile with no attestation, an unreadable one,
-  an unknown schema, or one installed for a different actor all dispatch normally and record a
-  named `attestation_absence` beside the delivery. A misbound seat now leaves evidence at wake
+  an unknown schema, one installed for a different actor, and a live session the edge cannot
+  attribute all dispatch normally and record a named `attestation_absence` beside the delivery. A misbound seat now leaves evidence at wake
   time instead of needing git forensics afterwards.
 - **A redelivery rebinds the current columns.** A seat reinstalled between attempts ran the
   second attempt under different artifacts; the live columns must name that new claim. The

@@ -49,14 +49,15 @@ export class LiveIngressRegistry {
     }
     const bindingKey = key(input.actor, input.provider);
     const previous = this.entries.get(bindingKey);
-    // A reinstall must not reattribute an already-running session. Keep the
-    // snapshot captured when this sessionId first registered; a new session
-    // (or a lapsed heartbeat) takes whatever the surface just sent.
-    const keepPrior = previous !== undefined
+    // A new sessionId, or a lapsed heartbeat, is a different claim entirely and
+    // takes whatever the surface just sent. Within one unexpired sessionId the
+    // reports are reconciled, not overwritten — see retainedAttestation.
+    const held = previous !== undefined
       && previous.expiresAt > this.now()
       && previous.sessionId === input.sessionId
-      && previous.runtimeAttestation !== undefined;
-    const runtimeAttestation = keepPrior ? previous.runtimeAttestation : input.runtimeAttestation;
+      ? previous.runtimeAttestation
+      : undefined;
+    const runtimeAttestation = retainedAttestation(held, input.runtimeAttestation);
     const entry: LiveIngress = Object.freeze({
       ...input,
       ...(runtimeAttestation !== undefined ? { runtimeAttestation } : {}),
@@ -89,4 +90,52 @@ export class LiveIngressRegistry {
 
 function key(actor: string, provider: Provider): string {
   return `${actor}:${provider}`;
+}
+
+/**
+ * A surface reports what its home holds *at report time* — the Claude hook is
+ * a fresh process at every boundary and re-reads `CLAUDE_CONFIG_DIR`, so its
+ * report is never proof of what the still-running session loaded. While the
+ * reports for one sessionId agree, the first snapshot stands and the delivery
+ * keeps an exact id.
+ *
+ * When they disagree, the edge has no evidence to pick a side: a mid-session
+ * reinstall under a still-running process and a crash-then-`--resume` of the
+ * same sessionId under new artifacts produce the identical report sequence,
+ * and `sessionId` equality is not proof that the loaded runtime survived. So
+ * the ambiguity is named rather than resolved — a wrong attestation id is
+ * worse than a named absence, and naming it still dispatches the wake (the
+ * edge records; it does not refuse). The absence is sticky by construction: a
+ * later agreeing report cannot restore knowledge that was never held.
+ */
+function retainedAttestation(
+  previous: AttestationRead | undefined,
+  reported: AttestationRead | undefined,
+): AttestationRead | undefined {
+  if (previous === undefined) return reported;
+  // A surface that sent nothing added no evidence; that is not a disagreement.
+  if (reported === undefined) return previous;
+  return namesTheSameArtifacts(previous, reported)
+    ? previous
+    : { ok: false, absence: "attestation_ambiguous" };
+}
+
+/**
+ * Do two reports name the same artifacts? The id is a content address over
+ * every other field of the record, so it is the whole identity: also comparing
+ * the commit and actor would be a fence no honest record can trip, and a record
+ * whose id disagrees with its own bytes is `weave doctor`'s to refuse, not the
+ * edge's to arbitrate.
+ *
+ * Two absences never disagree in the sense that matters: neither offers an id,
+ * so no guess is on the table and the first — the more specific evidence about
+ * this session's start — stands. Ambiguity is reserved for the case where a
+ * *recorded id* would otherwise be asserted on no evidence.
+ */
+function namesTheSameArtifacts(left: AttestationRead, right: AttestationRead): boolean {
+  if (left.ok !== right.ok) return false;
+  if (left.ok && right.ok) {
+    return left.attestation.attestationId === right.attestation.attestationId;
+  }
+  return true;
 }

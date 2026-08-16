@@ -23,7 +23,15 @@ export type AttestationAbsence =
   | "attestation_unreadable"
   | "attestation_unknown_schema"
   | "attestation_incomplete"
-  | "attestation_actor_mismatch";
+  | "attestation_actor_mismatch"
+  | "attestation_ambiguous";
+
+/**
+ * Absences the edge computes about a read, never ones a profile can claim:
+ * the actor mismatch is decided against the delivery, and the ambiguity is
+ * decided against a second report for the same live session.
+ */
+type EdgeComputedAbsence = "attestation_actor_mismatch" | "attestation_ambiguous";
 
 export interface WakeAttestation {
   attestationId: string;
@@ -84,7 +92,7 @@ export function readWakeAttestation(accountProfile: string): AttestationRead {
 /** Flattened wire form a live surface puts on `/live/register`. */
 export type AttestationWire =
   | { ok: true; attestationId: string; doctrineCommit: string; actor: string }
-  | { ok: false; absence: Exclude<AttestationAbsence, "attestation_actor_mismatch"> };
+  | { ok: false; absence: Exclude<AttestationAbsence, EdgeComputedAbsence> };
 
 export function attestationWire(read: AttestationRead): AttestationWire {
   if (read.ok) {
@@ -95,9 +103,9 @@ export function attestationWire(read: AttestationRead): AttestationWire {
       actor: read.attestation.actor,
     };
   }
-  // Actor mismatch is computed at bind time against the delivery, never sent
-  // by a surface as a claimed absence.
-  if (read.absence === "attestation_actor_mismatch") {
+  // The edge-computed absences are decided here, against the delivery and
+  // against the session's own earlier report; a surface can never claim one.
+  if (read.absence === "attestation_actor_mismatch" || read.absence === "attestation_ambiguous") {
     return { ok: false, absence: "attestation_unreadable" };
   }
   return { ok: false, absence: read.absence };

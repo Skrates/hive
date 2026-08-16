@@ -528,9 +528,11 @@ test("a seat with no attestation still wakes, and the delivery says why it is un
   store.close();
 });
 
-test("a live session keeps the attestation it started with across a reinstall", async () => {
-  // The profile on disk can change while the session stays registered; the
-  // outcome still belongs to the artifacts loaded when the session started.
+test("a reinstall under a live session records the ambiguity instead of guessing an id", async () => {
+  // The profile on disk can change while the session stays registered. The
+  // surface re-reads it at every boundary, so the edge cannot tell a reinstall
+  // under a still-running process from a crash-and-resume of the same session
+  // under new artifacts. It names the ambiguity — and still dispatches.
   const live = new LiveIngressRegistry();
   live.register({
     actor: "ariadne",
@@ -572,7 +574,10 @@ test("a live session keeps the attestation it started with across a reinstall", 
   })]);
 
   assert.equal(await edge.processOne(), true);
-  assert.equal(store.get(1)!.attestation_id, "sha256:" + "a".repeat(64));
+  const ambiguous = store.get(1)!;
+  assert.equal(ambiguous.status, "processed", "an unattributable turn still wakes");
+  assert.equal(ambiguous.attestation_id, null);
+  assert.equal(ambiguous.attestation_absence, "attestation_ambiguous");
   store.close();
 });
 
@@ -780,5 +785,58 @@ test("a live surface that appears after claim does not steal a headless dispatch
   assert.equal(adapter.liveDeliveries.length, 0);
   assert.equal(adapter.resumes.length, 1);
   assert.equal(store.get(1)!.attestation_id, "sha256:" + "c".repeat(64));
+  store.close();
+});
+
+class ResubscribingBroker extends FakeBroker {
+  constructor(queue: Delivery[], private readonly upserted: Subscription) {
+    super(queue);
+  }
+
+  // The broker rebuilds every transition's delivery by joining the live
+  // `subscriptions` row, so an admin upsert shows up on the NEXT transition.
+  override async accept(value: Delivery): Promise<Delivery> {
+    return { ...await super.accept(value), subscription: this.upserted };
+  }
+
+  override async beginDispatch(value: Delivery): Promise<Delivery> {
+    return { ...await super.beginDispatch(value), subscription: this.upserted };
+  }
+}
+
+test("a subscription upsert between claim and dispatch neither re-routes nor re-binds the turn", async () => {
+  // One snapshot governs the turn. Straddling two would file the receipt under
+  // a profile the provider never loaded (account-profile change) or hand the
+  // turn to an adapter the claim never selected (provider change) — both from
+  // an ordinary `hive subscribe` re-run landing mid-turn.
+  const record = (id: string, commit: string) => JSON.stringify({
+    schema: "weave.attestation/1",
+    attestation_id: "sha256:" + id.repeat(64),
+    actor: "ariadne",
+    doctrine: { remote: "RationallyPrime/weave-doctrine", commit: commit.repeat(40) },
+  });
+  const claimed = mkdtempSync(join(tmpdir(), "weave-claimed-sub-"));
+  writeFileSync(join(claimed, ATTESTATION_FILENAME), record("a", "1"));
+  const upserted = mkdtempSync(join(tmpdir(), "weave-upserted-sub-"));
+  writeFileSync(join(upserted, ATTESTATION_FILENAME), record("b", "2"));
+
+  const broker = new ResubscribingBroker(
+    [delivery(1, { subscription: subscription({ accountProfile: claimed }) })],
+    subscription({ provider: "claude", accountProfile: upserted }),
+  );
+  const store = new EdgeStore(":memory:");
+  const adapter = new StubAdapter();
+  const edge = new EdgeService(asBrokerClient(broker), store, new LiveIngressRegistry(), [adapter]);
+
+  assert.equal(await edge.processOne(), true);
+  // Routing: the claimed provider's adapter ran. Under the upserted snapshot
+  // there is no `claude` adapter, so the turn would have died pre-dispatch.
+  assert.equal(adapter.resumes.length, 1);
+  assert.deepEqual(broker.finishes.map((item) => item.result.status), ["processed"]);
+  // Binding: the row names the profile the provider actually ran under.
+  const row = store.get(1)!;
+  assert.equal(row.attestation_id, "sha256:" + "a".repeat(64));
+  assert.equal(row.doctrine_commit, "1".repeat(40));
+  assert.equal(row.attestation_absence, null);
   store.close();
 });
