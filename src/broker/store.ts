@@ -12,6 +12,7 @@ import type {
   TerminalDeliveryStatus,
 } from "../domain.js";
 import { retryBackoffMs } from "../domain.js";
+import { forgetDeliveryTraceparent } from "../observability.js";
 import type { Clock } from "../time.js";
 import { iso, systemClock } from "../time.js";
 
@@ -839,6 +840,7 @@ export class BrokerStore {
         WHERE delivery_id=? AND status IN ('claimed', 'accepted_local', 'dispatching', 'dispatched')
       `).run(JSON.stringify([reason]), now, now, delivery.id);
       this.enqueueOutbox(delivery, failureNotice(delivery, "failed", [reason]), REACTION_FAILED);
+      forgetDeliveryTraceparent(delivery.id);
       return;
     }
     const nextAttemptAt = new Date(this.clock.now().getTime() + retryBackoffMs(delivery.attempts)).toISOString();

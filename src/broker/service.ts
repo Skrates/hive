@@ -1,5 +1,5 @@
 import type { Delivery, DeliveryResultInput, Reason, ReplaySnapshot, SlackEventInput, SubscriptionInput } from "../domain.js";
-import { forgetDeliveryTraceparent, withSpan } from "../observability.js";
+import { forgetDeliveryTraceparent, peekDeliveryTraceparent, runInTraceparent, withSpan } from "../observability.js";
 import { BrokerStore } from "./store.js";
 
 export interface SlackTransport {
@@ -108,7 +108,20 @@ export class BrokerService {
 
   /** ADR-0003 R-6: agent outcome reports are not lease-fenced and always reach the thread. */
   recordOutcome(deliveryId: number, text: string): Delivery {
-    return this.store.recordOutcome(deliveryId, text);
+    const current = this.store.getDelivery(deliveryId);
+    return runInTraceparent(peekDeliveryTraceparent(deliveryId), () =>
+      withSpan("hive.broker.outcome", {
+        delivery_id: deliveryId,
+        actor: current.actor,
+        channel_id: current.event.channelId,
+        thread_ts: current.event.threadTs,
+        dedupe_key: current.eventId,
+      }, () => {
+        const delivery = this.store.recordOutcome(deliveryId, text);
+        forgetDeliveryTraceparent(deliveryId);
+        return delivery;
+      }),
+    );
   }
 
   replay(channelId: string, threadTs: string): Promise<ReplaySnapshot> {

@@ -12,6 +12,7 @@ import {
   StaleLeaseError,
 } from "./store.js";
 import { frameWakeInstruction, retryBackoffMs, SubscriptionInputSchema, type SlackEventInput, type SubscriptionInput } from "../domain.js";
+import { peekDeliveryTraceparent, rememberDeliveryTraceparent, resetObservabilityForTests } from "../observability.js";
 import type { Clock } from "../time.js";
 
 class FakeClock implements Clock {
@@ -344,6 +345,37 @@ test("release requeues with backoff and exhausts into failed", () => {
   assert.ok(store.listUnsentOutbox().some((entry) => /failed after 1 attempt/.test(entry.text)));
   clock.advance(1);
   assert.equal(store.claimNext("mac", 0), null);
+  store.close();
+});
+
+test("attempt exhaustion forgets the stored delivery traceparent", () => {
+  resetObservabilityForTests();
+  const { store } = fixture({ maxAttempts: 1 });
+  store.ingestEvent(event());
+  const claimed = store.claimNext("mac", 0)!;
+  const parent = `00-${"ab".repeat(16)}-${"cd".repeat(8)}-01`;
+  rememberDeliveryTraceparent(claimed.id, parent);
+  const released = store.release(claimed.id, "mac", claimed.leaseGeneration!, {
+    code: "provider_dispatch_unknown",
+    detail: "test uncertainty",
+  });
+  assert.equal(released.status, "failed");
+  assert.equal(peekDeliveryTraceparent(claimed.id), undefined);
+  store.close();
+});
+
+test("a retry requeue keeps the stored delivery traceparent", () => {
+  resetObservabilityForTests();
+  const { store, clock } = fixture({ maxAttempts: 3 });
+  store.ingestEvent(event());
+  const claimed = store.claimNext("mac", 0)!;
+  store.transition(claimed.id, "mac", claimed.leaseGeneration!, "claimed", "accepted_local");
+  const parent = `00-${"ab".repeat(16)}-${"cd".repeat(8)}-01`;
+  rememberDeliveryTraceparent(claimed.id, parent);
+  clock.advance(1_001);
+  assert.equal(store.requeueExpiredLeases(), 1);
+  assert.equal(store.getDelivery(claimed.id).status, "pending");
+  assert.equal(peekDeliveryTraceparent(claimed.id), parent);
   store.close();
 });
 
