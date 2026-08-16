@@ -340,8 +340,12 @@ export class LiveDeliveryCancellations {
 
   /**
    * Stop the named delivery and answer only once its provider path has settled.
-   * An unknown delivery is the idempotent case — it already settled — and is
-   * reported as a stop nobody had to make.
+   *
+   * A delivery this surface has no entry for is answered `cancelled: false`,
+   * which is NOT a report that it stopped: the registration may not have landed
+   * yet, or it may have settled and taken its interrupt result with it. The
+   * edge reads that answer as an unconfirmed stop, so the honest thing here is
+   * to say only what the map knows.
    */
   async cancel(deliveryId: number): Promise<LiveCancelResult> {
     const entry = this.inFlight.get(deliveryId);

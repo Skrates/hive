@@ -8,7 +8,7 @@ import type { Delivery, Subscription } from "../domain.js";
 import { prepareSocketPath } from "../local/uds.js";
 import type { LiveIngress } from "./live-registry.js";
 import { delimiter, dirname } from "node:path";
-import { CancellationUnconfirmedError, ClaudeProvider, claudePromptSlotArgs, codexPermissionArgs, CodexProvider, composeChildEnv, dispatchDeadlineAt, GrokProvider, grokPermissionArgs, prependPathEntry, ProviderPreDispatchError, requireAccountProfile, stampDispatchDeadline } from "./providers.js";
+import { CancellationUnconfirmedError, ClaudeProvider, claudePromptSlotArgs, codexPermissionArgs, CodexProvider, composeChildEnv, dispatchDeadlineAt, GrokProvider, grokPermissionArgs, LIVE_CANCEL_OUTCOMES, prependPathEntry, ProviderPreDispatchError, requireAccountProfile, stampDispatchDeadline } from "./providers.js";
 
 function subscription(overrides: Partial<Subscription> = {}): Subscription {
   return {
@@ -419,6 +419,123 @@ test("a surface that fails the cancel request yields an UNCONFIRMED cancellation
   assert.ok(error instanceof CancellationUnconfirmedError, "no answer is never a confirmed stop");
   assert.match((error as CancellationUnconfirmedError).detail, /did not answer the cancel request/);
 });
+
+/**
+ * Every answer a live surface can give to `/cancel`, and what the edge is
+ * entitled to conclude from it. The table is checked against
+ * `LIVE_CANCEL_OUTCOMES` below, so a fifth answer cannot be added to the reader
+ * without a case here that says whether it releases the fence.
+ *
+ * The load-bearing row is `no_record`. `cancelled: false` is the answer for a
+ * registration that has not landed AND for one that already settled, discarding
+ * a recorded failed interrupt with it — so it is not evidence of a stop, and
+ * reading it as one released the fence beside a turn known to be running.
+ */
+const LIVE_CANCEL_ANSWERS: ReadonlyArray<{
+  outcome: (typeof LIVE_CANCEL_OUTCOMES)[number];
+  what: string;
+  answers: ReadonlyArray<{ status: number; body: unknown }>;
+  confirmed: boolean;
+  detail: RegExp;
+  asks: number;
+}> = [
+  {
+    outcome: "stopped",
+    what: "the surface stopped the turn and the interrupt landed",
+    answers: [{ status: 200, body: { cancelled: true, interrupted: true } }],
+    confirmed: true,
+    detail: /cancelled at the edge's dispatch bound/,
+    asks: 1,
+  },
+  {
+    outcome: "stopped",
+    what: "the surface stopped a tracked delivery that had accepted no turn",
+    answers: [{ status: 200, body: { cancelled: true, interrupted: null } }],
+    confirmed: true,
+    detail: /cancelled at the edge's dispatch bound/,
+    asks: 1,
+  },
+  {
+    outcome: "interrupt_failed",
+    what: "the surface could not interrupt the accepted turn",
+    answers: [{ status: 200, body: { cancelled: true, interrupted: false } }],
+    confirmed: false,
+    detail: /could not interrupt the accepted turn/,
+    asks: 1,
+  },
+  {
+    outcome: "no_record",
+    what: "the surface has no record of the delivery, twice",
+    answers: [
+      { status: 200, body: { cancelled: false, interrupted: null } },
+      { status: 200, body: { cancelled: false, interrupted: null } },
+    ],
+    confirmed: false,
+    detail: /has no record of this delivery/,
+    asks: 2,
+  },
+  {
+    outcome: "no_record",
+    what: "the first no-record answer raced the arriving /deliver and the re-ask finds the turn",
+    answers: [
+      { status: 200, body: { cancelled: false, interrupted: null } },
+      { status: 200, body: { cancelled: true, interrupted: true } },
+    ],
+    confirmed: true,
+    detail: /cancelled at the edge's dispatch bound/,
+    asks: 2,
+  },
+  {
+    outcome: "no_answer",
+    what: "the surface never answers the cancel request",
+    answers: [{ status: 500, body: { error: "live_delivery_failed" } }],
+    confirmed: false,
+    detail: /did not answer the cancel request/,
+    asks: 1,
+  },
+];
+
+test("the cancel-answer table covers every outcome the reader can produce", () => {
+  assert.deepEqual(
+    [...new Set(LIVE_CANCEL_ANSWERS.map((row) => row.outcome))].sort(),
+    [...LIVE_CANCEL_OUTCOMES].sort(),
+    "a new /cancel outcome needs a row saying whether it releases the delivery fence",
+  );
+});
+
+for (const [index, row] of LIVE_CANCEL_ANSWERS.entries()) {
+  test(`a live cancel where ${row.what} is ${row.confirmed ? "a" : "NOT a"} confirmed stop`, async (t) => {
+    const root = mkdtempSync(join(tmpdir(), "hive-live-cancel-table-"));
+    t.after(() => rmSync(root, { recursive: true, force: true }));
+    const socketPath = join(root, "surface.sock");
+    prepareSocketPath(socketPath);
+    let ask = 0;
+    const surface = cancellableSurface(socketPath, () => row.answers[Math.min(ask++, row.answers.length - 1)]!);
+    await surface.ready;
+    t.after(() => surface.server.close());
+
+    const codex = new CodexProvider();
+    const controller = new AbortController();
+    const deliveryId = 40 + index;
+    const dispatch = codex.deliverLive(liveIngress(socketPath), delivery(deliveryId), "framed", controller.signal);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    controller.abort();
+
+    const error = await dispatch.then(() => null, (reason: unknown) => reason);
+    assert.ok(error instanceof Error, "an aborted live dispatch never resolves");
+    assert.equal(
+      error instanceof CancellationUnconfirmedError,
+      !row.confirmed,
+      `${row.what}: an unconfirmed stop must be its own failure class, so the release files it as such`,
+    );
+    assert.match((error as Error).message, row.detail);
+    assert.deepEqual(
+      surface.cancels,
+      Array.from({ length: row.asks }, () => deliveryId),
+      `${row.what}: the edge asks the surface exactly ${row.asks} time(s)`,
+    );
+  });
+}
 
 test("dispatch abort kills the provider process group, including SIGTERM-immune descendants", async (t) => {
   const root = mkdtempSync(join(tmpdir(), "hive-pgid-"));

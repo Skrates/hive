@@ -423,7 +423,9 @@ test("the cancel answer waits for the tracked delivery to stop, and reports the 
   assert.deepEqual(
     await cancellations.cancel(77),
     { cancelled: false, interrupted: null },
-    "a delivery that already settled is not in flight, and cancelling it again is a no-op",
+    "a settled delivery leaves no record here — including whatever it knew about its"
+      + " interrupt — so this answer says only 'not in flight', never 'it stopped';"
+      + " the edge reads it as an unconfirmed cancellation",
   );
 });
 

@@ -133,14 +133,17 @@ export class CodexProvider implements ProviderAdapter {
       const pending = pendingCancellation();
       if (pending !== null) {
         let outcome = await pending;
-        if (outcome.confirmed && !outcome.sawDelivery) {
-          // The cancel raced the still-arriving /deliver: an unknown-delivery
-          // answer given before the delivery request settled proves nothing.
-          // Now that /deliver HAS settled, one re-ask is authoritative —
-          // either the registration landed (and is stopped) or it never will.
+        if (outcome.outcome === "no_record") {
+          // The cancel raced the still-arriving /deliver: a no-record answer
+          // given before the delivery request settled proves nothing. Now that
+          // /deliver HAS settled, one re-ask is the last word — the
+          // registration either landed (and is stopped, upgrading this to a
+          // confirmed cancellation) or the surface still has no record, which
+          // is not a stop. Only this member is re-asked: a surface that never
+          // answered would spend the cancel bound a second time.
           outcome = await requestLiveCancel(ingress.socketPath, delivery.id);
         }
-        if (!outcome.confirmed) throw new CancellationUnconfirmedError(delivery.id, outcome.detail);
+        if (!cancelConfirmed(outcome)) throw new CancellationUnconfirmedError(delivery.id, outcome.detail);
         throw new Error(`Codex live turn for delivery ${delivery.id} was cancelled at the edge's dispatch bound`);
       }
       if (error instanceof UdsHttpError && surfaceErrorCode(error.responseBody) === "account_profile_mismatch") {
@@ -390,25 +393,35 @@ export const CHILD_KILL_GRACE_MS = 5_000;
  */
 export const LIVE_CANCEL_CONFIRM_MS = 20_000;
 
+/**
+ * What one `/cancel` exchange established. Exactly one of four states, because
+ * the two that a `confirmed`/`sawDelivery` boolean pair used to fold together —
+ * "the surface has no record" and "the surface never answered" — need different
+ * handling: only the first is worth re-asking, and only the first is bounded by
+ * an answer that already arrived.
+ *
+ * `stopped` is the only member that permits releasing the delivery's fence as a
+ * clean cancellation; every other member is an UNconfirmed stop, because this
+ * result is the edge's only evidence that a released delivery is safe to retry.
+ */
+export const LIVE_CANCEL_OUTCOMES = ["stopped", "interrupt_failed", "no_record", "no_answer"] as const;
+type LiveCancelOutcome = (typeof LIVE_CANCEL_OUTCOMES)[number];
+
 interface LiveCancellation {
-  /** The surface reported the turn as stopped (or as never accepted). */
-  confirmed: boolean;
-  /**
-   * The surface actually observed this delivery. An unknown-delivery answer
-   * (`cancelled: false, interrupted: null`) while the `/deliver` request is
-   * still in flight is a race, not a settlement — it must be re-asked once
-   * the delivery request itself has settled.
-   */
-  sawDelivery: boolean;
+  outcome: LiveCancelOutcome;
   detail: string;
+}
+
+/** A cancellation is confirmed only when the surface said the turn stopped. */
+function cancelConfirmed(cancellation: LiveCancellation): boolean {
+  return cancellation.outcome === "stopped";
 }
 
 /**
  * Ask a live surface to stop one delivery and report what it answered. Every
  * failure mode — an unreachable socket, a timeout, a surface that could not
- * interrupt its accepted turn — is an UNconfirmed cancellation, never a silent
- * success: this result is the edge's only evidence that a released delivery is
- * safe to retry.
+ * interrupt its accepted turn, a surface with no record of the delivery — is an
+ * UNconfirmed cancellation, never a silent success.
  */
 async function requestLiveCancel(socketPath: string, deliveryId: number): Promise<LiveCancellation> {
   try {
@@ -420,20 +433,25 @@ async function requestLiveCancel(socketPath: string, deliveryId: number): Promis
       AbortSignal.timeout(LIVE_CANCEL_CONFIRM_MS),
     );
     if (result.interrupted === false) {
-      return { confirmed: false, sawDelivery: true, detail: "the live surface could not interrupt the accepted turn" };
+      return { outcome: "interrupt_failed", detail: "the live surface could not interrupt the accepted turn" };
     }
-    const sawDelivery = result.cancelled === true || result.interrupted !== null;
-    return {
-      confirmed: true,
-      sawDelivery,
-      detail: sawDelivery
-        ? "the live surface confirmed the turn stopped"
-        : "the live surface never observed this delivery",
-    };
+    if (result.cancelled !== true) {
+      // No record of the delivery — and that answer is produced by two states
+      // the surface cannot tell apart: a registration that has not landed yet,
+      // and one that already settled. The settle is the dangerous one: the
+      // tracked operation's teardown deletes its entry and discards whatever it
+      // recorded about its interrupt, so a turn whose interrupt is KNOWN to
+      // have failed answers exactly like one that never existed. The edge does
+      // not read that as a stop (R-3).
+      return {
+        outcome: "no_record",
+        detail: "the live surface has no record of this delivery and cannot say whether its turn stopped",
+      };
+    }
+    return { outcome: "stopped", detail: "the live surface confirmed the turn stopped" };
   } catch (error) {
     return {
-      confirmed: false,
-      sawDelivery: false,
+      outcome: "no_answer",
       detail: `the live surface did not answer the cancel request: ${error instanceof Error ? error.message : String(error)}`,
     };
   }
