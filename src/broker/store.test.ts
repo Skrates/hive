@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  ActorCaseCollisionError,
   BrokerStore,
   DISPATCHED_OUTCOME_GRACE_MS,
   InvalidTransitionError,
@@ -729,10 +730,13 @@ function mintFixture() {
   store.ingestEvent(event());
   const source = store.claimNext("mac", 0)!;
   const mint = (
-    input: { sourceDeliveryId: number; actor: string; text: string; threadTs: string | null },
+    input: { sourceDeliveryId: number; actor: string; text: string; threadTs: string | null; generation?: number },
     edgeId = "mac",
-  ) => store.mintSeatWake(input, edgeId);
-  return { store, clock, sourceId: source.id, mint };
+  ) => store.mintSeatWake(
+    { ...input, generation: input.generation ?? source.leaseGeneration! },
+    edgeId,
+  );
+  return { store, clock, sourceId: source.id, generation: source.leaseGeneration!, mint };
 }
 
 test("a seat mint commits the delivery and its commons render in one transaction", () => {
@@ -994,6 +998,110 @@ test("a mint binds the source delivery to the calling edge's current fence", () 
     (error: unknown) => error instanceof SeatWakeRefusedError && error.code === "source_not_held",
   );
   store.close();
+});
+
+test("a mint is bound to one live dispatch, not merely to the calling machine", () => {
+  const { store, clock, sourceId, generation, mint } = mintFixture();
+  const input = { sourceDeliveryId: sourceId, actor: "gnomon", text: "from this dispatch", threadTs: null };
+
+  // The r4 finding: `claimed_by === edgeId` authenticates the machine, and one
+  // edge claims for many actors by design. Custody now goes through
+  // assertLease, so a generation this dispatch does not hold is refused even
+  // though the delivery IS claimed, by this edge, in a fenced status — the
+  // exact state the old predicate accepted.
+  assert.throws(
+    () => mint({ ...input, generation: generation + 1 }),
+    (error: unknown) => error instanceof SeatWakeRefusedError && error.code === "source_not_held",
+  );
+
+  // The stale-child half: the turn's own generation stops minting once the
+  // lease behind it has expired, rather than staying good for as long as the
+  // row sits in a fenced status.
+  clock.advance(30_001);
+  assert.throws(
+    () => mint(input),
+    (error: unknown) => error instanceof SeatWakeRefusedError && error.code === "source_not_held",
+  );
+
+  // And nothing was written on the way to either refusal.
+  assert.equal(store.listDeliveries().filter((delivery) => delivery.actor === "gnomon").length, 0);
+  assert.equal(store.listUnsentOutbox().length, 0);
+  store.close();
+});
+
+test("a persisted mixed-case actor is canonicalized in place, across every table that keys by it", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "hive-actor-case-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const path = join(directory, "broker.sqlite");
+
+  const clock = new FakeClock(new Date("2026-07-12T00:00:00.000Z"));
+  const first = new BrokerStore(path, clock);
+  first.createEdge("mac");
+  first.upsertSubscription(subscription({ actor: "gnomon" }));
+  first.ingestEvent(event({ actor: "gnomon", text: "WAKE: gnomon | hello" }));
+  const deliveryId = first.listDeliveries()[0]!.id;
+  first.claimNext("mac", 0);
+  // Rewrite the enrolled name to the shape a pre-canonicalization broker wrote:
+  // the schema cannot produce it any more, but a live v5 database can hold it.
+  first.db.pragma("foreign_keys = OFF");
+  for (const table of ["subscriptions", "deliveries", "slack_events", "actor_leases"]) {
+    first.db.prepare(`UPDATE ${table} SET actor='Gnomon' WHERE actor='gnomon'`).run();
+  }
+  first.db.prepare("UPDATE deliveries SET coalesce_key='Gnomon:C1:100.1'").run();
+  first.db.prepare("INSERT INTO event_targets(raw_event_id, actors_json, frozen_at) VALUES (?, ?, ?)")
+    .run("Ev-frozen", JSON.stringify(["Gnomon"]), "2026-07-12T00:00:00.000Z");
+  first.close();
+
+  const reopened = new BrokerStore(path, clock);
+  t.after(() => reopened.close());
+
+  // The row the lookups can now reach — before this migration it was live,
+  // unroutable and undeletable, and re-enrolling made a second row.
+  assert.ok(reopened.getSubscription("gnomon"));
+  assert.equal(reopened.getDelivery(deliveryId).actor, "gnomon");
+  // Every actor-keyed table moves together: a subscription-only rewrite would
+  // leave the same defect one table over.
+  const leases = reopened.db.prepare("SELECT actor FROM actor_leases").all() as { actor: string }[];
+  assert.deepEqual(leases.map((row) => row.actor), ["gnomon"]);
+  const events = reopened.db.prepare("SELECT actor FROM slack_events").all() as { actor: string }[];
+  assert.deepEqual(events.map((row) => row.actor), ["gnomon"]);
+  // Derived data moves with it: a stale coalesce key would stop this thread's
+  // next message folding into its own pending delivery.
+  assert.equal(reopened.getDelivery(deliveryId).coalesceKey, "gnomon:C1:100.1");
+  const frozen = reopened.db.prepare("SELECT actors_json FROM event_targets WHERE raw_event_id='Ev-frozen'")
+    .get() as { actors_json: string };
+  assert.deepEqual(JSON.parse(frozen.actors_json), ["gnomon"]);
+  // Re-enrolling updates the row instead of writing a lowercase twin beside it.
+  reopened.upsertSubscription(subscription({ actor: "gnomon" }));
+  assert.equal((reopened.db.prepare("SELECT count(*) AS n FROM subscriptions").get() as { n: number }).n, 1);
+  // And the retire path reaches it again: before the migration it found no row
+  // and answered `false` — an actor that could not be deleted by any name.
+  assert.throws(
+    () => reopened.deleteSubscription("gnomon"),
+    (error: unknown) => error instanceof InvalidTransitionError && new RegExp(`delivery ${deliveryId}`).test(error.message),
+  );
+});
+
+test("two case-variant enrollments stop the broker instead of being merged", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "hive-actor-collision-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const path = join(directory, "broker.sqlite");
+
+  const first = new BrokerStore(path);
+  first.createEdge("mac");
+  first.upsertSubscription(subscription({ actor: "gnomon" }));
+  first.db.prepare("INSERT INTO subscriptions SELECT 'Gnomon', provider, provider_surface, provider_version, "
+    + "session_id, home_edge, workspace, edge_workspaces_json, wake_policy, permission_profile, account_profile, "
+    + "lease_ttl_ms, delivery_ttl_ms, home_grace_ms, spawn_rate_limit, max_attempts, expires_at, updated_at "
+    + "FROM subscriptions WHERE actor='gnomon'").run();
+  first.close();
+
+  // Two enrollments differing only by case are two rows a human made. Merging
+  // them is a data decision a migration has no standing to take (R-3).
+  assert.throws(
+    () => new BrokerStore(path),
+    (error: unknown) => error instanceof ActorCaseCollisionError && /Gnomon/.test(error.message),
+  );
 });
 
 test("subscription actors are stored under the same canonical key wake targets use", () => {

@@ -101,6 +101,12 @@ export class EdgeControlServer {
     // under its machine credential and relays the broker's answer verbatim —
     // including a refusal, so the minting seat learns exactly why nothing was
     // delivered instead of watching its handoff vanish (R-3).
+    //
+    // The source delivery is resolved HERE, from the edge's own dispatch state,
+    // and never read from the request. Filesystem ownership of this socket
+    // authenticates the machine; on a multi-actor box the machine is not the
+    // seat, so a body that named a delivery id would let any co-tenant mint
+    // under a peer's attribution.
     if (request.method === "POST" && request.url === "/wake") {
       const parsed = SeatWakeInputSchema.safeParse(await readJson(request));
       if (!parsed.success) {
@@ -109,8 +115,21 @@ export class EdgeControlServer {
           detail: parsed.error.issues.map((issue) => `${issue.path.join(".")}: ${issue.message}`).join("; "),
         });
       }
+      const source = this.edge.resolveMintSource(parsed.data.token);
+      if (!source) {
+        return json(response, 403, {
+          error: "unknown_dispatch_token",
+          detail: "no dispatch on this edge holds that token — a turn can mint only while it is running",
+        });
+      }
       try {
-        return json(response, 201, await this.edge.broker.mintWake(parsed.data));
+        return json(response, 201, await this.edge.broker.mintWake({
+          sourceDeliveryId: source.deliveryId,
+          generation: source.generation,
+          actor: parsed.data.actor,
+          text: parsed.data.text,
+          threadTs: parsed.data.threadTs,
+        }));
       } catch (error) {
         if (error instanceof BrokerHttpError) {
           return json(response, error.status, parseErrorBody(error.responseBody));

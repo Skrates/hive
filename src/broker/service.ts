@@ -3,7 +3,7 @@ import type {
   DeliveryResultInput,
   Reason,
   ReplaySnapshot,
-  SeatWakeInput,
+  SeatWakeMint,
   SeatWakeReceipt,
   SlackEventInput,
   SubscriptionInput,
@@ -53,7 +53,7 @@ export class BrokerService {
    * the ledger commits, so the CLI cannot report success for a coordinate
    * the edge will then fail to replay.
    */
-  async mintSeatWake(input: SeatWakeInput, edgeId: string): Promise<SeatWakeReceipt> {
+  async mintSeatWake(input: SeatWakeMint, edgeId: string): Promise<SeatWakeReceipt> {
     if (input.threadTs !== null) {
       if (!isSlackMessageTs(input.threadTs)) {
         throw new SeatWakeRefusedError(

@@ -72,12 +72,20 @@ Deliberate address is therefore an explicit act, never inferred from where text 
 
 ```sh
 hive wake theoros "verify the KRA-1056 gate set on PR #1072"
-hive wake theoros --from 486 --thread 1786809717.355459 "…"
+hive wake theoros --thread 1786809717.355459 "…"
 ```
 
-- **The minting seat is named by the delivery it is executing.** Headless turns export
-  `HIVE_DELIVERY_ID`; a live-delivered wake passes `--from <delivery-id>` from its envelope. The
-  broker resolves the sender from that delivery's ledger row, so attribution is never a client claim.
+- **A seat cannot name the delivery it mints from.** The edge issues each provider turn a
+  capability (`HIVE_DELIVERY_TOKEN`, exported into the child and revoked when the turn settles);
+  `hive wake` presents it, and the *edge* resolves which delivery — and which lease generation —
+  that turn is. The broker then reads the sender from that ledger row, so attribution is never a
+  client claim. One edge serves several actors over one owner-only socket, so a delivery id in the
+  request would let any co-tenant seat mint under a peer's name; the machine credential proves the
+  machine, and the machine is not the seat. The honest ceiling: seats on a box share a Unix user,
+  so this binds a mint to the run that requested it, not against a seat that deliberately reads a
+  peer process's state.
+- **Only a turn this edge dispatched can mint.** A live-delivered turn holds no per-dispatch
+  capability and is refused (KRA-1118); so is a child that outlived its dispatch.
 - **The wake lands in the minting seat's thread** unless `--thread` names another thread in the same
   channel. The receiver's outcome relays there, which is what makes a handoff answerable where it
   was asked.
@@ -85,7 +93,8 @@ hive wake theoros --from 486 --thread 1786809717.355459 "…"
   are one transaction; the post goes out through the ordinary `hive_*`-stamped outbox, so humans see
   the handoff and admission ignores it.
 - **A mint that cannot be delivered exits non-zero with the reason** (`unroutable_actor`,
-  `unknown_source_delivery`, `self_mint_forbidden`, `broadcast_forbidden`) — never rendered-and-gone.
+  `unknown_source_delivery`, `source_not_held`, `unknown_dispatch_token`, `self_mint_forbidden`,
+  `broadcast_forbidden`) — never rendered-and-gone.
 - **A seat cannot broadcast or wake itself.** `everyone` stays a human-sender act, and a
   self-directed mint is an unbounded loop with no operator in it.
 - **Replaying the identical mint is a no-op** that names the original delivery, so a lost CLI

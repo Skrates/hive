@@ -3,7 +3,7 @@ import type {
   DeliveryResultInput,
   Reason,
   ReplaySnapshot,
-  SeatWakeInput,
+  SeatWakeMint,
   SeatWakeReceipt,
   SubscriptionInput,
 } from "../domain.js";
@@ -73,7 +73,7 @@ export class BrokerClient {
    * machine credential. The broker resolves the minting seat from the source
    * delivery, so the edge carries intent — never attribution.
    */
-  async mintWake(input: SeatWakeInput): Promise<SeatWakeReceipt> {
+  async mintWake(input: SeatWakeMint): Promise<SeatWakeReceipt> {
     const response = await this.request("/v1/wakes", {
       method: "POST",
       body: JSON.stringify(input),

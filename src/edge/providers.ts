@@ -63,6 +63,13 @@ export class ProviderPreDispatchError extends Error {
  */
 export interface HeadlessDispatch {
   deliveryId: number;
+  /**
+   * KRA-1097: this turn's mint capability, valid only while the turn runs. The
+   * child presents it to `hive wake`; it never names a delivery id, because one
+   * edge serves many actors over one socket and an id names a row any co-tenant
+   * could name too.
+   */
+  token: string;
 }
 
 export interface ProviderAdapter {
@@ -337,6 +344,11 @@ export function composeChildEnv(
     // inside a wake. Set after profileEnv so an adapter can never shadow it,
     // and set here — not per adapter — so no dispatch path can forget it.
     HIVE_DELIVERY_ID: String(context.deliveryId),
+    // The mint capability of THIS turn. `hive wake` sends it instead of naming
+    // a delivery, so a co-tenant seat's id — or this child's own id after the
+    // turn ends — cannot be presented as a source. Revoked by the edge the
+    // moment the provider turn settles.
+    HIVE_DELIVERY_TOKEN: context.token,
     // Grok pins HOME to the account profile (R-5). `hive wake` falls back to
     // `homedir()/.hive/edge.sock` when this is unset, which would then resolve
     // inside that profile instead of the edge's owner-local socket. Export the

@@ -6,14 +6,14 @@ import type {
   DeliveryStatus,
   EdgeWorkspace,
   Reason,
-  SeatWakeInput,
+  SeatWakeMint,
   SeatWakeReceipt,
   SlackEventInput,
   Subscription,
   SubscriptionInput,
   TerminalDeliveryStatus,
 } from "../domain.js";
-import { EVERYONE, isSlackMessageTs, retryBackoffMs } from "../domain.js";
+import { canonicalActor, EVERYONE, isSlackMessageTs, retryBackoffMs } from "../domain.js";
 import type { Clock } from "../time.js";
 import { iso, systemClock } from "../time.js";
 
@@ -50,6 +50,12 @@ export const OUTBOX_MAX_ATTEMPTS = 50;
 export class StaleLeaseError extends Error {}
 export class InvalidTransitionError extends Error {}
 export class LegacyDatabaseError extends Error {}
+/**
+ * Two subscriptions differing only by case. Canonicalization would merge two
+ * enrollments into one row, so the broker refuses to boot instead — a data
+ * decision belongs to the operator, never to a migration (R-3).
+ */
+export class ActorCaseCollisionError extends Error {}
 
 /**
  * KRA-1097 / ADR-0003 R-3: a seat's deliberate address that cannot be delivered
@@ -71,13 +77,19 @@ export type SeatWakeRefusalCode =
   | "self_mint_forbidden"
   | "broadcast_forbidden";
 
-/** Statuses in which an edge still holds the single-claimant fence. */
-const FENCED = new Set<DeliveryStatus>([
-  "claimed",
-  "accepted_local",
-  "dispatching",
-  "dispatched",
-]);
+/**
+ * Why a mint's custody check failed, for the refusal message only. The refusal
+ * itself is decided by {@link BrokerStore.assertLease}; re-deriving the verdict
+ * here would rebuild the very predicate that primitive exists to own.
+ */
+function mintCustodyDetail(source: Delivery, edgeId: string, generation: number): string {
+  if (source.claimedBy === null) return `delivery ${source.id} is not currently fenced on any edge`;
+  if (source.claimedBy !== edgeId) {
+    return `delivery ${source.id} is held by edge \`${source.claimedBy}\`, not this caller`;
+  }
+  return `delivery ${source.id} is not held at generation ${generation} `
+    + `(the ledger holds ${source.leaseGeneration ?? "none"}); this dispatch's lease has moved on`;
+}
 
 export interface OutboxEntry {
   outboxId: number;
@@ -285,6 +297,109 @@ export class BrokerStore {
       );
     `);
     this.ensureOutboxReactionColumns();
+    this.canonicalizePersistedActors();
+  }
+
+  /**
+   * Forward-only schema step: actor identity is canonically lowercase.
+   * `SubscriptionInputSchema` lowercases every enrollment and every lookup path
+   * (`getSubscription`, the wake target, the DELETE route) now looks up the
+   * lowercase key — but a database written before that rule still holds its
+   * original casing, and no lookup can reach those rows any more. A persisted
+   * `Gnomon` is live, unroutable and undeletable, and re-enrolling it writes a
+   * second row instead of updating the first.
+   *
+   * The finding offered two cures; the second — lookups that also try the
+   * original casing — is a dual-shape reader and is forbidden. So the stored
+   * keys move to the canonical form once, here, and only one shape ever exists
+   * afterwards.
+   *
+   * Every actor-keyed table moves together, discovered by column name rather
+   * than by a hand-kept list: rewriting `subscriptions` alone would leave the
+   * same defect one table over (a delivery pointing at a key that no longer
+   * exists, a lease under the old name), and a hand-kept list silently omits
+   * the next table someone adds. `deliveries.coalesce_key` embeds the actor and
+   * moves with it — otherwise a canonicalized delivery stops coalescing with
+   * its own thread's next message. `event_targets.actors_json` is a frozen
+   * fan-out list and moves too.
+   */
+  private canonicalizePersistedActors(): void {
+    const actors = (this.db.prepare("SELECT actor FROM subscriptions").all() as Row[])
+      .map((row) => String(row.actor));
+    if (actors.every((actor) => actor === canonicalActor(actor))) return;
+
+    // Two enrollments differing only by case are two rows a human made; merging
+    // them is a data decision this migration has no standing to take. R-3: stop
+    // loudly, name both, and let the operator resolve it.
+    const byCanonical = new Map<string, string[]>();
+    for (const actor of actors) {
+      byCanonical.set(canonicalActor(actor), [...byCanonical.get(canonicalActor(actor)) ?? [], actor]);
+    }
+    const collisions = [...byCanonical].filter(([, names]) => names.length > 1);
+    if (collisions.length > 0) {
+      throw new ActorCaseCollisionError(
+        "broker database holds case-variant subscriptions for one actor ("
+        + collisions.map(([key, names]) => `${key} ← ${names.join(", ")}`).join("; ")
+        + "); canonicalizing would silently merge two enrollments — delete the stale rows and restart",
+      );
+    }
+
+    const actorTables = (this.db.prepare(
+      "SELECT name FROM sqlite_master WHERE type='table'",
+    ).all() as Row[])
+      .map((row) => String(row.name))
+      .filter((table) => (this.db.pragma(`table_info(${table})`) as { name: string }[])
+        .some((column) => column.name === "actor"));
+
+    // Parent and child rows move in the same transaction, so the intermediate
+    // state violates the deliveries→subscriptions foreign key by construction.
+    // Suspending enforcement for the rewrite is the standard SQLite migration
+    // shape; `foreign_key_check` below proves the result is sound rather than
+    // assuming it. The pragma cannot change inside a transaction, hence outside.
+    this.db.pragma("foreign_keys = OFF");
+    try {
+      this.db.transaction(() => {
+        // Scan each table's own values rather than only the enrolled names: a
+        // row can name an actor no subscription still holds (an event kept past
+        // a retirement), and leaving it mixed-case rebuilds the same
+        // unreachable-key defect the moment that name is enrolled again.
+        for (const table of actorTables) {
+          const names = (this.db.prepare(`SELECT DISTINCT actor FROM ${table}`).all() as Row[])
+            .map((row) => String(row.actor));
+          for (const name of names) {
+            const canonical = canonicalActor(name);
+            if (canonical === name) continue;
+            this.db.prepare(`UPDATE ${table} SET actor=? WHERE actor=?`).run(canonical, name);
+          }
+        }
+        // The coalesce key is `actor:channel:thread` — derived data that would
+        // otherwise keep the pre-canonical name and split the thread in two.
+        for (const row of this.db.prepare("SELECT delivery_id, actor, coalesce_key FROM deliveries").all() as Row[]) {
+          const key = String(row.coalesce_key);
+          const rebuilt = [String(row.actor), ...key.split(":").slice(1)].join(":");
+          if (rebuilt === key) continue;
+          this.db.prepare("UPDATE deliveries SET coalesce_key=? WHERE delivery_id=?")
+            .run(rebuilt, Number(row.delivery_id));
+        }
+        for (const row of this.db.prepare("SELECT raw_event_id, actors_json FROM event_targets").all() as Row[]) {
+          const frozen = JSON.parse(String(row.actors_json)) as string[];
+          const canonical = frozen.map(canonicalActor);
+          if (canonical.every((name, index) => name === frozen[index])) continue;
+          this.db.prepare("UPDATE event_targets SET actors_json=? WHERE raw_event_id=?")
+            .run(JSON.stringify(canonical), String(row.raw_event_id));
+        }
+        // Inside the transaction: a dangling row must roll the rewrite back,
+        // not be reported after it has already committed.
+        const violations = this.db.pragma("foreign_key_check") as unknown[];
+        if (violations.length > 0) {
+          throw new Error(
+            `actor canonicalization left ${violations.length} dangling foreign key row(s); the store was not migrated`,
+          );
+        }
+      })();
+    } finally {
+      this.db.pragma("foreign_keys = ON");
+    }
   }
 
   /** Forward-only schema step: pre-reaction databases gain the two nullable columns in place. */
@@ -593,8 +708,13 @@ export class BrokerStore {
    *
    * - **Attribution is ledger-derived.** The minting seat is whoever owns the
    *   source delivery, read from this store. A caller cannot name a sender.
-   *   The source must be the calling edge's current fenced delivery — an
-   *   authenticated edge cannot mint from another seat's (or a terminal) row.
+   *   Custody of that row is proven by {@link assertLease} — the same primitive
+   *   every other delivery act passes through — so the mint is bound to one
+   *   live dispatch, not merely to a machine. `claimed_by` alone does not
+   *   separate co-tenant seats: one edge claims for many actors by design, so a
+   *   check that ends at the edge id would let any seat on a box mint under a
+   *   peer's name. The edge names the delivery it is running and the generation
+   *   it holds; a stale generation is refused here.
    * - **INV-48 spirit: the ledger commits before any Slack render.** The
    *   delivery row and the commons post are one transaction, and the post is
    *   an outbox row stamped `hive_*` on the way out — visible to humans,
@@ -605,7 +725,7 @@ export class BrokerStore {
    * The mint is idempotent over (source delivery, target, thread, text): a
    * replayed command returns the original delivery and posts nothing new.
    */
-  mintSeatWake(input: SeatWakeInput, edgeId: string): SeatWakeReceipt {
+  mintSeatWake(input: SeatWakeMint, edgeId: string): SeatWakeReceipt {
     return this.db.transaction(() => {
       const sourceRow = this.db.prepare("SELECT delivery_id FROM deliveries WHERE delivery_id=?")
         .get(input.sourceDeliveryId) as Row | undefined;
@@ -623,7 +743,7 @@ export class BrokerStore {
         );
       }
       const from = source.actor;
-      const target = input.actor.toLowerCase();
+      const target = canonicalActor(input.actor);
       // A seat never fans out: `everyone` expansion is reserved for a human
       // sender (the same rule that keeps a quoted "WAKE: everyone" in an agent
       // reply from chain-waking the fleet).
@@ -674,13 +794,17 @@ export class BrokerStore {
           `delivery ${input.sourceDeliveryId} is ${source.status} and can no longer mint a wake`,
         );
       }
-      if (source.claimedBy !== edgeId || !FENCED.has(source.status)) {
-        throw new SeatWakeRefusedError(
-          "source_not_held",
-          source.claimedBy === null
-            ? `delivery ${input.sourceDeliveryId} is not currently fenced on any edge`
-            : `delivery ${input.sourceDeliveryId} is held by edge \`${source.claimedBy}\`, not this caller`,
-        );
+      // Custody goes through the one primitive, never a predicate rebuilt here:
+      // claimed-by-this-edge AND this exact lease generation AND the lease still
+      // live. The r1 cure ended at the edge id and its own docstring then
+      // asserted a property the check could not enforce — a co-tenant seat and a
+      // stale child of the same edge both satisfied it.
+      try {
+        this.assertLease(input.sourceDeliveryId, edgeId, input.generation);
+      } catch (error) {
+        if (!(error instanceof StaleLeaseError)) throw error;
+        // Diagnosis only — the refusal itself was decided by assertLease above.
+        throw new SeatWakeRefusedError("source_not_held", mintCustodyDetail(source, edgeId, input.generation));
       }
       const ingest = this.ingestEvent({
         eventId,
