@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { attestationWire, readWakeAttestation } from "../edge/attestation.js";
 import { udsRequestJson } from "../local/uds.js";
+import { resolveEdgeSocketPath } from "../edge/providers.js";
 
 /**
  * ADR-0003 R-4 steering matrix: Claude Code delivery is next-boundary.
@@ -102,7 +103,7 @@ async function main(): Promise<void> {
   const actor = process.env.HIVE_ACTOR;
   if (!actor) return;
   const hiveHome = process.env.HIVE_HOME ?? join(homedir(), ".hive");
-  const edgeSocket = process.env.HIVE_EDGE_SOCKET ?? join(hiveHome, "edge.sock");
+  const edgeSocket = resolveEdgeSocketPath();
   const ingressRoot = process.env.HIVE_INGRESS_DIR ?? join(hiveHome, "ingress");
   const inboxDirectory = join(ingressRoot, actor);
 

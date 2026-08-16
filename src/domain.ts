@@ -174,6 +174,7 @@ export interface SeatWakeReceipt {
 /** A trusted message folded into an existing pending delivery for the same actor/thread. */
 export interface CoalescedMessage {
   senderId: string;
+  senderKind: SlackEventInput["senderKind"];
   messageTs: string;
   text: string;
 }
@@ -275,9 +276,14 @@ export function frameWakeInstruction(
   // Coalesced messages are equally trusted instructions from the same thread —
   // they ride in the imperative section, never demoted to replay data.
   for (const coalesced of delivery.coalescedMessages) {
+    // Same attribution rule as the primary event: a seat-minted line names its
+    // sender as a seat, so a coalesced peer wake is never dressed as operator text.
+    const coalescedSender = coalesced.senderKind === "seat"
+      ? `seat ${coalesced.senderId}`
+      : coalesced.senderId;
     lines.push(
       "",
-      `Additional message from ${coalesced.senderId} in the same thread (coalesced into this delivery):`,
+      `Additional message from ${coalescedSender} in the same thread (coalesced into this delivery):`,
       "",
       coalesced.text,
     );

@@ -813,6 +813,38 @@ test("a replayed mint is a no-op that names the original delivery", () => {
   store.close();
 });
 
+test("a replayed mint still answers after the source delivery terminalizes", () => {
+  const { store, sourceId, mint } = mintFixture();
+  const input = { sourceDeliveryId: sourceId, actor: "gnomon", text: "same text", threadTs: null };
+
+  const first = mint(input);
+  const source = store.getDelivery(sourceId);
+  store.finish(sourceId, "mac", source.leaseGeneration!, "processed", []);
+
+  // The guarantee exists precisely for this retry: the CLI response was lost,
+  // and by the time the seat replays the command its own source delivery has
+  // terminalized. The custody fences guard fresh mints only.
+  const second = mint(input);
+  assert.equal(second.deliveryId, first.deliveryId);
+  assert.equal(second.created, false);
+  const renders = store.listUnsentOutbox().filter((entry) => /wake minted by/.test(entry.text));
+  assert.equal(renders.length, 1);
+  store.close();
+});
+
+test("a coalesced seat wake is framed as seat text, not operator text", () => {
+  const { store, sourceId, mint } = mintFixture();
+  const input = { sourceDeliveryId: sourceId, actor: "gnomon", text: "first wake", threadTs: null };
+  const first = mint(input);
+  const second = mint({ ...input, text: "second wake, coalesced" });
+  assert.equal(second.deliveryId, first.deliveryId);
+
+  const framed = frameWakeInstruction(store.getDelivery(first.deliveryId), null, "edge");
+  assert.match(framed, /^Message from seat ariadne /);
+  assert.match(framed, /Additional message from seat ariadne in the same thread/);
+  store.close();
+});
+
 test("an undeliverable mint throws and leaves no trace of itself", () => {
   const { store, sourceId, mint } = mintFixture();
 
