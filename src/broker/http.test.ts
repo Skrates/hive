@@ -49,12 +49,15 @@ test("stop() force-closes an in-flight long-poll instead of hanging on it", { ti
   await new Promise((resolve) => setTimeout(resolve, 150));
 
   // The drain window is asserted by ordering, not by duration: the in-flight
-  // long-poll must still be open at a probe taken well inside the window, and
-  // aborted once stop() returns. Reading a wall-clock lower bound instead would
-  // flake — a setTimeout(50) can be observed as 49ms of Date.now() — while an
-  // immediate force-close aborts the poll ~300ms before this probe fires.
+  // long-poll must still be open at a probe taken near the end of the window,
+  // and aborted once stop() returns. Reading a wall-clock lower bound instead
+  // would flake — a setTimeout(50) can be observed as 49ms of Date.now() —
+  // while an early force-close (or a drain cap well below drainMs) aborts the
+  // poll before this probe fires. The probe sits only a scheduling margin
+  // before drainMs so a substantially shorter window fails the race.
   const drainMs = 400;
-  const probeMs = 100;
+  const schedulingMarginMs = 50;
+  const probeMs = drainMs - schedulingMarginMs;
   const started = Date.now();
   const stopping = server.stop(drainMs);
   const midWindow = await Promise.race([
