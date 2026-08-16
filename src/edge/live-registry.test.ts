@@ -99,11 +99,13 @@ test("a session whose first registration reported nothing cannot adopt a later i
   assert.deepEqual(renewed.runtimeAttestation, { ok: false, absence: "attestation_ambiguous" });
 });
 
-test("an unreported heartbeat is non-evidence, exactly like an omitted field", () => {
+test("a heartbeat reporting the unreported absence leaves a known snapshot alone", () => {
   // The other side of the same coin: `attestation_unreported` arriving as the
   // NEW report adds nothing and must not disturb a known snapshot. Asymmetric
   // by design — as the PREVIOUS value it means the start snapshot was never
   // known, which is why the test above ends ambiguous and this one does not.
+  // (The field can no longer be omitted, so the absence is the only shape this
+  // case takes — naming it "an omitted field" would describe a dead input.)
   const live = new LiveIngressRegistry();
   live.register(registration({ runtimeAttestation: first }), 60_000);
   const renewed = live.register(

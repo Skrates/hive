@@ -47,6 +47,16 @@ if command -v tailscaled >/dev/null 2>&1; then
   tailscale up --ssh --authkey="${TAILSCALE_AUTHKEY:?set in edge.env}" --hostname=hive-runpod || true
 fi
 
+# libuv's default threadpool is 4 — exactly MAX_CONCURRENT_DISPATCHES. The
+# claim-time attestation read runs on that pool, and this seat's HOME is on
+# /workspace, RunPod's network-backed volume: a stalled mount parks each read on
+# a libuv thread no timeout can reclaim, and the 2s bound frees the dispatch
+# slot so the edge keeps claiming and keeps issuing them. Unsized, the pool ends
+# up permanently blocked and every later threadpool job queues behind it. Set
+# before both execs so a non-Docker run gets it too; the image ENV covers the
+# container.
+export UV_THREADPOOL_SIZE="${UV_THREADPOOL_SIZE:-16}"
+
 if [[ -f /opt/hive/dist/cli.js ]]; then
   exec node /opt/hive/dist/cli.js edge
 fi

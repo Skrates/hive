@@ -84,6 +84,20 @@ RUN curl -fsSL https://github.com/runpod/runpodctl/releases/latest/download/runp
 RUN npm install -g @anthropic-ai/claude-code
 ENV DISABLE_AUTOUPDATER=1
 
+# libuv's default threadpool is 4 — exactly MAX_CONCURRENT_DISPATCHES. The
+# claim-time attestation read runs on that pool, and this is THE deployment the
+# guard exists for: the seat's HOME is /workspace/.hive/profiles/talos, and
+# /workspace is RunPod's network-backed volume. A stalled mount parks each read
+# on a libuv thread that no timeout can reclaim; the 2s bound frees the delivery
+# and its dispatch slot, so the edge keeps claiming and keeps issuing reads
+# until the whole pool is permanently blocked and every later threadpool job
+# (further reads, all fs/promises work, dns.lookup for a broker reconnect)
+# queues behind it. Sized above the dispatch cap so that stall stays loud and
+# bounded instead of silently exhausting the pool. Set here as well as in
+# start-edge.sh: this covers a hand-run container, the script covers a
+# non-Docker run from /workspace/hive.
+ENV UV_THREADPOOL_SIZE=16
+
 # Grok Build — Talos's harness: xAI's agentic CLI, spawned by the edge's grok
 # provider adapter with HOME pinned to the account profile (Grok Build keeps
 # auth + config under ~/.grok and has no config-dir override). Subscription
