@@ -164,6 +164,14 @@ A live registration freezes the runtime attestation captured when that `sessionI
 registered, and holds it while the surface keeps reporting the same record. A new session id,
 or a lapsed heartbeat, takes a fresh snapshot.
 
+A registration that carries no attestation field at all is recorded as `attestation_unreported`
+rather than as an omission, so "this session never told us what it loaded" stays distinguishable
+from "no session is registered". That matters in one direction only: if the *first* registration
+reported nothing, a later heartbeat that does carry an id cannot be adopted as the snapshot the
+session started under — the pair is `attestation_ambiguous`, because a session spanning a hook
+rollout may have loaded different artifacts than the ones now on disk. In the other direction a
+heartbeat carrying nothing is simply non-evidence and leaves a known snapshot untouched.
+
 When the reports for one live `sessionId` *disagree*, the edge names the ambiguity instead of
 picking a side. A surface reports what its home holds at report time — the Claude hook is a new
 process at every boundary — so a reinstall under a still-running session and a crash-then-`--resume`
@@ -190,6 +198,12 @@ The edge records; it does not verify and it does not refuse.
   an unknown schema, one installed for a different actor, and a live session the edge cannot
   attribute all dispatch normally and record a named `attestation_absence` beside the delivery. A misbound seat now leaves evidence at wake
   time instead of needing git forensics afterwards.
+- **Nor does it stall.** "Does not refuse" is worth nothing if the read can hang instead: a
+  profile on a network mount is a supported shape, and `O_NONBLOCK` bounds FIFOs and devices but
+  has no effect on a regular file whose mount has stalled. The read runs on the libuv threadpool
+  for that reason, so an unavailable mount costs one threadpool slot and delays that delivery —
+  it does not park the edge's event loop, where it would have frozen every co-tenant actor's
+  claims and every lease heartbeat on the machine.
 - **A redelivery rebinds the current columns.** A seat reinstalled between attempts ran the
   second attempt under different artifacts; the live columns must name that new claim. The
   replaced attempt's binding and receipt are appended to `attestation_history` so an uncertain

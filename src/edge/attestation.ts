@@ -1,4 +1,5 @@
-import { closeSync, constants, fstatSync, openSync, readSync } from "node:fs";
+import { constants } from "node:fs";
+import { open, type FileHandle } from "node:fs/promises";
 import { join } from "node:path";
 
 /**
@@ -59,8 +60,8 @@ export type AttestationRead =
  * *claims*, bound immutably to the delivery; whether the claim is true is the
  * doctor's verdict, on the same id.
  */
-export function readWakeAttestation(accountProfile: string): AttestationRead {
-  const opened = openAttestationFile(join(accountProfile, ATTESTATION_FILENAME));
+export async function readWakeAttestation(accountProfile: string): Promise<AttestationRead> {
+  const opened = await openAttestationFile(join(accountProfile, ATTESTATION_FILENAME));
   if (!opened.ok) return opened;
   const raw = opened.raw;
   let record: unknown;
@@ -149,30 +150,43 @@ export function parseAttestationWire(value: unknown): AttestationRead | undefine
 }
 
 /**
- * Open-and-read that cannot stall the edge loop. `dispatchClaimed` calls this
- * before its first `await`, so a FIFO or device left at the attestation path
- * would otherwise block every co-tenant delivery on this edge. Non-blocking
- * open + `fstat` + a bounded read turns those into `attestation_unreadable`.
+ * Open-and-read that cannot stall the edge loop, in either of the two ways the
+ * founding finding named — "blocks **or** throws".
+ *
+ * `O_NONBLOCK` answers only the second half: it bounds a FIFO or device left at
+ * the attestation path, turning it into `attestation_unreadable`. It has no
+ * bounding effect on a *regular* file, so on a stalled network mount the open
+ * itself parks in uninterruptible sleep — and `providers.ts` documents
+ * home-as-profile on a network volume as a first-party shape, not a corner. A
+ * synchronous read there froze every co-tenant claim and every lease heartbeat
+ * on this edge, because Node is single-threaded.
+ *
+ * `fs/promises` moves the syscalls onto the libuv threadpool, so a stalled
+ * mount costs a threadpool slot instead of the event loop: other actors' claims
+ * and the lease heartbeats keep running. Both guards are kept — the threadpool
+ * bounds the regular-file stall, `O_NONBLOCK` still bounds FIFOs and devices.
  */
-function openAttestationFile(path: string): { ok: true; raw: string } | { ok: false; absence: AttestationAbsence } {
-  let fd: number;
+async function openAttestationFile(
+  path: string,
+): Promise<{ ok: true; raw: string } | { ok: false; absence: AttestationAbsence }> {
+  let handle: FileHandle;
   try {
-    fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
+    handle = await open(path, constants.O_RDONLY | constants.O_NONBLOCK);
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     return { ok: false, absence: code === "ENOENT" ? "no_attestation_file" : "attestation_unreadable" };
   }
   try {
-    const info = fstatSync(fd);
+    const info = await handle.stat();
     if (!info.isFile() || info.size < 0 || info.size > MAX_ATTESTATION_BYTES) {
       return { ok: false, absence: "attestation_unreadable" };
     }
     const buf = Buffer.alloc(info.size);
-    const n = readSync(fd, buf, 0, buf.length, 0);
-    if (n < 0 || n > MAX_ATTESTATION_BYTES) {
+    const { bytesRead } = await handle.read(buf, 0, buf.length, 0);
+    if (bytesRead < 0 || bytesRead > MAX_ATTESTATION_BYTES) {
       return { ok: false, absence: "attestation_unreadable" };
     }
-    return { ok: true, raw: buf.subarray(0, n).toString("utf8") };
+    return { ok: true, raw: buf.subarray(0, bytesRead).toString("utf8") };
   } catch {
     return { ok: false, absence: "attestation_unreadable" };
   } finally {
@@ -180,7 +194,7 @@ function openAttestationFile(path: string): { ok: true; raw: string } | { ok: fa
     // would override the read's verdict with an exception; the bytes (or the
     // named absence) are already decided by the time close runs.
     try {
-      closeSync(fd);
+      await handle.close();
     } catch {
       /* the verdict stands */
     }

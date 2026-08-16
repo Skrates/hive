@@ -77,6 +77,38 @@ test("an install under a live session that had none is ambiguous, not adopted", 
   assert.deepEqual(renewed.runtimeAttestation, { ok: false, absence: "attestation_ambiguous" });
 });
 
+test("a session whose first registration reported nothing cannot adopt a later id", () => {
+  // The hole this file had: "the prior registration omitted the field" and
+  // "there was no prior registration" both reach the registry as `undefined`,
+  // so a later report was adopted as though captured at session start. The
+  // ingress now names the omission (`attestation_unreported`), which makes the
+  // two distinguishable and this case a disagreement rather than an adoption.
+  // A session spanning a hook rollout — old hook sends no field, new hook sends
+  // one — is the shape; if the profile changed in between, the id is not what
+  // the running turn loaded.
+  const live = new LiveIngressRegistry();
+  live.register(
+    registration({ runtimeAttestation: { ok: false, absence: "attestation_unreported" } }),
+    60_000,
+  );
+  const renewed = live.register(registration({ runtimeAttestation: second }), 60_000);
+  assert.deepEqual(renewed.runtimeAttestation, { ok: false, absence: "attestation_ambiguous" });
+});
+
+test("an unreported heartbeat is non-evidence, exactly like an omitted field", () => {
+  // The other side of the same coin: `attestation_unreported` arriving as the
+  // NEW report adds nothing and must not disturb a known snapshot. Asymmetric
+  // by design — as the PREVIOUS value it means the start snapshot was never
+  // known, which is why the test above ends ambiguous and this one does not.
+  const live = new LiveIngressRegistry();
+  live.register(registration({ runtimeAttestation: first }), 60_000);
+  const renewed = live.register(
+    registration({ runtimeAttestation: { ok: false, absence: "attestation_unreported" } }),
+    60_000,
+  );
+  assert.deepEqual(renewed.runtimeAttestation, first);
+});
+
 test("a surface that reports no attestation does not disturb the session's snapshot", () => {
   // Silence is not a disagreement — a hook with no CLAUDE_CONFIG_DIR sends none.
   const live = new LiveIngressRegistry();

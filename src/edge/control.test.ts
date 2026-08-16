@@ -84,6 +84,55 @@ test("a live register carries the surface's runtime attestation", async (t) => {
   }
 });
 
+test("a register with no attestation field is recorded as having reported nothing", async (t) => {
+  // The destruction site. Dropping the key here made `undefined` inside the
+  // registry mean two different things — "no prior registration" and "the
+  // prior registration said nothing" — and no downstream reconciliation can
+  // recover a distinction the write already erased.
+  const { root, socketPath, live, server } = fixture();
+  t.after(async () => {
+    await server.stop();
+    rmSync(root, { recursive: true, force: true });
+  });
+  await server.start();
+
+  await udsRequestJson(socketPath, "POST", "/live/register", {
+    actor: "codex-1",
+    provider: "codex",
+    socketPath: join(root, "codex-live.sock"),
+    sessionId: "rollout-task",
+    surfaceVersion: "hive-codex-live",
+    ttlMs: 120_000,
+  });
+  assert.deepEqual(
+    live.get("codex-1", "codex")?.runtimeAttestation,
+    { ok: false, absence: "attestation_unreported" },
+  );
+
+  // …and because the omission is now named, a later heartbeat that DOES carry
+  // an id cannot be adopted as the snapshot this session started under. A
+  // session spanning a hook rollout is the shape; if the profile was replaced
+  // in between, that id is not what the running turn loaded.
+  await udsRequestJson(socketPath, "POST", "/live/register", {
+    actor: "codex-1",
+    provider: "codex",
+    socketPath: join(root, "codex-live.sock"),
+    sessionId: "rollout-task",
+    surfaceVersion: "hive-codex-live",
+    ttlMs: 120_000,
+    attestation: {
+      ok: true,
+      attestationId: "sha256:" + "d".repeat(64),
+      doctrineCommit: "2".repeat(40),
+      actor: "codex-1",
+    },
+  });
+  assert.deepEqual(
+    live.get("codex-1", "codex")?.runtimeAttestation,
+    { ok: false, absence: "attestation_ambiguous" },
+  );
+});
+
 test("the control plane relays agent outcomes to the broker without a lease fence", async (t) => {
   const { root, socketPath, outcomes, server } = fixture();
   t.after(async () => {

@@ -114,7 +114,13 @@ function retainedAttestation(
 ): AttestationRead | undefined {
   if (previous === undefined) return reported;
   // A surface that sent nothing added no evidence; that is not a disagreement.
+  // `attestation_unreported` is how the ingress records "this heartbeat carried
+  // no attestation field", so it is the same non-evidence as `undefined` when
+  // it arrives as the NEW report. It is not interchangeable as the PREVIOUS
+  // value: there it means the session's first snapshot was never known, which
+  // is exactly why a later id cannot be adopted as that snapshot.
   if (reported === undefined) return previous;
+  if (!reported.ok && reported.absence === "attestation_unreported") return previous;
   return namesTheSameArtifacts(previous, reported)
     ? previous
     : { ok: false, absence: "attestation_ambiguous" };

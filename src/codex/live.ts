@@ -192,7 +192,7 @@ export async function runCodexLive(config: Config): Promise<void> {
       // Desktop attachments execute under HIVE_CODEX_DESKTOP_HOME, which
       // need only share auth.json with the pinned profile. Bind the wake
       // to the home the turn actually loaded.
-      attestation: attestationWire(readWakeAttestation(liveRuntimeHome(current.kind, config.desktopHome))),
+      attestation: attestationWire(await readWakeAttestation(liveRuntimeHome(current.kind, config.desktopHome))),
     });
   };
   await register();

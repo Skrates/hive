@@ -169,7 +169,19 @@ export class EdgeService {
       // Capture the live route once so attestation and dispatch name the same
       // surface. A later expiry, deregister, or replacement must not re-select.
       const live = this.live.get(delivery.actor, delivery.subscription.provider);
-      const binding = bindingFor(attestationForDelivery(live, delivery), delivery.actor);
+      // This read is now awaited, so `receive` — and with it the redelivery
+      // dedupe below — no longer runs in the same synchronous turn as the
+      // claim. That window is safe by three existing guards, and the
+      // alternative (write a row with neither an id nor a named absence, then
+      // rebind) would mint exactly the silence this binding exists to
+      // eliminate: (1) `claimNext` adds the actor to `busyActors` synchronously
+      // before calling this method and passes that set to `broker.claim`, so
+      // this edge cannot re-claim the same actor while the read is in flight;
+      // (2) `receive`'s upsert is guarded in SQL on (generation, attempts) and
+      // is atomic, so a competing writer cannot regress the row; (3) the
+      // dedupe read below still precedes every broker transition and the
+      // provider start, which is the ordering it exists to protect.
+      const binding = bindingFor(await attestationForDelivery(live, delivery), delivery.actor);
       const existing = this.store.receive(delivery, generation, binding);
       if (["dispatched", "processed"].includes(existing.status)) return;
 
@@ -180,7 +192,7 @@ export class EdgeService {
 
       const dispatch = await this.withLeaseHeartbeat(
         current,
-        () => this.dispatch(current, replay, live, () => {
+        () => this.dispatch(current, replay, live, async () => {
           providerStarted = true;
           // The last uncovered cell of {live, headless} × {claim, provider-start}:
           // a headless child reads its profile when it spawns, which is several
@@ -194,7 +206,7 @@ export class EdgeService {
               bindingFor(
                 // `current.subscription` is the claimed snapshot (asClaimed), so
                 // this re-read and the spawn/resume below name one profile.
-                readWakeAttestation(current.subscription.accountProfile),
+                await readWakeAttestation(current.subscription.accountProfile),
                 current.actor,
               ),
             );
@@ -341,7 +353,10 @@ export class EdgeService {
     delivery: Delivery,
     replay: ReplaySnapshot | null,
     live: LiveIngress | null,
-    onProviderStart: () => void,
+    // Awaited: the headless branch re-reads the profile attestation here, and
+    // that read is now off the event loop. The rebind must land before the
+    // provider starts, so the start waits for it.
+    onProviderStart: () => Promise<void>,
   ): Promise<ProviderDispatch> {
     const subscription = delivery.subscription;
     const adapter = this.adapters.get(subscription.provider);
@@ -349,7 +364,7 @@ export class EdgeService {
     adapter.preflight?.(subscription);
 
     if (live) {
-      onProviderStart();
+      await onProviderStart();
       // Codex live delivery waits for the exact app-server turn and lets the
       // edge relay its final assistant text. Claude live inbox delivery still
       // requires the agent-side reply because writing an inbox file is not a
@@ -363,12 +378,12 @@ export class EdgeService {
     if (!workspace) throw new PreDispatchError("workspace_not_mapped");
     const framed = frameWakeInstruction(delivery, replay, "edge");
     if (subscription.sessionId && this.broker.edgeId === subscription.homeEdge) {
-      onProviderStart();
+      await onProviderStart();
       return adapter.resume(subscription, workspace.cwd, framed);
     }
     if (subscription.wakePolicy === "resume") throw new PreDispatchError("resume_target_missing");
     if (!await this.broker.reserveSpawn(delivery)) throw new PreDispatchError("spawn_rate_limited");
-    onProviderStart();
+    await onProviderStart();
     return adapter.spawn(subscription, workspace.cwd, framed);
   }
 }
@@ -443,7 +458,7 @@ function safeEdgeErrorCode(error: unknown): string {
  * ≠ pinned profile) injects into Desktop; only that home's attestation names
  * the artifacts the turn actually used.
  */
-function attestationForDelivery(live: LiveIngress | null, delivery: Delivery): AttestationRead {
+async function attestationForDelivery(live: LiveIngress | null, delivery: Delivery): Promise<AttestationRead> {
   if (live) {
     // A live surface that omitted its runtime attestation (pre-upgrade
     // process, or /live/register without the field) is recorded as exactly
