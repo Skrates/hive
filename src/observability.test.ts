@@ -18,7 +18,10 @@ import {
   rememberDeliveryTraceparent,
   forgetDeliveryTraceparent,
   resetObservabilityForTests,
+  runInTraceContext,
   sanitizeAttributes,
+  STRING_ATTRIBUTE_LIMITS,
+  shutdownObservability,
   withSpan,
 } from "./observability.js";
 
@@ -72,6 +75,27 @@ test("delivery traceparent memory is keyed by delivery id", () => {
   assert.equal(peekDeliveryTraceparent(7), undefined);
 });
 
+test("delivery memory retains tracestate and inject recovers both W3C fields", (t) => {
+  resetObservabilityForTests();
+  t.after(() => resetObservabilityForTests());
+  const parent = `00-${"ab".repeat(16)}-${"cd".repeat(8)}-01`;
+  const tracestate = "congo=t61rcWkgMzE";
+  rememberDeliveryTraceparent(3, parent, tracestate);
+  logfire.configure({
+    serviceName: "hive-test-tracestate",
+    sendToLogfire: false,
+    console: false,
+  });
+  installObservabilitySdkForTests(logfire);
+
+  const headers: Record<string, string> = {};
+  runInTraceContext({ traceparent: parent, tracestate }, () => {
+    injectTraceHeaders(headers);
+  });
+  assert.equal(headers.traceparent, parent);
+  assert.equal(headers.tracestate, tracestate);
+});
+
 test("parseTraceparent accepts W3C and rejects zeros and junk", () => {
   const ok = `00-${"ab".repeat(16)}-${"cd".repeat(8)}-01`;
   assert.deepEqual(parseTraceparent(ok), {
@@ -113,6 +137,41 @@ test("sanitizeAttributes keeps the allow-list and drops body-shaped keys", () =>
   assert.deepEqual(sneaky, { delivery_id: 1 });
   assert.equal("text" in sneaky, false);
   assert.equal("token" in sneaky, false);
+});
+
+test("sanitizeAttributes truncates allowlisted strings to field-specific limits", () => {
+  const actor = "a".repeat(STRING_ATTRIBUTE_LIMITS.actor! + 40);
+  const dedupe = "Ev" + "x".repeat(STRING_ATTRIBUTE_LIMITS.dedupe_key! + 20);
+  const sanitized = sanitizeAttributes({
+    delivery_id: 9,
+    actor,
+    dedupe_key: dedupe,
+    channel_id: "C1",
+  });
+  assert.equal(sanitized.delivery_id, 9);
+  assert.equal(typeof sanitized.actor, "string");
+  assert.equal((sanitized.actor as string).length, STRING_ATTRIBUTE_LIMITS.actor);
+  assert.equal((sanitized.dedupe_key as string).length, STRING_ATTRIBUTE_LIMITS.dedupe_key);
+  assert.equal(sanitized.channel_id, "C1");
+});
+
+test("shutdownObservability clears its cap timer when the SDK flush finishes first", async (t) => {
+  resetObservabilityForTests();
+  t.after(() => resetObservabilityForTests());
+  let shutdowns = 0;
+  installObservabilitySdkForTests({
+    configure() { return undefined as never; },
+    span() { throw new Error("unused"); },
+    async shutdown() {
+      shutdowns += 1;
+    },
+  } as unknown as typeof logfire);
+
+  const started = Date.now();
+  await shutdownObservability();
+  const elapsed = Date.now() - started;
+  assert.equal(shutdowns, 1);
+  assert.ok(elapsed < 1_500, `flush must not wait out the 2s cap after it resolves (${elapsed}ms)`);
 });
 
 test("a failing provider's stderr does not appear on the recorded deliver span", async (t) => {

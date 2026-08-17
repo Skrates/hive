@@ -12,7 +12,7 @@ import type {
   TerminalDeliveryStatus,
 } from "../domain.js";
 import { retryBackoffMs } from "../domain.js";
-import { forgetDeliveryTraceparent } from "../observability.js";
+import { captureActiveTraceContext, forgetDeliveryTraceparent, peekDeliveryTrace } from "../observability.js";
 import type { Clock } from "../time.js";
 import { iso, systemClock } from "../time.js";
 
@@ -63,6 +63,9 @@ export interface OutboxEntry {
   createdAt: string;
   sentAt: string | null;
   attempts: number;
+  /** W3C context captured at enqueue so the later Slack send stays on the delivery trace. */
+  traceparent: string | null;
+  tracestate: string | null;
 }
 
 /** Delivery-lifecycle reaction stamps: glanceable state on the wake message itself. */
@@ -243,7 +246,9 @@ export class BrokerStore {
         sent_at TEXT,
         attempts INTEGER NOT NULL DEFAULT 0,
         next_attempt_at TEXT,
-        abandoned_at TEXT
+        abandoned_at TEXT,
+        traceparent TEXT,
+        tracestate TEXT
       );
 
       CREATE INDEX IF NOT EXISTS outbox_unsent_idx
@@ -256,6 +261,7 @@ export class BrokerStore {
       );
     `);
     this.ensureOutboxReactionColumns();
+    this.ensureOutboxTraceColumns();
   }
 
   /** Forward-only schema step: pre-reaction databases gain the two nullable columns in place. */
@@ -270,6 +276,17 @@ export class BrokerStore {
     // The single-timestamp shape never shipped past this branch; no dual readers survive it.
     if (columns.includes("reaction_target_ts")) {
       this.db.exec("ALTER TABLE outbox DROP COLUMN reaction_target_ts");
+    }
+  }
+
+  /** Forward-only schema step: existing databases gain the durable W3C columns in place. */
+  private ensureOutboxTraceColumns(): void {
+    const columns = (this.db.pragma("table_info(outbox)") as { name: string }[]).map((c) => c.name);
+    if (!columns.includes("traceparent")) {
+      this.db.exec("ALTER TABLE outbox ADD COLUMN traceparent TEXT");
+    }
+    if (!columns.includes("tracestate")) {
+      this.db.exec("ALTER TABLE outbox ADD COLUMN tracestate TEXT");
     }
   }
 
@@ -772,6 +789,7 @@ export class BrokerStore {
         // Slack outage can neither lose it nor rerun the trusted instruction.
         this.enqueueOutbox(current, outcomePost(current, outcomeText), REACTION_PROCESSED);
       }
+      forgetDeliveryTraceparent(deliveryId);
       return this.getDelivery(deliveryId);
     })();
   }
@@ -874,15 +892,17 @@ export class BrokerStore {
         `).run(JSON.stringify([{ code: "agent_outcome_reported", detail: "the agent reported its outcome" }]), now, now, deliveryId);
       }
       this.enqueueOutbox(current, outcomePost(current, text), REACTION_PROCESSED);
+      forgetDeliveryTraceparent(deliveryId);
       return this.getDelivery(deliveryId);
     })();
   }
 
   enqueueThreadNotice(channelId: string, threadTs: string, text: string): void {
+    const ctx = captureActiveTraceContext();
     this.db.prepare(`
-      INSERT INTO outbox(delivery_id, channel_id, thread_ts, text, created_at)
-      VALUES (NULL, ?, ?, ?, ?)
-    `).run(channelId, threadTs, text, iso(this.clock));
+      INSERT INTO outbox(delivery_id, channel_id, thread_ts, text, created_at, traceparent, tracestate)
+      VALUES (NULL, ?, ?, ?, ?, ?, ?)
+    `).run(channelId, threadTs, text, iso(this.clock), ctx?.traceparent ?? null, ctx?.tracestate ?? null);
   }
 
   enqueueOutbox(delivery: Delivery, text: string, reaction: string | null = null): void {
@@ -894,9 +914,10 @@ export class BrokerStore {
           delivery.event.messageTs,
           ...delivery.coalescedMessages.map((message) => message.messageTs),
         ])]);
+    const ctx = peekDeliveryTrace(delivery.id) ?? captureActiveTraceContext();
     this.db.prepare(`
-      INSERT INTO outbox(delivery_id, channel_id, thread_ts, text, reaction, reaction_targets_json, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO outbox(delivery_id, channel_id, thread_ts, text, reaction, reaction_targets_json, created_at, traceparent, tracestate)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       delivery.id,
       delivery.event.channelId,
@@ -905,6 +926,8 @@ export class BrokerStore {
       reaction,
       targets,
       iso(this.clock),
+      ctx?.traceparent ?? null,
+      ctx?.tracestate ?? null,
     );
   }
 
@@ -1012,6 +1035,7 @@ export class BrokerStore {
     `).run(status, JSON.stringify(reasons), now, now, deliveryId);
     if (result.changes === 1) {
       this.enqueueOutbox(delivery, failureNotice(delivery, status, reasons), REACTION_FAILED);
+      forgetDeliveryTraceparent(deliveryId);
     }
   }
 }
@@ -1124,5 +1148,7 @@ function outboxFromRow(row: Row): OutboxEntry {
     createdAt: String(row.created_at),
     sentAt: row.sent_at === null ? null : String(row.sent_at),
     attempts: Number(row.attempts),
+    traceparent: row.traceparent === null || row.traceparent === undefined ? null : String(row.traceparent),
+    tracestate: row.tracestate === null || row.tracestate === undefined ? null : String(row.tracestate),
   };
 }

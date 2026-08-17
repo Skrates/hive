@@ -23,6 +23,11 @@ export type DeliverySpanAttributes = {
   dispatch_mode?: "live" | "resume" | "spawn";
 };
 
+export type TraceContext = {
+  traceparent: string;
+  tracestate?: string;
+};
+
 const ALLOWED_ATTRIBUTE_KEYS = new Set<string>([
   "delivery_id",
   "dedupe_key",
@@ -34,15 +39,28 @@ const ALLOWED_ATTRIBUTE_KEYS = new Set<string>([
   "dispatch_mode",
 ]);
 
+/** Field-specific caps so allowlisted strings cannot export unbounded cardinality. */
+export const STRING_ATTRIBUTE_LIMITS: Record<string, number> = {
+  dedupe_key: 128,
+  channel_id: 32,
+  thread_ts: 32,
+  actor: 64,
+  event_type: 16,
+  outcome: 32,
+  dispatch_mode: 16,
+};
+
 const TRACEPARENT_RE = /^00-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$/;
 const ZERO_TRACE_ID = "0".repeat(32);
 const ZERO_SPAN_ID = "0".repeat(16);
+/** W3C tracestate maximum; a longer value is dropped rather than truncated into invalid syntax. */
+const MAX_TRACESTATE_LENGTH = 512;
 
 type LogfireNode = typeof import("@pydantic/logfire-node");
 
 let enabled = false;
 let sdk: LogfireNode | null = null;
-const deliveryTraceparents = new Map<number, string>();
+const deliveryTraces = new Map<number, TraceContext>();
 
 export function observabilityEnabled(): boolean {
   return enabled;
@@ -114,13 +132,20 @@ export async function shutdownObservability(): Promise<void> {
   const current = sdk;
   enabled = false;
   sdk = null;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, 2_000);
+    timer.unref?.();
+  });
   try {
     await Promise.race([
       current.shutdown({ timeoutMillis: 2_000 }),
-      delay(2_000),
+      timeout,
     ]);
   } catch {
     // A Logfire outage must be invisible to the bus.
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
   }
 }
 
@@ -141,18 +166,28 @@ export function withSpan<T>(name: string, attributes: DeliverySpanAttributes, fn
   }
 }
 
-export function rememberDeliveryTraceparent(deliveryId: number, traceparent?: string): void {
-  const value = traceparent ?? captureActiveTraceparent();
-  if (value === undefined) return;
-  deliveryTraceparents.set(deliveryId, value);
+export function rememberDeliveryTraceparent(
+  deliveryId: number,
+  traceparent?: string,
+  tracestate?: string,
+): void {
+  const ctx = traceparent === undefined
+    ? captureActiveTraceContext()
+    : boundTraceContext({ traceparent, tracestate });
+  if (ctx === undefined) return;
+  deliveryTraces.set(deliveryId, ctx);
 }
 
 export function peekDeliveryTraceparent(deliveryId: number): string | undefined {
-  return deliveryTraceparents.get(deliveryId);
+  return deliveryTraces.get(deliveryId)?.traceparent;
+}
+
+export function peekDeliveryTrace(deliveryId: number): TraceContext | undefined {
+  return deliveryTraces.get(deliveryId);
 }
 
 export function forgetDeliveryTraceparent(deliveryId: number): void {
-  deliveryTraceparents.delete(deliveryId);
+  deliveryTraces.delete(deliveryId);
 }
 
 export function captureActiveTraceparent(): string | undefined {
@@ -179,25 +214,62 @@ export function parseTraceparent(value: string): { traceId: string; spanId: stri
   return { traceId, spanId, flags: Number.parseInt(flagBits, 16) };
 }
 
-export function runInTraceparent<T>(traceparent: string | undefined, fn: () => T): T {
-  if (traceparent === undefined) return fn();
-  const parsed = parseTraceparent(traceparent);
+export function captureActiveTraceContext(): TraceContext | undefined {
+  try {
+    const carrier: Record<string, string> = {};
+    propagation.inject(context.active(), carrier);
+    const injected = boundTraceContext({
+      traceparent: carrier["traceparent"],
+      tracestate: carrier["tracestate"],
+    });
+    if (injected) return injected;
+  } catch {
+    // fall through to the hand-serialized parent
+  }
+  const traceparent = captureActiveTraceparent();
+  return traceparent === undefined ? undefined : { traceparent };
+}
+
+export function runInTraceContext<T>(ctx: TraceContext | undefined, fn: () => T): T {
+  if (ctx === undefined) return fn();
+  const parsed = parseTraceparent(ctx.traceparent);
   if (!parsed) return fn();
   try {
-    const parent = context.active();
-    const next = trace.setSpanContext(parent, {
-      traceId: parsed.traceId,
-      spanId: parsed.spanId,
-      traceFlags: (parsed.flags & TraceFlags.SAMPLED) === TraceFlags.SAMPLED ? TraceFlags.SAMPLED : TraceFlags.NONE,
-      isRemote: true,
+    const extracted = propagation.extract(context.active(), {
+      traceparent: ctx.traceparent,
+      ...(ctx.tracestate ? { tracestate: ctx.tracestate } : {}),
     });
-    return context.with(next, fn);
+    return context.with(extracted, fn);
   } catch {
-    return fn();
+    try {
+      const parent = context.active();
+      const next = trace.setSpanContext(parent, {
+        traceId: parsed.traceId,
+        spanId: parsed.spanId,
+        traceFlags: (parsed.flags & TraceFlags.SAMPLED) === TraceFlags.SAMPLED ? TraceFlags.SAMPLED : TraceFlags.NONE,
+        isRemote: true,
+      });
+      return context.with(next, fn);
+    } catch {
+      return fn();
+    }
   }
 }
 
-/** Inject W3C traceparent from the active context. No-op when unset or empty. */
+export function runInTraceparent<T>(traceparent: string | undefined, fn: () => T, tracestate?: string): T {
+  if (traceparent === undefined) return fn();
+  return runInTraceContext({ traceparent, ...(tracestate ? { tracestate } : {}) }, fn);
+}
+
+/** Headers for one W3C hop. Empty when no context is stored. */
+export function traceContextHeaders(ctx: TraceContext | undefined): Record<string, string> {
+  if (ctx === undefined) return {};
+  return ctx.tracestate
+    ? { traceparent: ctx.traceparent, tracestate: ctx.tracestate }
+    : { traceparent: ctx.traceparent };
+}
+
+/** Inject W3C traceparent and tracestate from the active context. No-op when unset or empty. */
 export function injectTraceHeaders(headers: Record<string, string>): void {
   if (!enabled) return;
   try {
@@ -216,7 +288,13 @@ export function sanitizeAttributes(attributes: DeliverySpanAttributes): Record<s
   const out: Record<string, string | number> = {};
   for (const [key, value] of Object.entries(attributes)) {
     if (!ALLOWED_ATTRIBUTE_KEYS.has(key) || value === undefined) continue;
-    if (typeof value === "string" || typeof value === "number") out[key] = value;
+    if (typeof value === "number") {
+      out[key] = value;
+      continue;
+    }
+    if (typeof value !== "string") continue;
+    const limit = STRING_ATTRIBUTE_LIMITS[key];
+    out[key] = limit !== undefined && value.length > limit ? value.slice(0, limit) : value;
   }
   return out;
 }
@@ -224,7 +302,7 @@ export function sanitizeAttributes(attributes: DeliverySpanAttributes): Record<s
 export function resetObservabilityForTests(): void {
   enabled = false;
   sdk = null;
-  deliveryTraceparents.clear();
+  deliveryTraces.clear();
 }
 
 /** Test-only: drive `withSpan` against a configured SDK without a write token. */
@@ -233,8 +311,16 @@ export function installObservabilitySdkForTests(module: LogfireNode): void {
   enabled = true;
 }
 
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms);
-  });
+function boundTraceContext(input: {
+  traceparent: string | undefined;
+  tracestate?: string | undefined;
+}): TraceContext | undefined {
+  if (input.traceparent === undefined) return undefined;
+  const parsed = parseTraceparent(input.traceparent);
+  if (!parsed) return undefined;
+  const tracestate = input.tracestate;
+  if (tracestate === undefined || tracestate.length === 0 || tracestate.length > MAX_TRACESTATE_LENGTH) {
+    return { traceparent: input.traceparent };
+  }
+  return { traceparent: input.traceparent, tracestate };
 }

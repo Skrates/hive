@@ -254,4 +254,122 @@ test("recordOutcome restores the stored delivery context, spans, and forgets the
   assert.equal(outcome.attributes.channel_id, "C1");
   assert.equal(outcome.attributes.thread_ts, "100.1");
   assert.equal(outcome.attributes.dedupe_key, "Ev-outcome");
+
+  const queued = store.listUnsentOutbox().find((entry) => entry.deliveryId === deliveryId);
+  assert.ok(queued, "recordOutcome must persist the outcome on the outbox");
+  assert.equal(queued.traceparent, parent);
+});
+
+test("drainOutboxOnce sends under the persisted delivery trace, including a failed send", async (t) => {
+  resetObservabilityForTests();
+  t.after(() => resetObservabilityForTests());
+
+  const store = new BrokerStore(":memory:");
+  t.after(() => store.close());
+  const deliveryId = seedDispatchedDelivery(store);
+  const parent = `00-${"ab".repeat(16)}-${"cd".repeat(8)}-01`;
+  const tracestate = "congo=t61rcWkgMzE";
+  rememberDeliveryTraceparent(deliveryId, parent, tracestate);
+
+  const exporter = new InMemorySpanExporter();
+  logfire.configure({
+    serviceName: "hive-test-outbox",
+    sendToLogfire: false,
+    console: false,
+    additionalSpanProcessors: [new SimpleSpanProcessor(exporter)],
+  });
+  installObservabilitySdkForTests(logfire);
+
+  new BrokerService(store, unusedSlack).recordOutcome(deliveryId, "done: shipped the fix");
+  const queued = store.listUnsentOutbox().find((entry) => /shipped the fix/.test(entry.text));
+  assert.ok(queued);
+  assert.equal(queued.traceparent, parent);
+  assert.equal(queued.tracestate, tracestate);
+
+  let replies = 0;
+  const failingSlack: SlackTransport = {
+    async replay(): Promise<ReplaySnapshot> { throw new Error("not used"); },
+    async reply(): Promise<string> {
+      replies += 1;
+      throw new Error("slack down");
+    },
+    async react(): Promise<void> {},
+  };
+  assert.equal(await new BrokerService(store, failingSlack).drainOutbox(), 0);
+  assert.equal(replies, 1);
+
+  const send = exporter.getFinishedSpans().find((span) => span.name === "hive.broker.outbox.send");
+  assert.ok(send, "drain must emit hive.broker.outbox.send");
+  assert.equal(send.spanContext().traceId, "ab".repeat(16));
+  assert.equal(send.attributes.delivery_id, deliveryId);
+  assert.equal(send.attributes.channel_id, "C1");
+  assert.equal(send.attributes.thread_ts, "100.1");
+  const row = store.db.prepare(
+    "SELECT sent_at, abandoned_at, attempts FROM outbox WHERE outbox_id=?",
+  ).get(queued.outboxId) as { sent_at: string | null; abandoned_at: string | null; attempts: number };
+  assert.equal(row.sent_at, null);
+  assert.equal(row.abandoned_at, null);
+  assert.equal(row.attempts, 1);
+});
+
+test("accept and release emit broker transition spans", (t) => {
+  resetObservabilityForTests();
+  t.after(() => resetObservabilityForTests());
+
+  const store = new BrokerStore(":memory:");
+  t.after(() => store.close());
+  store.createEdge("mac");
+  store.upsertSubscription({
+    actor: "ariadne",
+    provider: "codex",
+    providerSurface: "app-server",
+    providerVersion: "test",
+    sessionId: null,
+    homeEdge: "mac",
+    workspace: "hive",
+    edgeWorkspaces: [{ edgeId: "mac", cwd: "/work/hive", worktree: null }],
+    wakePolicy: "spawn",
+    permissionProfile: "read-only",
+    accountProfile: "/profiles/ariadne",
+    leaseTtlMs: 1_000,
+    deliveryTtlMs: 5_000,
+    homeGraceMs: 0,
+    spawnRateLimit: 1,
+    maxAttempts: 1,
+    expiresAt: null,
+  } satisfies SubscriptionInput);
+  store.ingestEvent({
+    eventId: "Ev-transition",
+    workspaceId: "T1",
+    channelId: "C1",
+    threadTs: "100.1",
+    messageTs: "100.2",
+    senderId: "U1",
+    senderKind: "user",
+    actor: "ariadne",
+    text: "WAKE: ariadne | transition spans",
+    raw: {},
+    receivedAt: "2026-08-01T00:00:00.000Z",
+  } satisfies SlackEventInput);
+  const claimed = store.claimNext("mac", 0)!;
+
+  const exporter = new InMemorySpanExporter();
+  logfire.configure({
+    serviceName: "hive-test-transition",
+    sendToLogfire: false,
+    console: false,
+    additionalSpanProcessors: [new SimpleSpanProcessor(exporter)],
+  });
+  installObservabilitySdkForTests(logfire);
+
+  const broker = new BrokerService(store, unusedSlack);
+  broker.accept(claimed.id, "mac", claimed.leaseGeneration!);
+  broker.release(claimed.id, "mac", claimed.leaseGeneration!, {
+    code: "provider_dispatch_unknown",
+    detail: "test uncertainty",
+  });
+
+  const names = exporter.getFinishedSpans().map((span) => span.name);
+  assert.ok(names.includes("hive.broker.accept"), `expected accept span, got ${names.join(",")}`);
+  assert.ok(names.includes("hive.broker.release"), `expected release span, got ${names.join(",")}`);
 });
