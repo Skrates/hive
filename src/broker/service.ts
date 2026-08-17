@@ -1,5 +1,5 @@
 import type { Delivery, DeliveryResultInput, Reason, ReplaySnapshot, SlackEventInput, SubscriptionInput } from "../domain.js";
-import { forgetDeliveryTraceparent, peekDeliveryTraceparent, runInTraceparent, withSpan } from "../observability.js";
+import { forgetDeliveryTraceparent, peekDeliveryTrace, runInTraceContext, withSpan } from "../observability.js";
 import { BrokerStore } from "./store.js";
 
 export interface SlackTransport {
@@ -70,11 +70,13 @@ export class BrokerService {
   }
 
   accept(deliveryId: number, edgeId: string, generation: number): Delivery {
-    return this.store.transition(deliveryId, edgeId, generation, "claimed", "accepted_local");
+    return withSpan("hive.broker.accept", { delivery_id: deliveryId }, () =>
+      this.store.transition(deliveryId, edgeId, generation, "claimed", "accepted_local"));
   }
 
   beginDispatch(deliveryId: number, edgeId: string, generation: number): Delivery {
-    return this.store.transition(deliveryId, edgeId, generation, "accepted_local", "dispatching");
+    return withSpan("hive.broker.dispatch", { delivery_id: deliveryId }, () =>
+      this.store.transition(deliveryId, edgeId, generation, "accepted_local", "dispatching"));
   }
 
   /**
@@ -82,15 +84,18 @@ export class BrokerService {
    * sender-visible delivery receipt commit in one store transaction.
    */
   markDispatched(deliveryId: number, edgeId: string, generation: number): Delivery {
-    return this.store.markDispatched(deliveryId, edgeId, generation);
+    return withSpan("hive.broker.dispatched", { delivery_id: deliveryId }, () =>
+      this.store.markDispatched(deliveryId, edgeId, generation));
   }
 
   renew(deliveryId: number, edgeId: string, generation: number): Delivery {
-    return this.store.renewDeliveryLease(deliveryId, edgeId, generation);
+    return withSpan("hive.broker.renew", { delivery_id: deliveryId }, () =>
+      this.store.renewDeliveryLease(deliveryId, edgeId, generation));
   }
 
   reserveSpawn(deliveryId: number, edgeId: string, generation: number): boolean {
-    return this.store.reserveSpawn(deliveryId, edgeId, generation);
+    return withSpan("hive.broker.reserve_spawn", { delivery_id: deliveryId }, () =>
+      this.store.reserveSpawn(deliveryId, edgeId, generation));
   }
 
   finish(deliveryId: number, edgeId: string, result: DeliveryResultInput): Delivery {
@@ -103,13 +108,14 @@ export class BrokerService {
 
   /** ADR-0003 R-3: uncertainty releases the delivery for redelivery instead of declaring an outcome. */
   release(deliveryId: number, edgeId: string, generation: number, reason: Reason): Delivery {
-    return this.store.release(deliveryId, edgeId, generation, reason);
+    return withSpan("hive.broker.release", { delivery_id: deliveryId }, () =>
+      this.store.release(deliveryId, edgeId, generation, reason));
   }
 
   /** ADR-0003 R-6: agent outcome reports are not lease-fenced and always reach the thread. */
   recordOutcome(deliveryId: number, text: string): Delivery {
     const current = this.store.getDelivery(deliveryId);
-    return runInTraceparent(peekDeliveryTraceparent(deliveryId), () =>
+    return runInTraceContext(peekDeliveryTrace(deliveryId), () =>
       withSpan("hive.broker.outcome", {
         delivery_id: deliveryId,
         actor: current.actor,
@@ -162,27 +168,40 @@ export class BrokerService {
     const entries = this.store.listUnsentOutbox();
     let sent = 0;
     for (const entry of entries) {
-      try {
-        await this.slack.reply(entry.channelId, entry.threadTs, entry.text, entry.deliveryId === null
-          ? {}
-          : { delivery_id: String(entry.deliveryId) });
-        // Reactions are glanceable annotation, not part of the two-events
-        // contract, so they are never awaited: this drain is the single-flight
-        // pass every claim() waits on, and one hung or rate-limit-held
-        // reactions.add would stall wake delivery bus-wide. The row's sent
-        // mark depends only on the text post; a failed stamp is logged and dropped.
-        if (entry.reaction !== null) {
-          for (const targetTs of entry.reactionTargets) {
-            void this.slack.react(entry.channelId, targetTs, entry.reaction).catch((error) => {
-              console.error("hive outbox reaction failed", entry.outboxId, entry.reaction, targetTs, error);
-            });
+      const ctx = entry.traceparent === null
+        ? undefined
+        : { traceparent: entry.traceparent, ...(entry.tracestate === null ? {} : { tracestate: entry.tracestate }) };
+      const posted = await runInTraceContext(ctx, () =>
+        withSpan("hive.broker.outbox.send", {
+          ...(entry.deliveryId === null ? {} : { delivery_id: entry.deliveryId }),
+          channel_id: entry.channelId,
+          thread_ts: entry.threadTs,
+        }, async () => {
+          try {
+            await this.slack.reply(entry.channelId, entry.threadTs, entry.text, entry.deliveryId === null
+              ? {}
+              : { delivery_id: String(entry.deliveryId) });
+            // Reactions are glanceable annotation, not part of the two-events
+            // contract, so they are never awaited: this drain is the single-flight
+            // pass every claim() waits on, and one hung or rate-limit-held
+            // reactions.add would stall wake delivery bus-wide. The row's sent
+            // mark depends only on the text post; a failed stamp is logged and dropped.
+            if (entry.reaction !== null) {
+              for (const targetTs of entry.reactionTargets) {
+                void this.slack.react(entry.channelId, targetTs, entry.reaction).catch((error) => {
+                  console.error("hive outbox reaction failed", entry.outboxId, entry.reaction, targetTs, error);
+                });
+              }
+            }
+            this.store.markOutboxSent(entry.outboxId);
+            return true;
+          } catch {
+            this.store.markOutboxAttempt(entry.outboxId);
+            return false;
           }
-        }
-        this.store.markOutboxSent(entry.outboxId);
-        sent += 1;
-      } catch {
-        this.store.markOutboxAttempt(entry.outboxId);
-      }
+        }),
+      );
+      if (posted) sent += 1;
     }
     return sent;
   }

@@ -364,6 +364,34 @@ test("attempt exhaustion forgets the stored delivery traceparent", () => {
   store.close();
 });
 
+test("an expired pending delivery forgets its stored traceparent", () => {
+  resetObservabilityForTests();
+  const { store, clock } = fixture({ wakePolicy: "resume", sessionId: "thread-1", deliveryTtlMs: 100 });
+  store.ingestEvent(event());
+  const parent = `00-${"ab".repeat(16)}-${"cd".repeat(8)}-01`;
+  rememberDeliveryTraceparent(1, parent);
+  clock.advance(101);
+  assert.equal(store.claimNext("mac", 0), null);
+  assert.equal(store.getDelivery(1).status, "undeliverable");
+  assert.equal(peekDeliveryTraceparent(1), undefined);
+  const notice = store.listUnsentOutbox()[0];
+  assert.equal(notice?.traceparent, parent);
+  store.close();
+});
+
+test("a resume subscription with no session forgets its stored traceparent", () => {
+  resetObservabilityForTests();
+  const { store } = fixture({ wakePolicy: "resume", sessionId: null });
+  store.ingestEvent(event());
+  const parent = `00-${"ab".repeat(16)}-${"cd".repeat(8)}-01`;
+  rememberDeliveryTraceparent(1, parent);
+  assert.equal(store.claimNext("mac", 0), null);
+  assert.equal(store.getDelivery(1).status, "undeliverable");
+  assert.equal(store.getDelivery(1).reasons[0]?.code, "resume_target_missing");
+  assert.equal(peekDeliveryTraceparent(1), undefined);
+  store.close();
+});
+
 test("a retry requeue keeps the stored delivery traceparent", () => {
   resetObservabilityForTests();
   const { store, clock } = fixture({ maxAttempts: 3 });
@@ -729,6 +757,8 @@ test("thread notices carry no reaction and pre-reaction databases migrate in pla
   const columns = (second.db.pragma("table_info(outbox)") as { name: string }[]).map((c) => c.name);
   assert.ok(!columns.includes("reaction_target_ts"));
   assert.ok(columns.includes("reaction_targets_json"));
+  assert.ok(columns.includes("traceparent"));
+  assert.ok(columns.includes("tracestate"));
   second.close();
 });
 

@@ -2,10 +2,12 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { URL } from "node:url";
 import { DeliveryResultInputSchema, ReasonSchema, SubscriptionInputSchema } from "../domain.js";
 import {
-  captureActiveTraceparent,
-  peekDeliveryTraceparent,
-  runInTraceparent,
+  captureActiveTraceContext,
+  peekDeliveryTrace,
+  runInTraceContext,
+  traceContextHeaders,
   withSpan,
+  type TraceContext,
 } from "../observability.js";
 import { BrokerService } from "./service.js";
 import { InvalidTransitionError, StaleLeaseError } from "./store.js";
@@ -65,12 +67,10 @@ export class BrokerHttpServer {
       return json(response, 200, { ok: true });
     }
     // Claim is the broker→edge handoff: ignore any inbound poll context and
-    // emit the delivery's stored traceparent on the response instead.
+    // emit the delivery's stored W3C context on the response instead.
     const isClaim = request.method === "GET" && url.pathname === "/v1/deliveries";
-    const incoming = !isClaim && typeof request.headers.traceparent === "string"
-      ? request.headers.traceparent
-      : undefined;
-    return runInTraceparent(incoming, () => this.dispatch(url, request, response));
+    const incoming = isClaim ? undefined : incomingTraceContext(request);
+    return runInTraceContext(incoming, () => this.dispatch(url, request, response));
   }
 
   private async dispatch(url: URL, request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -105,7 +105,7 @@ export class BrokerHttpServer {
       const busyActors = busy ? busy.split(",").filter((item) => item.length > 0) : [];
       const delivery = await this.broker.claim(edgeId, after, waitMs, busyActors);
       if (!delivery) return json(response, 204, null);
-      return runInTraceparent(peekDeliveryTraceparent(delivery.id), () =>
+      return runInTraceContext(peekDeliveryTrace(delivery.id), () =>
         withSpan("hive.broker.claim", {
           delivery_id: delivery.id,
           actor: delivery.actor,
@@ -113,8 +113,8 @@ export class BrokerHttpServer {
           thread_ts: delivery.event.threadTs,
           dedupe_key: delivery.eventId,
         }, () => {
-          const traceparent = captureActiveTraceparent() ?? peekDeliveryTraceparent(delivery.id);
-          return json(response, 200, delivery, traceparent ? { traceparent } : {});
+          const ctx = captureActiveTraceContext() ?? peekDeliveryTrace(delivery.id);
+          return json(response, 200, delivery, traceContextHeaders(ctx));
         }),
       );
     }
@@ -232,6 +232,17 @@ function constantTimeEqual(left: string, right: string): boolean {
   let result = 0;
   for (let i = 0; i < left.length; i += 1) result |= left.charCodeAt(i) ^ right.charCodeAt(i);
   return result === 0;
+}
+
+function incomingTraceContext(request: IncomingMessage): TraceContext | undefined {
+  const traceparent = headerString(request.headers.traceparent);
+  if (traceparent === undefined) return undefined;
+  const tracestate = headerString(request.headers.tracestate);
+  return tracestate === undefined ? { traceparent } : { traceparent, tracestate };
+}
+
+function headerString(value: string | string[] | undefined): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
 function json(

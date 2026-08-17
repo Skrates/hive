@@ -14,7 +14,8 @@ export class BrokerClient {
     if (response.status === 204) return null;
     const delivery = await this.json<Delivery>(response);
     const traceparent = response.headers.get("traceparent");
-    if (traceparent) rememberDeliveryTraceparent(delivery.id, traceparent);
+    const tracestate = response.headers.get("tracestate");
+    if (traceparent) rememberDeliveryTraceparent(delivery.id, traceparent, tracestate ?? undefined);
     return delivery;
   }
 

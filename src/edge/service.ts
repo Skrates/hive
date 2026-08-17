@@ -9,8 +9,8 @@ import {
 import { readWakeAttestation, type AttestationRead } from "./attestation.js";
 import {
   forgetDeliveryTraceparent,
-  peekDeliveryTraceparent,
-  runInTraceparent,
+  peekDeliveryTrace,
+  runInTraceContext,
   withSpan,
 } from "../observability.js";
 import { EdgeStore, bindingFor } from "./store.js";
@@ -154,9 +154,9 @@ export class EdgeService {
 
   /** The full post-claim delivery lifecycle; never throws — all failures land in recordDeliveryFailure. */
   private async dispatchClaimed(delivery: Delivery, generation: number): Promise<void> {
-    const parent = peekDeliveryTraceparent(delivery.id);
+    const parent = peekDeliveryTrace(delivery.id);
     try {
-      await runInTraceparent(parent, () =>
+      await runInTraceContext(parent, () =>
         withSpan("hive.edge.dispatch", {
           delivery_id: delivery.id,
           actor: delivery.actor,

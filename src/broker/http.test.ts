@@ -129,9 +129,47 @@ test("claim response carries the stored delivery traceparent", async (t) => {
   });
   assert.equal(response.status, 200);
   assert.equal(response.headers.get("traceparent"), parent);
+  assert.equal(response.headers.get("tracestate"), null);
   const body = await response.json() as { id: number; eventId: string };
   assert.equal(body.id, 1);
   assert.equal(body.eventId, "Ev-trace");
+});
+
+test("claim response carries stored tracestate alongside traceparent", async (t) => {
+  resetObservabilityForTests();
+  t.after(() => resetObservabilityForTests());
+  const store = new BrokerStore(":memory:");
+  t.after(() => store.close());
+  const edgeToken = store.createEdge("edge-1");
+  store.upsertSubscription(subscription());
+  store.ingestEvent({
+    eventId: "Ev-tracestate",
+    workspaceId: "T1",
+    channelId: "C1",
+    threadTs: "100.1",
+    messageTs: "100.2",
+    senderId: "U1",
+    senderKind: "user",
+    actor: "ariadne",
+    text: "WAKE: ariadne | metadata only",
+    raw: {},
+    receivedAt: "2026-08-01T00:00:00.000Z",
+  });
+  const parent = `00-${"ab".repeat(16)}-${"cd".repeat(8)}-01`;
+  const tracestate = "congo=t61rcWkgMzE";
+  rememberDeliveryTraceparent(1, parent, tracestate);
+
+  const broker = new BrokerService(store, slack);
+  const server = new BrokerHttpServer(broker, { host: "127.0.0.1", port: 0, adminToken: "x".repeat(32) });
+  const { port } = await server.start();
+  t.after(() => server.stop());
+
+  const response = await fetch(`http://127.0.0.1:${port}/v1/deliveries?wait_ms=0`, {
+    headers: { "x-hive-edge": "edge-1", authorization: `Bearer ${edgeToken}` },
+  });
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("traceparent"), parent);
+  assert.equal(response.headers.get("tracestate"), tracestate);
 });
 
 test("claim response has no traceparent when none was stored", async (t) => {
