@@ -131,15 +131,13 @@ export class CodexProvider implements ProviderAdapter {
  * Codex has no dedicated effort flag; `-c` overrides the config key for this
  * invocation only. The value is passed unquoted — the child receives the
  * argument verbatim with no shell in between, and Codex's TOML-ish parser
- * treats a bare word as a string. Codex does not validate the value at CLI
- * parse (probed, v0.146.0), so the mapping here is the only guard. Its ladder
- * tops at `ultra` (above xhigh), so the wake's `max` maps UP to `ultra` —
- * the requested ceiling lands on the provider's actual ceiling.
+ * treats a bare word as a string. Its ladder accepts the whole wake grammar
+ * including `max` (attested by a live config.toml running exactly that), so
+ * the tier passes verbatim — no mapping.
  */
 export function codexEffortArgs(effort: WakeEffort | null): string[] {
   if (effort === null) return [];
-  const tier = effort === "max" ? "ultra" : effort;
-  return ["-c", `model_reasoning_effort=${tier}`];
+  return ["-c", `model_reasoning_effort=${effort}`];
 }
 
 function surfaceErrorCode(body: string): string | null {
