@@ -12,11 +12,16 @@
  * material in the replay context never reaches this parser.
  */
 
-/** The wake-grammar tiers — Claude's vocabulary, the widest of the three. */
-export const WAKE_EFFORT_TIERS = ["low", "medium", "high", "xhigh", "max"] as const;
+/**
+ * The wake-grammar tiers — the UNION of the provider ladders, so a ticket can
+ * request any tier some provider actually has. `ultra` is Codex's top rung
+ * (max + agent swarm); providers whose ladder stops lower clamp to their own
+ * ceiling.
+ */
+export const WAKE_EFFORT_TIERS = ["low", "medium", "high", "xhigh", "max", "ultra"] as const;
 export type WakeEffort = (typeof WAKE_EFFORT_TIERS)[number];
 
-const EFFORT_LINE = /^Effort: (low|medium|high|xhigh|max)$/;
+const EFFORT_LINE = /^Effort: (low|medium|high|xhigh|max|ultra)$/;
 
 /**
  * The single effort tier a wake requests, or null.
@@ -38,12 +43,17 @@ export function parseWakeEffort(text: string): WakeEffort | null {
 
 /**
  * Grok Build validates `--reasoning-effort` at CLI parse against
- * `low|medium|high|xhigh` (probed live, grok 1.0.4) — no `max`, so `max`
- * clamps down to its ceiling. Grok alone: Claude and Codex both accept the
- * wake grammar verbatim, `max` included. The clamp is
- * deterministic doctrine, not a silent fallback: the wake text still shows the
+ * `low|medium|high|xhigh` (probed live, grok 1.0.4), so `max` and `ultra`
+ * clamp down to its ceiling. Claude's ladder tops at `max` (`ultra` clamps
+ * there); Codex alone speaks the whole grammar verbatim. The clamps are
+ * deterministic doctrine, not silent fallbacks: the wake text still shows the
  * requested tier verbatim, and this mapping is the published contract.
  */
 export function clampEffortToXhigh(effort: WakeEffort): "low" | "medium" | "high" | "xhigh" {
-  return effort === "max" ? "xhigh" : effort;
+  return effort === "max" || effort === "ultra" ? "xhigh" : effort;
+}
+
+/** Claude's ceiling is `max` — only Codex's swarm rung sits above it. */
+export function clampEffortToMax(effort: WakeEffort): "low" | "medium" | "high" | "xhigh" | "max" {
+  return effort === "ultra" ? "max" : effort;
 }

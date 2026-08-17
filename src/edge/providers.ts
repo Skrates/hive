@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import type { Delivery, Provider, Subscription } from "../domain.js";
 import { UdsHttpError, udsRequestJson } from "../local/uds.js";
-import { clampEffortToXhigh, type WakeEffort } from "./effort.js";
+import { clampEffortToMax, clampEffortToXhigh, type WakeEffort } from "./effort.js";
 import type { LiveIngress } from "./live-registry.js";
 
 const MAX_CODEX_LIVE_RECEIPT_CHARS = 4_000;
@@ -131,9 +131,9 @@ export class CodexProvider implements ProviderAdapter {
  * Codex has no dedicated effort flag; `-c` overrides the config key for this
  * invocation only. The value is passed unquoted — the child receives the
  * argument verbatim with no shell in between, and Codex's TOML-ish parser
- * treats a bare word as a string. Its ladder accepts the whole wake grammar
- * including `max` (attested by a live config.toml running exactly that), so
- * the tier passes verbatim — no mapping.
+ * treats a bare word as a string. Its ladder IS the whole wake grammar —
+ * `max` attested by a live config.toml running exactly that, `ultra` its
+ * swarm rung above — so the tier passes verbatim, no mapping.
  */
 export function codexEffortArgs(effort: WakeEffort | null): string[] {
   if (effort === null) return [];
@@ -286,13 +286,13 @@ export class ClaudeProvider implements ProviderAdapter {
 }
 
 /**
- * Claude's `--effort` accepts the wake grammar verbatim (it IS the wake
- * grammar — the widest vocabulary of the three providers), and the flag
- * outranks the profile's `settings.json` effortLevel for this session only.
+ * Claude's `--effort` ladder is `low..max`; Codex's swarm rung `ultra` clamps
+ * to `max` here. The flag outranks the profile's `settings.json` effortLevel
+ * for this session only.
  */
 export function claudeEffortArgs(effort: WakeEffort | null): string[] {
   if (effort === null) return [];
-  return ["--effort", effort];
+  return ["--effort", clampEffortToMax(effort)];
 }
 
 /**
