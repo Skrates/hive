@@ -54,7 +54,9 @@ test("provider arg folds: null is byte-identical absence; tiers land in each pro
   assert.deepEqual(grokEffortArgs("xhigh"), ["--reasoning-effort", "xhigh"]);
   assert.deepEqual(grokEffortArgs("max"), ["--reasoning-effort", "xhigh"]);
 
-  // Codex rides the per-invocation config override, clamped the same way.
+  // Codex rides the per-invocation config override; its ladder tops at ultra,
+  // so the wake's ceiling maps UP to the provider's ceiling — never down.
   assert.deepEqual(codexEffortArgs("high"), ["-c", "model_reasoning_effort=high"]);
-  assert.deepEqual(codexEffortArgs("max"), ["-c", "model_reasoning_effort=xhigh"]);
+  assert.deepEqual(codexEffortArgs("xhigh"), ["-c", "model_reasoning_effort=xhigh"]);
+  assert.deepEqual(codexEffortArgs("max"), ["-c", "model_reasoning_effort=ultra"]);
 });

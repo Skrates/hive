@@ -132,11 +132,14 @@ export class CodexProvider implements ProviderAdapter {
  * invocation only. The value is passed unquoted — the child receives the
  * argument verbatim with no shell in between, and Codex's TOML-ish parser
  * treats a bare word as a string. Codex does not validate the value at CLI
- * parse (probed, v0.146.0), so the clamp here is the only guard.
+ * parse (probed, v0.146.0), so the mapping here is the only guard. Its ladder
+ * tops at `ultra` (above xhigh), so the wake's `max` maps UP to `ultra` —
+ * the requested ceiling lands on the provider's actual ceiling.
  */
 export function codexEffortArgs(effort: WakeEffort | null): string[] {
   if (effort === null) return [];
-  return ["-c", `model_reasoning_effort=${clampEffortToXhigh(effort)}`];
+  const tier = effort === "max" ? "ultra" : effort;
+  return ["-c", `model_reasoning_effort=${tier}`];
 }
 
 function surfaceErrorCode(body: string): string | null {
