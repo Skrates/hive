@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { ATTESTATION_FILENAME } from "./attestation.js";
 import type { Delivery, DeliveryResultInput, Reason, ReplaySnapshot, Subscription } from "../domain.js";
+import type { WakeEffort } from "./effort.js";
 import type { BrokerClient } from "./broker-client.js";
 import { LiveIngressRegistry, type LiveIngress } from "./live-registry.js";
 import {
@@ -170,6 +171,7 @@ class StubAdapter implements ProviderAdapter {
   readonly provider = "codex" as const;
   readonly spawns: string[] = [];
   readonly resumes: string[] = [];
+  readonly efforts: (WakeEffort | null)[] = [];
   readonly liveDeliveries: number[] = [];
   readonly liveFrames: string[] = [];
   readonly liveSockets: string[] = [];
@@ -195,18 +197,36 @@ class StubAdapter implements ProviderAdapter {
     return this.behavior.liveResult ?? { receipt: `live:${value.id}`, processed: false };
   }
 
-  async resume(_subscription: Subscription, _cwd: string, framed: string): Promise<ProviderDispatch> {
+  async resume(_subscription: Subscription, _cwd: string, framed: string, effort: WakeEffort | null): Promise<ProviderDispatch> {
     if (this.behavior.dispatchError) throw this.behavior.dispatchError;
     this.resumes.push(framed);
+    this.efforts.push(effort);
     return this.behavior.headlessResult ?? { receipt: JSON.stringify({ type: "result", result: "resumed" }), outcome: "resumed", processed: true };
   }
 
-  async spawn(_subscription: Subscription, _cwd: string, framed: string): Promise<ProviderDispatch> {
+  async spawn(_subscription: Subscription, _cwd: string, framed: string, effort: WakeEffort | null): Promise<ProviderDispatch> {
     if (this.behavior.dispatchError) throw this.behavior.dispatchError;
     this.spawns.push(framed);
+    this.efforts.push(effort);
     return this.behavior.headlessResult ?? { receipt: JSON.stringify({ type: "result", result: "spawned" }), outcome: "spawned", processed: true };
   }
 }
+
+test("a wake carrying an Effort line reaches the adapter with that tier; a plain wake reaches it with null", async () => {
+  const broker = new FakeBroker([
+    delivery(1, { event: { ...delivery(1).event, text: "WAKE: ariadne\n\nEffort: xhigh\ndo the thing" } }),
+    delivery(2),
+  ]);
+  const store = new EdgeStore(":memory:");
+  const adapter = new StubAdapter();
+  const edge = new EdgeService(asBrokerClient(broker), store, new LiveIngressRegistry(), [adapter]);
+
+  assert.equal(await edge.processOne(), true);
+  assert.equal(await edge.processOne(), true);
+  // The overlay is per-delivery: it binds the one invocation it rode in on and
+  // leaves the next wake at the profile default.
+  assert.deepEqual(adapter.efforts, ["xhigh", null]);
+});
 
 test("a headless resume dispatch completes, posts its outcome, and finishes processed", async () => {
   const broker = new FakeBroker([delivery(1)]);
@@ -375,12 +395,12 @@ test("a slow turn for one actor does not starve a co-tenant actor's delivery (mu
   let releaseSlowTurn!: () => void;
   const slowTurn = new Promise<void>((resolve) => { releaseSlowTurn = resolve; });
   class SlowForGnomonAdapter extends StubAdapter {
-    override async spawn(sub: Subscription, cwd: string, framed: string): Promise<ProviderDispatch> {
+    override async spawn(sub: Subscription, cwd: string, framed: string, effort: WakeEffort | null): Promise<ProviderDispatch> {
       if (sub.actor === "gnomon") {
         await slowTurn;
         return { receipt: JSON.stringify({ type: "result", result: "slow done" }), outcome: "slow done", processed: true };
       }
-      return super.spawn(sub, cwd, framed);
+      return super.spawn(sub, cwd, framed, effort);
     }
   }
   const broker = new FakeBroker([
@@ -425,7 +445,7 @@ test("two deliveries for the SAME actor never run concurrently — the edge decl
   let inFlightSameActor = 0;
   let maxInFlightSameActor = 0;
   class CountingAdapter extends StubAdapter {
-    override async spawn(sub: Subscription, cwd: string, framed: string): Promise<ProviderDispatch> {
+    override async spawn(sub: Subscription, cwd: string, framed: string, _effort: WakeEffort | null): Promise<ProviderDispatch> {
       inFlightSameActor += 1;
       maxInFlightSameActor = Math.max(maxInFlightSameActor, inFlightSameActor);
       try {

@@ -137,7 +137,7 @@ test("Grok Build live delivery terminalizes loudly; resume without a session id 
   const grok = new GrokProvider();
   await assert.rejects(grok.deliverLive(), /no live-ingress surface/);
   await assert.rejects(
-    async () => grok.resume(subscription({ provider: "grok", sessionId: null }), "/tmp", "framed"),
+    async () => grok.resume(subscription({ provider: "grok", sessionId: null }), "/tmp", "framed", null),
     /resume target missing/,
   );
 });

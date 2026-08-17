@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import type { Delivery, Provider, Subscription } from "../domain.js";
 import { UdsHttpError, udsRequestJson } from "../local/uds.js";
+import { clampEffortToXhigh, type WakeEffort } from "./effort.js";
 import type { LiveIngress } from "./live-registry.js";
 
 const MAX_CODEX_LIVE_RECEIPT_CHARS = 4_000;
@@ -49,9 +50,13 @@ export class ProviderPreDispatchError extends Error {
 export interface ProviderAdapter {
   provider: Provider;
   preflight?(subscription: Subscription): void;
+  /**
+   * Live delivery reaches a session that is already running — its effort was
+   * fixed at ITS spawn, so the overlay does not apply here by construction.
+   */
   deliverLive(ingress: LiveIngress, delivery: Delivery, framed: string): Promise<ProviderDispatch>;
-  resume(subscription: Subscription, cwd: string, framed: string): Promise<ProviderDispatch>;
-  spawn(subscription: Subscription, cwd: string, framed: string): Promise<ProviderDispatch>;
+  resume(subscription: Subscription, cwd: string, framed: string, effort: WakeEffort | null): Promise<ProviderDispatch>;
+  spawn(subscription: Subscription, cwd: string, framed: string, effort: WakeEffort | null): Promise<ProviderDispatch>;
 }
 
 /**
@@ -100,26 +105,38 @@ export class CodexProvider implements ProviderAdapter {
     return { receipt, outcome, processed: true };
   }
 
-  resume(subscription: Subscription, cwd: string, framed: string): Promise<ProviderDispatch> {
+  resume(subscription: Subscription, cwd: string, framed: string, effort: WakeEffort | null): Promise<ProviderDispatch> {
     if (!subscription.sessionId) throw new Error("resume target missing");
     return runHeadless(
       "codex",
-      ["exec", "resume", subscription.sessionId, "-", "--json", ...codexPermissionArgs(subscription.permissionProfile)],
+      ["exec", "resume", subscription.sessionId, "-", "--json", ...codexEffortArgs(effort), ...codexPermissionArgs(subscription.permissionProfile)],
       cwd,
       framed,
       { CODEX_HOME: requireAccountProfile(subscription) },
     );
   }
 
-  spawn(subscription: Subscription, cwd: string, framed: string): Promise<ProviderDispatch> {
+  spawn(subscription: Subscription, cwd: string, framed: string, effort: WakeEffort | null): Promise<ProviderDispatch> {
     return runHeadless(
       "codex",
-      ["exec", "--cd", cwd, "--json", ...codexPermissionArgs(subscription.permissionProfile), "-"],
+      ["exec", "--cd", cwd, "--json", ...codexEffortArgs(effort), ...codexPermissionArgs(subscription.permissionProfile), "-"],
       cwd,
       framed,
       { CODEX_HOME: requireAccountProfile(subscription) },
     );
   }
+}
+
+/**
+ * Codex has no dedicated effort flag; `-c` overrides the config key for this
+ * invocation only. The value is passed unquoted — the child receives the
+ * argument verbatim with no shell in between, and Codex's TOML-ish parser
+ * treats a bare word as a string. Codex does not validate the value at CLI
+ * parse (probed, v0.146.0), so the clamp here is the only guard.
+ */
+export function codexEffortArgs(effort: WakeEffort | null): string[] {
+  if (effort === null) return [];
+  return ["-c", `model_reasoning_effort=${clampEffortToXhigh(effort)}`];
 }
 
 function surfaceErrorCode(body: string): string | null {
@@ -159,26 +176,36 @@ export class GrokProvider implements ProviderAdapter {
     return Promise.reject(new Error("Grok Build has no live-ingress surface; deliveries fall through to spawn"));
   }
 
-  resume(subscription: Subscription, cwd: string, framed: string): Promise<ProviderDispatch> {
+  resume(subscription: Subscription, cwd: string, framed: string, effort: WakeEffort | null): Promise<ProviderDispatch> {
     if (!subscription.sessionId) throw new Error("resume target missing");
     return runHeadless(
       process.env.HIVE_GROK_COMMAND ?? "grok",
-      ["-r", subscription.sessionId, "--output-format", "streaming-messages-json", ...grokPermissionArgs(subscription.permissionProfile), "-p", framed],
+      ["-r", subscription.sessionId, "--output-format", "streaming-messages-json", ...grokEffortArgs(effort), ...grokPermissionArgs(subscription.permissionProfile), "-p", framed],
       cwd,
       null,
       { HOME: requireAccountProfile(subscription) },
     );
   }
 
-  spawn(subscription: Subscription, cwd: string, framed: string): Promise<ProviderDispatch> {
+  spawn(subscription: Subscription, cwd: string, framed: string, effort: WakeEffort | null): Promise<ProviderDispatch> {
     return runHeadless(
       process.env.HIVE_GROK_COMMAND ?? "grok",
-      ["--output-format", "streaming-messages-json", ...grokPermissionArgs(subscription.permissionProfile), "-p", framed],
+      ["--output-format", "streaming-messages-json", ...grokEffortArgs(effort), ...grokPermissionArgs(subscription.permissionProfile), "-p", framed],
       cwd,
       null,
       { HOME: requireAccountProfile(subscription) },
     );
   }
+}
+
+/**
+ * Grok validates at CLI parse against `low|medium|high|xhigh` (grok 1.0.4);
+ * an unclamped `max` would burn the whole wake on an argument error — the
+ * exact failure class of the `-p`-must-come-last scar above.
+ */
+export function grokEffortArgs(effort: WakeEffort | null): string[] {
+  if (effort === null) return [];
+  return ["--reasoning-effort", clampEffortToXhigh(effort)];
 }
 
 export interface ClaudeInboxConfig {
@@ -233,28 +260,38 @@ export class ClaudeProvider implements ProviderAdapter {
     return `claude-inbox:${finalPath}`;
   }
 
-  resume(subscription: Subscription, cwd: string, framed: string): Promise<ProviderDispatch> {
+  resume(subscription: Subscription, cwd: string, framed: string, effort: WakeEffort | null): Promise<ProviderDispatch> {
     if (!subscription.sessionId) throw new Error("resume target missing");
     const profile = requireAccountProfile(subscription);
     return runHeadless(
       process.env.HIVE_CLAUDE_COMMAND ?? "claude",
-      ["-p", "--resume", subscription.sessionId, "--output-format", "stream-json", "--verbose", ...claudePermissionArgs(subscription.permissionProfile), ...claudePromptSlotArgs(profile), framed],
+      ["-p", "--resume", subscription.sessionId, "--output-format", "stream-json", "--verbose", ...claudeEffortArgs(effort), ...claudePermissionArgs(subscription.permissionProfile), ...claudePromptSlotArgs(profile), framed],
       cwd,
       null,
       { CLAUDE_CONFIG_DIR: profile },
     );
   }
 
-  spawn(subscription: Subscription, cwd: string, framed: string): Promise<ProviderDispatch> {
+  spawn(subscription: Subscription, cwd: string, framed: string, effort: WakeEffort | null): Promise<ProviderDispatch> {
     const profile = requireAccountProfile(subscription);
     return runHeadless(
       process.env.HIVE_CLAUDE_COMMAND ?? "claude",
-      ["-p", "--output-format", "stream-json", "--verbose", ...claudePermissionArgs(subscription.permissionProfile), ...claudePromptSlotArgs(profile), framed],
+      ["-p", "--output-format", "stream-json", "--verbose", ...claudeEffortArgs(effort), ...claudePermissionArgs(subscription.permissionProfile), ...claudePromptSlotArgs(profile), framed],
       cwd,
       null,
       { CLAUDE_CONFIG_DIR: profile },
     );
   }
+}
+
+/**
+ * Claude's `--effort` accepts the wake grammar verbatim (it IS the wake
+ * grammar — the widest vocabulary of the three providers), and the flag
+ * outranks the profile's `settings.json` effortLevel for this session only.
+ */
+export function claudeEffortArgs(effort: WakeEffort | null): string[] {
+  if (effort === null) return [];
+  return ["--effort", effort];
 }
 
 /**
