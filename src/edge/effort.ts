@@ -39,8 +39,8 @@ export function parseWakeEffort(text: string): WakeEffort | null {
 /**
  * Grok Build validates `--reasoning-effort` at CLI parse against
  * `low|medium|high|xhigh` (probed live, grok 1.0.4) — no `max`, so `max`
- * clamps down to its ceiling. (Codex is NOT this shape: its ladder tops at
- * `ultra`, and its mapping lives beside its adapter.) The clamp is
+ * clamps down to its ceiling. Grok alone: Claude and Codex both accept the
+ * wake grammar verbatim, `max` included. The clamp is
  * deterministic doctrine, not a silent fallback: the wake text still shows the
  * requested tier verbatim, and this mapping is the published contract.
  */
