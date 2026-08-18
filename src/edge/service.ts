@@ -370,6 +370,10 @@ export class EdgeService {
     if (!adapter) throw new PreDispatchError("provider_adapter_missing");
     adapter.preflight?.(subscription);
 
+    // Overlay is computed for every route, including live. A live session's
+    // effort was fixed at its own spawn, so the flag cannot apply there —
+    // but a requested overlay that we cannot honour must not vanish silently.
+    const effort = parseDeliveryEffort(delivery);
     if (live) {
       await onProviderStart();
       // Codex live delivery waits for the exact app-server turn and lets the
@@ -377,6 +381,14 @@ export class EdgeService {
       // requires the agent-side reply because writing an inbox file is not a
       // provider completion signal.
       const outcomeReporter = subscription.provider === "codex" ? "edge" : "agent";
+      if (effort !== null) {
+        console.error(
+          "hive edge effort overlay unused",
+          delivery.id,
+          effort,
+          "live_session_fixed_at_spawn",
+        );
+      }
       return adapter.deliverLive(live, delivery, frameWakeInstruction(delivery, replay, outcomeReporter));
     }
     if (subscription.wakePolicy === "live_only") throw new PreDispatchError("live_ingress_unavailable");
@@ -384,11 +396,6 @@ export class EdgeService {
     const workspace = subscription.edgeWorkspaces.find((item) => item.edgeId === this.broker.edgeId);
     if (!workspace) throw new PreDispatchError("workspace_not_mapped");
     const framed = frameWakeInstruction(delivery, replay, "edge");
-    // The overlay ranges over the delivery's trusted instruction set — the
-    // initiating event text plus every coalesced follow-up. Those follow-ups
-    // ride in this invocation's imperative section; conflicting tiers fail
-    // closed to the profile default.
-    const effort = parseDeliveryEffort(delivery);
     if (subscription.sessionId && this.broker.edgeId === subscription.homeEdge) {
       await onProviderStart();
       return adapter.resume(subscription, workspace.cwd, framed, effort);

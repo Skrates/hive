@@ -309,6 +309,47 @@ test("a completion-tracked Codex live injection commits its final response as th
   store.close();
 });
 
+test("a live delivery that carries an Effort overlay publishes that it did not apply", async () => {
+  const broker = new FakeBroker([
+    delivery(4, {
+      event: { ...delivery(4).event, text: "WAKE: ariadne\n\nEffort: max\ndo the thing" },
+      subscription: subscription({ wakePolicy: "live_only" }),
+    }),
+    delivery(5, { subscription: subscription({ wakePolicy: "live_only" }) }),
+  ]);
+  const store = new EdgeStore(":memory:");
+  const adapter = new StubAdapter({
+    liveResult: { receipt: "live", outcome: "done", processed: true },
+  });
+  const live = new LiveIngressRegistry();
+  live.register({
+    actor: "ariadne",
+    provider: "codex",
+    socketPath: "/tmp/x.sock",
+    sessionId: "thread-1",
+    surfaceVersion: "test",
+    runtimeAttestation: { ok: false, absence: "attestation_unreported" },
+  }, 60_000);
+  const edge = new EdgeService(asBrokerClient(broker), store, live, [adapter]);
+  const logged: unknown[][] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => {
+    logged.push(args);
+  };
+  try {
+    assert.equal(await edge.processOne(), true);
+    assert.equal(await edge.processOne(), true);
+  } finally {
+    console.error = original;
+  }
+  assert.deepEqual(adapter.liveDeliveries, [4, 5]);
+  assert.equal(adapter.efforts.length, 0);
+  const unused = logged.filter((args) => args[0] === "hive edge effort overlay unused");
+  assert.equal(unused.length, 1);
+  assert.deepEqual(unused[0], ["hive edge effort overlay unused", 4, "max", "live_session_fixed_at_spawn"]);
+  store.close();
+});
+
 test("a deterministic pre-dispatch failure finishes undeliverable, never released", async () => {
   const broker = new FakeBroker([delivery(3)]);
   const store = new EdgeStore(":memory:");
