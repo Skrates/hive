@@ -1,5 +1,5 @@
 import { frameWakeInstruction, type Delivery, type Provider, type Reason, type ReplaySnapshot } from "../domain.js";
-import { parseWakeEffort } from "./effort.js";
+import { parseDeliveryEffort } from "./effort.js";
 import { BrokerClient } from "./broker-client.js";
 import { LiveIngressRegistry, type LiveIngress } from "./live-registry.js";
 import {
@@ -384,10 +384,11 @@ export class EdgeService {
     const workspace = subscription.edgeWorkspaces.find((item) => item.edgeId === this.broker.edgeId);
     if (!workspace) throw new PreDispatchError("workspace_not_mapped");
     const framed = frameWakeInstruction(delivery, replay, "edge");
-    // The overlay is read from the initiating wake message only — the trusted
-    // text the WAKE: envelope itself rode in on. Coalesced follow-ups steer
-    // the agent, not the invocation that is about to be constructed.
-    const effort = parseWakeEffort(delivery.event.text);
+    // The overlay ranges over the delivery's trusted instruction set — the
+    // initiating event text plus every coalesced follow-up. Those follow-ups
+    // ride in this invocation's imperative section; conflicting tiers fail
+    // closed to the profile default.
+    const effort = parseDeliveryEffort(delivery);
     if (subscription.sessionId && this.broker.edgeId === subscription.homeEdge) {
       await onProviderStart();
       return adapter.resume(subscription, workspace.cwd, framed, effort);

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { clampEffortToXhigh, parseWakeEffort, WAKE_EFFORT_TIERS } from "./effort.js";
+import { clampEffortToXhigh, parseDeliveryEffort, parseWakeEffort, WAKE_EFFORT_TIERS } from "./effort.js";
 import { claudeEffortArgs, codexEffortArgs, grokEffortArgs } from "./providers.js";
 
 test("a bare Effort line yields its tier; absence yields null", () => {
@@ -34,6 +34,43 @@ test("conflicting tiers are a human ambiguity — fail closed; repeats are not a
 
 test("CRLF wakes parse — Slack text can arrive carriage-returned", () => {
   assert.equal(parseWakeEffort("WAKE: fable\r\nEffort: medium\r\n"), "medium");
+});
+
+test("the overlay fold ranges over the delivery, not one of its trusted messages", () => {
+  // Overlay arrives only in a coalesced follow-up — same authority surface
+  // as the initiating wake, and the same text the prompt will carry.
+  assert.equal(
+    parseDeliveryEffort({
+      event: { text: "WAKE: talos\n\ndo the thing" },
+      coalescedMessages: [{ text: "WAKE: talos\n\nEffort: max\nalso this" }],
+    }),
+    "max",
+  );
+  // Distinct tiers across the delivery are a conflict — fail closed. The
+  // initiating message must not silently win.
+  assert.equal(
+    parseDeliveryEffort({
+      event: { text: "WAKE: talos\n\nEffort: low\ndo the thing" },
+      coalescedMessages: [{ text: "WAKE: talos\n\nEffort: max\nalso this" }],
+    }),
+    null,
+  );
+  // Repeats of one tier across messages are not a conflict.
+  assert.equal(
+    parseDeliveryEffort({
+      event: { text: "WAKE: talos\n\nEffort: high\ndo the thing" },
+      coalescedMessages: [{ text: "WAKE: talos\n\nEffort: high\nalso this" }],
+    }),
+    "high",
+  );
+  // Zero coalesced messages is the initiating text alone.
+  assert.equal(
+    parseDeliveryEffort({
+      event: { text: "WAKE: talos\n\nEffort: xhigh\ndo the thing" },
+      coalescedMessages: [],
+    }),
+    "xhigh",
+  );
 });
 
 test("tiers above a provider's ceiling clamp to that ceiling", () => {

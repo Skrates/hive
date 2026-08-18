@@ -7,9 +7,11 @@
  * touched — the overlay lives and dies with the one CLI invocation, which is
  * what kills the edit-profile-then-revert dance permanently.
  *
- * The line rides the *trusted wake message itself* (the delivery's event
- * text), the same authority surface the `WAKE:` envelope rides. Quoted
- * material in the replay context never reaches this parser.
+ * The line rides the delivery's trusted instruction set: the initiating
+ * event text plus every coalesced same-thread follow-up. That is the same
+ * authority surface the `WAKE:` envelope rides, and the same texts
+ * `frameWakeInstruction` puts in the imperative section. Quoted material
+ * in the replay context never reaches this parser.
  */
 
 /**
@@ -33,7 +35,9 @@ function isWakeEffort(value: string): value is WakeEffort {
  * Null on zero `Effort:` lines (profile default applies — the no-label wake
  * stays byte-identical in behavior) and on *conflicting* lines (two distinct
  * tiers is a human ambiguity; fail closed to the profile default rather than
- * guess a precedence). Repeats of the same tier are not a conflict.
+ * guess a precedence). Repeats of the same tier are not a conflict. The
+ * unit of that fold is the delivery — one provider invocation — not one of
+ * the trusted messages that invocation carries.
  */
 export function parseWakeEffort(text: string): WakeEffort | null {
   const found = new Set<WakeEffort>();
@@ -44,6 +48,18 @@ export function parseWakeEffort(text: string): WakeEffort | null {
   }
   if (found.size !== 1) return null;
   return [...found][0] ?? null;
+}
+
+/**
+ * Overlay for one delivery: initiating text plus every coalesced follow-up,
+ * through the same `found.size !== 1` fold as {@link parseWakeEffort}.
+ */
+export function parseDeliveryEffort(
+  delivery: { event: { text: string }; coalescedMessages: readonly { text: string }[] },
+): WakeEffort | null {
+  return parseWakeEffort(
+    [delivery.event.text, ...delivery.coalescedMessages.map((message) => message.text)].join("\n"),
+  );
 }
 
 /**

@@ -228,6 +228,25 @@ test("a wake carrying an Effort line reaches the adapter with that tier; a plain
   assert.deepEqual(adapter.efforts, ["xhigh", null]);
 });
 
+test("an Effort line in a coalesced follow-up binds the invocation; a conflict fails closed", async () => {
+  const broker = new FakeBroker([
+    delivery(1, {
+      coalescedMessages: [{ senderId: "U1", messageTs: "100.9", text: "WAKE: ariadne\n\nEffort: max\nalso this" }],
+    }),
+    delivery(2, {
+      event: { ...delivery(2).event, text: "WAKE: ariadne\n\nEffort: low\ndo the thing" },
+      coalescedMessages: [{ senderId: "U1", messageTs: "100.9", text: "WAKE: ariadne\n\nEffort: max\nalso this" }],
+    }),
+  ]);
+  const store = new EdgeStore(":memory:");
+  const adapter = new StubAdapter();
+  const edge = new EdgeService(asBrokerClient(broker), store, new LiveIngressRegistry(), [adapter]);
+
+  assert.equal(await edge.processOne(), true);
+  assert.equal(await edge.processOne(), true);
+  assert.deepEqual(adapter.efforts, ["max", null]);
+});
+
 test("a headless resume dispatch completes, posts its outcome, and finishes processed", async () => {
   const broker = new FakeBroker([delivery(1)]);
   const store = new EdgeStore(":memory:");
