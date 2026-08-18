@@ -58,25 +58,14 @@ function classifyEffort(found: Set<WakeEffort>): DeliveryEffort {
 }
 
 /**
- * The single honourable effort tier a wake text requests, or null.
- *
- * Null on zero `Effort:` lines (profile default applies — the no-label wake
- * stays byte-identical in behavior) and on *conflicting* lines (two distinct
- * tiers is a human ambiguity; fail closed to the profile default rather than
- * guess a precedence). Repeats of the same tier are not a conflict. The
- * delivery fold ({@link parseDeliveryEffort}) keeps the three outcomes
- * distinct so a caller that must publish a conflict can see it.
- */
-export function parseWakeEffort(text: string): WakeEffort | null {
-  const parsed = classifyEffort(collectWakeEffort(text));
-  return parsed.kind === "tier" ? parsed.tier : null;
-}
-
-/**
  * Overlay for one delivery: initiating text plus every coalesced follow-up,
- * through the same found-set fold as {@link parseWakeEffort}. Each message
- * is collected on its own so a join cannot mint a directive no single
- * message contains.
+ * through the found-set fold. Each message is collected on its own so a
+ * join cannot mint a directive no single message contains.
+ *
+ * `none` on zero `Effort:` lines (profile default applies — the no-label
+ * wake stays byte-identical in behavior). `conflict` on two distinct tiers
+ * (a human ambiguity; fail closed rather than guess a precedence). Repeats
+ * of the same tier are not a conflict.
  */
 export function parseDeliveryEffort(
   delivery: { event: { text: string }; coalescedMessages: readonly { text: string }[] },

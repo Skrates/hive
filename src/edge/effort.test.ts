@@ -1,39 +1,55 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { clampEffortToXhigh, parseDeliveryEffort, parseWakeEffort, WAKE_EFFORT_TIERS } from "./effort.js";
+import { clampEffortToXhigh, parseDeliveryEffort, WAKE_EFFORT_TIERS } from "./effort.js";
 import { claudeEffortArgs, codexEffortArgs, grokEffortArgs } from "./providers.js";
 
-test("a bare Effort line yields its tier; absence yields null", () => {
-  assert.equal(parseWakeEffort("WAKE: talos\n\nTICKET: KRA-1 x\nEffort: xhigh\nbody"), "xhigh");
-  assert.equal(parseWakeEffort("WAKE: talos\n\nTICKET: KRA-1 x\nbody"), null);
-  assert.equal(parseWakeEffort(""), null);
+function singleMessage(text: string) {
+  return { event: { text }, coalescedMessages: [] as const };
+}
+
+test("a bare Effort line yields its tier; absence yields none", () => {
+  assert.deepEqual(
+    parseDeliveryEffort(singleMessage("WAKE: talos\n\nTICKET: KRA-1 x\nEffort: xhigh\nbody")),
+    { kind: "tier", tier: "xhigh" },
+  );
+  assert.deepEqual(parseDeliveryEffort(singleMessage("WAKE: talos\n\nTICKET: KRA-1 x\nbody")), { kind: "none" });
+  assert.deepEqual(parseDeliveryEffort(singleMessage("")), { kind: "none" });
 });
 
 test("every wake-grammar tier parses", () => {
   for (const tier of WAKE_EFFORT_TIERS) {
-    assert.equal(parseWakeEffort(`Effort: ${tier}`), tier);
+    assert.deepEqual(parseDeliveryEffort(singleMessage(`Effort: ${tier}`)), { kind: "tier", tier });
   }
 });
 
 test("the line is exact — embedded, suffixed, or invalid-tier mentions never bind", () => {
   // Mid-sentence mention: prose about effort is not a directive.
-  assert.equal(parseWakeEffort("we should raise Effort: xhigh next time"), null);
+  assert.deepEqual(parseDeliveryEffort(singleMessage("we should raise Effort: xhigh next time")), { kind: "none" });
   // Trailing text after the tier: not the published grammar.
-  assert.equal(parseWakeEffort("Effort: xhigh (requested by label)"), null);
+  assert.deepEqual(parseDeliveryEffort(singleMessage("Effort: xhigh (requested by label)")), { kind: "none" });
   // Unknown tier: fail closed, never coerce.
-  assert.equal(parseWakeEffort("Effort: turbo"), null);
+  assert.deepEqual(parseDeliveryEffort(singleMessage("Effort: turbo")), { kind: "none" });
   // Case drift: the dispatcher emits lowercase; anything else is not the grammar.
-  assert.equal(parseWakeEffort("Effort: XHIGH"), null);
-  assert.equal(parseWakeEffort("effort: xhigh"), null);
+  assert.deepEqual(parseDeliveryEffort(singleMessage("Effort: XHIGH")), { kind: "none" });
+  assert.deepEqual(parseDeliveryEffort(singleMessage("effort: xhigh")), { kind: "none" });
 });
 
 test("conflicting tiers are a human ambiguity — fail closed; repeats are not a conflict", () => {
-  assert.equal(parseWakeEffort("Effort: low\nEffort: max"), null);
-  assert.equal(parseWakeEffort("Effort: high\nquoted:\nEffort: high"), "high");
+  assert.deepEqual(parseDeliveryEffort(singleMessage("Effort: low\nEffort: max")), {
+    kind: "conflict",
+    tiers: ["low", "max"],
+  });
+  assert.deepEqual(parseDeliveryEffort(singleMessage("Effort: high\nquoted:\nEffort: high")), {
+    kind: "tier",
+    tier: "high",
+  });
 });
 
 test("CRLF wakes parse — Slack text can arrive carriage-returned", () => {
-  assert.equal(parseWakeEffort("WAKE: fable\r\nEffort: medium\r\n"), "medium");
+  assert.deepEqual(parseDeliveryEffort(singleMessage("WAKE: fable\r\nEffort: medium\r\n")), {
+    kind: "tier",
+    tier: "medium",
+  });
 });
 
 test("the overlay fold ranges over the delivery, not one of its trusted messages", () => {
@@ -76,6 +92,19 @@ test("the overlay fold ranges over the delivery, not one of its trusted messages
     parseDeliveryEffort({
       event: { text: "WAKE: talos\n\ndo the thing" },
       coalescedMessages: [],
+    }),
+    { kind: "none" },
+  );
+});
+
+test("a join cannot mint a directive no single message contains", () => {
+  // Split across the message boundary: naive join("") would assemble
+  // `Effort: max` from two innocent fragments. Each message is collected
+  // on its own, so the fold must stay `none`.
+  assert.deepEqual(
+    parseDeliveryEffort({
+      event: { text: "WAKE: talos\n\nEffort:" },
+      coalescedMessages: [{ text: " max\nalso this" }],
     }),
     { kind: "none" },
   );
