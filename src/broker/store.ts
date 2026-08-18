@@ -12,7 +12,7 @@ import type {
   TerminalDeliveryStatus,
 } from "../domain.js";
 import { retryBackoffMs } from "../domain.js";
-import { captureActiveTraceContext, forgetDeliveryTraceparent, peekDeliveryTrace } from "../observability.js";
+import { captureActiveTraceContext, forgetDeliveryTraceparent, peekDeliveryTrace, rememberDeliveryTraceparent } from "../observability.js";
 import type { Clock } from "../time.js";
 import { iso, systemClock } from "../time.js";
 
@@ -201,6 +201,8 @@ export class BrokerStore {
         terminal_at TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
+        traceparent TEXT,
+        tracestate TEXT,
         UNIQUE(event_id, actor),
         FOREIGN KEY(event_id) REFERENCES slack_events(event_id),
         FOREIGN KEY(actor) REFERENCES subscriptions(actor),
@@ -262,6 +264,7 @@ export class BrokerStore {
     `);
     this.ensureOutboxReactionColumns();
     this.ensureOutboxTraceColumns();
+    this.ensureDeliveryTraceColumns();
   }
 
   /** Forward-only schema step: pre-reaction databases gain the two nullable columns in place. */
@@ -287,6 +290,17 @@ export class BrokerStore {
     }
     if (!columns.includes("tracestate")) {
       this.db.exec("ALTER TABLE outbox ADD COLUMN tracestate TEXT");
+    }
+  }
+
+  /** Forward-only schema step: existing databases persist the delivery's own W3C context. */
+  private ensureDeliveryTraceColumns(): void {
+    const columns = (this.db.pragma("table_info(deliveries)") as { name: string }[]).map((c) => c.name);
+    if (!columns.includes("traceparent")) {
+      this.db.exec("ALTER TABLE deliveries ADD COLUMN traceparent TEXT");
+    }
+    if (!columns.includes("tracestate")) {
+      this.db.exec("ALTER TABLE deliveries ADD COLUMN tracestate TEXT");
     }
   }
 
@@ -547,11 +561,12 @@ export class BrokerStore {
         `).run(deliveryId, event.eventId);
         return { created: true, deliveryId };
       }
+      const ctx = captureActiveTraceContext();
       const result = this.db.prepare(`
         INSERT INTO deliveries(
           event_id, actor, status, coalesce_key, initial_snapshot_json, snapshot_ts,
-          created_at, updated_at
-        ) VALUES (?, ?, 'pending', ?, ?, ?, ?, ?)
+          created_at, updated_at, traceparent, tracestate
+        ) VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)
       `).run(
         event.eventId,
         event.actor,
@@ -560,6 +575,8 @@ export class BrokerStore {
         initialSnapshot === null ? null : now,
         now,
         now,
+        ctx?.traceparent ?? null,
+        ctx?.tracestate ?? null,
       );
       const deliveryId = Number(result.lastInsertRowid);
       this.db.prepare(`
@@ -953,19 +970,20 @@ export class BrokerStore {
       .run(iso(this.clock), outboxId);
   }
 
-  markOutboxAttempt(outboxId: number): void {
+  markOutboxAttempt(outboxId: number): "attempt_failed" | "abandoned" {
     const row = this.db.prepare("SELECT attempts FROM outbox WHERE outbox_id=?").get(outboxId) as Row | undefined;
-    if (!row) return;
+    if (!row) return "attempt_failed";
     const attempts = Number(row.attempts) + 1;
     if (attempts >= OUTBOX_MAX_ATTEMPTS) {
       this.db.prepare("UPDATE outbox SET attempts=?, abandoned_at=? WHERE outbox_id=?")
         .run(attempts, iso(this.clock), outboxId);
       console.error("hive outbox row abandoned after max attempts", outboxId);
-      return;
+      return "abandoned";
     }
     const nextAttemptAt = new Date(this.clock.now().getTime() + retryBackoffMs(attempts)).toISOString();
     this.db.prepare("UPDATE outbox SET attempts=?, next_attempt_at=? WHERE outbox_id=?")
       .run(attempts, nextAttemptAt, outboxId);
+    return "attempt_failed";
   }
 
   getDelivery(deliveryId: number): Delivery {
@@ -983,6 +1001,17 @@ export class BrokerStore {
     `).get(deliveryId) as Row | undefined;
     if (!row) throw new Error(`delivery ${deliveryId} not found`);
     const delivery = deliveryFromRow(row);
+    if (!TERMINAL.has(delivery.status) && peekDeliveryTrace(delivery.id) === undefined) {
+      const traceparent = row.traceparent === null || row.traceparent === undefined
+        ? undefined
+        : String(row.traceparent);
+      const tracestate = row.tracestate === null || row.tracestate === undefined
+        ? undefined
+        : String(row.tracestate);
+      if (traceparent !== undefined) {
+        rememberDeliveryTraceparent(delivery.id, traceparent, tracestate);
+      }
+    }
     const events = this.db.prepare(`
       SELECT de.event_id, de.relation, e.sender_id, e.message_ts, e.text
       FROM delivery_events de JOIN slack_events e ON e.event_id=de.event_id

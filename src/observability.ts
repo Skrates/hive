@@ -166,6 +166,20 @@ export function withSpan<T>(name: string, attributes: DeliverySpanAttributes, fn
   }
 }
 
+/** Record allowlisted attributes on the active span. Fail-open if none is active. */
+export function setSpanAttributes(attributes: DeliverySpanAttributes): void {
+  if (!enabled) return;
+  try {
+    const span = trace.getActiveSpan();
+    if (!span) return;
+    for (const [key, value] of Object.entries(sanitizeAttributes(attributes))) {
+      span.setAttribute(key, value);
+    }
+  } catch {
+    // fail-open
+  }
+}
+
 export function rememberDeliveryTraceparent(
   deliveryId: number,
   traceparent?: string,
