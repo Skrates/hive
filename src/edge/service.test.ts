@@ -523,6 +523,23 @@ async function flush(rounds = 3): Promise<void> {
   }
 }
 
+/**
+ * Wait until `reached` holds, yielding to the event loop between checks.
+ *
+ * Every dispatch now awaits `readWakeAttestation` before the provider starts, so
+ * "the dispatch started" is gated on real filesystem I/O, not on a countable
+ * number of microtask turns. `flush(3)` happened to cover one pending read on a
+ * warm local disk and did not cover two in CI. Bounded by rounds rather than
+ * wall clock so it cannot flake against its own timer.
+ */
+async function until(reached: () => boolean, rounds = 500): Promise<boolean> {
+  for (let round = 0; round < rounds; round += 1) {
+    if (reached()) return true;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  return reached();
+}
+
 const THREE_HOURS_MS = 3 * 60 * 60_000;
 
 /**
@@ -592,8 +609,7 @@ test("a dispatch that outlives the wall-clock deadline is aborted, and released 
   const done = edge.processOne();
   let settled = false;
   void done.then(() => { settled = true; });
-  await flush();
-  assert.equal(adapter.signals.length, 1, "the dispatch started");
+  assert.ok(await until(() => adapter.signals.length === 1), "the dispatch started");
   assert.equal(adapter.signals[0]?.aborted, false, "and is not aborted before its deadline");
   assert.equal(dispatchDeadlineAt(adapter.signals[0]), 1_000_000 + THREE_HOURS_MS);
 
@@ -628,7 +644,7 @@ test("a provider that never stops releases as an UNCONFIRMED cancellation, once 
   const edge = new EdgeService(asBrokerClient(broker), store, new LiveIngressRegistry(), [adapter], timers);
 
   const done = edge.processOne();
-  await flush();
+  assert.ok(await until(() => adapter.signals.length === 1), "the dispatch started");
   await timers.advance(THREE_HOURS_MS + 1_000);
   assert.equal(adapter.signals[0]?.aborted, true);
   assert.equal(broker.releases.length, 0, "an unanswering provider still holds the fence inside the bound");
@@ -686,8 +702,7 @@ test("with every dispatch slot hung, a newly published delivery is still claimed
 
   const controller = new AbortController();
   const run = edge.run(controller.signal);
-  await flush();
-  assert.equal(adapter.signals.length, 4, "all four slots are occupied by hung turns");
+  assert.ok(await until(() => adapter.signals.length === 4), "all four slots are occupied by hung turns");
   assert.equal(edge.saturated(), true);
 
   // A fresh delivery arrives for a fifth actor while the edge is wedged.
@@ -729,8 +744,7 @@ test("abortActiveDispatches tears down in-flight turns before a watchdog exit wo
 
   const controller = new AbortController();
   const run = edge.run(controller.signal);
-  await flush();
-  assert.equal(adapter.signals.length, 2);
+  assert.ok(await until(() => adapter.signals.length === 2), "both dispatches started");
   assert.equal(adapter.signals.every((signal) => signal?.aborted === false), true);
 
   edge.abortActiveDispatches();
@@ -772,8 +786,7 @@ test("a healthy long dispatch keeps the loop polling, so the watchdog reads heal
 
   const controller = new AbortController();
   const run = edge.run(controller.signal);
-  await flush();
-  assert.equal(adapter.signals.length, 1, "the slow turn is running");
+  assert.ok(await until(() => adapter.signals.length === 1), "the slow turn is running");
 
   for (let cycle = 0; cycle < 4; cycle += 1) {
     await timers.advance(300_000);
