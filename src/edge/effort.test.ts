@@ -39,37 +39,45 @@ test("CRLF wakes parse — Slack text can arrive carriage-returned", () => {
 test("the overlay fold ranges over the delivery, not one of its trusted messages", () => {
   // Overlay arrives only in a coalesced follow-up — same authority surface
   // as the initiating wake, and the same text the prompt will carry.
-  assert.equal(
+  assert.deepEqual(
     parseDeliveryEffort({
       event: { text: "WAKE: talos\n\ndo the thing" },
       coalescedMessages: [{ text: "WAKE: talos\n\nEffort: max\nalso this" }],
     }),
-    "max",
+    { kind: "tier", tier: "max" },
   );
   // Distinct tiers across the delivery are a conflict — fail closed. The
-  // initiating message must not silently win.
-  assert.equal(
+  // initiating message must not silently win, and the result is not `none`.
+  assert.deepEqual(
     parseDeliveryEffort({
       event: { text: "WAKE: talos\n\nEffort: low\ndo the thing" },
       coalescedMessages: [{ text: "WAKE: talos\n\nEffort: max\nalso this" }],
     }),
-    null,
+    { kind: "conflict", tiers: ["low", "max"] },
   );
   // Repeats of one tier across messages are not a conflict.
-  assert.equal(
+  assert.deepEqual(
     parseDeliveryEffort({
       event: { text: "WAKE: talos\n\nEffort: high\ndo the thing" },
       coalescedMessages: [{ text: "WAKE: talos\n\nEffort: high\nalso this" }],
     }),
-    "high",
+    { kind: "tier", tier: "high" },
   );
   // Zero coalesced messages is the initiating text alone.
-  assert.equal(
+  assert.deepEqual(
     parseDeliveryEffort({
       event: { text: "WAKE: talos\n\nEffort: xhigh\ndo the thing" },
       coalescedMessages: [],
     }),
-    "xhigh",
+    { kind: "tier", tier: "xhigh" },
+  );
+  // Absence is its own kind — the caller can tell it from a conflict.
+  assert.deepEqual(
+    parseDeliveryEffort({
+      event: { text: "WAKE: talos\n\ndo the thing" },
+      coalescedMessages: [],
+    }),
+    { kind: "none" },
   );
 });
 

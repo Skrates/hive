@@ -29,37 +29,63 @@ function isWakeEffort(value: string): value is WakeEffort {
   return (WAKE_EFFORT_TIERS as readonly string[]).includes(value);
 }
 
-/**
- * The single effort tier a wake requests, or null.
- *
- * Null on zero `Effort:` lines (profile default applies — the no-label wake
- * stays byte-identical in behavior) and on *conflicting* lines (two distinct
- * tiers is a human ambiguity; fail closed to the profile default rather than
- * guess a precedence). Repeats of the same tier are not a conflict. The
- * unit of that fold is the delivery — one provider invocation — not one of
- * the trusted messages that invocation carries.
- */
-export function parseWakeEffort(text: string): WakeEffort | null {
+function collectWakeEffort(text: string): Set<WakeEffort> {
   const found = new Set<WakeEffort>();
   for (const line of text.split("\n")) {
     const match = EFFORT_LINE.exec(line.trimEnd());
     const tier = match?.[1];
     if (tier !== undefined && isWakeEffort(tier)) found.add(tier);
   }
-  if (found.size !== 1) return null;
-  return [...found][0] ?? null;
+  return found;
+}
+
+/**
+ * Delivery-wide overlay parse. Distinguishes the three outcomes of the
+ * found-set fold so a conflict cannot masquerade as absence.
+ */
+export type DeliveryEffort =
+  | { readonly kind: "none" }
+  | { readonly kind: "tier"; readonly tier: WakeEffort }
+  | { readonly kind: "conflict"; readonly tiers: readonly WakeEffort[] };
+
+function classifyEffort(found: Set<WakeEffort>): DeliveryEffort {
+  if (found.size === 0) return { kind: "none" };
+  if (found.size === 1) {
+    const tier = [...found][0];
+    return tier === undefined ? { kind: "none" } : { kind: "tier", tier };
+  }
+  return { kind: "conflict", tiers: [...found] };
+}
+
+/**
+ * The single honourable effort tier a wake text requests, or null.
+ *
+ * Null on zero `Effort:` lines (profile default applies — the no-label wake
+ * stays byte-identical in behavior) and on *conflicting* lines (two distinct
+ * tiers is a human ambiguity; fail closed to the profile default rather than
+ * guess a precedence). Repeats of the same tier are not a conflict. The
+ * delivery fold ({@link parseDeliveryEffort}) keeps the three outcomes
+ * distinct so a caller that must publish a conflict can see it.
+ */
+export function parseWakeEffort(text: string): WakeEffort | null {
+  const parsed = classifyEffort(collectWakeEffort(text));
+  return parsed.kind === "tier" ? parsed.tier : null;
 }
 
 /**
  * Overlay for one delivery: initiating text plus every coalesced follow-up,
- * through the same `found.size !== 1` fold as {@link parseWakeEffort}.
+ * through the same found-set fold as {@link parseWakeEffort}. Each message
+ * is collected on its own so a join cannot mint a directive no single
+ * message contains.
  */
 export function parseDeliveryEffort(
   delivery: { event: { text: string }; coalescedMessages: readonly { text: string }[] },
-): WakeEffort | null {
-  return parseWakeEffort(
-    [delivery.event.text, ...delivery.coalescedMessages.map((message) => message.text)].join("\n"),
-  );
+): DeliveryEffort {
+  const found = new Set<WakeEffort>();
+  for (const text of [delivery.event.text, ...delivery.coalescedMessages.map((message) => message.text)]) {
+    for (const tier of collectWakeEffort(text)) found.add(tier);
+  }
+  return classifyEffort(found);
 }
 
 /**

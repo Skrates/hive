@@ -350,6 +350,77 @@ test("a live delivery that carries an Effort overlay publishes that it did not a
   store.close();
 });
 
+test("a conflicting Effort overlay on a headless delivery publishes that it did not apply", async () => {
+  const broker = new FakeBroker([
+    delivery(6, {
+      event: { ...delivery(6).event, text: "WAKE: ariadne\n\nEffort: low\ndo the thing" },
+      coalescedMessages: [{ senderId: "U1", messageTs: "100.9", text: "WAKE: ariadne\n\nEffort: max\nalso this" }],
+    }),
+    delivery(7),
+  ]);
+  const store = new EdgeStore(":memory:");
+  const adapter = new StubAdapter();
+  const edge = new EdgeService(asBrokerClient(broker), store, new LiveIngressRegistry(), [adapter]);
+  const logged: unknown[][] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => {
+    logged.push(args);
+  };
+  try {
+    assert.equal(await edge.processOne(), true);
+    assert.equal(await edge.processOne(), true);
+  } finally {
+    console.error = original;
+  }
+  // Fail-closed: neither tier is applied. The plain follow-up stays silent,
+  // so one exact unused line is unreachable without the conflict diagnostic.
+  assert.deepEqual(adapter.efforts, [null, null]);
+  const unused = logged.filter((args) => args[0] === "hive edge effort overlay unused");
+  assert.equal(unused.length, 1);
+  assert.deepEqual(unused[0], ["hive edge effort overlay unused", 6, "low,max", "conflict"]);
+  store.close();
+});
+
+test("a live delivery with a conflicting Effort overlay publishes the conflict, not a live-session unused", async () => {
+  const broker = new FakeBroker([
+    delivery(8, {
+      event: { ...delivery(8).event, text: "WAKE: ariadne\n\nEffort: low\ndo the thing" },
+      coalescedMessages: [{ senderId: "U1", messageTs: "100.9", text: "WAKE: ariadne\n\nEffort: max\nalso this" }],
+      subscription: subscription({ wakePolicy: "live_only" }),
+    }),
+  ]);
+  const store = new EdgeStore(":memory:");
+  const adapter = new StubAdapter({
+    liveResult: { receipt: "live", outcome: "done", processed: true },
+  });
+  const live = new LiveIngressRegistry();
+  live.register({
+    actor: "ariadne",
+    provider: "codex",
+    socketPath: "/tmp/x.sock",
+    sessionId: "thread-1",
+    surfaceVersion: "test",
+    runtimeAttestation: { ok: false, absence: "attestation_unreported" },
+  }, 60_000);
+  const edge = new EdgeService(asBrokerClient(broker), store, live, [adapter]);
+  const logged: unknown[][] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => {
+    logged.push(args);
+  };
+  try {
+    assert.equal(await edge.processOne(), true);
+  } finally {
+    console.error = original;
+  }
+  assert.deepEqual(adapter.liveDeliveries, [8]);
+  assert.equal(adapter.efforts.length, 0);
+  const unused = logged.filter((args) => args[0] === "hive edge effort overlay unused");
+  assert.equal(unused.length, 1);
+  assert.deepEqual(unused[0], ["hive edge effort overlay unused", 8, "low,max", "conflict"]);
+  store.close();
+});
+
 test("a deterministic pre-dispatch failure finishes undeliverable, never released", async () => {
   const broker = new FakeBroker([delivery(3)]);
   const store = new EdgeStore(":memory:");

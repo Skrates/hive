@@ -373,7 +373,32 @@ export class EdgeService {
     // Overlay is computed for every route, including live. A live session's
     // effort was fixed at its own spawn, so the flag cannot apply there —
     // but a requested overlay that we cannot honour must not vanish silently.
-    const effort = parseDeliveryEffort(delivery);
+    // The honourable tier is the one named member; every other non-none
+    // parse result is a request we refuse and publish.
+    const parsed = parseDeliveryEffort(delivery);
+    const effort = parsed.kind === "tier" ? parsed.tier : null;
+    switch (parsed.kind) {
+      case "none":
+        break;
+      case "tier":
+        if (live) {
+          console.error(
+            "hive edge effort overlay unused",
+            delivery.id,
+            parsed.tier,
+            "live_session_fixed_at_spawn",
+          );
+        }
+        break;
+      case "conflict":
+        console.error(
+          "hive edge effort overlay unused",
+          delivery.id,
+          parsed.tiers.join(","),
+          "conflict",
+        );
+        break;
+    }
     if (live) {
       await onProviderStart();
       // Codex live delivery waits for the exact app-server turn and lets the
@@ -381,14 +406,6 @@ export class EdgeService {
       // requires the agent-side reply because writing an inbox file is not a
       // provider completion signal.
       const outcomeReporter = subscription.provider === "codex" ? "edge" : "agent";
-      if (effort !== null) {
-        console.error(
-          "hive edge effort overlay unused",
-          delivery.id,
-          effort,
-          "live_session_fixed_at_spawn",
-        );
-      }
       return adapter.deliverLive(live, delivery, frameWakeInstruction(delivery, replay, outcomeReporter));
     }
     if (subscription.wakePolicy === "live_only") throw new PreDispatchError("live_ingress_unavailable");
