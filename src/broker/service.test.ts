@@ -10,7 +10,7 @@ import {
   resetObservabilityForTests,
 } from "../observability.js";
 import { BrokerService, type SlackTransport } from "./service.js";
-import { BrokerStore } from "./store.js";
+import { BrokerStore, OUTBOX_MAX_ATTEMPTS } from "./store.js";
 
 const unusedSlack: SlackTransport = {
   async replay(): Promise<ReplaySnapshot> { throw new Error("not used"); },
@@ -304,12 +304,58 @@ test("drainOutboxOnce sends under the persisted delivery trace, including a fail
   assert.equal(send.attributes.delivery_id, deliveryId);
   assert.equal(send.attributes.channel_id, "C1");
   assert.equal(send.attributes.thread_ts, "100.1");
+  assert.equal(send.attributes.outcome, "attempt_failed");
   const row = store.db.prepare(
     "SELECT sent_at, abandoned_at, attempts FROM outbox WHERE outbox_id=?",
   ).get(queued.outboxId) as { sent_at: string | null; abandoned_at: string | null; attempts: number };
   assert.equal(row.sent_at, null);
   assert.equal(row.abandoned_at, null);
   assert.equal(row.attempts, 1);
+
+  store.db.prepare("UPDATE outbox SET attempts=?, next_attempt_at=NULL WHERE outbox_id=?")
+    .run(OUTBOX_MAX_ATTEMPTS - 1, queued.outboxId);
+  exporter.reset();
+  assert.equal(await new BrokerService(store, failingSlack).drainOutbox(), 0);
+  const abandoned = exporter.getFinishedSpans().find((span) => span.name === "hive.broker.outbox.send");
+  assert.ok(abandoned, "exhausting drain must emit hive.broker.outbox.send");
+  assert.equal(abandoned.attributes.outcome, "abandoned");
+  const exhausted = store.db.prepare(
+    "SELECT sent_at, abandoned_at, attempts FROM outbox WHERE outbox_id=?",
+  ).get(queued.outboxId) as { sent_at: string | null; abandoned_at: string | null; attempts: number };
+  assert.equal(exhausted.sent_at, null);
+  assert.ok(exhausted.abandoned_at);
+  assert.equal(exhausted.attempts, OUTBOX_MAX_ATTEMPTS);
+});
+
+test("drainOutboxOnce records sent on a successful outbox span", async (t) => {
+  resetObservabilityForTests();
+  t.after(() => resetObservabilityForTests());
+
+  const store = new BrokerStore(":memory:");
+  t.after(() => store.close());
+  const deliveryId = seedDispatchedDelivery(store);
+  const parent = `00-${"ab".repeat(16)}-${"cd".repeat(8)}-01`;
+  rememberDeliveryTraceparent(deliveryId, parent);
+
+  const exporter = new InMemorySpanExporter();
+  logfire.configure({
+    serviceName: "hive-test-outbox-sent",
+    sendToLogfire: false,
+    console: false,
+    additionalSpanProcessors: [new SimpleSpanProcessor(exporter)],
+  });
+  installObservabilitySdkForTests(logfire);
+
+  new BrokerService(store, unusedSlack).recordOutcome(deliveryId, "done: shipped the fix");
+  const sendingSlack: SlackTransport = {
+    async replay(): Promise<ReplaySnapshot> { throw new Error("not used"); },
+    async reply(): Promise<string> { return "100.9"; },
+    async react(): Promise<void> {},
+  };
+  assert.equal(await new BrokerService(store, sendingSlack).drainOutbox(), 1);
+  const send = exporter.getFinishedSpans().find((span) => span.name === "hive.broker.outbox.send");
+  assert.ok(send, "drain must emit hive.broker.outbox.send");
+  assert.equal(send.attributes.outcome, "sent");
 });
 
 test("accept and release emit broker transition spans", (t) => {
@@ -364,6 +410,7 @@ test("accept and release emit broker transition spans", (t) => {
 
   const broker = new BrokerService(store, unusedSlack);
   broker.accept(claimed.id, "mac", claimed.leaseGeneration!);
+  broker.renew(claimed.id, "mac", claimed.leaseGeneration!);
   broker.release(claimed.id, "mac", claimed.leaseGeneration!, {
     code: "provider_dispatch_unknown",
     detail: "test uncertainty",
@@ -372,4 +419,5 @@ test("accept and release emit broker transition spans", (t) => {
   const names = exporter.getFinishedSpans().map((span) => span.name);
   assert.ok(names.includes("hive.broker.accept"), `expected accept span, got ${names.join(",")}`);
   assert.ok(names.includes("hive.broker.release"), `expected release span, got ${names.join(",")}`);
+  assert.ok(!names.includes("hive.broker.renew"), `renew must not emit a span, got ${names.join(",")}`);
 });

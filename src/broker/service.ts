@@ -1,5 +1,5 @@
 import type { Delivery, DeliveryResultInput, Reason, ReplaySnapshot, SlackEventInput, SubscriptionInput } from "../domain.js";
-import { forgetDeliveryTraceparent, peekDeliveryTrace, runInTraceContext, withSpan } from "../observability.js";
+import { forgetDeliveryTraceparent, peekDeliveryTrace, runInTraceContext, setSpanAttributes, withSpan } from "../observability.js";
 import { BrokerStore } from "./store.js";
 
 export interface SlackTransport {
@@ -89,8 +89,10 @@ export class BrokerService {
   }
 
   renew(deliveryId: number, edgeId: string, generation: number): Delivery {
-    return withSpan("hive.broker.renew", { delivery_id: deliveryId }, () =>
-      this.store.renewDeliveryLease(deliveryId, edgeId, generation));
+    // Lease heartbeat is O(duration), not O(delivery). A span here would
+    // dominate every long headless turn (~3/leaseTtlMs); the next transition
+    // already surfaces a sticky renew failure.
+    return this.store.renewDeliveryLease(deliveryId, edgeId, generation);
   }
 
   reserveSpawn(deliveryId: number, edgeId: string, generation: number): boolean {
@@ -194,9 +196,10 @@ export class BrokerService {
               }
             }
             this.store.markOutboxSent(entry.outboxId);
+            setSpanAttributes({ outcome: "sent" });
             return true;
           } catch {
-            this.store.markOutboxAttempt(entry.outboxId);
+            setSpanAttributes({ outcome: this.store.markOutboxAttempt(entry.outboxId) });
             return false;
           }
         }),

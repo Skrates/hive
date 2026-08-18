@@ -44,10 +44,13 @@ on the machines; never write it to a file in this repo or on a seat.
 | `LOGFIRE_ENVIRONMENT` | Optional deployment environment label. |
 
 Spans follow one delivery across the broker→edge claim response (`traceparent` and `tracestate`)
-and through the durable outbox send. They carry delivery id, dedupe key, channel id, thread ts,
-actor, event type, dispatch mode, and outcome — never message bodies, Slack tokens, or credentials.
-Allowlisted string fields are length-capped before export. Export is batched; a Logfire outage
-cannot delay or drop a delivery.
+and through the durable outbox send. The delivery row stores that W3C context, so a broker
+restart continues the same trace at claim rather than opening a new root. They carry delivery
+id, dedupe key, channel id, thread ts, actor, event type, dispatch mode, and outcome — never
+message bodies, Slack tokens, or credentials. Allowlisted string fields are length-capped
+before export. Lease renewal is not spanned: it is periodic for the provider turn (~20s at
+the production 60s TTL), and a failed heartbeat already surfaces on the next transition.
+Export is batched; a Logfire outage cannot delay or drop a delivery.
 
 ## Broker
 

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import Database from "better-sqlite3";
+import * as logfire from "@pydantic/logfire-node";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,7 +13,13 @@ import {
   StaleLeaseError,
 } from "./store.js";
 import { frameWakeInstruction, retryBackoffMs, SubscriptionInputSchema, type SlackEventInput, type SubscriptionInput } from "../domain.js";
-import { peekDeliveryTraceparent, rememberDeliveryTraceparent, resetObservabilityForTests } from "../observability.js";
+import {
+  installObservabilitySdkForTests,
+  peekDeliveryTraceparent,
+  rememberDeliveryTraceparent,
+  resetObservabilityForTests,
+  withSpan,
+} from "../observability.js";
 import type { Clock } from "../time.js";
 
 class FakeClock implements Clock {
@@ -390,6 +397,68 @@ test("a resume subscription with no session forgets its stored traceparent", () 
   assert.equal(store.getDelivery(1).reasons[0]?.code, "resume_target_missing");
   assert.equal(peekDeliveryTraceparent(1), undefined);
   store.close();
+});
+
+test("ingest persists W3C context and getDelivery restores it after the in-memory map is cleared", (t) => {
+  resetObservabilityForTests();
+  t.after(() => resetObservabilityForTests());
+  logfire.configure({
+    serviceName: "hive-test-delivery-trace",
+    sendToLogfire: false,
+    console: false,
+  });
+  installObservabilitySdkForTests(logfire);
+  const { store } = fixture();
+  withSpan("hive.test.ingest", {}, () => {
+    store.ingestEvent(event());
+  });
+  const persisted = store.db.prepare(
+    "SELECT traceparent, tracestate FROM deliveries WHERE delivery_id=1",
+  ).get() as { traceparent: string | null; tracestate: string | null };
+  assert.ok(persisted.traceparent, "ingest under a span must persist a traceparent");
+
+  resetObservabilityForTests();
+  assert.equal(peekDeliveryTraceparent(1), undefined);
+  store.getDelivery(1);
+  assert.equal(peekDeliveryTraceparent(1), persisted.traceparent);
+  store.close();
+});
+
+test("a terminal delivery does not re-hydrate a forgotten traceparent from the row", (t) => {
+  resetObservabilityForTests();
+  t.after(() => resetObservabilityForTests());
+  logfire.configure({
+    serviceName: "hive-test-delivery-trace-terminal",
+    sendToLogfire: false,
+    console: false,
+  });
+  installObservabilitySdkForTests(logfire);
+  const { store } = fixture();
+  withSpan("hive.test.ingest", {}, () => {
+    store.ingestEvent(event());
+  });
+  store.db.prepare("UPDATE deliveries SET status='processed' WHERE delivery_id=1").run();
+  resetObservabilityForTests();
+  store.getDelivery(1);
+  assert.equal(peekDeliveryTraceparent(1), undefined);
+  store.close();
+});
+
+test("existing databases gain delivery W3C columns in place", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "hive-delivery-trace-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const path = join(directory, "broker.sqlite");
+  const first = new BrokerStore(path);
+  first.close();
+  const raw = new Database(path);
+  raw.exec("ALTER TABLE deliveries DROP COLUMN traceparent");
+  raw.exec("ALTER TABLE deliveries DROP COLUMN tracestate");
+  raw.close();
+  const second = new BrokerStore(path);
+  const columns = (second.db.pragma("table_info(deliveries)") as { name: string }[]).map((c) => c.name);
+  assert.ok(columns.includes("traceparent"));
+  assert.ok(columns.includes("tracestate"));
+  second.close();
 });
 
 test("a retry requeue keeps the stored delivery traceparent", () => {
