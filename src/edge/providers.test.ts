@@ -241,6 +241,8 @@ test("Codex live delivery travels over the surface's owner-only UDS socket", asy
     socketPath,
     sessionId: "thread-1",
     surfaceVersion: "test",
+    // Required: a registration names its attestation or names its absence.
+    runtimeAttestation: { ok: false, absence: "attestation_unreported" },
     expiresAt: Date.now() + 60_000,
   };
   const result = await codex.deliverLive(ingress, delivery(11), "framed body");
@@ -287,6 +289,8 @@ test("Codex live delivery forwards the stamped dispatch deadline to the live ser
     socketPath,
     sessionId: "thread-1",
     surfaceVersion: "test",
+    // These tests exercise cancellation and deadlines, not attestation binding.
+    runtimeAttestation: { ok: false, absence: "attestation_unreported" },
     expiresAt: Date.now() + 60_000,
   };
   await codex.deliverLive(ingress, delivery(11), "framed body", controller.signal);
@@ -344,6 +348,8 @@ function liveIngress(socketPath: string): LiveIngress {
     socketPath,
     sessionId: "thread-1",
     surfaceVersion: "test",
+    // These tests exercise cancellation and deadlines, not attestation binding.
+    runtimeAttestation: { ok: false, absence: "attestation_unreported" },
     expiresAt: Date.now() + 60_000,
   };
 }
@@ -687,6 +693,8 @@ test("an oversized live receipt is rejected", async (t) => {
     socketPath,
     sessionId: "thread-1",
     surfaceVersion: "test",
+    // Required: a registration names its attestation or names its absence.
+    runtimeAttestation: { ok: false, absence: "attestation_unreported" },
     expiresAt: Date.now() + 60_000,
   };
   await assert.rejects(
@@ -714,6 +722,8 @@ test("a missing live outcome is rejected instead of parsing the diagnostic recei
     socketPath,
     sessionId: "thread-1",
     surfaceVersion: "test",
+    // Required: a registration names its attestation or names its absence.
+    runtimeAttestation: { ok: false, absence: "attestation_unreported" },
     expiresAt: Date.now() + 60_000,
   };
   await assert.rejects(
@@ -741,6 +751,8 @@ test("a structured Desktop account rejection remains a deterministic pre-dispatc
     socketPath,
     sessionId: "thread-1",
     surfaceVersion: "test",
+    // Required: a registration names its attestation or names its absence.
+    runtimeAttestation: { ok: false, absence: "attestation_unreported" },
     expiresAt: Date.now() + 60_000,
   };
   await assert.rejects(

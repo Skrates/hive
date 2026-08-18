@@ -1,6 +1,6 @@
 import { frameWakeInstruction, type Delivery, type Provider, type Reason, type ReplaySnapshot } from "../domain.js";
 import { BROKER_REQUEST_TIMEOUT_CODE, BrokerClient } from "./broker-client.js";
-import { LiveIngressRegistry } from "./live-registry.js";
+import { LiveIngressRegistry, type LiveIngress } from "./live-registry.js";
 import {
   CancellationUnconfirmedError,
   CHILD_KILL_GRACE_MS,
@@ -10,7 +10,8 @@ import {
   type ProviderAdapter,
   type ProviderDispatch,
 } from "./providers.js";
-import { EdgeStore } from "./store.js";
+import { readWakeAttestation, type AttestationRead } from "./attestation.js";
+import { EdgeStore, bindingFor } from "./store.js";
 
 export interface EdgeTimers {
   set(callback: () => void, delayMs: number): unknown;
@@ -35,8 +36,12 @@ const systemEdgeTimers: EdgeTimers = {
  * edge declares its busy actors on every claim and the broker skips their
  * deliveries. This cap therefore bounds how many *distinct* actors run turns
  * simultaneously on one machine.
+ *
+ * Exported because `launchers.test.ts` asserts every repo-owned launcher sizes
+ * `UV_THREADPOOL_SIZE` above this cap; that gate reads the constant rather than
+ * restating the number, so raising the cap here raises the bar there too.
  */
-const MAX_CONCURRENT_DISPATCHES = 4;
+export const MAX_CONCURRENT_DISPATCHES = 4;
 
 /**
  * Wall-clock ceiling on one provider dispatch.
@@ -261,13 +266,50 @@ export class EdgeService {
   private async dispatchClaimed(delivery: Delivery, generation: number): Promise<void> {
     let current = delivery;
     let providerStarted = false;
+    // ONE subscription governs the whole turn. Every broker transition rebuilds
+    // its delivery by joining the live `subscriptions` row, so an ordinary
+    // `hive subscribe` re-run landing mid-turn would otherwise let routing and
+    // binding straddle two snapshots: the adapter, workspace and account
+    // profile taken from the new row while the live route and the recorded
+    // attestation came from the claimed one — a Codex registration handed to
+    // the Claude adapter, or a receipt filed under a profile the provider never
+    // loaded. The claim selected this edge, this route and this binding from
+    // `delivery.subscription`; that snapshot is what this turn runs under, and
+    // the next delivery gets the new one.
+    const asClaimed = (value: Delivery): Delivery => ({ ...value, subscription: delivery.subscription });
     try {
-      const existing = this.store.receive(delivery, generation);
+      // Bind the wake to the seat attestation BEFORE dispatch: a delivery's
+      // outcome must resolve to the artifacts installed when the turn started
+      // (KRA-1077). Reading the record can never fail the wake — an absent or
+      // unreadable one is stored as a named absence, never as silence.
+      // Capture the live route once so attestation and dispatch name the same
+      // surface. A later expiry, deregister, or replacement must not re-select.
+      const live = this.live.get(delivery.actor, delivery.subscription.provider);
+      // This read is now awaited, so `receive` — and with it the redelivery
+      // dedupe below — no longer runs in the same synchronous turn as the
+      // claim. That window is safe by three existing guards, and the
+      // alternative (write a row with neither an id nor a named absence, then
+      // rebind) would mint exactly the silence this binding exists to
+      // eliminate: (1) `claimNext` adds the actor to `busyActors` synchronously
+      // before calling this method and passes that set to `broker.claim`, so
+      // this edge cannot re-claim the same actor while the read is in flight;
+      // (2) `receive`'s upsert is guarded in SQL on (generation, attempts) and
+      // is atomic, so a competing writer cannot regress the row; (3) the
+      // dedupe read below still precedes every broker transition and the
+      // provider start, which is the ordering it exists to protect; and (4) —
+      // the one that carries the unbounded case, since every other await here
+      // is a bounded broker round-trip — if the read outlives the lease, the
+      // turn terminalizes safely rather than double-dispatching: `transition`
+      // sends the generation, so `accept` is fenced, and `recordDeliveryFailure`
+      // wraps the broker disposition and the local `setStatus` separately, so a
+      // stale-generation edge logs and releases.
+      const binding = bindingFor(await attestationForDelivery(live, delivery), delivery.actor);
+      const existing = this.store.receive(delivery, generation, binding);
       if (["dispatched", "processed"].includes(existing.status)) return;
 
-      current = await this.broker.accept(delivery);
+      current = asClaimed(await this.broker.accept(delivery));
       const replay = await this.broker.replay(current);
-      current = await this.broker.beginDispatch(current);
+      current = asClaimed(await this.broker.beginDispatch(current));
       this.store.setStatus(current.id, generation, "dispatching");
 
       // The deadline sits INSIDE the heartbeat, not around it: a dispatch that
@@ -277,10 +319,29 @@ export class EdgeService {
         current,
         () => this.withDispatchDeadline(
           current,
-          (deadline) => this.dispatch(current, replay, () => { providerStarted = true; }, deadline),
+          (deadline) => this.dispatch(current, replay, live, async () => {
+            providerStarted = true;
+            // The last uncovered cell of {live, headless} × {claim, provider-start}:
+            // a headless child reads its profile when it spawns, which is several
+            // awaits after the claim-time capture. Re-read at the moment the
+            // provider actually starts and re-point the row, so the recorded
+            // attestation names the artifacts this turn runs under.
+            if (!live) {
+              this.store.rebind(
+                current.id,
+                generation,
+                bindingFor(
+                  // `current.subscription` is the claimed snapshot (asClaimed), so
+                  // this re-read and the spawn/resume below name one profile.
+                  await readWakeAttestation(current.subscription.accountProfile),
+                  current.actor,
+                ),
+              );
+            }
+          }, deadline),
         ),
       );
-      current = await this.broker.markDispatched(current);
+      current = asClaimed(await this.broker.markDispatched(current));
       this.store.setStatus(current.id, generation, "dispatched", dispatch.receipt);
       if (dispatch.processed) {
         // A completed provider turn (headless, or a completion-tracked Codex
@@ -548,7 +609,11 @@ export class EdgeService {
   private async dispatch(
     delivery: Delivery,
     replay: ReplaySnapshot | null,
-    onProviderStart: () => void,
+    live: LiveIngress | null,
+    // Awaited: the headless branch re-reads the profile attestation here, and
+    // that read is now off the event loop. The rebind must land before the
+    // provider starts, so the start waits for it.
+    onProviderStart: () => Promise<void>,
     deadline?: AbortSignal,
   ): Promise<ProviderDispatch> {
     const subscription = delivery.subscription;
@@ -556,9 +621,8 @@ export class EdgeService {
     if (!adapter) throw new PreDispatchError("provider_adapter_missing");
     adapter.preflight?.(subscription);
 
-    const live = this.live.get(delivery.actor, subscription.provider);
     if (live) {
-      onProviderStart();
+      await onProviderStart();
       // Codex live delivery waits for the exact app-server turn and lets the
       // edge relay its final assistant text. Claude live inbox delivery still
       // requires the agent-side reply because writing an inbox file is not a
@@ -572,12 +636,12 @@ export class EdgeService {
     if (!workspace) throw new PreDispatchError("workspace_not_mapped");
     const framed = frameWakeInstruction(delivery, replay, "edge");
     if (subscription.sessionId && this.broker.edgeId === subscription.homeEdge) {
-      onProviderStart();
+      await onProviderStart();
       return adapter.resume(subscription, workspace.cwd, framed, deadline);
     }
     if (subscription.wakePolicy === "resume") throw new PreDispatchError("resume_target_missing");
     if (!await this.broker.reserveSpawn(delivery)) throw new PreDispatchError("spawn_rate_limited");
-    onProviderStart();
+    await onProviderStart();
     return adapter.spawn(subscription, workspace.cwd, framed, deadline);
   }
 }
@@ -674,4 +738,24 @@ function safeEdgeErrorCode(error: unknown): string {
     "account_profile_mismatch",
     "stale lease",
   ].find((code) => message.includes(code)) ?? "edge_iteration_failed";
+}
+
+/**
+ * A live surface that announced a runtime home wins over a fresh read of the
+ * pinned `accountProfile`. Foreground Codex split-state (`HIVE_CODEX_DESKTOP_HOME`
+ * ≠ pinned profile) injects into Desktop; only that home's attestation names
+ * the artifacts the turn actually used.
+ */
+async function attestationForDelivery(live: LiveIngress | null, delivery: Delivery): Promise<AttestationRead> {
+  if (live) {
+    // A live surface that omitted its runtime attestation (pre-upgrade
+    // process, or /live/register without the field) carries the absence the
+    // ingress minted for it — the field is required on a registration, so
+    // there is nothing to substitute here. Substituting a fresh profile read
+    // would bind the wake to a home the turn may never have used — foreground
+    // Desktop split-state (HIVE_CODEX_DESKTOP_HOME ≠ pinned profile) is the
+    // counterexample.
+    return live.runtimeAttestation;
+  }
+  return readWakeAttestation(delivery.subscription.accountProfile);
 }

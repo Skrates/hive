@@ -149,6 +149,95 @@ when the corresponding outbox row drains: :eyes: once the delivery is dispatched
 when an outcome closes it, :x: on any terminal failure. Reactions are annotation, not contract —
 the thread posts above remain the durable record, and a failed stamp is logged and dropped.
 
+## Wake attestation binding (KRA-1077)
+
+Every delivery the edge claims is bound, before dispatch, to the attestation of the home the
+turn will actually execute under. Headless spawn/resume reads `.weave-attestation.json` from the
+subscription's `accountProfile`. A live surface that has registered a runtime attestation wins
+instead — a foreground Codex Desktop attachment (`HIVE_CODEX_DESKTOP_HOME` ≠ pinned profile)
+injects into Desktop and must be bound to Desktop's record, not the pinned profile's. The
+`attestation_id` and doctrine commit sit in the same `local_deliveries` row as the provider
+receipt. That row is the trace: delivery id → attestation id → the exact instruction, settings,
+and skill corpus hashes the seat was installed with. `weave doctor` resolves the other end.
+
+A live registration freezes the runtime attestation captured when that `sessionId` first
+registered, and holds it while the surface keeps reporting the same record. A new session id,
+or a lapsed heartbeat, takes a fresh snapshot.
+
+A registration that carries no attestation field at all is recorded as `attestation_unreported`
+rather than as an omission, so "this session never told us what it loaded" stays distinguishable
+from "no session is registered". That matters in one direction only: if the *first* registration
+reported nothing, a later heartbeat that does carry an id cannot be adopted as the snapshot the
+session started under — the pair is `attestation_ambiguous`, because a session spanning a hook
+rollout may have loaded different artifacts than the ones now on disk. In the other direction a
+heartbeat carrying nothing is simply non-evidence and leaves a known snapshot untouched.
+
+When the reports for one live `sessionId` *disagree*, the edge names the ambiguity instead of
+picking a side. A surface reports what its home holds at report time — the Claude hook is a new
+process at every boundary — so a reinstall under a still-running session and a crash-then-`--resume`
+of the same session id under new artifacts send the identical sequence, and `sessionId` equality
+is not proof the loaded runtime survived. The delivery records `attestation_ambiguous` and
+dispatches normally; a wrong id would be worse than a named absence. Two absences are not a
+disagreement — neither offers an id, so the session's first, more specific absence stands.
+
+One subscription snapshot governs a whole turn: the one the delivery was claimed under. Broker
+transitions rebuild their delivery by joining the live `subscriptions` row, so an ordinary
+`hive subscribe` re-run landing mid-turn would otherwise route the dispatch through the new
+snapshot while the row recorded the binding taken from the claimed one. The new snapshot governs
+the next delivery.
+
+The edge records; it does not verify and it does not refuse.
+
+- **Verification lives in one implementation.** `weave doctor` rehashes the record and rejects one
+  whose id does not match its own bytes. Re-deriving the content address here would mean a second
+  canonical-JSON encoder in another language, and two encoders that disagreed by one escape
+  sequence would reject every honest wake. What the edge stores is what the profile *claims*, bound
+  immutably to the delivery; whether the claim is true is the doctor's verdict on the same id.
+- **An absent record never fails a wake.** Attestation is evidence, not authority — KRA-1074's D1
+  ruled the surface first and enforcement after. A profile with no attestation, an unreadable one,
+  an unknown schema, one installed for a different actor, and a live session the edge cannot
+  attribute all dispatch normally and record a named `attestation_absence` beside the delivery. A misbound seat now leaves evidence at wake
+  time instead of needing git forensics afterwards.
+- **Nor does it stall — under three separate bounds.** "Does not refuse" is worth nothing if the
+  read can hang instead: a profile on a network mount is a supported shape, and `O_NONBLOCK`
+  bounds FIFOs and devices but has no effect on a regular file whose mount has stalled. So the
+  read carries three guards for three failure modes: `O_NONBLOCK` for FIFOs and devices; the
+  libuv threadpool, so a stalled mount cannot park the event loop; and a wall-clock timeout
+  (`ATTESTATION_READ_TIMEOUT_MS`, 2s), because the threadpool bounds the *loop* and not the
+  *delivery*. Without the third, a stalled read holds one of the four dispatch slots
+  indefinitely, and four of them stop the claim loop for every actor on the edge — the outcome
+  the threadpool move was meant to prevent, reached by a different route. The blocked libuv
+  thread itself cannot be reclaimed by a timeout, so `UV_THREADPOOL_SIZE` is set above the
+  dispatch cap in every repo-owned launcher, rather than left at libuv's default of 4, which is
+  exactly the dispatch cap and a default nobody chose. At the time of writing that is
+  `deploy/systemd/hive-edge.service` (cx53, linux laptop), `deploy/launchd/run-edge.zsh`
+  (macbook), and `deploy/machines/edge-runpod/{Dockerfile,start-edge.sh}` (RunPod) — read as
+  orientation, not as the authority; the authority is `src/edge/launchers.test.ts`, and the list
+  here may lag it. The RunPod entry is the one that matters most, not least: its seat HOME is on
+  `/workspace`, a network-backed volume, so it is the deployment the whole three-guard stack was
+  written for.
+
+  **Adding a launcher without this line reintroduces the exhaustion on that machine alone, so the
+  enumeration is derived, not written down.** `src/edge/launchers.test.ts` walks `deploy/`, finds
+  every file whose executable lines launch the edge, and fails if one of them does not set
+  `UV_THREADPOOL_SIZE` above `MAX_CONCURRENT_DISPATCHES`. A fourth launcher joins that set by
+  existing — no doc edit, no allowlist entry. Do **not** verify this with `git grep
+  UV_THREADPOOL_SIZE`: that grep enumerates the launchers which already *have* the line, so the
+  one launcher missing it contributes no hit and the output looks exactly as correct as a clean
+  run. `bun run check` is the check; the gate reads the constant from `src/edge/service.ts`
+  rather than restating `4`, so raising the dispatch cap raises the required pool size with it.
+
+  The residual, stated rather than claimed away: **a mount that is slow but working records a
+  false `attestation_unreadable`.** That is the deliberate trade — a delivery bounded at two
+  seconds with an honest "the edge could not read this in time" beats an exact id that arrives
+  after the edge has stopped claiming. It is the same absence a FIFO already yields, so bounding
+  the read mints no new state.
+- **A redelivery rebinds the current columns.** A seat reinstalled between attempts ran the
+  second attempt under different artifacts; the live columns must name that new claim. The
+  replaced attempt's binding and receipt are appended to `attestation_history` so an uncertain
+  first try — which at-least-once delivery may already have produced effects under — stays
+  traceable beside the later one.
+
 ## Scheduled wakes
 
 A Slack message scheduled with the native **Send later** posts as the scheduling user at the

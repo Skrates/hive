@@ -188,11 +188,27 @@ test("stop() force-closes an in-flight long-poll instead of hanging on it", { ti
   // Give the server a beat to accept the request and enter the long-poll wait.
   await new Promise((resolve) => setTimeout(resolve, 150));
 
+  // The drain window is asserted by ordering, not by duration: the in-flight
+  // long-poll must still be open at a probe taken near the end of the window,
+  // and aborted once stop() returns. Reading a wall-clock lower bound instead
+  // would flake — a setTimeout(50) can be observed as 49ms of Date.now() —
+  // while an early force-close (or a drain cap well below drainMs) aborts the
+  // poll before this probe fires. The probe sits only a scheduling margin
+  // before drainMs so a substantially shorter window fails the race.
+  const drainMs = 400;
+  const schedulingMarginMs = 50;
+  const probeMs = drainMs - schedulingMarginMs;
   const started = Date.now();
-  await server.stop(50); // short drain window, then force-close the in-flight request
+  const stopping = server.stop(drainMs);
+  const midWindow = await Promise.race([
+    longPollSettled,
+    new Promise<"open">((resolve) => { setTimeout(() => resolve("open"), probeMs); }),
+  ]);
+  assert.equal(midWindow, "open", `the long-poll was still draining ${probeMs}ms into the ${drainMs}ms window, not force-closed on entry`);
+
+  await stopping;
   const elapsedMs = Date.now() - started;
 
-  assert.ok(elapsedMs >= 50, `waited out the ${50}ms drain window before forcing (took ${elapsedMs}ms)`);
   assert.ok(elapsedMs < 2_000, `stop() still completed promptly, in ${elapsedMs}ms`);
   assert.equal(await longPollSettled, "aborted", "the in-flight long-poll was force-closed, not left to finish");
 });
