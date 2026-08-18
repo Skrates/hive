@@ -21,7 +21,11 @@
 export const WAKE_EFFORT_TIERS = ["low", "medium", "high", "xhigh", "max", "ultra"] as const;
 export type WakeEffort = (typeof WAKE_EFFORT_TIERS)[number];
 
-const EFFORT_LINE = /^Effort: (low|medium|high|xhigh|max|ultra)$/;
+const EFFORT_LINE = new RegExp(`^Effort: (${WAKE_EFFORT_TIERS.join("|")})$`);
+
+function isWakeEffort(value: string): value is WakeEffort {
+  return (WAKE_EFFORT_TIERS as readonly string[]).includes(value);
+}
 
 /**
  * The single effort tier a wake requests, or null.
@@ -35,7 +39,8 @@ export function parseWakeEffort(text: string): WakeEffort | null {
   const found = new Set<WakeEffort>();
   for (const line of text.split("\n")) {
     const match = EFFORT_LINE.exec(line.trimEnd());
-    if (match) found.add(match[1] as WakeEffort);
+    const tier = match?.[1];
+    if (tier !== undefined && isWakeEffort(tier)) found.add(tier);
   }
   if (found.size !== 1) return null;
   return [...found][0] ?? null;

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { clampEffortToXhigh, parseWakeEffort } from "./effort.js";
+import { clampEffortToXhigh, parseWakeEffort, WAKE_EFFORT_TIERS } from "./effort.js";
 import { claudeEffortArgs, codexEffortArgs, grokEffortArgs } from "./providers.js";
 
 test("a bare Effort line yields its tier; absence yields null", () => {
@@ -10,7 +10,7 @@ test("a bare Effort line yields its tier; absence yields null", () => {
 });
 
 test("every wake-grammar tier parses", () => {
-  for (const tier of ["low", "medium", "high", "xhigh", "max", "ultra"] as const) {
+  for (const tier of WAKE_EFFORT_TIERS) {
     assert.equal(parseWakeEffort(`Effort: ${tier}`), tier);
   }
 });
