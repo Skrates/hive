@@ -14,7 +14,7 @@ on:
   issue_comment:
     types: [created]
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch:
 
 # One run at a time, never cancelled: the helper's idempotency is
