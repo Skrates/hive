@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { ATTESTATION_FILENAME } from "./attestation.js";
 import type { Delivery, DeliveryResultInput, Reason, ReplaySnapshot, Subscription } from "../domain.js";
+import type { WakeEffort } from "./effort.js";
 import type { BrokerClient } from "./broker-client.js";
 import { LiveIngressRegistry, type LiveIngress } from "./live-registry.js";
 import {
@@ -170,6 +171,7 @@ class StubAdapter implements ProviderAdapter {
   readonly provider = "codex" as const;
   readonly spawns: string[] = [];
   readonly resumes: string[] = [];
+  readonly efforts: (WakeEffort | null)[] = [];
   readonly liveDeliveries: number[] = [];
   readonly liveFrames: string[] = [];
   readonly liveSockets: string[] = [];
@@ -195,18 +197,55 @@ class StubAdapter implements ProviderAdapter {
     return this.behavior.liveResult ?? { receipt: `live:${value.id}`, processed: false };
   }
 
-  async resume(_subscription: Subscription, _cwd: string, framed: string): Promise<ProviderDispatch> {
+  async resume(_subscription: Subscription, _cwd: string, framed: string, effort: WakeEffort | null): Promise<ProviderDispatch> {
     if (this.behavior.dispatchError) throw this.behavior.dispatchError;
     this.resumes.push(framed);
+    this.efforts.push(effort);
     return this.behavior.headlessResult ?? { receipt: JSON.stringify({ type: "result", result: "resumed" }), outcome: "resumed", processed: true };
   }
 
-  async spawn(_subscription: Subscription, _cwd: string, framed: string): Promise<ProviderDispatch> {
+  async spawn(_subscription: Subscription, _cwd: string, framed: string, effort: WakeEffort | null): Promise<ProviderDispatch> {
     if (this.behavior.dispatchError) throw this.behavior.dispatchError;
     this.spawns.push(framed);
+    this.efforts.push(effort);
     return this.behavior.headlessResult ?? { receipt: JSON.stringify({ type: "result", result: "spawned" }), outcome: "spawned", processed: true };
   }
 }
+
+test("a wake carrying an Effort line reaches the adapter with that tier; a plain wake reaches it with null", async () => {
+  const broker = new FakeBroker([
+    delivery(1, { event: { ...delivery(1).event, text: "WAKE: ariadne\n\nEffort: xhigh\ndo the thing" } }),
+    delivery(2),
+  ]);
+  const store = new EdgeStore(":memory:");
+  const adapter = new StubAdapter();
+  const edge = new EdgeService(asBrokerClient(broker), store, new LiveIngressRegistry(), [adapter]);
+
+  assert.equal(await edge.processOne(), true);
+  assert.equal(await edge.processOne(), true);
+  // The overlay is per-delivery: it binds the one invocation it rode in on and
+  // leaves the next wake at the profile default.
+  assert.deepEqual(adapter.efforts, ["xhigh", null]);
+});
+
+test("an Effort line in a coalesced follow-up binds the invocation; a conflict fails closed", async () => {
+  const broker = new FakeBroker([
+    delivery(1, {
+      coalescedMessages: [{ senderId: "U1", messageTs: "100.9", text: "WAKE: ariadne\n\nEffort: max\nalso this" }],
+    }),
+    delivery(2, {
+      event: { ...delivery(2).event, text: "WAKE: ariadne\n\nEffort: low\ndo the thing" },
+      coalescedMessages: [{ senderId: "U1", messageTs: "100.9", text: "WAKE: ariadne\n\nEffort: max\nalso this" }],
+    }),
+  ]);
+  const store = new EdgeStore(":memory:");
+  const adapter = new StubAdapter();
+  const edge = new EdgeService(asBrokerClient(broker), store, new LiveIngressRegistry(), [adapter]);
+
+  assert.equal(await edge.processOne(), true);
+  assert.equal(await edge.processOne(), true);
+  assert.deepEqual(adapter.efforts, ["max", null]);
+});
 
 test("a headless resume dispatch completes, posts its outcome, and finishes processed", async () => {
   const broker = new FakeBroker([delivery(1)]);
@@ -267,6 +306,118 @@ test("a completion-tracked Codex live injection commits its final response as th
   assert.equal(broker.finishes[0]?.result.status, "processed");
   assert.equal(broker.finishes[0]?.result.outcome, "live completed");
   assert.equal(store.get(2)?.status, "processed");
+  store.close();
+});
+
+test("a live delivery that carries an Effort overlay publishes that it did not apply", async () => {
+  const broker = new FakeBroker([
+    delivery(4, {
+      event: { ...delivery(4).event, text: "WAKE: ariadne\n\nEffort: max\ndo the thing" },
+      subscription: subscription({ wakePolicy: "live_only" }),
+    }),
+    delivery(5, { subscription: subscription({ wakePolicy: "live_only" }) }),
+  ]);
+  const store = new EdgeStore(":memory:");
+  const adapter = new StubAdapter({
+    liveResult: { receipt: "live", outcome: "done", processed: true },
+  });
+  const live = new LiveIngressRegistry();
+  live.register({
+    actor: "ariadne",
+    provider: "codex",
+    socketPath: "/tmp/x.sock",
+    sessionId: "thread-1",
+    surfaceVersion: "test",
+    runtimeAttestation: { ok: false, absence: "attestation_unreported" },
+  }, 60_000);
+  const edge = new EdgeService(asBrokerClient(broker), store, live, [adapter]);
+  const logged: unknown[][] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => {
+    logged.push(args);
+  };
+  try {
+    assert.equal(await edge.processOne(), true);
+    assert.equal(await edge.processOne(), true);
+  } finally {
+    console.error = original;
+  }
+  assert.deepEqual(adapter.liveDeliveries, [4, 5]);
+  assert.equal(adapter.efforts.length, 0);
+  const unused = logged.filter((args) => args[0] === "hive edge effort overlay unused");
+  assert.equal(unused.length, 1);
+  assert.deepEqual(unused[0], ["hive edge effort overlay unused", 4, "max", "live_session_fixed_at_spawn"]);
+  store.close();
+});
+
+test("a conflicting Effort overlay on a headless delivery publishes that it did not apply", async () => {
+  const broker = new FakeBroker([
+    delivery(6, {
+      event: { ...delivery(6).event, text: "WAKE: ariadne\n\nEffort: low\ndo the thing" },
+      coalescedMessages: [{ senderId: "U1", messageTs: "100.9", text: "WAKE: ariadne\n\nEffort: max\nalso this" }],
+    }),
+    delivery(7),
+  ]);
+  const store = new EdgeStore(":memory:");
+  const adapter = new StubAdapter();
+  const edge = new EdgeService(asBrokerClient(broker), store, new LiveIngressRegistry(), [adapter]);
+  const logged: unknown[][] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => {
+    logged.push(args);
+  };
+  try {
+    assert.equal(await edge.processOne(), true);
+    assert.equal(await edge.processOne(), true);
+  } finally {
+    console.error = original;
+  }
+  // Fail-closed: neither tier is applied. The plain follow-up stays silent,
+  // so one exact unused line is unreachable without the conflict diagnostic.
+  assert.deepEqual(adapter.efforts, [null, null]);
+  const unused = logged.filter((args) => args[0] === "hive edge effort overlay unused");
+  assert.equal(unused.length, 1);
+  assert.deepEqual(unused[0], ["hive edge effort overlay unused", 6, "low,max", "conflict"]);
+  store.close();
+});
+
+test("a live delivery with a conflicting Effort overlay publishes the conflict, not a live-session unused", async () => {
+  const broker = new FakeBroker([
+    delivery(8, {
+      event: { ...delivery(8).event, text: "WAKE: ariadne\n\nEffort: low\ndo the thing" },
+      coalescedMessages: [{ senderId: "U1", messageTs: "100.9", text: "WAKE: ariadne\n\nEffort: max\nalso this" }],
+      subscription: subscription({ wakePolicy: "live_only" }),
+    }),
+  ]);
+  const store = new EdgeStore(":memory:");
+  const adapter = new StubAdapter({
+    liveResult: { receipt: "live", outcome: "done", processed: true },
+  });
+  const live = new LiveIngressRegistry();
+  live.register({
+    actor: "ariadne",
+    provider: "codex",
+    socketPath: "/tmp/x.sock",
+    sessionId: "thread-1",
+    surfaceVersion: "test",
+    runtimeAttestation: { ok: false, absence: "attestation_unreported" },
+  }, 60_000);
+  const edge = new EdgeService(asBrokerClient(broker), store, live, [adapter]);
+  const logged: unknown[][] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => {
+    logged.push(args);
+  };
+  try {
+    assert.equal(await edge.processOne(), true);
+  } finally {
+    console.error = original;
+  }
+  assert.deepEqual(adapter.liveDeliveries, [8]);
+  assert.equal(adapter.efforts.length, 0);
+  const unused = logged.filter((args) => args[0] === "hive edge effort overlay unused");
+  assert.equal(unused.length, 1);
+  assert.deepEqual(unused[0], ["hive edge effort overlay unused", 8, "low,max", "conflict"]);
   store.close();
 });
 
@@ -375,12 +526,12 @@ test("a slow turn for one actor does not starve a co-tenant actor's delivery (mu
   let releaseSlowTurn!: () => void;
   const slowTurn = new Promise<void>((resolve) => { releaseSlowTurn = resolve; });
   class SlowForGnomonAdapter extends StubAdapter {
-    override async spawn(sub: Subscription, cwd: string, framed: string): Promise<ProviderDispatch> {
+    override async spawn(sub: Subscription, cwd: string, framed: string, effort: WakeEffort | null): Promise<ProviderDispatch> {
       if (sub.actor === "gnomon") {
         await slowTurn;
         return { receipt: JSON.stringify({ type: "result", result: "slow done" }), outcome: "slow done", processed: true };
       }
-      return super.spawn(sub, cwd, framed);
+      return super.spawn(sub, cwd, framed, effort);
     }
   }
   const broker = new FakeBroker([
@@ -425,7 +576,7 @@ test("two deliveries for the SAME actor never run concurrently — the edge decl
   let inFlightSameActor = 0;
   let maxInFlightSameActor = 0;
   class CountingAdapter extends StubAdapter {
-    override async spawn(sub: Subscription, cwd: string, framed: string): Promise<ProviderDispatch> {
+    override async spawn(sub: Subscription, cwd: string, framed: string, _effort: WakeEffort | null): Promise<ProviderDispatch> {
       inFlightSameActor += 1;
       maxInFlightSameActor = Math.max(maxInFlightSameActor, inFlightSameActor);
       try {
