@@ -1,5 +1,5 @@
 import type { AttestationRead } from "./attestation.js";
-import type { Provider } from "../domain.js";
+import { canonicalActor, type Provider } from "../domain.js";
 
 /**
  * ADR-0003 R-4: a live surface announces "I can receive injections for this
@@ -96,7 +96,10 @@ export class LiveIngressRegistry {
 }
 
 function key(actor: string, provider: Provider): string {
-  return `${actor}:${provider}`;
+  // The broker canonicalizes actor keys (domain.canonicalActor); a live
+  // registration arriving through HIVE_ACTOR must land under the same key or
+  // a mixed-case enrollment registers a surface no delivery can ever find.
+  return `${canonicalActor(actor)}:${provider}`;
 }
 
 /**

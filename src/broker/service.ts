@@ -1,5 +1,15 @@
-import type { Delivery, DeliveryResultInput, Reason, ReplaySnapshot, SlackEventInput, SubscriptionInput } from "../domain.js";
-import { BrokerStore } from "./store.js";
+import type {
+  Delivery,
+  DeliveryResultInput,
+  Reason,
+  ReplaySnapshot,
+  SeatWakeMint,
+  SeatWakeReceipt,
+  SlackEventInput,
+  SubscriptionInput,
+} from "../domain.js";
+import { isSlackMessageTs } from "../domain.js";
+import { BrokerStore, SeatWakeRefusedError } from "./store.js";
 
 export interface SlackTransport {
   replay(channelId: string, threadTs: string): Promise<ReplaySnapshot>;
@@ -31,6 +41,49 @@ export class BrokerService {
 
   ingest(event: SlackEventInput, initialSnapshot: unknown | null = null) {
     return this.store.ingestEvent(event, initialSnapshot);
+  }
+
+  /**
+   * KRA-1097: a seat's explicit address to a peer. The ledger row and the
+   * commons render commit together; the render goes out through the ordinary
+   * `hive_*`-stamped outbox, so Slack admission ignores it exactly as it
+   * ignores every other Hive post. An undeliverable mint throws (R-3).
+   *
+   * An alternate `--thread` is proven against Slack in this channel before
+   * the ledger commits, so the CLI cannot report success for a coordinate
+   * the edge will then fail to replay.
+   */
+  async mintSeatWake(input: SeatWakeMint, edgeId: string): Promise<SeatWakeReceipt> {
+    // An identical retry answers from the ledger before any Slack probe: the
+    // idempotence guarantee must hold precisely when the response was lost,
+    // and Slack being down at retry time is part of that failure mode.
+    const replayed = this.store.resolveSeatWakeReplay(input);
+    if (replayed) return replayed;
+    if (input.threadTs !== null) {
+      if (!isSlackMessageTs(input.threadTs)) {
+        throw new SeatWakeRefusedError(
+          "invalid_thread",
+          `thread coordinate \`${input.threadTs}\` is not a Slack message timestamp`,
+        );
+      }
+      let source: Delivery | null = null;
+      try {
+        source = this.store.getDelivery(input.sourceDeliveryId);
+      } catch {
+        source = null;
+      }
+      if (source && input.threadTs !== source.event.threadTs) {
+        try {
+          await this.slack.replay(source.event.channelId, input.threadTs);
+        } catch {
+          throw new SeatWakeRefusedError(
+            "invalid_thread",
+            `thread \`${input.threadTs}\` is not a valid thread in channel ${source.event.channelId}`,
+          );
+        }
+      }
+    }
+    return this.store.mintSeatWake(input, edgeId);
   }
 
   /** True if any subscription is live — the deafness watchdog's arming gate. */

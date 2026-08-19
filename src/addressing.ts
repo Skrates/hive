@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { AddressedWake } from "./domain.js";
+import { canonicalActor } from "./domain.js";
 
 // The envelope grammar. An actor token is `[a-z][a-z0-9_-]*`; a recipient LIST is
 // one or more tokens separated by commas. Separators are HORIZONTAL whitespace
@@ -19,7 +20,7 @@ function resolveEnvelope(match: RegExpExecArray): AddressedWake | null {
   // A dangling comma after the captured list signals an intended-but-malformed
   // recipient — reject the whole line rather than silently waking the prefix.
   if (match[2]) return null;
-  const actors = [...new Set(match[1]!.split(",").map((token) => token.trim().toLowerCase()))];
+  const actors = [...new Set(match[1]!.split(",").map((token) => canonicalActor(token.trim())))];
   return { actors, envelope: match[0].trim() };
 }
 

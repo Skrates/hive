@@ -8,6 +8,7 @@ import { attestationWire, readWakeAttestation } from "../edge/attestation.js";
 import { prepareSocketPath, udsRequestJson } from "../local/uds.js";
 import { CodexAppServerClient } from "./app-server.js";
 import { readCodexForegroundBinding, type CodexForegroundBinding } from "./binding.js";
+import { resolveEdgeSocketPath } from "../edge/providers.js";
 import { CodexDesktopIpcClient } from "./desktop-ipc.js";
 import { CodexThreadCatalog } from "./discovery.js";
 
@@ -522,7 +523,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   await runCodexLive({
     actor,
     threadId: required("HIVE_SESSION_ID"),
-    edgeSocket: process.env.HIVE_EDGE_SOCKET ?? join(hiveHome, "edge.sock"),
+    edgeSocket: resolveEdgeSocketPath(),
     surfaceSocket: process.env.HIVE_SURFACE_SOCKET ?? join(hiveHome, `codex-live-${actor}.sock`),
     surfaceVersion: process.env.HIVE_PROVIDER_VERSION ?? "unknown",
     bindingFile: process.env.HIVE_CODEX_BINDING_FILE ?? join(hiveHome, "codex-bindings", `${actor}.json`),

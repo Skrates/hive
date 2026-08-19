@@ -1,4 +1,24 @@
-import type { Delivery, DeliveryResultInput, Reason, ReplaySnapshot, SubscriptionInput } from "../domain.js";
+import type {
+  Delivery,
+  DeliveryResultInput,
+  Reason,
+  ReplaySnapshot,
+  SeatWakeMint,
+  SeatWakeReceipt,
+  SubscriptionInput,
+} from "../domain.js";
+
+/**
+ * A non-2xx broker answer, carrying the status and raw body so a caller can
+ * relay the broker's own reason rather than flattening it to "request failed".
+ * The message keeps the historical `broker <status>: <body>` shape.
+ */
+export class BrokerHttpError extends Error {
+  constructor(readonly status: number, readonly responseBody: string) {
+    super(`broker ${status}: ${responseBody}`);
+    this.name = "BrokerHttpError";
+  }
+}
 
 export class BrokerClient {
   constructor(
@@ -48,6 +68,19 @@ export class BrokerClient {
   }
 
   /** ADR-0003 R-6: relay an agent's outcome report; deliberately not lease-fenced. */
+  /**
+   * KRA-1097: relay a seat's `hive wake` mint to the broker under this edge's
+   * machine credential. The broker resolves the minting seat from the source
+   * delivery, so the edge carries intent — never attribution.
+   */
+  async mintWake(input: SeatWakeMint): Promise<SeatWakeReceipt> {
+    const response = await this.request("/v1/wakes", {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
+    return this.json<SeatWakeReceipt>(response);
+  }
+
   async outcome(deliveryId: number, text: string): Promise<Delivery> {
     const response = await this.request(`/v1/deliveries/${deliveryId}/outcome`, {
       method: "POST",
@@ -128,8 +161,7 @@ export class BrokerClient {
 
   private async json<T>(response: Response): Promise<T> {
     if (!response.ok) {
-      const body = await response.text();
-      throw new Error(`broker ${response.status}: ${body}`);
+      throw new BrokerHttpError(response.status, await response.text());
     }
     return await response.json() as T;
   }

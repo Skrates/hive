@@ -1,7 +1,8 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { ProviderSchema } from "../domain.js";
+import { ProviderSchema, SeatWakeInputSchema } from "../domain.js";
 import { prepareSocketPath } from "../local/uds.js";
 import { parseAttestationWire } from "./attestation.js";
+import { BrokerHttpError } from "./broker-client.js";
 import { LiveIngressRegistryError } from "./live-registry.js";
 import type { EdgeService } from "./service.js";
 
@@ -96,6 +97,47 @@ export class EdgeControlServer {
       return json(response, 200, { ok: true });
     }
 
+    // KRA-1097: a seat's explicit wake mint. The edge forwards it to the broker
+    // under its machine credential and relays the broker's answer verbatim —
+    // including a refusal, so the minting seat learns exactly why nothing was
+    // delivered instead of watching its handoff vanish (R-3).
+    //
+    // The source delivery is resolved HERE, from the edge's own dispatch state,
+    // and never read from the request. Filesystem ownership of this socket
+    // authenticates the machine; on a multi-actor box the machine is not the
+    // seat, so a body that named a delivery id would let any co-tenant mint
+    // under a peer's attribution.
+    if (request.method === "POST" && request.url === "/wake") {
+      const parsed = SeatWakeInputSchema.safeParse(await readJson(request));
+      if (!parsed.success) {
+        return json(response, 400, {
+          error: "invalid_wake",
+          detail: parsed.error.issues.map((issue) => `${issue.path.join(".")}: ${issue.message}`).join("; "),
+        });
+      }
+      const source = this.edge.resolveMintSource(parsed.data.token);
+      if (!source) {
+        return json(response, 403, {
+          error: "unknown_dispatch_token",
+          detail: "no dispatch on this edge holds that token — a turn can mint only while it is running",
+        });
+      }
+      try {
+        return json(response, 201, await this.edge.broker.mintWake({
+          sourceDeliveryId: source.deliveryId,
+          generation: source.generation,
+          actor: parsed.data.actor,
+          text: parsed.data.text,
+          threadTs: parsed.data.threadTs,
+        }));
+      } catch (error) {
+        if (error instanceof BrokerHttpError) {
+          return json(response, error.status, parseErrorBody(error.responseBody));
+        }
+        throw error;
+      }
+    }
+
     if (request.method === "POST" && request.url === "/outcome") {
       const body = await readJson(request);
       const deliveryId = Number(body.deliveryId);
@@ -119,6 +161,25 @@ async function readJson(request: IncomingMessage): Promise<Record<string, unknow
   } catch {
     throw new Error("invalid_json");
   }
+}
+
+/**
+ * The broker's error body, relayed as-is when it is the JSON envelope every
+ * broker error uses. A non-JSON body (a proxy page, a truncated response) is
+ * never guessed at — it surfaces as an opaque relay failure with the raw text.
+ */
+function parseErrorBody(body: string): { error: string; detail?: string } {
+  try {
+    const value = JSON.parse(body) as { error?: unknown; detail?: unknown };
+    if (typeof value.error === "string") {
+      return typeof value.detail === "string"
+        ? { error: value.error, detail: value.detail }
+        : { error: value.error };
+    }
+  } catch {
+    // fall through to the opaque shape below
+  }
+  return { error: "broker_relay_failed", detail: body.slice(0, 500) };
 }
 
 function requiredString(value: unknown, name: string): string {
