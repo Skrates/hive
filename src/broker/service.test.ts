@@ -115,6 +115,130 @@ test("drain stamps the row's reaction on the wake message and a reaction failure
   assert.deepEqual(store.listUnsentOutbox(), []);
 });
 
+function seedPendingWake(store: BrokerStore): void {
+  store.createEdge("mac");
+  store.upsertSubscription({
+    actor: "ariadne",
+    provider: "codex",
+    providerSurface: "app-server",
+    providerVersion: "0.144.0-alpha.4",
+    sessionId: null,
+    homeEdge: "mac",
+    workspace: "taxis",
+    edgeWorkspaces: [{ edgeId: "mac", cwd: "/work/taxis", worktree: null }],
+    wakePolicy: "spawn",
+    permissionProfile: "read-only",
+    accountProfile: "/home/user/.codex-hive",
+    leaseTtlMs: 1_000,
+    deliveryTtlMs: 60_000,
+    homeGraceMs: 2_000,
+    spawnRateLimit: 1,
+    maxAttempts: 3,
+    expiresAt: null,
+  });
+  store.ingestEvent({
+    eventId: "Ev-claim",
+    workspaceId: "T1",
+    channelId: "C1",
+    threadTs: "100.1",
+    messageTs: "100.2",
+    senderId: "U1",
+    senderKind: "user",
+    actor: "ariadne",
+    text: "WAKE: ariadne | test",
+    raw: { type: "message" },
+    receivedAt: "2026-07-12T00:00:00.000Z",
+  });
+}
+
+test("a long-poll that outlives its wait window during drainOutbox does not lease work", async (t) => {
+  const store = new BrokerStore(":memory:");
+  t.after(() => store.close());
+  seedPendingWake(store);
+  store.enqueueThreadNotice("C1", "100.1", "one durable notice");
+
+  let releaseReply!: () => void;
+  const blocked = new Promise<void>((resolve) => { releaseReply = resolve; });
+  let markStarted!: () => void;
+  const started = new Promise<void>((resolve) => { markStarted = resolve; });
+  const slack: SlackTransport = {
+    async replay(): Promise<ReplaySnapshot> { throw new Error("not used"); },
+    async reply(): Promise<string> {
+      markStarted();
+      await blocked;
+      return "100.3";
+    },
+    async react(): Promise<void> {},
+  };
+  const broker = new BrokerService(store, slack);
+  const pending = broker.claim("mac", 0, 40);
+  await started;
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  releaseReply();
+  assert.equal(await pending, null);
+  assert.equal(store.claimNext("mac", 0)?.claimedBy, "mac");
+});
+
+test("an aborted claim does not lease work after drainOutbox resumes", async (t) => {
+  const store = new BrokerStore(":memory:");
+  t.after(() => store.close());
+  seedPendingWake(store);
+  store.enqueueThreadNotice("C1", "100.1", "one durable notice");
+
+  let releaseReply!: () => void;
+  const blocked = new Promise<void>((resolve) => { releaseReply = resolve; });
+  let markStarted!: () => void;
+  const started = new Promise<void>((resolve) => { markStarted = resolve; });
+  const slack: SlackTransport = {
+    async replay(): Promise<ReplaySnapshot> { throw new Error("not used"); },
+    async reply(): Promise<string> {
+      markStarted();
+      await blocked;
+      return "100.3";
+    },
+    async react(): Promise<void> {},
+  };
+  const broker = new BrokerService(store, slack);
+  const controller = new AbortController();
+  const pending = broker.claim("mac", 0, 5_000, [], controller.signal);
+  await started;
+  controller.abort();
+  releaseReply();
+  assert.equal(await pending, null);
+  assert.equal(store.claimNext("mac", 0)?.claimedBy, "mac");
+});
+
+test("a claim whose caller is no longer live after drainOutbox does not lease work", async (t) => {
+  const store = new BrokerStore(":memory:");
+  t.after(() => store.close());
+  seedPendingWake(store);
+  store.enqueueThreadNotice("C1", "100.1", "one durable notice");
+
+  let releaseReply!: () => void;
+  const blocked = new Promise<void>((resolve) => { releaseReply = resolve; });
+  let markStarted!: () => void;
+  const started = new Promise<void>((resolve) => { markStarted = resolve; });
+  const slack: SlackTransport = {
+    async replay(): Promise<ReplaySnapshot> { throw new Error("not used"); },
+    async reply(): Promise<string> {
+      markStarted();
+      await blocked;
+      return "100.3";
+    },
+    async react(): Promise<void> {},
+  };
+  const broker = new BrokerService(store, slack);
+  let live = true;
+  // waitMs=0 skips the pre-claim deadline, so only the liveness check
+  // (the fetch-timeout shape) can refuse the lease after drain resumes.
+  const pending = broker.claim("mac", 0, 0, [], undefined, () => live);
+  await started;
+  live = false;
+  releaseReply();
+  assert.equal(await pending, null);
+  assert.equal(store.claimNext("mac", 0)?.claimedBy, "mac");
+});
+
 test("a hung reactions call never stalls the serialized drain that claim() waits on", async (t) => {
   const store = new BrokerStore(":memory:");
   t.after(() => store.close());

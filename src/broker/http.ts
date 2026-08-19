@@ -88,7 +88,14 @@ export class BrokerHttpServer {
       const waitMs = integerParam(url.searchParams.get("wait_ms"), 0);
       const busy = url.searchParams.get("busy");
       const busyActors = busy ? busy.split(",").filter((item) => item.length > 0) : [];
-      const delivery = await this.broker.claim(edgeId, after, waitMs, busyActors);
+      const delivery = await this.broker.claim(
+        edgeId,
+        after,
+        waitMs,
+        busyActors,
+        requestAbortSignal(request, response),
+        () => connectionStillLive(request, response),
+      );
       return delivery ? json(response, 200, delivery) : json(response, 204, null);
     }
 
@@ -205,6 +212,48 @@ function constantTimeEqual(left: string, right: string): boolean {
   let result = 0;
   for (let i = 0; i < left.length; i += 1) result |= left.charCodeAt(i) ^ right.charCodeAt(i);
   return result === 0;
+}
+
+/**
+ * Abort the claim when the edge hangs up. Aborting fetch (including
+ * `AbortSignal.timeout`) closes the client first; `socket.close` is not the
+ * first event the server sees — `socket.end` makes `writable` false while the
+ * socket is still not destroyed. Without those earlier events, a stalled
+ * `drainOutbox()` can resume into `claimNext()` and lease work to an edge
+ * that will never read it.
+ */
+function requestAbortSignal(request: IncomingMessage, response: ServerResponse): AbortSignal {
+  const controller = new AbortController();
+  const abort = (): void => {
+    if (!response.writableEnded) controller.abort();
+  };
+  if (!connectionStillLive(request, response) && !response.writableEnded) {
+    controller.abort();
+    return controller.signal;
+  }
+  const socket = request.socket;
+  socket.once("end", abort);
+  socket.once("close", abort);
+  socket.once("error", abort);
+  request.once("aborted", abort);
+  request.once("close", abort);
+  response.once("close", abort);
+  response.once("finish", () => {
+    socket.off("end", abort);
+    socket.off("close", abort);
+    socket.off("error", abort);
+    request.off("aborted", abort);
+    request.off("close", abort);
+    response.off("close", abort);
+  });
+  return controller.signal;
+}
+
+/** The HTTP connection can still carry a claim response to the calling edge. */
+function connectionStillLive(request: IncomingMessage, response: ServerResponse): boolean {
+  if (response.writableEnded || response.destroyed || request.destroyed) return false;
+  const socket = request.socket;
+  return Boolean(socket && !socket.destroyed && socket.writable);
 }
 
 function json(response: ServerResponse, status: number, value: unknown): void {

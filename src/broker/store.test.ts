@@ -710,3 +710,47 @@ test("claimNext skips actors the claiming edge declared busy", () => {
   assert.equal(store.claimNext("mac", 0, [])?.claimedBy, "mac");
   store.close();
 });
+
+test("lease generation is a per-ACTOR counter, not a per-delivery retry count", () => {
+  // The 2026-08-15 triage read `hive edge delivery failed 445 80 …` as "the
+  // broker re-leased delivery 445 eighty times with no exhaustion", and filed a
+  // missing-bound against the broker on that basis. The bound was never
+  // missing: `attempts` is what `requeueOrFail` enforces, and the generation is
+  // the actor's lease counter, which climbs across the actor's whole life. This
+  // pins the semantic so the misreading cannot be made twice.
+  const { store, clock } = fixture({ maxAttempts: 10, leaseTtlMs: 1_000, deliveryTtlMs: 24 * 60 * 60_000 });
+  store.ingestEvent(event({ eventId: "Ev-a", messageTs: "100.2" }));
+
+  const first = store.claimNext("mac", 0)!;
+  assert.equal(first.attempts, 1);
+  const firstGeneration = first.leaseGeneration!;
+
+  // Three lease expiries: the generation climbs once per re-acquisition.
+  for (let round = 0; round < 3; round += 1) {
+    clock.advance(1_001);
+    store.requeueExpiredLeases();
+    clock.advance(retryBackoffMs(round + 1) + 1);
+    const again = store.claimNext("mac", 0)!;
+    assert.equal(again.attempts, round + 2, "attempts counts THIS delivery's tries");
+    assert.equal(again.leaseGeneration, firstGeneration + round + 1, "generation counts the ACTOR's leases");
+  }
+
+  clock.advance(1_001);
+  store.requeueExpiredLeases();
+  assert.equal(store.getDelivery(1).status, "pending", "four attempts is still well inside maxAttempts");
+  assert.ok(firstGeneration + 3 >= 4, "the actor's generation has climbed while the delivery retried four times");
+
+  // A second actor's very first delivery starts at generation 1 — the counter
+  // belongs to the actor's lease, not to any delivery's retry history.
+  store.upsertSubscription(subscription({
+    actor: "theoros",
+    sessionId: "thread-2",
+    deliveryTtlMs: 24 * 60 * 60_000,
+  }));
+  store.ingestEvent(event({ eventId: "Ev-b", actor: "theoros", messageTs: "200.2", threadTs: "200.1" }));
+  const other = store.claimNext("mac", 0, ["ariadne"])!;
+  assert.equal(other.actor, "theoros");
+  assert.equal(other.attempts, 1);
+  assert.equal(other.leaseGeneration, 1);
+  store.close();
+});

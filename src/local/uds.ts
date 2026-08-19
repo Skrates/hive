@@ -29,6 +29,7 @@ export function udsRequest(
   method: "GET" | "POST",
   path: string,
   body?: unknown,
+  signal?: AbortSignal,
 ): Promise<UdsResponse> {
   return new Promise((resolve, reject) => {
     const payload = body === undefined ? null : JSON.stringify(body);
@@ -37,6 +38,7 @@ export function udsRequest(
         socketPath,
         method,
         path,
+        signal,
         headers: payload === null
           ? {}
           : { "content-type": "application/json", "content-length": Buffer.byteLength(payload) },
@@ -50,6 +52,10 @@ export function udsRequest(
         }));
       },
     );
+    // A peer that accepts the connection and then never answers leaves this
+    // promise pending forever — the same shape that parked the cx53 run loop
+    // inside a broker fetch (2026-08-15). The caller's deadline signal aborts
+    // the request so the wait is always bounded by someone.
     request.once("error", reject);
     if (payload !== null) request.write(payload);
     request.end();
@@ -61,8 +67,9 @@ export async function udsRequestJson<T>(
   method: "GET" | "POST",
   path: string,
   body?: unknown,
+  signal?: AbortSignal,
 ): Promise<T> {
-  const response = await udsRequest(socketPath, method, path, body);
+  const response = await udsRequest(socketPath, method, path, body, signal);
   if (response.status < 200 || response.status >= 300) {
     throw new UdsHttpError(path, response.status, response.body);
   }

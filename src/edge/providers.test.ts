@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { createServer } from "node:http";
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createServer, type ServerResponse } from "node:http";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -8,7 +8,7 @@ import type { Delivery, Subscription } from "../domain.js";
 import { prepareSocketPath } from "../local/uds.js";
 import type { LiveIngress } from "./live-registry.js";
 import { delimiter, dirname } from "node:path";
-import { ClaudeProvider, claudePromptSlotArgs, codexPermissionArgs, CodexProvider, composeChildEnv, GrokProvider, grokPermissionArgs, prependPathEntry, ProviderPreDispatchError, requireAccountProfile } from "./providers.js";
+import { CancellationUnconfirmedError, CHILD_KILL_GRACE_MS, ClaudeProvider, claudePromptSlotArgs, codexPermissionArgs, CodexProvider, composeChildEnv, dispatchDeadlineAt, GrokProvider, grokPermissionArgs, LIVE_CANCEL_OUTCOMES, prependPathEntry, ProviderPreDispatchError, requireAccountProfile, stampDispatchDeadline } from "./providers.js";
 
 function subscription(overrides: Partial<Subscription> = {}): Subscription {
   return {
@@ -249,10 +249,430 @@ test("Codex live delivery travels over the surface's owner-only UDS socket", asy
   assert.match(result.receipt, /hive\.live\.completed/);
   assert.equal(result.outcome, longOutcome);
   assert.equal(result.processed, true);
-  const payload = seen[0] as { delivery: { id: number }; framed: string };
+  const payload = seen[0] as { delivery: { id: number }; framed: string; deadlineAt?: number };
   assert.equal(payload.delivery.id, 11);
   assert.equal(payload.framed, "framed body");
+  assert.equal(payload.deadlineAt, undefined);
 });
+
+test("Codex live delivery forwards the stamped dispatch deadline to the live server", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "hive-uds-deadline-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const socketPath = join(root, "surface.sock");
+  prepareSocketPath(socketPath);
+
+  const seen: unknown[] = [];
+  const server = createServer((request, response) => {
+    const chunks: Buffer[] = [];
+    request.on("data", (chunk: Buffer) => chunks.push(chunk));
+    request.on("end", () => {
+      seen.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({
+        receipt: JSON.stringify({ type: "hive.live.completed", surface: "app-server", turnId: "turn-deadline" }),
+        outcome: "done",
+        processed: true,
+      }));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen({ path: socketPath }, resolve));
+  t.after(() => server.close());
+
+  const controller = new AbortController();
+  stampDispatchDeadline(controller.signal, 1_700_000_000_000);
+  assert.equal(dispatchDeadlineAt(controller.signal), 1_700_000_000_000);
+
+  const codex = new CodexProvider();
+  const ingress: LiveIngress = {
+    actor: "ariadne",
+    provider: "codex",
+    socketPath,
+    sessionId: "thread-1",
+    surfaceVersion: "test",
+    // These tests exercise cancellation and deadlines, not attestation binding.
+    runtimeAttestation: { ok: false, absence: "attestation_unreported" },
+    expiresAt: Date.now() + 60_000,
+  };
+  await codex.deliverLive(ingress, delivery(11), "framed body", controller.signal);
+  const payload = seen[0] as { deadlineAt?: number };
+  assert.equal(payload.deadlineAt, 1_700_000_000_000);
+});
+
+/**
+ * A live surface stub that holds every `/deliver` open until it is cancelled,
+ * and answers `/cancel` with whatever the test wants the far side to report.
+ */
+function cancellableSurface(
+  socketPath: string,
+  cancelAnswer: (deliveryId: number) => { status: number; body: unknown },
+  answerDelayMs = 30,
+): { server: ReturnType<typeof createServer>; cancels: number[]; ready: Promise<void> } {
+  const cancels: number[] = [];
+  const held: ServerResponse[] = [];
+  const server = createServer((request, response) => {
+    const chunks: Buffer[] = [];
+    request.on("data", (chunk: Buffer) => chunks.push(chunk));
+    request.on("end", () => {
+      const payload = JSON.parse(Buffer.concat(chunks).toString("utf8")) as {
+        deliveryId?: number;
+        delivery?: { id: number };
+      };
+      if (request.url === "/cancel") {
+        cancels.push(payload.deliveryId!);
+        // The far side takes time to interrupt; only then does it answer, and
+        // only then may the `/deliver` request fail.
+        setTimeout(() => {
+          const answer = cancelAnswer(payload.deliveryId!);
+          const body = JSON.stringify(answer.body);
+          for (const open of held.splice(0)) {
+            const failure = JSON.stringify({ error: "live_delivery_failed" });
+            open.writeHead(500, { "content-type": "application/json", "content-length": Buffer.byteLength(failure) });
+            open.end(failure);
+          }
+          response.writeHead(answer.status, { "content-type": "application/json", "content-length": Buffer.byteLength(body) });
+          response.end(body);
+        }, answerDelayMs);
+        return;
+      }
+      held.push(response);
+    });
+  });
+  const ready = new Promise<void>((resolve) => server.listen({ path: socketPath }, resolve));
+  return { server, cancels, ready };
+}
+
+function liveIngress(socketPath: string): LiveIngress {
+  return {
+    actor: "ariadne",
+    provider: "codex",
+    socketPath,
+    sessionId: "thread-1",
+    surfaceVersion: "test",
+    // These tests exercise cancellation and deadlines, not attestation binding.
+    runtimeAttestation: { ok: false, absence: "attestation_unreported" },
+    expiresAt: Date.now() + 60_000,
+  };
+}
+
+test("an aborted live dispatch asks the surface to cancel and waits for the answer", async (t) => {
+  // Destroying the UDS client is a send. The edge releases this delivery's
+  // broker fence when `deliverLive` rejects and the first retry is 5s behind
+  // it, so the rejection may not arrive before the surface says the turn
+  // stopped — otherwise the retry runs beside a live turn.
+  const root = mkdtempSync(join(tmpdir(), "hive-live-cancel-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const socketPath = join(root, "surface.sock");
+  prepareSocketPath(socketPath);
+  const surface = cancellableSurface(socketPath, () => ({ status: 200, body: { cancelled: true, interrupted: true } }));
+  await surface.ready;
+  t.after(() => surface.server.close());
+
+  const codex = new CodexProvider();
+  const controller = new AbortController();
+  const dispatch = codex.deliverLive(liveIngress(socketPath), delivery(21), "framed", controller.signal);
+  let settled = false;
+  void dispatch.then(() => { settled = true; }, () => { settled = true; });
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  controller.abort();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(settled, false, "the dispatch is still held while the surface interrupts");
+
+  await assert.rejects(() => dispatch, /cancelled at the edge's dispatch bound/);
+  assert.deepEqual(surface.cancels, [21], "the surface was asked to cancel this exact delivery");
+});
+
+test("a surface that cannot interrupt its turn yields an UNCONFIRMED cancellation", async (t) => {
+  // `interrupted: false` is the far side saying the turn may still be running.
+  // Filing that as an ordinary deadline would hide the one case where the
+  // retry really can collide (R-3).
+  const root = mkdtempSync(join(tmpdir(), "hive-live-uncancelled-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const socketPath = join(root, "surface.sock");
+  prepareSocketPath(socketPath);
+  const surface = cancellableSurface(socketPath, () => ({ status: 200, body: { cancelled: true, interrupted: false } }));
+  await surface.ready;
+  t.after(() => surface.server.close());
+
+  const codex = new CodexProvider();
+  const controller = new AbortController();
+  const dispatch = codex.deliverLive(liveIngress(socketPath), delivery(22), "framed", controller.signal);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  controller.abort();
+
+  const error = await dispatch.then(() => null, (reason: unknown) => reason);
+  assert.ok(error instanceof CancellationUnconfirmedError, "an unconfirmed stop is its own failure class");
+  assert.equal((error as CancellationUnconfirmedError).deliveryId, 22);
+  assert.match((error as CancellationUnconfirmedError).detail, /could not interrupt the accepted turn/);
+});
+
+test("a surface that fails the cancel request yields an UNCONFIRMED cancellation", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "hive-live-cancel-failed-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const socketPath = join(root, "surface.sock");
+  prepareSocketPath(socketPath);
+  const surface = cancellableSurface(socketPath, () => ({ status: 500, body: { error: "live_delivery_failed" } }));
+  await surface.ready;
+  t.after(() => surface.server.close());
+
+  const codex = new CodexProvider();
+  const controller = new AbortController();
+  const dispatch = codex.deliverLive(liveIngress(socketPath), delivery(23), "framed", controller.signal);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  controller.abort();
+
+  const error = await dispatch.then(() => null, (reason: unknown) => reason);
+  assert.ok(error instanceof CancellationUnconfirmedError, "no answer is never a confirmed stop");
+  assert.match((error as CancellationUnconfirmedError).detail, /did not answer the cancel request/);
+});
+
+/**
+ * Every answer a live surface can give to `/cancel`, and what the edge is
+ * entitled to conclude from it. The table is checked against
+ * `LIVE_CANCEL_OUTCOMES` below, so a fifth answer cannot be added to the reader
+ * without a case here that says whether it releases the fence.
+ *
+ * The load-bearing row is `no_record`. `cancelled: false` is the answer for a
+ * registration that has not landed AND for one that already settled, discarding
+ * a recorded failed interrupt with it — so it is not evidence of a stop, and
+ * reading it as one released the fence beside a turn known to be running.
+ */
+const LIVE_CANCEL_ANSWERS: ReadonlyArray<{
+  outcome: (typeof LIVE_CANCEL_OUTCOMES)[number];
+  what: string;
+  answers: ReadonlyArray<{ status: number; body: unknown }>;
+  confirmed: boolean;
+  detail: RegExp;
+  asks: number;
+}> = [
+  {
+    outcome: "stopped",
+    what: "the surface stopped the turn and the interrupt landed",
+    answers: [{ status: 200, body: { cancelled: true, interrupted: true } }],
+    confirmed: true,
+    detail: /cancelled at the edge's dispatch bound/,
+    asks: 1,
+  },
+  {
+    outcome: "stopped",
+    what: "the surface stopped a tracked delivery that had accepted no turn",
+    answers: [{ status: 200, body: { cancelled: true, interrupted: null } }],
+    confirmed: true,
+    detail: /cancelled at the edge's dispatch bound/,
+    asks: 1,
+  },
+  {
+    outcome: "interrupt_failed",
+    what: "the surface could not interrupt the accepted turn",
+    answers: [{ status: 200, body: { cancelled: true, interrupted: false } }],
+    confirmed: false,
+    detail: /could not interrupt the accepted turn/,
+    asks: 1,
+  },
+  {
+    outcome: "no_record",
+    what: "the surface has no record of the delivery, twice",
+    answers: [
+      { status: 200, body: { cancelled: false, interrupted: null } },
+      { status: 200, body: { cancelled: false, interrupted: null } },
+    ],
+    confirmed: false,
+    detail: /has no record of this delivery/,
+    asks: 2,
+  },
+  {
+    outcome: "no_record",
+    what: "the first no-record answer raced the arriving /deliver and the re-ask finds the turn",
+    answers: [
+      { status: 200, body: { cancelled: false, interrupted: null } },
+      { status: 200, body: { cancelled: true, interrupted: true } },
+    ],
+    confirmed: true,
+    detail: /cancelled at the edge's dispatch bound/,
+    asks: 2,
+  },
+  {
+    outcome: "no_answer",
+    what: "the surface never answers the cancel request",
+    answers: [{ status: 500, body: { error: "live_delivery_failed" } }],
+    confirmed: false,
+    detail: /did not answer the cancel request/,
+    asks: 1,
+  },
+];
+
+test("the cancel-answer table covers every outcome the reader can produce", () => {
+  assert.deepEqual(
+    [...new Set(LIVE_CANCEL_ANSWERS.map((row) => row.outcome))].sort(),
+    [...LIVE_CANCEL_OUTCOMES].sort(),
+    "a new /cancel outcome needs a row saying whether it releases the delivery fence",
+  );
+});
+
+for (const [index, row] of LIVE_CANCEL_ANSWERS.entries()) {
+  test(`a live cancel where ${row.what} is ${row.confirmed ? "a" : "NOT a"} confirmed stop`, async (t) => {
+    const root = mkdtempSync(join(tmpdir(), "hive-live-cancel-table-"));
+    t.after(() => rmSync(root, { recursive: true, force: true }));
+    const socketPath = join(root, "surface.sock");
+    prepareSocketPath(socketPath);
+    let ask = 0;
+    const surface = cancellableSurface(socketPath, () => row.answers[Math.min(ask++, row.answers.length - 1)]!);
+    await surface.ready;
+    t.after(() => surface.server.close());
+
+    const codex = new CodexProvider();
+    const controller = new AbortController();
+    const deliveryId = 40 + index;
+    const dispatch = codex.deliverLive(liveIngress(socketPath), delivery(deliveryId), "framed", controller.signal);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    controller.abort();
+
+    const error = await dispatch.then(() => null, (reason: unknown) => reason);
+    assert.ok(error instanceof Error, "an aborted live dispatch never resolves");
+    assert.equal(
+      error instanceof CancellationUnconfirmedError,
+      !row.confirmed,
+      `${row.what}: an unconfirmed stop must be its own failure class, so the release files it as such`,
+    );
+    assert.match((error as Error).message, row.detail);
+    assert.deepEqual(
+      surface.cancels,
+      Array.from({ length: row.asks }, () => deliveryId),
+      `${row.what}: the edge asks the surface exactly ${row.asks} time(s)`,
+    );
+  });
+}
+
+test("dispatch abort kills the provider process group, including SIGTERM-immune descendants", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "hive-pgid-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const profile = join(root, "profile");
+  mkdirSync(profile);
+  const marker = join(root, "grandchild.pid");
+  const cli = join(root, "cli.mjs");
+  writeFileSync(cli, `#!/usr/bin/env node
+import { spawn } from "node:child_process";
+import { writeFileSync } from "node:fs";
+spawn(process.execPath, ["-e", ${JSON.stringify(`
+  process.on("SIGTERM", () => {});
+  require("fs").writeFileSync(${JSON.stringify(marker)}, String(process.pid));
+  setInterval(() => {}, 1000);
+`)}], { stdio: "ignore" });
+setInterval(() => {}, 1000);
+`, { mode: 0o755 });
+
+  const previous = process.env.HIVE_CLAUDE_COMMAND;
+  process.env.HIVE_CLAUDE_COMMAND = cli;
+  t.after(() => {
+    if (previous === undefined) delete process.env.HIVE_CLAUDE_COMMAND;
+    else process.env.HIVE_CLAUDE_COMMAND = previous;
+  });
+
+  const claude = new ClaudeProvider({ ingressRoot: join(root, "inbox") });
+  const controller = new AbortController();
+  const turn = claude.spawn(
+    subscription({ provider: "claude", accountProfile: profile, sessionId: null }),
+    root,
+    "framed",
+    controller.signal,
+  );
+
+  const started = Date.now();
+  while (!existsSync(marker) && Date.now() - started < 5_000) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.ok(existsSync(marker), "grandchild published its pid");
+  const grandchildPid = Number(readFileSync(marker, "utf8"));
+  t.after(() => {
+    try { process.kill(grandchildPid, "SIGKILL"); } catch { /* already gone */ }
+  });
+  assert.equal(processAlive(grandchildPid), true);
+
+  controller.abort();
+  await assert.rejects(turn, /exited|deadline/);
+
+  const killDeadline = Date.now() + 8_000;
+  while (processAlive(grandchildPid) && Date.now() < killDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.equal(processAlive(grandchildPid), false, "the descendant must die with the group, not outlive the CLI");
+});
+
+test("a confirmed group exit disarms the delayed SIGKILL", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "hive-pgid-disarm-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const profile = join(root, "profile");
+  mkdirSync(profile);
+  const marker = join(root, "cli.pid");
+  const cli = join(root, "cli.mjs");
+  // No SIGTERM handler and no descendants: the whole group is gone well inside
+  // the grace, so the armed SIGKILL can only ever reach a reused identifier.
+  writeFileSync(cli, `#!/usr/bin/env node
+import { writeFileSync } from "node:fs";
+writeFileSync(${JSON.stringify(marker)}, String(process.pid));
+setInterval(() => {}, 1000);
+`, { mode: 0o755 });
+
+  const previous = process.env.HIVE_CLAUDE_COMMAND;
+  process.env.HIVE_CLAUDE_COMMAND = cli;
+  t.after(() => {
+    if (previous === undefined) delete process.env.HIVE_CLAUDE_COMMAND;
+    else process.env.HIVE_CLAUDE_COMMAND = previous;
+  });
+
+  // Every signal the edge aims at this group, recorded at the syscall — a
+  // SIGKILL to a dead group throws and is swallowed, so the attempt is the only
+  // observable that survives.
+  let childPid: number | null = null;
+  const aimed: string[] = [];
+  const realKill = process.kill.bind(process);
+  process.kill = ((pid: number, signal?: NodeJS.Signals | number) => {
+    if (childPid !== null && (pid === childPid || pid === -childPid) && signal !== 0) aimed.push(String(signal));
+    return realKill(pid, signal as NodeJS.Signals);
+  }) as typeof process.kill;
+  t.after(() => { process.kill = realKill; });
+
+  const claude = new ClaudeProvider({ ingressRoot: join(root, "inbox") });
+  const controller = new AbortController();
+  const turn = claude.spawn(
+    subscription({ provider: "claude", accountProfile: profile, sessionId: null }),
+    root,
+    "framed",
+    controller.signal,
+  );
+
+  const started = Date.now();
+  while (!existsSync(marker) && Date.now() - started < 5_000) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.ok(existsSync(marker), "the CLI published its pid");
+  childPid = Number(readFileSync(marker, "utf8"));
+  t.after(() => {
+    try { realKill(childPid as number, "SIGKILL"); } catch { /* already gone */ }
+  });
+
+  controller.abort();
+  await assert.rejects(turn, /exited|deadline/);
+  assert.equal(processAlive(childPid), false, "the dispatch returns only after the group is gone");
+  assert.deepEqual(aimed, ["SIGTERM"], "the abort escalates with SIGTERM first, and nothing else has fired yet");
+
+  await new Promise((resolve) => setTimeout(resolve, CHILD_KILL_GRACE_MS + 500));
+  assert.deepEqual(
+    aimed,
+    ["SIGTERM"],
+    "no SIGKILL may fire at a PID the edge already watched exit — that number belongs to whoever reused it",
+  );
+});
+
+function processAlive(pid: number): boolean {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const state = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0];
+    return state !== undefined && state !== "Z";
+  } catch {
+    return false;
+  }
+}
 
 test("an oversized live receipt is rejected", async (t) => {
   const root = mkdtempSync(join(tmpdir(), "hive-uds-bad-"));

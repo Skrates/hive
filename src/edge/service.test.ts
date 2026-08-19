@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -8,17 +8,20 @@ import type { Delivery, DeliveryResultInput, Reason, ReplaySnapshot, Subscriptio
 import type { BrokerClient } from "./broker-client.js";
 import { LiveIngressRegistry, type LiveIngress } from "./live-registry.js";
 import {
+  CHILD_KILL_GRACE_MS,
+  dispatchDeadlineAt,
+  LIVE_CANCEL_CONFIRM_MS,
   ProviderPreDispatchError,
   type ProviderAdapter,
   type ProviderDispatch,
 } from "./providers.js";
-import { headlessAcknowledgement } from "./providers.js";
-import { EdgeService } from "./service.js";
+import { headlessAcknowledgement, HeadlessStreamReader } from "./providers.js";
+import { CANCEL_CONFIRM_MS, EDGE_TEARDOWN_GRACE_MS, EdgeService, type EdgeTimers } from "./service.js";
 import { EdgeStore, type AttestationBinding } from "./store.js";
+import { EdgeLivenessWatchdog } from "./watchdog.js";
 
 /** These tests exercise generation/attempt fencing, not attestation binding. */
 const unbound: AttestationBinding = { attestationId: null, doctrineCommit: null, absence: "no_attestation_file" };
-
 
 test("Codex JSONL receipt yields the final agent message", () => {
   const receipt = [
@@ -201,7 +204,7 @@ class StubAdapter implements ProviderAdapter {
     return this.behavior.headlessResult ?? { receipt: JSON.stringify({ type: "result", result: "resumed" }), outcome: "resumed", processed: true };
   }
 
-  async spawn(_subscription: Subscription, _cwd: string, framed: string): Promise<ProviderDispatch> {
+  async spawn(_subscription: Subscription, _cwd: string, framed: string, _signal?: AbortSignal): Promise<ProviderDispatch> {
     if (this.behavior.dispatchError) throw this.behavior.dispatchError;
     this.spawns.push(framed);
     return this.behavior.headlessResult ?? { receipt: JSON.stringify({ type: "result", result: "spawned" }), outcome: "spawned", processed: true };
@@ -457,6 +460,421 @@ test("two deliveries for the SAME actor never run concurrently — the edge decl
   assert.equal(maxInFlightSameActor, 1);
   controller.abort();
   await run;
+});
+
+/**
+ * Virtual clock for the run loop. Every wait inside `EdgeService` — the empty-poll
+ * backoff, the capacity park, the lease heartbeat, the dispatch deadline — goes
+ * through the injected timers, so the three-hour bounds under test are exercised
+ * deterministically instead of being asserted at a scaled-down stand-in.
+ */
+class FakeTimers implements EdgeTimers {
+  private current = 1_000_000;
+  private sequence = 0;
+  private readonly pending = new Map<number, { at: number; callback: () => void }>();
+
+  now(): number {
+    return this.current;
+  }
+
+  set(callback: () => void, delayMs: number): unknown {
+    const id = (this.sequence += 1);
+    this.pending.set(id, { at: this.current + delayMs, callback });
+    return id;
+  }
+
+  clear(handle: unknown): void {
+    this.pending.delete(handle as number);
+  }
+
+  /** Advance the virtual clock, firing due callbacks in time order and draining microtasks between each. */
+  async advance(ms: number): Promise<void> {
+    const target = this.current + ms;
+    for (let guard = 0; guard < 200_000; guard += 1) {
+      let next: [number, { at: number; callback: () => void }] | null = null;
+      for (const entry of this.pending.entries()) {
+        if (entry[1].at <= target && (next === null || entry[1].at < next[1].at)) next = entry;
+      }
+      if (next === null) break;
+      this.pending.delete(next[0]);
+      this.current = next[1].at;
+      next[1].callback();
+      await flush();
+    }
+    this.current = target;
+    await flush();
+  }
+
+  /** Advance in bounded steps until `reached` holds, or give up at `maxMs` of virtual time. */
+  async advanceUntil(reached: () => boolean, maxMs: number, stepMs = 30_000): Promise<boolean> {
+    await flush();
+    for (let elapsed = 0; elapsed < maxMs; elapsed += stepMs) {
+      if (reached()) return true;
+      await this.advance(stepMs);
+    }
+    return reached();
+  }
+}
+
+/** Let every pending microtask and immediate callback settle. */
+async function flush(rounds = 3): Promise<void> {
+  for (let round = 0; round < rounds; round += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+}
+
+/**
+ * Wait until `reached` holds, yielding to the event loop between checks.
+ *
+ * Every dispatch now awaits `readWakeAttestation` before the provider starts, so
+ * "the dispatch started" is gated on real filesystem I/O, not on a countable
+ * number of microtask turns. `flush(3)` happened to cover one pending read on a
+ * warm local disk and did not cover two in CI. Bounded by rounds rather than
+ * wall clock so it cannot flake against its own timer.
+ */
+async function until(reached: () => boolean, rounds = 500): Promise<boolean> {
+  for (let round = 0; round < rounds; round += 1) {
+    if (reached()) return true;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  return reached();
+}
+
+const THREE_HOURS_MS = 3 * 60 * 60_000;
+
+/**
+ * A dispatch that never settles on its own — the incident's provider child.
+ * `hangsFor` names which actors wedge; everyone else runs the ordinary stub, so
+ * a test can prove the loop recovered by watching an unrelated actor complete.
+ */
+class HangingAdapter extends StubAdapter {
+  readonly signals: Array<AbortSignal | undefined> = [];
+
+  /**
+   * `stopAfterMs` is how long the provider takes to ACTUALLY stop once the edge
+   * aborts it — a live-surface interrupt is 10-15s of real work, a process
+   * group takes its SIGTERM grace. `null` models a provider that never stops,
+   * which is what the edge's cancellation bound has to survive. Timers are the
+   * virtual clock, so these delays cost no wall time.
+   */
+  constructor(
+    private readonly hangsFor: (actor: string) => boolean = () => true,
+    private readonly stopAfterMs: number | null = 0,
+    private readonly timers?: EdgeTimers,
+  ) {
+    super();
+  }
+
+  override spawn(sub: Subscription, cwd: string, framed: string, signal?: AbortSignal): Promise<ProviderDispatch> {
+    if (!this.hangsFor(sub.actor)) return super.spawn(sub, cwd, framed, signal);
+    this.signals.push(signal);
+    return new Promise<ProviderDispatch>((_resolve, reject) => {
+      // Never settles on its own: the whole point. Only the edge's deadline can
+      // end it — and then only after this provider has finished stopping.
+      if (this.stopAfterMs === null) return;
+      const stopAfterMs = this.stopAfterMs;
+      const timers = this.timers;
+      const stop = (): void => { reject(new Error("provider turn stopped at the edge's abort")); };
+      signal?.addEventListener("abort", () => {
+        if (stopAfterMs === 0 || timers === undefined) stop();
+        else timers.set(stop, stopAfterMs);
+      }, { once: true });
+    });
+  }
+}
+
+function hangingDelivery(id: number, actor: string): Delivery {
+  return delivery(id, {
+    actor,
+    coalesceKey: `${actor}:C1:100.${id}`,
+    subscription: subscription({ actor, sessionId: null }),
+  });
+}
+
+test("a dispatch that outlives the wall-clock deadline is aborted, and released only once it has stopped", async () => {
+  // The 2026-08-15 wedge in miniature: a provider turn that neither exits nor
+  // errors held its slot forever while the lease heartbeat renewed the broker's
+  // fence underneath it, so nothing anywhere could reclaim the delivery.
+  //
+  // This turn takes 8s to actually stop after the abort — the cost of a real
+  // interrupt. The fence must be held for those 8s: releasing on the abort
+  // itself makes the delivery eligible for retry (5s backoff) while the
+  // original turn is still executing.
+  const timers = new FakeTimers();
+  const broker = new FakeBroker([hangingDelivery(40, "gnomon")]);
+  const store = new EdgeStore(":memory:");
+  const adapter = new HangingAdapter(() => true, 8_000, timers);
+  const edge = new EdgeService(asBrokerClient(broker), store, new LiveIngressRegistry(), [adapter], timers);
+
+  const done = edge.processOne();
+  let settled = false;
+  void done.then(() => { settled = true; });
+  assert.ok(await until(() => adapter.signals.length === 1), "the dispatch started");
+  assert.equal(adapter.signals[0]?.aborted, false, "and is not aborted before its deadline");
+  assert.equal(dispatchDeadlineAt(adapter.signals[0]), 1_000_000 + THREE_HOURS_MS);
+
+  // Just short of the bound, the turn is still running and untouched.
+  await timers.advance(THREE_HOURS_MS - 1_000);
+  assert.equal(settled, false, "a long turn inside the bound is not killed");
+  assert.equal(broker.releases.length, 0);
+
+  await timers.advance(2_000);
+  assert.equal(adapter.signals[0]?.aborted, true, "the provider is asked to kill its child");
+  assert.equal(settled, false, "the dispatch is still held while the provider stops");
+  assert.equal(broker.releases.length, 0, "the fence outlives the abort, not just the send");
+
+  await timers.advance(8_000);
+  assert.equal(await done, true);
+  assert.equal(broker.releases.length, 1);
+  assert.equal(broker.releases[0]?.reason.code, "dispatch_deadline_exceeded");
+  assert.equal(broker.finishes.length, 0, "uncertainty releases; it never declares an outcome");
+  assert.equal(store.get(40)?.status, "released");
+  store.close();
+});
+
+test("a provider that never stops releases as an UNCONFIRMED cancellation, once the bound expires", async () => {
+  // The other half of the ordering contract: waiting for the stop must itself
+  // be bounded, or the fence-hold rebuilds the park this whole change removes.
+  // What the bound may not do is call the result clean — the turn may still be
+  // running, and the reason has to say so (R-3).
+  const timers = new FakeTimers();
+  const broker = new FakeBroker([hangingDelivery(41, "gnomon")]);
+  const store = new EdgeStore(":memory:");
+  const adapter = new HangingAdapter(() => true, null);
+  const edge = new EdgeService(asBrokerClient(broker), store, new LiveIngressRegistry(), [adapter], timers);
+
+  const done = edge.processOne();
+  assert.ok(await until(() => adapter.signals.length === 1), "the dispatch started");
+  await timers.advance(THREE_HOURS_MS + 1_000);
+  assert.equal(adapter.signals[0]?.aborted, true);
+  assert.equal(broker.releases.length, 0, "an unanswering provider still holds the fence inside the bound");
+
+  await timers.advance(CANCEL_CONFIRM_MS);
+  assert.equal(await done, true);
+  assert.equal(broker.releases.length, 1);
+  assert.equal(broker.releases[0]?.reason.code, "dispatch_cancellation_unconfirmed");
+  assert.match(broker.releases[0]?.reason.detail ?? "", /could not confirm it stopped/);
+  assert.equal(store.get(41)?.status, "released");
+  store.close();
+});
+
+test("the teardown clocks are ordered: exit grace > cancellation bound > every far-side stop", () => {
+  // Each of these bounds waits for the one below it. A grace that slipped under
+  // the stop it waits for is a check that cannot fire for its reason: the exit
+  // would kill the edge mid-interrupt and orphan the turn it was stopping.
+  assert.ok(EDGE_TEARDOWN_GRACE_MS > CANCEL_CONFIRM_MS, "the supervisor exit outlasts the cancellation bound");
+  assert.ok(CANCEL_CONFIRM_MS > LIVE_CANCEL_CONFIRM_MS, "the cancellation bound outlasts a live-surface receipt");
+  assert.ok(CANCEL_CONFIRM_MS > CHILD_KILL_GRACE_MS, "and outlasts a headless SIGTERM grace");
+  // The live receipt in turn outlasts the far side's own interrupt timeouts:
+  // 10s on the Codex app-server, 15s on the Desktop IPC client.
+  assert.ok(LIVE_CANCEL_CONFIRM_MS > 15_000, "the receipt outlasts the slowest provider interrupt");
+});
+
+test("the edge command's supervisor teardown uses the ordered grace, not the child-kill grace", () => {
+  // The watchdog exit path is wired in the CLI, where no unit test reaches the
+  // timer. Assert the wiring at the source: a default or a stale constant here
+  // is exactly how this bound silently reverted to 5.5s.
+  const cli = readFileSync(join(process.cwd(), "src", "cli.ts"), "utf8");
+  assert.match(cli, /setTimeout\(\(\) => process\.exit\(code\), EDGE_TEARDOWN_GRACE_MS\)/);
+  // Strip comments first: the prose ABOVE that wiring names the old constant,
+  // and an absence assertion that matches its own documentation proves nothing.
+  const code = cli.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
+  assert.doesNotMatch(code, /CHILD_KILL_GRACE_MS \+ 500/);
+});
+
+test("with every dispatch slot hung, a newly published delivery is still claimed once the bound elapses", async () => {
+  // The acceptance criterion: four hung dispatches used to park the run loop on
+  // `Promise.race(this.inFlight)` permanently, and the fifth delivery was never
+  // claimed. Bounding the park alone does NOT fix this — the loop would re-park
+  // forever — so this test is the honest joint check of the deadline and the park.
+  const timers = new FakeTimers();
+  const queue = [
+    hangingDelivery(50, "alpha"),
+    hangingDelivery(51, "beta"),
+    hangingDelivery(52, "gamma"),
+    hangingDelivery(53, "delta"),
+  ];
+  const broker = new FakeBroker(queue);
+  const store = new EdgeStore(":memory:");
+  const wedged = new Set(["alpha", "beta", "gamma", "delta"]);
+  const adapter = new HangingAdapter((actor) => wedged.has(actor));
+  const edge = new EdgeService(asBrokerClient(broker), store, new LiveIngressRegistry(), [adapter], timers);
+
+  const controller = new AbortController();
+  const run = edge.run(controller.signal);
+  assert.ok(await until(() => adapter.signals.length === 4), "all four slots are occupied by hung turns");
+  assert.equal(edge.saturated(), true);
+
+  // A fresh delivery arrives for a fifth actor while the edge is wedged.
+  queue.push(delivery(54, {
+    actor: "epsilon",
+    coalesceKey: "epsilon:C1:100.54",
+    subscription: subscription({ actor: "epsilon", sessionId: null }),
+  }));
+  await timers.advance(CAPACITY_PARK_PROBE_MS);
+  assert.ok(!broker.finishes.some((f) => f.deliveryId === 54), "still wedged before the bound");
+
+  const claimed = await timers.advanceUntil(
+    () => broker.finishes.some((f) => f.deliveryId === 54 && f.result.status === "processed"),
+    THREE_HOURS_MS + 10 * 60_000,
+  );
+  assert.ok(claimed, "the fifth delivery is claimed and processed once the hung slots time out");
+  assert.equal(broker.releases.filter((r) => r.reason.code === "dispatch_deadline_exceeded").length, 4);
+  controller.abort();
+  await timers.advanceUntil(() => false, 60_000);
+  await run;
+  store.close();
+});
+
+/** One capacity park plus a margin — long enough to prove the loop re-parked rather than progressed. */
+const CAPACITY_PARK_PROBE_MS = 90_000;
+
+test("abortActiveDispatches tears down in-flight turns before a watchdog exit would kill the process", async () => {
+  // One to three headless turns can be running while the loop is still
+  // considered unsaturated. process.exit() used to skip their abort
+  // controllers, leaving detached process groups behind the restart.
+  const timers = new FakeTimers();
+  const broker = new FakeBroker([
+    hangingDelivery(70, "gnomon"),
+    hangingDelivery(71, "theoros"),
+  ]);
+  const store = new EdgeStore(":memory:");
+  const adapter = new HangingAdapter();
+  const edge = new EdgeService(asBrokerClient(broker), store, new LiveIngressRegistry(), [adapter], timers);
+
+  const controller = new AbortController();
+  const run = edge.run(controller.signal);
+  assert.ok(await until(() => adapter.signals.length === 2), "both dispatches started");
+  assert.equal(adapter.signals.every((signal) => signal?.aborted === false), true);
+
+  edge.abortActiveDispatches();
+  assert.equal(adapter.signals.every((signal) => signal?.aborted === true), true);
+
+  const released = await timers.advanceUntil(
+    () => broker.releases.length === 2,
+    60_000,
+  );
+  assert.ok(released, "aborted dispatches reach a release disposition");
+  // A watchdog/shutdown abort is the edge's own cancellation, not a deadline:
+  // the thread notice must not claim the provider exceeded 180 minutes.
+  assert.equal(broker.releases.every((item) => item.reason.code === "dispatch_cancelled_by_edge"), true);
+
+  controller.abort();
+  await timers.advanceUntil(() => false, 60_000);
+  await run;
+  store.close();
+});
+
+test("a healthy long dispatch keeps the loop polling, so the watchdog reads healthy throughout", async () => {
+  // The regression guard on the watchdog: one slow turn with slots still free
+  // must never look like a wedge. The loop keeps claiming, so `lastPollAt`
+  // keeps advancing even though the turn never ends.
+  const timers = new FakeTimers();
+  const broker = new FakeBroker([hangingDelivery(60, "gnomon")]);
+  const store = new EdgeStore(":memory:");
+  const adapter = new HangingAdapter();
+  const edge = new EdgeService(asBrokerClient(broker), store, new LiveIngressRegistry(), [adapter], timers);
+
+  const exits: number[] = [];
+  const watchdog = new EdgeLivenessWatchdog({
+    lastPollAt: () => edge.lastPollAt(),
+    saturated: () => edge.saturated(),
+    exit: (code) => { exits.push(code); },
+    now: () => timers.now(),
+    log: () => {},
+  }, 300_000);
+
+  const controller = new AbortController();
+  const run = edge.run(controller.signal);
+  assert.ok(await until(() => adapter.signals.length === 1), "the slow turn is running");
+
+  for (let cycle = 0; cycle < 4; cycle += 1) {
+    await timers.advance(300_000);
+    assert.equal(watchdog.check(), "healthy");
+  }
+  assert.deepEqual(exits, [], "a slow turn is never mistaken for a deaf edge");
+  assert.ok(edge.lastPollAt()! > 1_000_000, "the loop went on polling under the slow turn");
+
+  controller.abort();
+  await timers.advanceUntil(() => false, THREE_HOURS_MS + 60_000);
+  await run;
+  store.close();
+});
+
+test("a broker poll that throws leaves the last-poll stamp standing, so the wedge window keeps running", async () => {
+  // `lastPollAt` is evidence of REACHING the broker. A loop spinning on claim
+  // errors is exactly as deaf as one that never returns; stamping on the
+  // attempt would make the watchdog a check that cannot fail for its reason.
+  const timers = new FakeTimers();
+  const store = new EdgeStore(":memory:");
+  class FailingBroker extends FakeBroker {
+    override async claim(): Promise<Delivery | null> {
+      throw new Error("connect ECONNREFUSED");
+    }
+  }
+  const broker = new FailingBroker([]);
+  const edge = new EdgeService(asBrokerClient(broker), store, new LiveIngressRegistry(), [new StubAdapter()], timers);
+
+  assert.equal(edge.lastPollAt(), null);
+  const controller = new AbortController();
+  const run = edge.run(controller.signal);
+  await timers.advance(600_000);
+  assert.equal(edge.lastPollAt(), null, "a throwing poll never counts as reaching the broker");
+
+  controller.abort();
+  await timers.advanceUntil(() => false, 60_000);
+  await run;
+  store.close();
+});
+
+test("the headless stream reader stays bounded across a stream far larger than its buffer", async () => {
+  // The 15.1G RSS: `runHeadless` kept every chunk of every child's stdout for
+  // the whole turn and then used the last 4 000 characters. A 77-minute Claude
+  // turn under `--verbose` echoes every tool result into that stream.
+  const reader = new HeadlessStreamReader(4_000);
+  reader.write(`${JSON.stringify({ type: "result", subtype: "success", result: "the answer" })}\n`);
+  const noise = `${JSON.stringify({ type: "user", message: "x".repeat(50_000) })}\n`;
+  let peakRetained = 0;
+  for (let line = 0; line < 400; line += 1) {
+    reader.write(noise);
+    peakRetained = Math.max(peakRetained, reader.retainedChars());
+  }
+  reader.finish();
+
+  assert.ok(noise.length * 400 > 20_000_000, "the probe stream really is large");
+  assert.ok(peakRetained <= 4_000 + noise.length, `retained ${peakRetained} characters`);
+  // Bounded memory must not cost the extraction: the answer arrived in the very
+  // first line, tens of megabytes before the end of the stream.
+  assert.equal(reader.outcome(), "the answer");
+  assert.equal(reader.receipt().length, 4_000);
+});
+
+test("the stream reader parses lines split across chunk boundaries, including mid-codepoint", async () => {
+  // A chunked stream splits wherever the pipe does, not where JSON does. The
+  // old whole-buffer reader never had to care; this one does.
+  const reader = new HeadlessStreamReader(4_000);
+  const line = `${JSON.stringify({ type: "result", subtype: "success", result: "héllo — ✅" })}\n`;
+  const bytes = Buffer.from(line, "utf8");
+  for (let index = 0; index < bytes.length; index += 3) {
+    reader.push(bytes.subarray(index, index + 3));
+  }
+  reader.finish();
+  assert.equal(reader.outcome(), "héllo — ✅");
+});
+
+test("an unbounded single line is dropped and counted rather than buffered", async () => {
+  // A line with no newline in sight is the one shape that could reintroduce the
+  // growth this reader exists to bound. It is dropped loudly, and the surrounding
+  // stream still parses.
+  const reader = new HeadlessStreamReader(4_000);
+  reader.write("{\"type\":\"user\",\"text\":\"");
+  for (let chunk = 0; chunk < 30; chunk += 1) reader.write("y".repeat(100_000));
+  reader.write("\"}\n");
+  assert.ok(reader.retainedChars() <= 4_000 + 1_000_000, `retained ${reader.retainedChars()} characters`);
+  reader.write(`${JSON.stringify({ type: "result", subtype: "success", result: "still parsing" })}\n`);
+  reader.finish();
+  assert.equal(reader.droppedLines, 1);
+  assert.equal(reader.outcome(), "still parsing");
 });
 
 test("every claimed delivery is bound to the attestation of the profile it runs under", async () => {

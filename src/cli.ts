@@ -18,8 +18,9 @@ import { EdgeControlServer } from "./edge/control.js";
 import { LiveIngressRegistry } from "./edge/live-registry.js";
 import { ProxyAgent, setGlobalDispatcher } from "undici";
 import { ClaudeProvider, CodexProvider, GrokProvider } from "./edge/providers.js";
-import { EdgeService } from "./edge/service.js";
+import { EDGE_TEARDOWN_GRACE_MS, EdgeService } from "./edge/service.js";
 import { EdgeStore } from "./edge/store.js";
+import { EdgeLivenessWatchdog } from "./edge/watchdog.js";
 import { udsRequestJson } from "./local/uds.js";
 import {
   assertCodexAttachmentActor,
@@ -124,8 +125,45 @@ program.command("edge")
     await control.start();
     const controller = new AbortController();
     const run = edge.run(controller.signal);
+    // Liveness watchdog: an edge that stays `active` under systemd while it has
+    // stopped claiming is invisible without this (cx53, 2026-08-15 — 80 minutes
+    // deaf, recovered only by a human running `systemctl restart`). The bounds
+    // inside the service close the mechanisms we can name; this closes the
+    // class by exiting for the supervisor when polling stops.
+    const watchdog = new EdgeLivenessWatchdog({
+      lastPollAt: () => edge.lastPollAt(),
+      saturated: () => edge.saturated(),
+      exit: (code) => {
+        // process.exit() would skip every per-dispatch abort controller.
+        // Headless turns now run as detached process groups, so they would
+        // survive the supervisor restart and race the recovered retry.
+        controller.abort();
+        edge.abortActiveDispatches();
+        // The teardown grace must outlast the cancellation the abort just
+        // started (a live-surface interrupt runs 10-15s). At the old
+        // CHILD_KILL_GRACE_MS + 500 this exit fired first and orphaned the very
+        // turn it was stopping — the wedge, one hop further out.
+        setTimeout(() => process.exit(code), EDGE_TEARDOWN_GRACE_MS);
+      },
+      now: () => Date.now(),
+      log: (message) => console.error(message),
+    }, config.HIVE_EDGE_WATCHDOG_STALE_MS);
+    const watchdogTimer = setInterval(() => {
+      try {
+        watchdog.check();
+      } catch (error) {
+        console.error("[edge-watchdog] cycle failed", error instanceof Error ? error.message : String(error));
+      }
+    }, config.HIVE_EDGE_WATCHDOG_STALE_MS);
     await untilSignal(async () => {
+      clearInterval(watchdogTimer);
       controller.abort();
+      // The run-loop signal only stops *claiming*; an in-flight provider turn
+      // would keep `run` awaiting until its dispatch deadline (hours), stalling
+      // ordinary service restarts until the supervisor escalates to SIGKILL —
+      // which then orphans the detached provider process groups. Tear down the
+      // dispatches exactly as the watchdog exit does, before awaiting the loop.
+      edge.abortActiveDispatches();
       await control.stop();
       await run;
       store.close();
@@ -278,6 +316,13 @@ const EdgeConfig = z.object({
    * UDS control server uses its own socket transport and is unaffected.
    */
   HIVE_BROKER_PROXY: z.string().url().optional(),
+  /**
+   * Liveness threshold: this long without a COMPLETED broker poll, while
+   * dispatch slots are free, is one stale cycle; two consecutive stale cycles
+   * exit the process for systemd. A healthy edge completes a poll at least
+   * every long-poll window (25s), so five minutes of silence is decisive.
+   */
+  HIVE_EDGE_WATCHDOG_STALE_MS: z.coerce.number().int().min(30_000).default(300_000),
 });
 
 function requiredEnv(name: string): string {

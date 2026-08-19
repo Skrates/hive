@@ -5,7 +5,28 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { WebSocketServer } from "ws";
-import { CodexAppServerClient } from "./app-server.js";
+import { CodexAppServerClient, delay } from "./app-server.js";
+
+test("a resolved polling delay removes its abort listener", async () => {
+  const controller = new AbortController();
+  const added: unknown[] = [];
+  const removed: unknown[] = [];
+  const add = controller.signal.addEventListener.bind(controller.signal);
+  const drop = controller.signal.removeEventListener.bind(controller.signal);
+  controller.signal.addEventListener = ((type: string, listener: unknown, options?: unknown) => {
+    if (type === "abort") added.push(listener);
+    return add(type, listener as never, options as never);
+  }) as typeof controller.signal.addEventListener;
+  controller.signal.removeEventListener = ((type: string, listener: unknown, options?: unknown) => {
+    if (type === "abort") removed.push(listener);
+    return drop(type, listener as never, options as never);
+  }) as typeof controller.signal.removeEventListener;
+
+  await delay(10, controller.signal);
+  assert.equal(added.length, 1);
+  assert.deepEqual(removed, added);
+  controller.abort();
+});
 
 test("the live bridge resumes a persisted thread on its own long-lived connection", async () => {
   const fixture = await appServerFixture((method) => method === "thread/read"
@@ -53,6 +74,8 @@ test("delivery correlates and waits for the exact completed Codex turn", async (
     assert.deepEqual(fixture.methods, [
       "initialize", "initialized", "thread/read", "turn/start", "thread/read",
     ]);
+    await fixture.client.interrupt("thread-1", accepted.turnId);
+    assert.equal(fixture.methods.at(-1), "turn/interrupt");
   } finally {
     await fixture.close();
   }

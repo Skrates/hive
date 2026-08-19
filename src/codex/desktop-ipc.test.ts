@@ -442,6 +442,32 @@ test("an owner conflict before the steer response rejects completion immediately
   );
 });
 
+test("interrupt asks Desktop to cancel the exact accepted turn", async (t) => {
+  const seen: Message[] = [];
+  const router = await mockRouter((socket, message) => {
+    seen.push(message);
+    if (message.method === "initialize") initialize(socket, message);
+    if (message.method === "thread-follower-interrupt-turn") {
+      socket.write(encode({
+        type: "response",
+        requestId: message.requestId,
+        resultType: "success",
+        method: "thread-follower-interrupt-turn",
+        result: {},
+      }));
+    }
+  });
+  t.after(() => router.close());
+  const client = new CodexDesktopIpcClient(router.path, 100);
+  t.after(() => client.close());
+  await client.connect();
+  await client.interrupt("thread-1", "turn-9");
+  const interrupt = seen.find((message) => message.method === "thread-follower-interrupt-turn");
+  assert.ok(interrupt);
+  assert.equal(interrupt.version, 1);
+  assert.deepEqual(interrupt.params, { conversationId: "thread-1", turnId: "turn-9" });
+});
+
 async function mockRouter(
   handler: (socket: Socket, message: Message) => void,
 ): Promise<{ path: string; close(): Promise<void> }> {

@@ -13,7 +13,8 @@ export const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 type ThreadFollowerMethod =
   | "thread-follower-load-complete-history"
   | "thread-follower-start-turn"
-  | "thread-follower-steer-turn";
+  | "thread-follower-steer-turn"
+  | "thread-follower-interrupt-turn";
 
 // These are the protocol versions advertised by the Codex Desktop IPC router.
 // Unknown methods are intentionally not accepted: this is a private, versioned seam.
@@ -22,6 +23,7 @@ const REQUEST_VERSIONS: Readonly<Record<"initialize" | ThreadFollowerMethod, num
   "thread-follower-load-complete-history": 1,
   "thread-follower-start-turn": 1,
   "thread-follower-steer-turn": 1,
+  "thread-follower-interrupt-turn": 1,
 };
 
 interface IpcResponse {
@@ -163,6 +165,7 @@ export class CodexDesktopIpcClient {
     conversationId: string,
     delivery: DesktopDelivery,
     timeoutMs: number,
+    signal?: AbortSignal,
   ): Promise<DesktopTurnCompletion> {
     const follower = this.followers.get(conversationId);
     if (!follower) {
@@ -172,7 +175,7 @@ export class CodexDesktopIpcClient {
         "not_following",
       ));
     }
-    return follower.waitForDeliveryOutcome(delivery, timeoutMs);
+    return follower.waitForDeliveryOutcome(delivery, timeoutMs, signal);
   }
 
   async deliver(
@@ -233,6 +236,15 @@ export class CodexDesktopIpcClient {
       clientUserMessageId,
       mode: "start",
     };
+  }
+
+  async interrupt(
+    conversationId: string,
+    turnId: string,
+    timeoutMs = this.requestTimeoutMs,
+  ): Promise<void> {
+    await this.connect();
+    await this.request("thread-follower-interrupt-turn", { conversationId, turnId }, timeoutMs);
   }
 
   private async open(): Promise<void> {
@@ -584,8 +596,13 @@ class ThreadFollower {
     return locateDelivery(this.state, clientUserMessageId);
   }
 
-  waitForDeliveryOutcome(delivery: DesktopDelivery, timeoutMs: number): Promise<DesktopTurnCompletion> {
+  waitForDeliveryOutcome(
+    delivery: DesktopDelivery,
+    timeoutMs: number,
+    signal?: AbortSignal,
+  ): Promise<DesktopTurnCompletion> {
     if (this.terminalError) return Promise.reject(this.terminalError);
+    if (signal?.aborted) return Promise.reject(new Error("Codex live delivery aborted"));
     const current = findDeliveryOutcome(this.state, delivery);
     if (current) return Promise.resolve(current);
     return new Promise((resolve, reject) => {
@@ -607,6 +624,12 @@ class ThreadFollower {
         }, timeoutMs),
       };
       this.waiters.add(waiter);
+      signal?.addEventListener("abort", () => {
+        if (!this.waiters.has(waiter)) return;
+        clearTimeout(waiter.timer);
+        this.waiters.delete(waiter);
+        reject(new Error("Codex live delivery aborted"));
+      }, { once: true });
     });
   }
 
