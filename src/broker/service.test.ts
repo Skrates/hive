@@ -10,7 +10,7 @@ import {
   resetObservabilityForTests,
 } from "../observability.js";
 import { BrokerService, type SlackTransport } from "./service.js";
-import { BrokerStore, OUTBOX_MAX_ATTEMPTS } from "./store.js";
+import { BrokerStore, InvalidTransitionError, OUTBOX_MAX_ATTEMPTS, StaleLeaseError } from "./store.js";
 
 const unusedSlack: SlackTransport = {
   async replay(): Promise<ReplaySnapshot> { throw new Error("not used"); },
@@ -57,6 +57,44 @@ function seedDispatchedDelivery(store: BrokerStore): number {
   store.transition(claimed.id, "mac", 1, "accepted_local", "dispatching");
   store.transition(claimed.id, "mac", 1, "dispatching", "dispatched");
   return claimed.id;
+}
+
+/** A claimed delivery whose lease is long enough that only the test ends it. */
+function seedClaimedDelivery(store: BrokerStore, eventId: string) {
+  store.createEdge("mac");
+  store.upsertSubscription({
+    actor: "ariadne",
+    provider: "codex",
+    providerSurface: "app-server",
+    providerVersion: "test",
+    sessionId: null,
+    homeEdge: "mac",
+    workspace: "hive",
+    edgeWorkspaces: [{ edgeId: "mac", cwd: "/work/hive", worktree: null }],
+    wakePolicy: "spawn",
+    permissionProfile: "read-only",
+    accountProfile: "/profiles/ariadne",
+    leaseTtlMs: 60_000,
+    deliveryTtlMs: 300_000,
+    homeGraceMs: 0,
+    spawnRateLimit: 1,
+    maxAttempts: 1,
+    expiresAt: null,
+  } satisfies SubscriptionInput);
+  store.ingestEvent({
+    eventId,
+    workspaceId: "T1",
+    channelId: "C1",
+    threadTs: "100.1",
+    messageTs: "100.2",
+    senderId: "U1",
+    senderKind: "user",
+    actor: "ariadne",
+    text: "WAKE: ariadne | renew spans",
+    raw: {},
+    receivedAt: "2026-08-01T00:00:00.000Z",
+  } satisfies SlackEventInput);
+  return store.claimNext("mac", 0)!;
 }
 
 test("overlapping outbox drains share one healthy in-process pass", async (t) => {
@@ -420,4 +458,65 @@ test("accept and release emit broker transition spans", (t) => {
   assert.ok(names.includes("hive.broker.accept"), `expected accept span, got ${names.join(",")}`);
   assert.ok(names.includes("hive.broker.release"), `expected release span, got ${names.join(",")}`);
   assert.ok(!names.includes("hive.broker.renew"), `renew must not emit a span, got ${names.join(",")}`);
+});
+
+test("a failed renewal emits the authority-loss span a healthy one withholds", (t) => {
+  resetObservabilityForTests();
+  t.after(() => resetObservabilityForTests());
+
+  const store = new BrokerStore(":memory:");
+  t.after(() => store.close());
+  const claimed = seedClaimedDelivery(store, "Ev-renew-stale");
+
+  const exporter = new InMemorySpanExporter();
+  logfire.configure({
+    serviceName: "hive-test-renew-stale",
+    sendToLogfire: false,
+    console: false,
+    additionalSpanProcessors: [new SimpleSpanProcessor(exporter)],
+  });
+  installObservabilitySdkForTests(logfire);
+
+  const broker = new BrokerService(store, unusedSlack);
+  const generation = claimed.leaseGeneration!;
+  // A stolen lease bumps the generation, so this edge's heartbeat is stale.
+  assert.throws(() => broker.renew(claimed.id, "mac", generation + 1), StaleLeaseError);
+  // The failure is not swallowed to buy the span: the 409 the edge sees still happens.
+  broker.renew(claimed.id, "mac", generation);
+
+  const renews = exporter.getFinishedSpans().filter((span) => span.name === "hive.broker.renew");
+  assert.equal(renews.length, 1, "only the failed renewal is spanned");
+  assert.equal(renews[0]!.attributes.outcome, "stale_lease");
+  assert.equal(renews[0]!.attributes.delivery_id, claimed.id);
+});
+
+test("renewing a terminal delivery spans the invalid transition", (t) => {
+  resetObservabilityForTests();
+  t.after(() => resetObservabilityForTests());
+
+  const store = new BrokerStore(":memory:");
+  t.after(() => store.close());
+  const claimed = seedClaimedDelivery(store, "Ev-renew-terminal");
+  const generation = claimed.leaseGeneration!;
+  // The lease outlives the terminal transition, so a heartbeat tick that races
+  // the end of the turn reaches renew with authority intact and nothing to renew.
+  store.finish(claimed.id, "mac", generation, "processed", []);
+
+  const exporter = new InMemorySpanExporter();
+  logfire.configure({
+    serviceName: "hive-test-renew-terminal",
+    sendToLogfire: false,
+    console: false,
+    additionalSpanProcessors: [new SimpleSpanProcessor(exporter)],
+  });
+  installObservabilitySdkForTests(logfire);
+
+  assert.throws(
+    () => new BrokerService(store, unusedSlack).renew(claimed.id, "mac", generation),
+    InvalidTransitionError,
+  );
+
+  const renews = exporter.getFinishedSpans().filter((span) => span.name === "hive.broker.renew");
+  assert.equal(renews.length, 1, "the invalid transition is spanned");
+  assert.equal(renews[0]!.attributes.outcome, "invalid_transition");
 });
