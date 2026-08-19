@@ -1,6 +1,6 @@
 import type { Delivery, DeliveryResultInput, Reason, ReplaySnapshot, SlackEventInput, SubscriptionInput } from "../domain.js";
 import { forgetDeliveryTraceparent, peekDeliveryTrace, runInTraceContext, setSpanAttributes, withSpan } from "../observability.js";
-import { BrokerStore } from "./store.js";
+import { BrokerStore, InvalidTransitionError, StaleLeaseError } from "./store.js";
 
 export interface SlackTransport {
   replay(channelId: string, threadTs: string): Promise<ReplaySnapshot>;
@@ -88,11 +88,24 @@ export class BrokerService {
       this.store.markDispatched(deliveryId, edgeId, generation));
   }
 
+  /**
+   * ADR-0002 observability: successful lease renewals are sampled or aggregated,
+   * authority-loss traces are retained. So a healthy renewal is not spanned at
+   * all — the heartbeat is O(turn duration), ~3 per `leaseTtlMs`, i.e. ~180 in a
+   * one-hour headless turn at the production 60s TTL — and a failed one is,
+   * because the edge's heartbeat error is sticky but is not reported until the
+   * turn ends. This span is the only artifact dated to the moment the fence broke.
+   */
   renew(deliveryId: number, edgeId: string, generation: number): Delivery {
-    // Lease heartbeat is O(duration), not O(delivery). A span here would
-    // dominate every long headless turn (~3/leaseTtlMs); the next transition
-    // already surfaces a sticky renew failure.
-    return this.store.renewDeliveryLease(deliveryId, edgeId, generation);
+    try {
+      return this.store.renewDeliveryLease(deliveryId, edgeId, generation);
+    } catch (error) {
+      return withSpan(
+        "hive.broker.renew",
+        { delivery_id: deliveryId, outcome: renewFailureOutcome(error) },
+        (): Delivery => { throw error; },
+      );
+    }
   }
 
   reserveSpawn(deliveryId: number, edgeId: string, generation: number): boolean {
@@ -212,4 +225,15 @@ export class BrokerService {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
+}
+
+/**
+ * Operator-facing vocabulary for a failed renewal, kept identical to the codes
+ * `BrokerHttpServer.handleError` puts on the 409 body so the span and the
+ * response the edge sees name the same failure.
+ */
+function renewFailureOutcome(error: unknown): string {
+  if (error instanceof StaleLeaseError) return "stale_lease";
+  if (error instanceof InvalidTransitionError) return "invalid_transition";
+  return "renew_failed";
 }

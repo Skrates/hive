@@ -48,9 +48,12 @@ and through the durable outbox send. The delivery row stores that W3C context, s
 restart continues the same trace at claim rather than opening a new root. They carry delivery
 id, dedupe key, channel id, thread ts, actor, event type, dispatch mode, and outcome — never
 message bodies, Slack tokens, or credentials. Allowlisted string fields are length-capped
-before export. Lease renewal is not spanned: it is periodic for the provider turn (~20s at
-the production 60s TTL), and a failed heartbeat already surfaces on the next transition.
-Export is batched; a Logfire outage cannot delay or drop a delivery.
+before export. A *successful* lease renewal is not spanned: the heartbeat is periodic for the
+whole provider turn (~20s at the production 60s TTL), so an hour-long wake would emit ~180 spans
+against ~12 lifecycle ones. A *failed* one is spanned as `hive.broker.renew`, with an `outcome` of
+`stale_lease`, `invalid_transition`, or `renew_failed`. The edge's own heartbeat error is sticky
+but is not reported until the turn ends, so that span is the only artifact dated to the moment
+authority was lost. Export is batched; a Logfire outage cannot delay or drop a delivery.
 
 ## Broker
 
