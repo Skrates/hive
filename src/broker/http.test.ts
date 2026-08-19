@@ -1,7 +1,14 @@
 import assert from "node:assert/strict";
 import http from "node:http";
+import * as logfire from "@pydantic/logfire-node";
 import test from "node:test";
-import type { ReplaySnapshot } from "../domain.js";
+import type { ReplaySnapshot, SubscriptionInput } from "../domain.js";
+import {
+  installObservabilitySdkForTests,
+  rememberDeliveryTraceparent,
+  resetObservabilityForTests,
+  withSpan,
+} from "../observability.js";
 import { BrokerHttpServer } from "./http.js";
 import { BrokerService, type SlackTransport } from "./service.js";
 import { BrokerStore } from "./store.js";
@@ -71,4 +78,184 @@ test("stop() force-closes an in-flight long-poll instead of hanging on it", { ti
 
   assert.ok(elapsedMs < 2_000, `stop() still completed promptly, in ${elapsedMs}ms`);
   assert.equal(await longPollSettled, "aborted", "the in-flight long-poll was force-closed, not left to finish");
+});
+
+function subscription(): SubscriptionInput {
+  return {
+    actor: "ariadne",
+    provider: "codex",
+    providerSurface: "app-server",
+    providerVersion: "test",
+    sessionId: "thread-1",
+    homeEdge: "edge-1",
+    workspace: "hive",
+    edgeWorkspaces: [{ edgeId: "edge-1", cwd: "/work/hive", worktree: null }],
+    wakePolicy: "live_only",
+    permissionProfile: "full-access",
+    accountProfile: "/profiles/ariadne",
+    leaseTtlMs: 1_000,
+    deliveryTtlMs: 5_000,
+    homeGraceMs: 0,
+    spawnRateLimit: 1,
+    maxAttempts: 5,
+    expiresAt: null,
+  };
+}
+
+test("claim response carries the stored delivery traceparent", async (t) => {
+  resetObservabilityForTests();
+  t.after(() => resetObservabilityForTests());
+  const store = new BrokerStore(":memory:");
+  t.after(() => store.close());
+  const edgeToken = store.createEdge("edge-1");
+  store.upsertSubscription(subscription());
+  store.ingestEvent({
+    eventId: "Ev-trace",
+    workspaceId: "T1",
+    channelId: "C1",
+    threadTs: "100.1",
+    messageTs: "100.2",
+    senderId: "U1",
+    senderKind: "user",
+    actor: "ariadne",
+    text: "WAKE: ariadne | metadata only",
+    raw: {},
+    receivedAt: "2026-08-01T00:00:00.000Z",
+  });
+  const parent = `00-${"ab".repeat(16)}-${"cd".repeat(8)}-01`;
+  rememberDeliveryTraceparent(1, parent);
+
+  const broker = new BrokerService(store, slack);
+  const server = new BrokerHttpServer(broker, { host: "127.0.0.1", port: 0, adminToken: "x".repeat(32) });
+  const { port } = await server.start();
+  t.after(() => server.stop());
+
+  const response = await fetch(`http://127.0.0.1:${port}/v1/deliveries?wait_ms=0`, {
+    headers: { "x-hive-edge": "edge-1", authorization: `Bearer ${edgeToken}` },
+  });
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("traceparent"), parent);
+  assert.equal(response.headers.get("tracestate"), null);
+  const body = await response.json() as { id: number; eventId: string };
+  assert.equal(body.id, 1);
+  assert.equal(body.eventId, "Ev-trace");
+});
+
+test("claim response carries stored tracestate alongside traceparent", async (t) => {
+  resetObservabilityForTests();
+  t.after(() => resetObservabilityForTests());
+  const store = new BrokerStore(":memory:");
+  t.after(() => store.close());
+  const edgeToken = store.createEdge("edge-1");
+  store.upsertSubscription(subscription());
+  store.ingestEvent({
+    eventId: "Ev-tracestate",
+    workspaceId: "T1",
+    channelId: "C1",
+    threadTs: "100.1",
+    messageTs: "100.2",
+    senderId: "U1",
+    senderKind: "user",
+    actor: "ariadne",
+    text: "WAKE: ariadne | metadata only",
+    raw: {},
+    receivedAt: "2026-08-01T00:00:00.000Z",
+  });
+  const parent = `00-${"ab".repeat(16)}-${"cd".repeat(8)}-01`;
+  const tracestate = "congo=t61rcWkgMzE";
+  rememberDeliveryTraceparent(1, parent, tracestate);
+
+  const broker = new BrokerService(store, slack);
+  const server = new BrokerHttpServer(broker, { host: "127.0.0.1", port: 0, adminToken: "x".repeat(32) });
+  const { port } = await server.start();
+  t.after(() => server.stop());
+
+  const response = await fetch(`http://127.0.0.1:${port}/v1/deliveries?wait_ms=0`, {
+    headers: { "x-hive-edge": "edge-1", authorization: `Bearer ${edgeToken}` },
+  });
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("traceparent"), parent);
+  assert.equal(response.headers.get("tracestate"), tracestate);
+});
+
+test("claim response restores the persisted delivery traceparent after a broker restart", async (t) => {
+  resetObservabilityForTests();
+  t.after(() => resetObservabilityForTests());
+  const store = new BrokerStore(":memory:");
+  t.after(() => store.close());
+  const edgeToken = store.createEdge("edge-1");
+  store.upsertSubscription(subscription());
+  logfire.configure({
+    serviceName: "hive-test-claim-restart",
+    sendToLogfire: false,
+    console: false,
+  });
+  installObservabilitySdkForTests(logfire);
+  withSpan("hive.test.ingest", {}, () => {
+    store.ingestEvent({
+      eventId: "Ev-restart",
+      workspaceId: "T1",
+      channelId: "C1",
+      threadTs: "100.1",
+      messageTs: "100.2",
+      senderId: "U1",
+      senderKind: "user",
+      actor: "ariadne",
+      text: "WAKE: ariadne | metadata only",
+      raw: {},
+      receivedAt: "2026-08-01T00:00:00.000Z",
+    });
+  });
+  const persisted = store.db.prepare(
+    "SELECT traceparent, tracestate FROM deliveries WHERE delivery_id=1",
+  ).get() as { traceparent: string | null; tracestate: string | null };
+  assert.ok(persisted.traceparent, "ingest under a span must persist a traceparent");
+  resetObservabilityForTests();
+
+  const broker = new BrokerService(store, slack);
+  const server = new BrokerHttpServer(broker, { host: "127.0.0.1", port: 0, adminToken: "x".repeat(32) });
+  const { port } = await server.start();
+  t.after(() => server.stop());
+
+  const response = await fetch(`http://127.0.0.1:${port}/v1/deliveries?wait_ms=0`, {
+    headers: { "x-hive-edge": "edge-1", authorization: `Bearer ${edgeToken}` },
+  });
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("traceparent"), persisted.traceparent);
+  if (persisted.tracestate !== null) {
+    assert.equal(response.headers.get("tracestate"), persisted.tracestate);
+  }
+});
+
+test("claim response has no traceparent when none was stored", async (t) => {
+  resetObservabilityForTests();
+  t.after(() => resetObservabilityForTests());
+  const store = new BrokerStore(":memory:");
+  t.after(() => store.close());
+  const edgeToken = store.createEdge("edge-1");
+  store.upsertSubscription(subscription());
+  store.ingestEvent({
+    eventId: "Ev-plain",
+    workspaceId: "T1",
+    channelId: "C1",
+    threadTs: "100.1",
+    messageTs: "100.2",
+    senderId: "U1",
+    senderKind: "user",
+    actor: "ariadne",
+    text: "WAKE: ariadne | no stored context",
+    raw: {},
+    receivedAt: "2026-08-01T00:00:00.000Z",
+  });
+
+  const broker = new BrokerService(store, slack);
+  const server = new BrokerHttpServer(broker, { host: "127.0.0.1", port: 0, adminToken: "x".repeat(32) });
+  const { port } = await server.start();
+  t.after(() => server.stop());
+
+  const response = await fetch(`http://127.0.0.1:${port}/v1/deliveries?wait_ms=0`, {
+    headers: { "x-hive-edge": "edge-1", authorization: `Bearer ${edgeToken}` },
+  });
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("traceparent"), null);
 });

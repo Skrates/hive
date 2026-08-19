@@ -2,6 +2,7 @@ import { SocketModeClient } from "@slack/socket-mode";
 import { WebClient } from "@slack/web-api";
 import { isAdmitted, parseAddressedWake, type AdmissionPolicy } from "../addressing.js";
 import { EVERYONE, type ReplaySnapshot, type SlackEventInput } from "../domain.js";
+import { rememberDeliveryTraceparent, withSpan } from "../observability.js";
 import type { BrokerService, SlackTransport } from "./service.js";
 
 interface SlackMessageEvent {
@@ -116,7 +117,8 @@ export async function handleSlackEnvelope(
   }
 
   const event = asSlackMessageEvent(body.event);
-  if (!event?.text) {
+  const text = event?.text;
+  if (!event || !text) {
     await ack();
     return;
   }
@@ -131,7 +133,7 @@ export async function handleSlackEnvelope(
   // precedence. Without one, thread affinity may still route the message to the
   // actors already bound to its thread — but only after the same admission
   // checks. Parsing is not routing; admission decides first.
-  const addressed = parseAddressedWake(event.text);
+  const addressed = parseAddressedWake(text);
   const senderKind = event.user ? "user" : "app";
   const senderId = event.user ?? event.app_id ?? event.bot_id;
   const threadTs = event.thread_ts ?? event.ts;
@@ -187,39 +189,52 @@ export async function handleSlackEnvelope(
     return;
   }
 
-  const receivedAt = now().toISOString();
-  for (const actor of targets) {
-    // One Slack message fans out to one delivery per target actor. A lone
-    // explicit envelope keeps the Slack event_id verbatim; affinity fan-out
-    // derives a per-actor durable identity so the slack_events primary key never
-    // collides across a multi-actor thread, while a Slack redelivery of the same
-    // event still deduplicates per actor and coalesces per actor as today.
-    const perActorEventId = addressed && targets.length === 1 ? eventId : `${eventId}#${actor}`;
-    const normalized: SlackEventInput = {
-      eventId: perActorEventId,
-      workspaceId,
-      channelId: event.channel,
-      threadTs,
-      messageTs: event.ts,
-      senderId,
-      senderKind,
-      actor,
-      text: event.text,
-      raw: body,
-      receivedAt,
-    };
-    // A fresh event row that minted no delivery means this actor has no live
-    // subscription: the wake was durably recorded but reached no one. Surface
-    // that dead-letter in the thread. Keyed on `created` so a lost-ACK
-    // redelivery (which dedupes to created:false) can never double-post the
-    // notice. Covers both entry points — an explicit envelope and affinity
-    // fan-out — since every target passes through this ingest.
-    const result = broker.ingest(normalized);
-    if (result.created && result.deliveryId === null && dropNotifier) {
-      dropNotifier.noticeUnroutableActor(event.channel, threadTs, actor);
+  await withSpan("hive.slack.receive", {
+    channel_id: event.channel,
+    thread_ts: threadTs,
+    event_type: addressed ? "wake" : "affinity",
+  }, async () => {
+    const receivedAt = now().toISOString();
+    for (const actor of targets) {
+      // One Slack message fans out to one delivery per target actor. A lone
+      // explicit envelope keeps the Slack event_id verbatim; affinity fan-out
+      // derives a per-actor durable identity so the slack_events primary key never
+      // collides across a multi-actor thread, while a Slack redelivery of the same
+      // event still deduplicates per actor and coalesces per actor as today.
+      const perActorEventId = addressed && targets.length === 1 ? eventId : `${eventId}#${actor}`;
+      const normalized: SlackEventInput = {
+        eventId: perActorEventId,
+        workspaceId,
+        channelId: event.channel,
+        threadTs,
+        messageTs: event.ts,
+        senderId,
+        senderKind,
+        actor,
+        text,
+        raw: body,
+        receivedAt,
+      };
+      // A fresh event row that minted no delivery means this actor has no live
+      // subscription: the wake was durably recorded but reached no one. Surface
+      // that dead-letter in the thread. Keyed on `created` so a lost-ACK
+      // redelivery (which dedupes to created:false) can never double-post the
+      // notice. Covers both entry points — an explicit envelope and affinity
+      // fan-out — since every target passes through this ingest.
+      const result = withSpan("hive.broker.ingest", {
+        actor,
+        channel_id: event.channel,
+        thread_ts: threadTs,
+        dedupe_key: perActorEventId,
+        event_type: addressed ? "wake" : "affinity",
+      }, () => broker.ingest(normalized));
+      if (result.deliveryId !== null) rememberDeliveryTraceparent(result.deliveryId);
+      if (result.created && result.deliveryId === null && dropNotifier) {
+        dropNotifier.noticeUnroutableActor(event.channel, threadTs, actor);
+      }
     }
-  }
-  await ack();
+    await ack();
+  });
 }
 
 function asSlackMessageEvent(value: unknown): SlackMessageEvent | null {

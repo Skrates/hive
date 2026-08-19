@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import Database from "better-sqlite3";
+import * as logfire from "@pydantic/logfire-node";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,6 +13,13 @@ import {
   StaleLeaseError,
 } from "./store.js";
 import { frameWakeInstruction, retryBackoffMs, SubscriptionInputSchema, type SlackEventInput, type SubscriptionInput } from "../domain.js";
+import {
+  installObservabilitySdkForTests,
+  peekDeliveryTraceparent,
+  rememberDeliveryTraceparent,
+  resetObservabilityForTests,
+  withSpan,
+} from "../observability.js";
 import type { Clock } from "../time.js";
 
 class FakeClock implements Clock {
@@ -344,6 +352,127 @@ test("release requeues with backoff and exhausts into failed", () => {
   assert.ok(store.listUnsentOutbox().some((entry) => /failed after 1 attempt/.test(entry.text)));
   clock.advance(1);
   assert.equal(store.claimNext("mac", 0), null);
+  store.close();
+});
+
+test("attempt exhaustion forgets the stored delivery traceparent", () => {
+  resetObservabilityForTests();
+  const { store } = fixture({ maxAttempts: 1 });
+  store.ingestEvent(event());
+  const claimed = store.claimNext("mac", 0)!;
+  const parent = `00-${"ab".repeat(16)}-${"cd".repeat(8)}-01`;
+  rememberDeliveryTraceparent(claimed.id, parent);
+  const released = store.release(claimed.id, "mac", claimed.leaseGeneration!, {
+    code: "provider_dispatch_unknown",
+    detail: "test uncertainty",
+  });
+  assert.equal(released.status, "failed");
+  assert.equal(peekDeliveryTraceparent(claimed.id), undefined);
+  store.close();
+});
+
+test("an expired pending delivery forgets its stored traceparent", () => {
+  resetObservabilityForTests();
+  const { store, clock } = fixture({ wakePolicy: "resume", sessionId: "thread-1", deliveryTtlMs: 100 });
+  store.ingestEvent(event());
+  const parent = `00-${"ab".repeat(16)}-${"cd".repeat(8)}-01`;
+  rememberDeliveryTraceparent(1, parent);
+  clock.advance(101);
+  assert.equal(store.claimNext("mac", 0), null);
+  assert.equal(store.getDelivery(1).status, "undeliverable");
+  assert.equal(peekDeliveryTraceparent(1), undefined);
+  const notice = store.listUnsentOutbox()[0];
+  assert.equal(notice?.traceparent, parent);
+  store.close();
+});
+
+test("a resume subscription with no session forgets its stored traceparent", () => {
+  resetObservabilityForTests();
+  const { store } = fixture({ wakePolicy: "resume", sessionId: null });
+  store.ingestEvent(event());
+  const parent = `00-${"ab".repeat(16)}-${"cd".repeat(8)}-01`;
+  rememberDeliveryTraceparent(1, parent);
+  assert.equal(store.claimNext("mac", 0), null);
+  assert.equal(store.getDelivery(1).status, "undeliverable");
+  assert.equal(store.getDelivery(1).reasons[0]?.code, "resume_target_missing");
+  assert.equal(peekDeliveryTraceparent(1), undefined);
+  store.close();
+});
+
+test("ingest persists W3C context and getDelivery restores it after the in-memory map is cleared", (t) => {
+  resetObservabilityForTests();
+  t.after(() => resetObservabilityForTests());
+  logfire.configure({
+    serviceName: "hive-test-delivery-trace",
+    sendToLogfire: false,
+    console: false,
+  });
+  installObservabilitySdkForTests(logfire);
+  const { store } = fixture();
+  withSpan("hive.test.ingest", {}, () => {
+    store.ingestEvent(event());
+  });
+  const persisted = store.db.prepare(
+    "SELECT traceparent, tracestate FROM deliveries WHERE delivery_id=1",
+  ).get() as { traceparent: string | null; tracestate: string | null };
+  assert.ok(persisted.traceparent, "ingest under a span must persist a traceparent");
+
+  resetObservabilityForTests();
+  assert.equal(peekDeliveryTraceparent(1), undefined);
+  store.getDelivery(1);
+  assert.equal(peekDeliveryTraceparent(1), persisted.traceparent);
+  store.close();
+});
+
+test("a terminal delivery does not re-hydrate a forgotten traceparent from the row", (t) => {
+  resetObservabilityForTests();
+  t.after(() => resetObservabilityForTests());
+  logfire.configure({
+    serviceName: "hive-test-delivery-trace-terminal",
+    sendToLogfire: false,
+    console: false,
+  });
+  installObservabilitySdkForTests(logfire);
+  const { store } = fixture();
+  withSpan("hive.test.ingest", {}, () => {
+    store.ingestEvent(event());
+  });
+  store.db.prepare("UPDATE deliveries SET status='processed' WHERE delivery_id=1").run();
+  resetObservabilityForTests();
+  store.getDelivery(1);
+  assert.equal(peekDeliveryTraceparent(1), undefined);
+  store.close();
+});
+
+test("existing databases gain delivery W3C columns in place", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "hive-delivery-trace-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const path = join(directory, "broker.sqlite");
+  const first = new BrokerStore(path);
+  first.close();
+  const raw = new Database(path);
+  raw.exec("ALTER TABLE deliveries DROP COLUMN traceparent");
+  raw.exec("ALTER TABLE deliveries DROP COLUMN tracestate");
+  raw.close();
+  const second = new BrokerStore(path);
+  const columns = (second.db.pragma("table_info(deliveries)") as { name: string }[]).map((c) => c.name);
+  assert.ok(columns.includes("traceparent"));
+  assert.ok(columns.includes("tracestate"));
+  second.close();
+});
+
+test("a retry requeue keeps the stored delivery traceparent", () => {
+  resetObservabilityForTests();
+  const { store, clock } = fixture({ maxAttempts: 3 });
+  store.ingestEvent(event());
+  const claimed = store.claimNext("mac", 0)!;
+  store.transition(claimed.id, "mac", claimed.leaseGeneration!, "claimed", "accepted_local");
+  const parent = `00-${"ab".repeat(16)}-${"cd".repeat(8)}-01`;
+  rememberDeliveryTraceparent(claimed.id, parent);
+  clock.advance(1_001);
+  assert.equal(store.requeueExpiredLeases(), 1);
+  assert.equal(store.getDelivery(claimed.id).status, "pending");
+  assert.equal(peekDeliveryTraceparent(claimed.id), parent);
   store.close();
 });
 
@@ -697,6 +826,8 @@ test("thread notices carry no reaction and pre-reaction databases migrate in pla
   const columns = (second.db.pragma("table_info(outbox)") as { name: string }[]).map((c) => c.name);
   assert.ok(!columns.includes("reaction_target_ts"));
   assert.ok(columns.includes("reaction_targets_json"));
+  assert.ok(columns.includes("traceparent"));
+  assert.ok(columns.includes("tracestate"));
   second.close();
 });
 

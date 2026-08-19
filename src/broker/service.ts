@@ -1,5 +1,6 @@
 import type { Delivery, DeliveryResultInput, Reason, ReplaySnapshot, SlackEventInput, SubscriptionInput } from "../domain.js";
-import { BrokerStore } from "./store.js";
+import { forgetDeliveryTraceparent, peekDeliveryTrace, runInTraceContext, setSpanAttributes, withSpan } from "../observability.js";
+import { BrokerStore, InvalidTransitionError, StaleLeaseError } from "./store.js";
 
 export interface SlackTransport {
   replay(channelId: string, threadTs: string): Promise<ReplaySnapshot>;
@@ -69,11 +70,13 @@ export class BrokerService {
   }
 
   accept(deliveryId: number, edgeId: string, generation: number): Delivery {
-    return this.store.transition(deliveryId, edgeId, generation, "claimed", "accepted_local");
+    return withSpan("hive.broker.accept", { delivery_id: deliveryId }, () =>
+      this.store.transition(deliveryId, edgeId, generation, "claimed", "accepted_local"));
   }
 
   beginDispatch(deliveryId: number, edgeId: string, generation: number): Delivery {
-    return this.store.transition(deliveryId, edgeId, generation, "accepted_local", "dispatching");
+    return withSpan("hive.broker.dispatch", { delivery_id: deliveryId }, () =>
+      this.store.transition(deliveryId, edgeId, generation, "accepted_local", "dispatching"));
   }
 
   /**
@@ -81,29 +84,65 @@ export class BrokerService {
    * sender-visible delivery receipt commit in one store transaction.
    */
   markDispatched(deliveryId: number, edgeId: string, generation: number): Delivery {
-    return this.store.markDispatched(deliveryId, edgeId, generation);
+    return withSpan("hive.broker.dispatched", { delivery_id: deliveryId }, () =>
+      this.store.markDispatched(deliveryId, edgeId, generation));
   }
 
+  /**
+   * ADR-0002 observability: successful lease renewals are sampled or aggregated,
+   * authority-loss traces are retained. So a healthy renewal is not spanned at
+   * all — the heartbeat is O(turn duration), ~3 per `leaseTtlMs`, i.e. ~180 in a
+   * one-hour headless turn at the production 60s TTL — and a failed one is,
+   * because the edge's heartbeat error is sticky but is not reported until the
+   * turn ends. This span is the only artifact dated to the moment the fence broke.
+   */
   renew(deliveryId: number, edgeId: string, generation: number): Delivery {
-    return this.store.renewDeliveryLease(deliveryId, edgeId, generation);
+    try {
+      return this.store.renewDeliveryLease(deliveryId, edgeId, generation);
+    } catch (error) {
+      return withSpan(
+        "hive.broker.renew",
+        { delivery_id: deliveryId, outcome: renewFailureOutcome(error) },
+        (): Delivery => { throw error; },
+      );
+    }
   }
 
   reserveSpawn(deliveryId: number, edgeId: string, generation: number): boolean {
-    return this.store.reserveSpawn(deliveryId, edgeId, generation);
+    return withSpan("hive.broker.reserve_spawn", { delivery_id: deliveryId }, () =>
+      this.store.reserveSpawn(deliveryId, edgeId, generation));
   }
 
   finish(deliveryId: number, edgeId: string, result: DeliveryResultInput): Delivery {
-    return this.store.finish(deliveryId, edgeId, result.generation, result.status, result.reasons, result.outcome);
+    return withSpan("hive.broker.finish", { delivery_id: deliveryId, outcome: result.status }, () => {
+      const delivery = this.store.finish(deliveryId, edgeId, result.generation, result.status, result.reasons, result.outcome);
+      forgetDeliveryTraceparent(deliveryId);
+      return delivery;
+    });
   }
 
   /** ADR-0003 R-3: uncertainty releases the delivery for redelivery instead of declaring an outcome. */
   release(deliveryId: number, edgeId: string, generation: number, reason: Reason): Delivery {
-    return this.store.release(deliveryId, edgeId, generation, reason);
+    return withSpan("hive.broker.release", { delivery_id: deliveryId }, () =>
+      this.store.release(deliveryId, edgeId, generation, reason));
   }
 
   /** ADR-0003 R-6: agent outcome reports are not lease-fenced and always reach the thread. */
   recordOutcome(deliveryId: number, text: string): Delivery {
-    return this.store.recordOutcome(deliveryId, text);
+    const current = this.store.getDelivery(deliveryId);
+    return runInTraceContext(peekDeliveryTrace(deliveryId), () =>
+      withSpan("hive.broker.outcome", {
+        delivery_id: deliveryId,
+        actor: current.actor,
+        channel_id: current.event.channelId,
+        thread_ts: current.event.threadTs,
+        dedupe_key: current.eventId,
+      }, () => {
+        const delivery = this.store.recordOutcome(deliveryId, text);
+        forgetDeliveryTraceparent(deliveryId);
+        return delivery;
+      }),
+    );
   }
 
   replay(channelId: string, threadTs: string): Promise<ReplaySnapshot> {
@@ -111,12 +150,14 @@ export class BrokerService {
   }
 
   async reply(deliveryId: number, edgeId: string, generation: number, text: string): Promise<string> {
-    const delivery = this.store.getDelivery(deliveryId);
-    this.store.assertLease(deliveryId, edgeId, generation);
-    const correlated = `${text}\n\n[event_id=${delivery.eventId} delivery_id=${delivery.id}]`;
-    return this.slack.reply(delivery.event.channelId, delivery.event.threadTs, correlated, {
-      event_id: delivery.eventId,
-      delivery_id: String(delivery.id),
+    return withSpan("hive.broker.reply", { delivery_id: deliveryId }, async () => {
+      const delivery = this.store.getDelivery(deliveryId);
+      this.store.assertLease(deliveryId, edgeId, generation);
+      const correlated = `${text}\n\n[event_id=${delivery.eventId} delivery_id=${delivery.id}]`;
+      return this.slack.reply(delivery.event.channelId, delivery.event.threadTs, correlated, {
+        event_id: delivery.eventId,
+        delivery_id: String(delivery.id),
+      });
     });
   }
 
@@ -142,27 +183,41 @@ export class BrokerService {
     const entries = this.store.listUnsentOutbox();
     let sent = 0;
     for (const entry of entries) {
-      try {
-        await this.slack.reply(entry.channelId, entry.threadTs, entry.text, entry.deliveryId === null
-          ? {}
-          : { delivery_id: String(entry.deliveryId) });
-        // Reactions are glanceable annotation, not part of the two-events
-        // contract, so they are never awaited: this drain is the single-flight
-        // pass every claim() waits on, and one hung or rate-limit-held
-        // reactions.add would stall wake delivery bus-wide. The row's sent
-        // mark depends only on the text post; a failed stamp is logged and dropped.
-        if (entry.reaction !== null) {
-          for (const targetTs of entry.reactionTargets) {
-            void this.slack.react(entry.channelId, targetTs, entry.reaction).catch((error) => {
-              console.error("hive outbox reaction failed", entry.outboxId, entry.reaction, targetTs, error);
-            });
+      const ctx = entry.traceparent === null
+        ? undefined
+        : { traceparent: entry.traceparent, ...(entry.tracestate === null ? {} : { tracestate: entry.tracestate }) };
+      const posted = await runInTraceContext(ctx, () =>
+        withSpan("hive.broker.outbox.send", {
+          ...(entry.deliveryId === null ? {} : { delivery_id: entry.deliveryId }),
+          channel_id: entry.channelId,
+          thread_ts: entry.threadTs,
+        }, async () => {
+          try {
+            await this.slack.reply(entry.channelId, entry.threadTs, entry.text, entry.deliveryId === null
+              ? {}
+              : { delivery_id: String(entry.deliveryId) });
+            // Reactions are glanceable annotation, not part of the two-events
+            // contract, so they are never awaited: this drain is the single-flight
+            // pass every claim() waits on, and one hung or rate-limit-held
+            // reactions.add would stall wake delivery bus-wide. The row's sent
+            // mark depends only on the text post; a failed stamp is logged and dropped.
+            if (entry.reaction !== null) {
+              for (const targetTs of entry.reactionTargets) {
+                void this.slack.react(entry.channelId, targetTs, entry.reaction).catch((error) => {
+                  console.error("hive outbox reaction failed", entry.outboxId, entry.reaction, targetTs, error);
+                });
+              }
+            }
+            this.store.markOutboxSent(entry.outboxId);
+            setSpanAttributes({ outcome: "sent" });
+            return true;
+          } catch {
+            setSpanAttributes({ outcome: this.store.markOutboxAttempt(entry.outboxId) });
+            return false;
           }
-        }
-        this.store.markOutboxSent(entry.outboxId);
-        sent += 1;
-      } catch {
-        this.store.markOutboxAttempt(entry.outboxId);
-      }
+        }),
+      );
+      if (posted) sent += 1;
     }
     return sent;
   }
@@ -170,4 +225,15 @@ export class BrokerService {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
+}
+
+/**
+ * Operator-facing vocabulary for a failed renewal, kept identical to the codes
+ * `BrokerHttpServer.handleError` puts on the 409 body so the span and the
+ * response the edge sees name the same failure.
+ */
+function renewFailureOutcome(error: unknown): string {
+  if (error instanceof StaleLeaseError) return "stale_lease";
+  if (error instanceof InvalidTransitionError) return "invalid_transition";
+  return "renew_failed";
 }

@@ -12,6 +12,7 @@ import type {
   TerminalDeliveryStatus,
 } from "../domain.js";
 import { retryBackoffMs } from "../domain.js";
+import { captureActiveTraceContext, forgetDeliveryTraceparent, peekDeliveryTrace, rememberDeliveryTraceparent } from "../observability.js";
 import type { Clock } from "../time.js";
 import { iso, systemClock } from "../time.js";
 
@@ -62,6 +63,9 @@ export interface OutboxEntry {
   createdAt: string;
   sentAt: string | null;
   attempts: number;
+  /** W3C context captured at enqueue so the later Slack send stays on the delivery trace. */
+  traceparent: string | null;
+  tracestate: string | null;
 }
 
 /** Delivery-lifecycle reaction stamps: glanceable state on the wake message itself. */
@@ -197,6 +201,8 @@ export class BrokerStore {
         terminal_at TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
+        traceparent TEXT,
+        tracestate TEXT,
         UNIQUE(event_id, actor),
         FOREIGN KEY(event_id) REFERENCES slack_events(event_id),
         FOREIGN KEY(actor) REFERENCES subscriptions(actor),
@@ -242,7 +248,9 @@ export class BrokerStore {
         sent_at TEXT,
         attempts INTEGER NOT NULL DEFAULT 0,
         next_attempt_at TEXT,
-        abandoned_at TEXT
+        abandoned_at TEXT,
+        traceparent TEXT,
+        tracestate TEXT
       );
 
       CREATE INDEX IF NOT EXISTS outbox_unsent_idx
@@ -255,6 +263,8 @@ export class BrokerStore {
       );
     `);
     this.ensureOutboxReactionColumns();
+    this.ensureOutboxTraceColumns();
+    this.ensureDeliveryTraceColumns();
   }
 
   /** Forward-only schema step: pre-reaction databases gain the two nullable columns in place. */
@@ -269,6 +279,28 @@ export class BrokerStore {
     // The single-timestamp shape never shipped past this branch; no dual readers survive it.
     if (columns.includes("reaction_target_ts")) {
       this.db.exec("ALTER TABLE outbox DROP COLUMN reaction_target_ts");
+    }
+  }
+
+  /** Forward-only schema step: existing databases gain the durable W3C columns in place. */
+  private ensureOutboxTraceColumns(): void {
+    const columns = (this.db.pragma("table_info(outbox)") as { name: string }[]).map((c) => c.name);
+    if (!columns.includes("traceparent")) {
+      this.db.exec("ALTER TABLE outbox ADD COLUMN traceparent TEXT");
+    }
+    if (!columns.includes("tracestate")) {
+      this.db.exec("ALTER TABLE outbox ADD COLUMN tracestate TEXT");
+    }
+  }
+
+  /** Forward-only schema step: existing databases persist the delivery's own W3C context. */
+  private ensureDeliveryTraceColumns(): void {
+    const columns = (this.db.pragma("table_info(deliveries)") as { name: string }[]).map((c) => c.name);
+    if (!columns.includes("traceparent")) {
+      this.db.exec("ALTER TABLE deliveries ADD COLUMN traceparent TEXT");
+    }
+    if (!columns.includes("tracestate")) {
+      this.db.exec("ALTER TABLE deliveries ADD COLUMN tracestate TEXT");
     }
   }
 
@@ -529,11 +561,12 @@ export class BrokerStore {
         `).run(deliveryId, event.eventId);
         return { created: true, deliveryId };
       }
+      const ctx = captureActiveTraceContext();
       const result = this.db.prepare(`
         INSERT INTO deliveries(
           event_id, actor, status, coalesce_key, initial_snapshot_json, snapshot_ts,
-          created_at, updated_at
-        ) VALUES (?, ?, 'pending', ?, ?, ?, ?, ?)
+          created_at, updated_at, traceparent, tracestate
+        ) VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)
       `).run(
         event.eventId,
         event.actor,
@@ -542,6 +575,8 @@ export class BrokerStore {
         initialSnapshot === null ? null : now,
         now,
         now,
+        ctx?.traceparent ?? null,
+        ctx?.tracestate ?? null,
       );
       const deliveryId = Number(result.lastInsertRowid);
       this.db.prepare(`
@@ -771,6 +806,7 @@ export class BrokerStore {
         // Slack outage can neither lose it nor rerun the trusted instruction.
         this.enqueueOutbox(current, outcomePost(current, outcomeText), REACTION_PROCESSED);
       }
+      forgetDeliveryTraceparent(deliveryId);
       return this.getDelivery(deliveryId);
     })();
   }
@@ -839,6 +875,7 @@ export class BrokerStore {
         WHERE delivery_id=? AND status IN ('claimed', 'accepted_local', 'dispatching', 'dispatched')
       `).run(JSON.stringify([reason]), now, now, delivery.id);
       this.enqueueOutbox(delivery, failureNotice(delivery, "failed", [reason]), REACTION_FAILED);
+      forgetDeliveryTraceparent(delivery.id);
       return;
     }
     const nextAttemptAt = new Date(this.clock.now().getTime() + retryBackoffMs(delivery.attempts)).toISOString();
@@ -872,15 +909,17 @@ export class BrokerStore {
         `).run(JSON.stringify([{ code: "agent_outcome_reported", detail: "the agent reported its outcome" }]), now, now, deliveryId);
       }
       this.enqueueOutbox(current, outcomePost(current, text), REACTION_PROCESSED);
+      forgetDeliveryTraceparent(deliveryId);
       return this.getDelivery(deliveryId);
     })();
   }
 
   enqueueThreadNotice(channelId: string, threadTs: string, text: string): void {
+    const ctx = captureActiveTraceContext();
     this.db.prepare(`
-      INSERT INTO outbox(delivery_id, channel_id, thread_ts, text, created_at)
-      VALUES (NULL, ?, ?, ?, ?)
-    `).run(channelId, threadTs, text, iso(this.clock));
+      INSERT INTO outbox(delivery_id, channel_id, thread_ts, text, created_at, traceparent, tracestate)
+      VALUES (NULL, ?, ?, ?, ?, ?, ?)
+    `).run(channelId, threadTs, text, iso(this.clock), ctx?.traceparent ?? null, ctx?.tracestate ?? null);
   }
 
   enqueueOutbox(delivery: Delivery, text: string, reaction: string | null = null): void {
@@ -892,9 +931,10 @@ export class BrokerStore {
           delivery.event.messageTs,
           ...delivery.coalescedMessages.map((message) => message.messageTs),
         ])]);
+    const ctx = peekDeliveryTrace(delivery.id) ?? captureActiveTraceContext();
     this.db.prepare(`
-      INSERT INTO outbox(delivery_id, channel_id, thread_ts, text, reaction, reaction_targets_json, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO outbox(delivery_id, channel_id, thread_ts, text, reaction, reaction_targets_json, created_at, traceparent, tracestate)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       delivery.id,
       delivery.event.channelId,
@@ -903,6 +943,8 @@ export class BrokerStore {
       reaction,
       targets,
       iso(this.clock),
+      ctx?.traceparent ?? null,
+      ctx?.tracestate ?? null,
     );
   }
 
@@ -928,19 +970,20 @@ export class BrokerStore {
       .run(iso(this.clock), outboxId);
   }
 
-  markOutboxAttempt(outboxId: number): void {
+  markOutboxAttempt(outboxId: number): "attempt_failed" | "abandoned" {
     const row = this.db.prepare("SELECT attempts FROM outbox WHERE outbox_id=?").get(outboxId) as Row | undefined;
-    if (!row) return;
+    if (!row) return "attempt_failed";
     const attempts = Number(row.attempts) + 1;
     if (attempts >= OUTBOX_MAX_ATTEMPTS) {
       this.db.prepare("UPDATE outbox SET attempts=?, abandoned_at=? WHERE outbox_id=?")
         .run(attempts, iso(this.clock), outboxId);
       console.error("hive outbox row abandoned after max attempts", outboxId);
-      return;
+      return "abandoned";
     }
     const nextAttemptAt = new Date(this.clock.now().getTime() + retryBackoffMs(attempts)).toISOString();
     this.db.prepare("UPDATE outbox SET attempts=?, next_attempt_at=? WHERE outbox_id=?")
       .run(attempts, nextAttemptAt, outboxId);
+    return "attempt_failed";
   }
 
   getDelivery(deliveryId: number): Delivery {
@@ -958,6 +1001,17 @@ export class BrokerStore {
     `).get(deliveryId) as Row | undefined;
     if (!row) throw new Error(`delivery ${deliveryId} not found`);
     const delivery = deliveryFromRow(row);
+    if (!TERMINAL.has(delivery.status) && peekDeliveryTrace(delivery.id) === undefined) {
+      const traceparent = row.traceparent === null || row.traceparent === undefined
+        ? undefined
+        : String(row.traceparent);
+      const tracestate = row.tracestate === null || row.tracestate === undefined
+        ? undefined
+        : String(row.tracestate);
+      if (traceparent !== undefined) {
+        rememberDeliveryTraceparent(delivery.id, traceparent, tracestate);
+      }
+    }
     const events = this.db.prepare(`
       SELECT de.event_id, de.relation, e.sender_id, e.message_ts, e.text
       FROM delivery_events de JOIN slack_events e ON e.event_id=de.event_id
@@ -1010,6 +1064,7 @@ export class BrokerStore {
     `).run(status, JSON.stringify(reasons), now, now, deliveryId);
     if (result.changes === 1) {
       this.enqueueOutbox(delivery, failureNotice(delivery, status, reasons), REACTION_FAILED);
+      forgetDeliveryTraceparent(deliveryId);
     }
   }
 }
@@ -1122,5 +1177,7 @@ function outboxFromRow(row: Row): OutboxEntry {
     createdAt: String(row.created_at),
     sentAt: row.sent_at === null ? null : String(row.sent_at),
     attempts: Number(row.attempts),
+    traceparent: row.traceparent === null || row.traceparent === undefined ? null : String(row.traceparent),
+    tracestate: row.tracestate === null || row.tracestate === undefined ? null : String(row.tracestate),
   };
 }

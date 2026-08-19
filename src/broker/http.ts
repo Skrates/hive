@@ -1,6 +1,14 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { URL } from "node:url";
 import { DeliveryResultInputSchema, ReasonSchema, SubscriptionInputSchema } from "../domain.js";
+import {
+  captureActiveTraceContext,
+  peekDeliveryTrace,
+  runInTraceContext,
+  traceContextHeaders,
+  withSpan,
+  type TraceContext,
+} from "../observability.js";
 import { BrokerService } from "./service.js";
 import { InvalidTransitionError, StaleLeaseError } from "./store.js";
 
@@ -58,7 +66,14 @@ export class BrokerHttpServer {
     if (request.method === "GET" && url.pathname === "/health") {
       return json(response, 200, { ok: true });
     }
+    // Claim is the broker→edge handoff: ignore any inbound poll context and
+    // emit the delivery's stored W3C context on the response instead.
+    const isClaim = request.method === "GET" && url.pathname === "/v1/deliveries";
+    const incoming = isClaim ? undefined : incomingTraceContext(request);
+    return runInTraceContext(incoming, () => this.dispatch(url, request, response));
+  }
 
+  private async dispatch(url: URL, request: IncomingMessage, response: ServerResponse): Promise<void> {
     if (url.pathname.startsWith("/v1/admin/")) {
       this.requireAdmin(request);
       if (request.method === "POST" && url.pathname === "/v1/admin/edges") {
@@ -89,7 +104,19 @@ export class BrokerHttpServer {
       const busy = url.searchParams.get("busy");
       const busyActors = busy ? busy.split(",").filter((item) => item.length > 0) : [];
       const delivery = await this.broker.claim(edgeId, after, waitMs, busyActors);
-      return delivery ? json(response, 200, delivery) : json(response, 204, null);
+      if (!delivery) return json(response, 204, null);
+      return runInTraceContext(peekDeliveryTrace(delivery.id), () =>
+        withSpan("hive.broker.claim", {
+          delivery_id: delivery.id,
+          actor: delivery.actor,
+          channel_id: delivery.event.channelId,
+          thread_ts: delivery.event.threadTs,
+          dedupe_key: delivery.eventId,
+        }, () => {
+          const ctx = captureActiveTraceContext() ?? peekDeliveryTrace(delivery.id);
+          return json(response, 200, delivery, traceContextHeaders(ctx));
+        }),
+      );
     }
 
     const outcome = /^\/v1\/deliveries\/(\d+)\/outcome$/.exec(url.pathname);
@@ -207,13 +234,33 @@ function constantTimeEqual(left: string, right: string): boolean {
   return result === 0;
 }
 
-function json(response: ServerResponse, status: number, value: unknown): void {
+function incomingTraceContext(request: IncomingMessage): TraceContext | undefined {
+  const traceparent = headerString(request.headers.traceparent);
+  if (traceparent === undefined) return undefined;
+  const tracestate = headerString(request.headers.tracestate);
+  return tracestate === undefined ? { traceparent } : { traceparent, tracestate };
+}
+
+function headerString(value: string | string[] | undefined): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function json(
+  response: ServerResponse,
+  status: number,
+  value: unknown,
+  extraHeaders: Record<string, string> = {},
+): void {
   if (status === 204) {
-    response.writeHead(status);
+    response.writeHead(status, extraHeaders);
     response.end();
     return;
   }
   const body = JSON.stringify(value);
-  response.writeHead(status, { "content-type": "application/json", "content-length": Buffer.byteLength(body) });
+  response.writeHead(status, {
+    "content-type": "application/json",
+    "content-length": Buffer.byteLength(body),
+    ...extraHeaders,
+  });
   response.end(body);
 }

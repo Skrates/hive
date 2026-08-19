@@ -7,6 +7,12 @@ import {
   type ProviderDispatch,
 } from "./providers.js";
 import { readWakeAttestation, type AttestationRead } from "./attestation.js";
+import {
+  forgetDeliveryTraceparent,
+  peekDeliveryTrace,
+  runInTraceContext,
+  withSpan,
+} from "../observability.js";
 import { EdgeStore, bindingFor } from "./store.js";
 
 export interface EdgeTimers {
@@ -152,6 +158,23 @@ export class EdgeService {
 
   /** The full post-claim delivery lifecycle; never throws — all failures land in recordDeliveryFailure. */
   private async dispatchClaimed(delivery: Delivery, generation: number): Promise<void> {
+    const parent = peekDeliveryTrace(delivery.id);
+    try {
+      await runInTraceContext(parent, () =>
+        withSpan("hive.edge.dispatch", {
+          delivery_id: delivery.id,
+          actor: delivery.actor,
+          channel_id: delivery.event.channelId,
+          thread_ts: delivery.event.threadTs,
+          dedupe_key: delivery.eventId,
+        }, () => this.runDispatchClaimed(delivery, generation)),
+      );
+    } finally {
+      forgetDeliveryTraceparent(delivery.id);
+    }
+  }
+
+  private async runDispatchClaimed(delivery: Delivery, generation: number): Promise<void> {
     let current = delivery;
     let providerStarted = false;
     // ONE subscription governs the whole turn. Every broker transition rebuilds
@@ -373,6 +396,12 @@ export class EdgeService {
     if (!adapter) throw new PreDispatchError("provider_adapter_missing");
     adapter.preflight?.(subscription);
 
+    const attrs = {
+      delivery_id: delivery.id,
+      actor: delivery.actor,
+      channel_id: delivery.event.channelId,
+      thread_ts: delivery.event.threadTs,
+    };
     if (live) {
       await onProviderStart();
       // Codex live delivery waits for the exact app-server turn and lets the
@@ -380,7 +409,9 @@ export class EdgeService {
       // requires the agent-side reply because writing an inbox file is not a
       // provider completion signal.
       const outcomeReporter = subscription.provider === "codex" ? "edge" : "agent";
-      return adapter.deliverLive(live, delivery, frameWakeInstruction(delivery, replay, outcomeReporter));
+      return withSpan("hive.edge.deliver", { ...attrs, dispatch_mode: "live" }, () =>
+        adapter.deliverLive(live, delivery, frameWakeInstruction(delivery, replay, outcomeReporter)),
+      );
     }
     if (subscription.wakePolicy === "live_only") throw new PreDispatchError("live_ingress_unavailable");
 
@@ -389,12 +420,16 @@ export class EdgeService {
     const framed = frameWakeInstruction(delivery, replay, "edge");
     if (subscription.sessionId && this.broker.edgeId === subscription.homeEdge) {
       await onProviderStart();
-      return adapter.resume(subscription, workspace.cwd, framed);
+      return withSpan("hive.edge.deliver", { ...attrs, dispatch_mode: "resume" }, () =>
+        adapter.resume(subscription, workspace.cwd, framed),
+      );
     }
     if (subscription.wakePolicy === "resume") throw new PreDispatchError("resume_target_missing");
     if (!await this.broker.reserveSpawn(delivery)) throw new PreDispatchError("spawn_rate_limited");
     await onProviderStart();
-    return adapter.spawn(subscription, workspace.cwd, framed);
+    return withSpan("hive.edge.deliver", { ...attrs, dispatch_mode: "spawn" }, () =>
+      adapter.spawn(subscription, workspace.cwd, framed),
+    );
   }
 }
 
