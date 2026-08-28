@@ -29,3 +29,10 @@ invariants.
 bun run check
 bun run build
 ```
+
+## Review
+
+`REVIEW-DOCTRINE.md` at this repo's root is the reviewer prompt (KRA-1198): find-dimensions
+distilled from the scar corpus, and noise-dimensions from the standing rulings. Note §C.1 — this
+repo is Weave-internal, single-operator tooling, so a security finding with no adversary is noise
+and is burned by citing the card, never by code. Reliability findings are always real.
