@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import type { Delivery } from "../domain.js";
+import { canonicalActor, type Delivery } from "../domain.js";
 import type { AttestationAbsence, AttestationRead } from "./attestation.js";
 
 /** What a delivery row records about the seat attestation it ran under. */
@@ -21,7 +21,11 @@ export function bindingFor(read: AttestationRead, actor: string): AttestationBin
   return {
     attestationId,
     doctrineCommit,
-    absence: read.attestation.actor === actor ? null : "attestation_actor_mismatch",
+    // Both sides canonical: the broker migrates stored actor keys to their
+    // canonical form (aa28fb3), while a pinned profile's attestation may still
+    // spell the actor the way it was enrolled. Identity is the actor, not the
+    // bytes of its spelling.
+    absence: canonicalActor(read.attestation.actor) === canonicalActor(actor) ? null : "attestation_actor_mismatch",
   };
 }
 
