@@ -3,6 +3,7 @@ import { URL } from "node:url";
 import { canonicalActor, DeliveryResultInputSchema, ReasonSchema, SeatWakeMintSchema, SubscriptionInputSchema } from "../domain.js";
 import { BrokerService } from "./service.js";
 import { InvalidTransitionError, SeatWakeRefusedError, StaleLeaseError } from "./store.js";
+import { ProfileReport } from "../health/report.js";
 
 export interface BrokerHttpConfig {
   host: string;
@@ -83,6 +84,18 @@ export class BrokerHttpServer {
     }
 
     const edgeId = this.requireEdge(request);
+    if (request.method === "GET" && url.pathname === "/v1/health/profiles") {
+      return json(response, 200, this.broker.store.healthProfiles(edgeId));
+    }
+    if (request.method === "POST" && url.pathname === "/v1/health") {
+      const report = ProfileReport.parse(await readJson(request));
+      const profile = this.broker.store.healthProfiles(edgeId).find(p => p.actor === report.actor);
+      if (!profile || profile.provider !== report.provider || profile.accountProfile !== report.accountProfile) {
+        throw new HttpError(403, "profile_mismatch");
+      }
+      this.broker.store.recordHealth(edgeId, report);
+      return json(response, 200, { ok: true });
+    }
     if (request.method === "GET" && url.pathname === "/v1/deliveries") {
       const after = integerParam(url.searchParams.get("after"), 0);
       const waitMs = integerParam(url.searchParams.get("wait_ms"), 0);

@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh the Hive AI usage and maintenance canvas
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/hive
+EnvironmentFile=%h/.config/hive/broker.env
+ExecStart=/usr/bin/env node %h/hive/dist/health/canvas-main.js %h/.config/hive/health-canvas.json %h/.local/state/hive/health-canvas.md publish
+TimeoutStartSec=180
+UMask=0077

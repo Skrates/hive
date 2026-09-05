@@ -11,6 +11,7 @@ import { BrokerService } from "./broker/service.js";
 import { SlackSocketIngress, SlackWebTransport } from "./broker/slack.js";
 import { BrokerStore } from "./broker/store.js";
 import { SlackDeafnessWatchdog } from "./broker/watchdog.js";
+import { startHealthReporter } from "./health/edge-reporter.js";
 import { SubscriptionInputSchema, type Delivery, type SeatWakeReceipt } from "./domain.js";
 import { ensureEdgeStateDirs } from "./edge/bootstrap.js";
 import { BrokerClient } from "./edge/broker-client.js";
@@ -124,7 +125,9 @@ program.command("edge")
     await control.start();
     const controller = new AbortController();
     const run = edge.run(controller.signal);
+    const stopHealth = startHealthReporter(broker, live);
     await untilSignal(async () => {
+      stopHealth();
       controller.abort();
       await control.stop();
       await run;
