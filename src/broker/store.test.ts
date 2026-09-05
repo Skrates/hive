@@ -7,6 +7,7 @@ import test from "node:test";
 import {
   ActorCaseCollisionError,
   ActorGrammarError,
+  TurnSlotReductionError,
   BrokerStore,
   DISPATCHED_OUTCOME_GRACE_MS,
   InvalidTransitionError,
@@ -1124,7 +1125,7 @@ test("a persisted actor outside the addressing grammar stops the broker instead 
   );
 });
 
-test("lowering turnSlots under a running high slot does not admit a second concurrent turn (KRA-1364)", () => {
+test("turnSlots cannot be lowered under a slot that still holds a lease; it can once that turn finishes (KRA-1364)", () => {
   const { store } = slotFixture(2);
   const first = store.claimNext("mac", 0, [])!;
   toDispatching(store, first);
@@ -1133,8 +1134,8 @@ test("lowering turnSlots under a running high slot does not admit a second concu
   toDispatching(store, second);
   store.finish(first.id, "mac", first.leaseGeneration!, "processed", []);
 
-  // The operator lowers the ceiling while slot 2 is still mid-turn.
-  store.upsertSubscription(SubscriptionInputSchema.parse({
+  // The operator lowers the ceiling while slot 2 is still mid-turn: refused, naming the running slot and edge.
+  const lowered = SubscriptionInputSchema.parse({
     ...subscription({
       sessionId: null,
       edgeWorkspaces: [
@@ -1143,18 +1144,20 @@ test("lowering turnSlots under a running high slot does not admit a second concu
       ],
     }),
     turnSlots: 1,
-  }));
-  assert.equal(store.getSubscription("ariadne")?.turnSlots, 1);
+  });
+  assert.throws(
+    () => store.upsertSubscription(lowered),
+    (error: unknown) => error instanceof TurnSlotReductionError && /2@mac/.test(error.message) && /turnSlots=1/.test(error.message),
+  );
+  assert.equal(store.getSubscription("ariadne")?.turnSlots, 2);
 
-  // One turn is running (in slot 2); the ceiling is one; nothing more is handed out.
-  assert.equal(store.claimNext("mac", 0, [{ actor: "ariadne", slot: 2 }]), null);
-  assert.equal(store.getDelivery(3).status, "pending");
-
-  // The running turn ends; the actor is back under its ceiling and claims in slot 1.
+  // Slot 2 finishes; the reduction lands; the next turn runs alone in slot 1.
   store.finish(second.id, "mac", second.leaseGeneration!, "processed", []);
+  store.upsertSubscription(lowered);
+  assert.equal(store.getSubscription("ariadne")?.turnSlots, 1);
   const third = store.claimNext("mac", 0, [])!;
-  assert.equal(third.id, 3);
   assert.equal(third.leaseSlot, 1);
+  assert.equal(store.claimNext("mac", 0, [{ actor: "ariadne", slot: 1 }]), null);
   store.close();
 });
 

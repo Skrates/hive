@@ -195,7 +195,10 @@ skips an actor whose slots are all declared; a `busy` entry without a slot is re
 `{slot}` placeholder in every `edgeWorkspaces[].cwd` — slot `n` runs in that path with `{slot}`
 replaced by `n`, so two concurrent turns never share a checkout. Those directories must exist on
 the edge before the first wake lands. A seat that declares nothing runs exactly the one-slot path it
-always did.
+always did. Lowering `turnSlots` is refused (`turn_slots_leased`, 409) while a turn is still running
+in any slot above the new ceiling, on any edge: capacity is counted from the claiming edge's own busy
+declaration, so a running high slot elsewhere would otherwise be invisible to the lowered ceiling.
+Let those turns finish, then retry the upsert.
 
 There is no reconciliation surface. If a delivery failed, the thread says so; send the message
 again or fix the edge.

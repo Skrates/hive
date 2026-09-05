@@ -2,7 +2,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { URL } from "node:url";
 import { canonicalActor, DeliveryResultInputSchema, ReasonSchema, SeatWakeMintSchema, SubscriptionInputSchema, BusySlotFormatError, parseBusySlots, type BusySlot } from "../domain.js";
 import { BrokerService } from "./service.js";
-import { InvalidTransitionError, SeatWakeRefusedError, StaleLeaseError } from "./store.js";
+import { InvalidTransitionError, SeatWakeRefusedError, StaleLeaseError, TurnSlotReductionError } from "./store.js";
 
 export interface BrokerHttpConfig {
   host: string;
@@ -177,6 +177,7 @@ export class BrokerHttpServer {
     // seat's CLI can exit non-zero saying exactly what could not be delivered.
     if (error instanceof SeatWakeRefusedError) return json(response, 422, { error: error.code, detail: error.message });
     if (error instanceof StaleLeaseError) return json(response, 409, { error: "stale_lease" });
+    if (error instanceof TurnSlotReductionError) return json(response, 409, { error: "turn_slots_leased", detail: error.message });
     if (error instanceof InvalidTransitionError) return json(response, 409, { error: "invalid_transition", detail: error.message });
     if (error instanceof SyntaxError) return json(response, 400, { error: "invalid_json" });
     const message = error instanceof Error ? error.message : String(error);

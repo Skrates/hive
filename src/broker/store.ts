@@ -68,6 +68,16 @@ export class ActorCaseCollisionError extends Error {}
 export class ActorGrammarError extends Error {}
 
 /**
+ * KRA-1364: a `turnSlots` reduction while a turn still runs in a slot above the
+ * new ceiling. Capacity is counted from the claiming edge's own busy
+ * declaration, so a running high slot on another edge would not be seen and a
+ * second turn could be admitted under the lowered ceiling. The upsert is refused
+ * until those turns finish; the message names the actor, the running slots and
+ * the requested ceiling (R-3).
+ */
+export class TurnSlotReductionError extends Error {}
+
+/**
  * KRA-1097 / ADR-0003 R-3: a seat's deliberate address that cannot be delivered
  * fails loudly back to the minting seat. The refusal carries a stable code so
  * the CLI can exit non-zero with the reason instead of rendering and vanishing.
@@ -530,6 +540,7 @@ export class BrokerStore {
 
   upsertSubscription(input: SubscriptionInput): Subscription {
     const now = iso(this.clock);
+    this.refuseReductionUnderLeasedSlots(input.actor, input.turnSlots);
     this.db.prepare(`
       INSERT INTO subscriptions(
         actor, provider, provider_surface, provider_version, session_id, home_edge, workspace,
@@ -577,6 +588,28 @@ export class BrokerStore {
       now,
     );
     return { ...input, updatedAt: now };
+  }
+
+  /**
+   * A ceiling can only come down over slots nobody is running in. A lease row
+   * outlives its turn (the sequential same-edge claim reuses it), so "held"
+   * means a claimed, non-terminal delivery in a slot above `turnSlots` — on any
+   * edge. Those refuse the upsert, so the fleet-wide limit is never undercut by
+   * a turn the lowered ceiling can no longer see.
+   */
+  private refuseReductionUnderLeasedSlots(actor: string, turnSlots: number): void {
+    const rows = this.db
+      .prepare(`
+        SELECT lease_slot, claimed_by FROM deliveries
+        WHERE actor = ? AND lease_slot > ? AND status IN ('claimed', 'accepted_local', 'dispatching', 'dispatched')
+        ORDER BY lease_slot
+      `)
+      .all(actor, turnSlots) as Array<{ lease_slot: number; claimed_by: string | null }>;
+    if (rows.length === 0) return;
+    const slots = rows.map((row) => `${row.lease_slot}@${row.claimed_by ?? "?"}`).join(", ");
+    throw new TurnSlotReductionError(
+      `subscription ${JSON.stringify(actor)}: turnSlots=${turnSlots} refused while turns run in slots above it (${slots}); let them finish, then retry`,
+    );
   }
 
   getSubscription(actor: string): Subscription | null {
