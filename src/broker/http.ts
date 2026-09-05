@@ -4,11 +4,14 @@ import { canonicalActor, DeliveryResultInputSchema, ReasonSchema, SeatWakeMintSc
 import { BrokerService } from "./service.js";
 import { InvalidTransitionError, SeatWakeRefusedError, StaleLeaseError } from "./store.js";
 import { ProfileReport } from "../health/report.js";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
 export interface BrokerHttpConfig {
   host: string;
   port: number;
   adminToken: string;
+  healthCanvasConfigPath?: string;
 }
 
 export class BrokerHttpServer {
@@ -85,7 +88,11 @@ export class BrokerHttpServer {
 
     const edgeId = this.requireEdge(request);
     if (request.method === "GET" && url.pathname === "/v1/health/profiles") {
-      return json(response, 200, this.broker.store.healthProfiles(edgeId));
+      const config = this.config.healthCanvasConfigPath ? JSON.parse(readFileSync(this.config.healthCanvasConfigPath, "utf8")) : null;
+      const registry = config ? JSON.parse(readFileSync(join(config.doctrineRoot, "seats/registry.json"), "utf8")) : {};
+      return json(response, 200, this.broker.store.healthProfiles(edgeId).map(profile => ({ ...profile,
+        skillsDirectory: registry[profile.actor]?.skills_dir !== undefined ? registry[profile.actor].skills_dir : join(profile.accountProfile, "skills"),
+      })));
     }
     if (request.method === "POST" && url.pathname === "/v1/health") {
       const report = ProfileReport.parse(await readJson(request));

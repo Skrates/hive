@@ -1,7 +1,7 @@
 /** Read-only, machine-local inventory. No Slack credentials and no listening port. */
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, readdirSync, lstatSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, hostname } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
@@ -43,9 +43,10 @@ function run(command: string[], env: NodeJS.ProcessEnv): string {
     maxBuffer: 2 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] });
 }
 
-export async function probeProfile(actor: string, root: string, provider: ProfileObservation["provider"]): Promise<ProfileObservation> {
+export async function probeProfile(actor: string, root: string, provider: ProfileObservation["provider"], skillsDirectory: string | null = join(root, "skills")): Promise<ProfileObservation> {
   const now = () => new Date().toISOString();
-  const result: ProfileObservation = { actor, provider, accountProfile: root, observedAt: now(),
+  const skillsRoot = skillsDirectory?.startsWith("~/") ? join(homedir(), skillsDirectory.slice(2)) : skillsDirectory;
+  const result: ProfileObservation = { actor, provider, accountProfile: root, sourceHost: hostname(), skillsRoot, observedAt: now(),
     usageProfileId: null, usageEdgeId: null, auth: { state: "unverified", observedAt: now() },
     mcp: [], skills: {}, doctrineCommit: null, plugins: [], inventory: { state: "observed", observedAt: now() } };
   if (!existsSync(root)) { result.inventory.state = "profile_missing"; return result; }
@@ -53,10 +54,9 @@ export async function probeProfile(actor: string, root: string, provider: Profil
     const collector = optionalJson(join(root, "ai-usage/config.json"));
     result.usageProfileId = typeof collector.profile_id === "string" ? collector.profile_id : null;
     result.usageEdgeId = typeof collector.edge_id === "string" ? collector.edge_id : null;
-    const skillsRoot = join(root, "skills");
-    const manifest = optionalJson(join(skillsRoot, ".weave-doctrine-manifest.json"));
+    const manifest = skillsRoot ? optionalJson(join(skillsRoot, ".weave-doctrine-manifest.json")) : {};
     result.doctrineCommit = typeof manifest.doctrine_commit === "string" ? manifest.doctrine_commit : null;
-    if (existsSync(skillsRoot)) for (const name of readdirSync(skillsRoot).sort()) {
+    if (skillsRoot && existsSync(skillsRoot)) for (const name of readdirSync(skillsRoot).sort()) {
       if (name.startsWith(".")) continue;
       try { if (lstatSync(join(skillsRoot, name)).isDirectory()) result.skills[name] = treeDigest(join(skillsRoot, name)); }
       catch { result.skills[name] = "unverified"; }
@@ -96,7 +96,7 @@ export async function probeProfile(actor: string, root: string, provider: Profil
   // Do not use an inherited API key to declare the pinned subscription authenticated.
   delete env.ANTHROPIC_API_KEY; delete env.OPENAI_API_KEY; delete env.CLAUDE_CODE_OAUTH_TOKEN;
   if (provider === "claude") {
-    const claude = existsSync(join(homedir(), ".local/bin/claude")) ? join(homedir(), ".local/bin/claude") : "claude";
+    const claude = process.env.HIVE_CLAUDE_COMMAND ?? "claude";
     try {
       let raw: string;
       try { raw = run([claude, "auth", "status", "--json"], env); }
@@ -139,9 +139,10 @@ export async function probeProfile(actor: string, root: string, provider: Profil
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  const [actor, provider, root] = process.argv.slice(2);
+  const [actor, provider, root, skillsDirectory] = process.argv.slice(2);
   if (!actor || !root || (provider !== "codex" && provider !== "claude" && provider !== "grok")) throw new Error("usage: profile-probe ACTOR PROVIDER PROFILE_PATH");
   const expanded = root.startsWith("~/") ? join(homedir(), root.slice(2)) : root;
   // An absent probe is different from an absent profile. Always report the explicit requested profile.
-  process.stdout.write(JSON.stringify(await probeProfile(actor, expanded, provider)) + "\n");
+  process.stdout.write(JSON.stringify(await probeProfile(actor, expanded, provider,
+    skillsDirectory === "null" ? null : skillsDirectory ?? join(expanded, "skills"))) + "\n");
 }

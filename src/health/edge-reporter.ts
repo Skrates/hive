@@ -9,26 +9,27 @@ import type { Provider } from "../domain.js";
 export function startHealthReporter(broker: BrokerClient, live: LiveIngressRegistry): () => void {
   let stopped = false;
   let timer: NodeJS.Timeout | undefined;
+  const controller = new AbortController();
   async function report(): Promise<void> {
     try {
-      const profiles = await broker.healthProfiles();
+      const profiles = await broker.healthProfiles(controller.signal);
       for (const profile of profiles) {
         if (stopped) return;
         try {
           const { stdout } = await promisify(execFile)(process.execPath,
-            [fileURLToPath(new URL("./profile-probe.js", import.meta.url)), profile.actor, profile.provider, profile.accountProfile],
-            { timeout: 110_000, maxBuffer: 2 * 1024 * 1024 });
+            [fileURLToPath(new URL("./profile-probe.js", import.meta.url)), profile.actor, profile.provider, profile.accountProfile, profile.skillsDirectory ?? "null"],
+            { timeout: 110_000, maxBuffer: 2 * 1024 * 1024, signal: controller.signal, killSignal: "SIGKILL" });
           if (stopped) return;
           const observation = JSON.parse(stdout);
           const receiving = live.get(profile.actor, profile.provider as Provider);
           observation.receiving = receiving ? { sessionId: receiving.sessionId, expiresAt: receiving.expiresAt,
             attestation: receiving.runtimeAttestation.ok ? receiving.runtimeAttestation.attestation.attestationId : null } : null;
-          await broker.reportHealth(observation);
-        } catch { console.error(`hive health probe failed for ${profile.actor}`); }
+          await broker.reportHealth(observation, controller.signal);
+        } catch { if (!stopped) console.error(`hive health probe failed for ${profile.actor}`); }
       }
-    } catch { console.error("hive health report unavailable"); }
+    } catch { if (!stopped) console.error("hive health report unavailable"); }
     finally { if (!stopped) { timer = setTimeout(() => void report(), 300_000); timer.unref(); } }
   }
   void report();
-  return () => { stopped = true; clearTimeout(timer); };
+  return () => { stopped = true; controller.abort(); clearTimeout(timer); };
 }

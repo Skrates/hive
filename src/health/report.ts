@@ -5,7 +5,8 @@ const State = z.enum(["unverified", "observed", "profile_missing", "inventory_in
   "local_login_present", "connected", "tools_available", "connection_failed", "configured_connection_unverified"]);
 const Check = z.object({ state: State, observedAt: z.iso.datetime() }).strict();
 export const ProfileReport = z.object({
-  actor: Name, provider: z.enum(["claude", "codex", "grok"]), accountProfile: Name, observedAt: z.iso.datetime(),
+  actor: Name, provider: z.enum(["claude", "codex", "grok"]), accountProfile: Name, sourceHost: Name,
+  skillsRoot: Name.nullable(), observedAt: z.iso.datetime(),
   usageProfileId: Name.nullable(), usageEdgeId: Name.nullable(), auth: Check,
   mcp: z.array(Check.extend({ name: Name }).strict()).max(200),
   skills: z.record(Name, z.string().regex(/^(?:[0-9a-f]{64}|unverified)$/)), doctrineCommit: z.string().regex(/^[0-9a-f]{40}$/).nullable(),

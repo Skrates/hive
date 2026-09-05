@@ -49,6 +49,7 @@ program.command("broker")
       host: config.HIVE_BROKER_HOST,
       port: config.HIVE_BROKER_PORT,
       adminToken: config.HIVE_ADMIN_TOKEN,
+      ...(config.HIVE_HEALTH_CANVAS_CONFIG ? { healthCanvasConfigPath: config.HIVE_HEALTH_CANVAS_CONFIG } : {}),
     });
     const slack = new SlackSocketIngress(
       config.HIVE_SLACK_APP_TOKEN,
@@ -321,6 +322,7 @@ const BrokerConfig = z.object({
   HIVE_SLACK_BOT_TOKEN: z.string().startsWith("xoxb-"),
   HIVE_SLACK_WORKSPACE_ID: z.string().min(1),
   HIVE_ADMISSION_POLICY: z.string().min(2),
+  HIVE_HEALTH_CANVAS_CONFIG: z.string().min(1).optional(),
   // Deafness threshold: silence past this while subscriptions are live opens a
   // link probe; unexplained silence then forces a Socket Mode reconnect, and a
   // second consecutive unexplained cycle exits for systemd.

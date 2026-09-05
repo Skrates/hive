@@ -11,7 +11,7 @@ const Command = z.array(z.string()).min(1);
 export const CanvasConfig = z.object({
   doctrineRoot: z.string(), brokerDb: z.string(), canvasId: z.string().optional(),
   usageUrl: z.url(),
-  probes: z.array(z.object({ actor: z.string(), command: Command })).default([]),
+  probes: z.array(z.object({ actor: z.string(), edgeId: z.string(), command: Command })).default([]),
   // Only explicit operator mappings join a collector to a seat when its local config is absent.
   usageBindings: z.array(z.object({ actor: z.string(), edgeId: z.string(), profileId: z.string() })).default([]),
   accountChanges: z.array(z.object({ actors: z.array(z.string()).min(1), label: z.string(), note: z.string(), previousPoolIds: z.array(z.string()).optional() })).default([]),
@@ -31,6 +31,7 @@ const DoctorProfile = z.object({ profile_id: Text, edge_id: Text.nullable(), pro
 });
 export type Pool = z.infer<typeof Pool>;
 export type DoctorProfile = z.infer<typeof DoctorProfile>;
+export type HealthObservation = ProfileObservation & { edgeId: string };
 export interface Seat {
   actor: string; provider: string; machine: string; profile: string;
   intendedSkills: Record<string, string> | null; intendedPlugins: string[];
@@ -39,7 +40,7 @@ export interface Seat {
 }
 export interface CanvasSnapshot {
   generatedAt: string; doctrineCommit: string; seats: Seat[]; pools: Pool[];
-  doctor: DoctorProfile[]; probes: ProfileObservation[]; failedProbes: string[];
+  doctor: DoctorProfile[]; probes: HealthObservation[]; failedProbes: string[];
   usageState: string; brokerState: string;
   bindings: CanvasConfig["usageBindings"];
   accountChanges: CanvasConfig["accountChanges"];
@@ -69,7 +70,7 @@ export async function collectCanvas(config: CanvasConfig): Promise<CanvasSnapsho
       intendedSkills: intended, intendedPlugins: Object.keys(plugins).filter(n => plugins[n] === true), subscription: null, delivery: null };
   });
   let brokerState = "observed";
-  const persisted: ProfileObservation[] = [];
+  const persisted: HealthObservation[] = [];
   try {
     const db = new Database(config.brokerDb, { readonly: true, fileMustExist: true });
     try {
@@ -88,10 +89,10 @@ export async function collectCanvas(config: CanvasConfig): Promise<CanvasSnapsho
         if (d) seat.delivery = { id: d.delivery_id, status: d.status, at: d.updated_at, sessionId: null };
       }
       if (db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='profile_health'").get()) {
-        const reports = db.prepare(`SELECT h.report_json FROM profile_health h JOIN subscriptions s ON s.actor=h.actor AND s.home_edge=h.edge_id`).all() as Array<{ report_json: string }>;
+        const reports = db.prepare(`SELECT h.edge_id,h.report_json FROM profile_health h JOIN subscriptions s ON s.actor=h.actor AND s.home_edge=h.edge_id`).all() as Array<{ edge_id: string; report_json: string }>;
         for (const row of reports) {
           const parsed = ProfileReport.safeParse(JSON.parse(row.report_json));
-          if (parsed.success) persisted.push(parsed.data);
+          if (parsed.success) persisted.push({ ...parsed.data, edgeId: row.edge_id });
         }
       }
     } finally { db.close(); }
@@ -122,7 +123,7 @@ export async function collectCanvas(config: CanvasConfig): Promise<CanvasSnapsho
         const data = ProfileReport.parse(await commandJson(probe.command));
         if (data.actor !== probe.actor) throw new Error("probe actor mismatch");
         snapshot.probes = snapshot.probes.filter(p => p.actor !== probe.actor);
-        snapshot.probes.push(data);
+        snapshot.probes.push({ ...data, edgeId: probe.edgeId });
       } catch { snapshot.failedProbes.push(probe.actor); }
     }),
   ]);
@@ -156,16 +157,21 @@ export function renderCanvas(s: CanvasSnapshot, refreshStatus = "Snapshot only. 
   const overview: unknown[][] = [];
   const details: string[] = [];
   const joined = new Set<string>();
+  const retiredPools = new Set(s.accountChanges.flatMap(c => c.previousPoolIds ?? []));
+  // Display policy only: retained source history is never deleted or rewritten.
+  const currentReporters = s.doctor.filter(d => d.configured && !retiredPools.has(d.pool_id ?? ""));
+  const currentIds = new Set(currentReporters.map(d => d.profile_id));
+  const currentPools = s.pools.filter(p => !retiredPools.has(p.id) && p.profiles.some(d => currentIds.has(d.id)));
   if (s.usageState !== "ready") attention.push(`Usage aggregator: ${s.usageState}; profile and quota status unverified.`);
   if (s.brokerState !== "observed") attention.push(`Hive broker: ${s.brokerState}; subscriptions and deliveries unverified.`);
   for (const seat of s.seats) {
     const p = s.probes.find(p => p.actor === seat.actor && p.provider === seat.provider &&
-      (p.accountProfile === seat.profile || (seat.profile.startsWith("~/") && p.accountProfile.endsWith(seat.profile.slice(1)))));
+      p.edgeId === seat.subscription?.edge && !seat.profile.startsWith("~/") && p.accountProfile === seat.profile);
     const binding = p?.usageProfileId && p.usageEdgeId ? { profileId: p.usageProfileId, edgeId: p.usageEdgeId }
       : s.bindings.find(b => b.actor === seat.actor);
-    const d = binding ? s.doctor.find(d => d.profile_id === binding.profileId && d.edge_id === binding.edgeId && d.provider === seat.provider) : undefined;
+    const d = binding ? currentReporters.find(d => d.profile_id === binding.profileId && d.edge_id === binding.edgeId && d.provider === seat.provider) : undefined;
     if (d) joined.add(d.profile_id);
-    const pool = d ? s.pools.find(pool => pool.id === d.pool_id) : undefined;
+    const pool = d ? currentPools.find(pool => pool.id === d.pool_id) : undefined;
     const probeFresh = p && !stale(p.observedAt, s.generatedAt);
     const auth = p ? `${stale(p.auth.observedAt, s.generatedAt) ? "stale / " : ""}${p.auth.state}` : "unverified";
     const missing = seat.intendedSkills && p ? Object.keys(seat.intendedSkills).filter(n => !(n in p.skills)) : [];
@@ -176,6 +182,7 @@ export function renderCanvas(s: CanvasSnapshot, refreshStatus = "Snapshot only. 
     const accountChange = s.accountChanges.find(change => change.actors.includes(seat.actor));
     if (accountChange) ownAttention.push(`current account: ${accountChange.label} (operator confirmed); ${accountChange.note}`);
     const receiving = p?.receiving;
+    const expired = seat.subscription?.expiresAt != null && Date.parse(seat.subscription.expiresAt) <= Date.parse(s.generatedAt);
     const receivingState = receiving && receiving.expiresAt > Date.parse(s.generatedAt) ? `receiving session ${receiving.sessionId ?? "unnamed"}`
       : receiving ? "receiving heartbeat expired" : p?.receiving === null ? "no registered receiving session at observation" : "receiving session unverified";
     if (!p) ownAttention.push(s.failedProbes.includes(seat.actor) ? "maintenance probe unreachable or failed (not an auth verdict)" : "maintenance never observed");
@@ -194,18 +201,20 @@ export function renderCanvas(s: CanvasSnapshot, refreshStatus = "Snapshot only. 
     else {
       if (stale(d.last_received_at, s.generatedAt)) ownAttention.push(`collector last receipt ${age(d.last_received_at, s.generatedAt)}`);
       if (d.last_outcome === "conflict") ownAttention.push(`latest usage rejected: ${d.last_conflict?.kind ?? "conflict"}`);
+      if (!pool || pool.windows.length === 0) ownAttention.push("no usable quota sample for the current collector");
     }
     if (pool && stale(pool.sampled_at, s.generatedAt)) ownAttention.push(`quota sample ${age(pool.sampled_at, s.generatedAt)}`);
     if (pool && pool.status !== "ok") ownAttention.push(`pool status ${pool.status} (pool evidence, not this profile's auth test)`);
     if (seat.subscription && stale(seat.subscription.lastSeen, s.generatedAt)) ownAttention.push(`Hive edge last seen ${age(seat.subscription.lastSeen, s.generatedAt)}`);
+    if (expired) ownAttention.push("Hive subscription expired; new wakes are unroutable");
     if (seat.delivery && ["failed", "undeliverable"].includes(seat.delivery.status)) ownAttention.push(`last Hive delivery ${seat.delivery.status}`);
     attention.push(...ownAttention.map(text => `${seat.actor}: ${text}.`));
     overview.push([seat.actor, `${seat.provider} / ${seat.subscription?.edge ?? seat.machine}`, accountChange ? `${accountChange.label}; collector ${d?.profile_id ?? "unmatched"}` : d?.profile_id ?? "unmatched",
-      auth, installation, seat.subscription ? `edge ${age(seat.subscription.lastSeen, s.generatedAt)}; ${receivingState}` : "no observed subscription"]);
-    details.push(`## ${cell(seat.actor)}\n\nProfile: ${cell(seat.profile)}. Maintenance observed: ${stamp(p?.observedAt ?? null, s.generatedAt)}.\n\n` +
+      auth, installation, expired ? "subscription expired; unroutable" : seat.subscription ? `edge ${age(seat.subscription.lastSeen, s.generatedAt)}; ${receivingState}` : "no observed subscription"]);
+    details.push(`## ${cell(seat.actor)}\n\nProfile: ${cell(seat.profile)}. Health source: ${cell(p ? `${p.edgeId} / ${p.sourceHost}` : `unverified; expected ${seat.subscription?.edge ?? seat.machine}`)}. Maintenance observed: ${stamp(p?.observedAt ?? null, s.generatedAt)}.\n\n` +
       (accountChange ? `Current account: ${cell(accountChange.label)}, shared by ${accountChange.actors.map(cell).join(", ")} (operator confirmed). ${cell(accountChange.note)}\n\n` : "") +
       `Provider auth: ${auth}; checked ${stamp(p?.auth.observedAt ?? null, s.generatedAt)}. Local login presence does not prove a successful provider request.\n\n` +
-      `Skills on disk: receipt ${cell(p?.doctrineCommit ?? "absent")}; intended ${s.doctrineCommit}. Missing: ${cell(missing.join(", ") || (p ? "none" : "unverified"))}. Differ from intended: ${cell(changed.join(", ") || (p ? "none" : "unverified"))}. An older receipt alone does not prove that files differ. Existing-session loaded skills and plugins: unverified.\n\n` +
+      `Skills on disk: ${cell(p?.skillsRoot ?? "unverified or disabled")}; receipt ${cell(p?.doctrineCommit ?? "absent")}; intended ${s.doctrineCommit}. Missing: ${cell(missing.join(", ") || (p ? "none" : "unverified"))}. Differ from intended: ${cell(changed.join(", ") || (p ? "none" : "unverified"))}. An older receipt alone does not prove that files differ. Existing-session loaded skills and plugins: unverified.\n\n` +
       table(["MCP server", "Connection / auth observation", "Checked at"], p ? p.mcp.map(c => [c.name, c.state, stamp(c.observedAt, s.generatedAt)]) : [["unknown", "unverified", "never observed"]]) + "\n\n" +
       table(["Plugin / marketplace", "Disk version(s)", "Intended cached catalog version", "Evidence"], p?.plugins.length ? p.plugins.map(i => [i.name, i.installed ?? "missing", i.intended ?? "not declared", i.state]) : [["unknown", "unverified", "not declared", "unverified"]]) + "\n\n" +
       `Plugin inventory checked: ${stamp(p?.inventory.observedAt ?? null, s.generatedAt)}. Cached catalogs are not a live marketplace version check.\n\n` +
@@ -213,18 +222,18 @@ export function renderCanvas(s: CanvasSnapshot, refreshStatus = "Snapshot only. 
       (seat.delivery ? `Most recent delivery: #${seat.delivery.id}, ${seat.delivery.status}, ${stamp(seat.delivery.at, s.generatedAt)}.` : "No observed delivery.") +
       ` ${receivingState}. Reported runtime attestation: ${cell(receiving?.attestation ?? "unverified")}; it is a session claim, not verification of loaded files. An edge heartbeat or past delivery is not current session readiness.`);
   }
-  for (const d of s.doctor.filter(d => !joined.has(d.profile_id))) {
+  for (const d of currentReporters.filter(d => !joined.has(d.profile_id))) {
     overview.push([`collector: ${d.profile_id}`, `${d.provider ?? "unknown"} / ${d.edge_id ?? "unknown edge"}`, d.profile_id, "unverified", "unverified", "seat binding unverified"]);
-    attention.push(`${d.profile_id}: ${d.configured ? "configured collector" : "historical reporter; not currently configured"}; ${age(d.last_received_at, s.generatedAt)}; seat binding unverified.`);
+    attention.push(`${d.profile_id}: configured collector; ${age(d.last_received_at, s.generatedAt)}; seat binding unverified.`);
   }
   return `${refreshStatus}\n\nUpdated ${s.generatedAt}. Refresh target: every 5 minutes; treat this entire canvas as stale after 15 minutes without an update.\n\n` +
     `## Needs attention\n\n${attention.length ? attention.map(t => `- ${cell(t)}`).join("\n") : "No failures observed; unverified checks remain unverified."}\n\n` +
-    `## Every defined seat and reporter\n\n${table(["Seat / reporter", "Provider / machine", "Usage profile", "Provider auth", "Skills on disk", "Hive"], overview)}\n\n` +
+    `## Current seats and reporters\n\n${table(["Seat / reporter", "Provider / machine", "Usage profile", "Provider auth", "Skills on disk", "Hive"], overview)}\n\n` +
     `## Quota pools\n\nPools are listed once. Profiles in the same pool share the reported quota; provisional bindings do not establish shared identity. Retained windows can be older than collector receipts.\n\n` +
-    table(["Pool ID / label", "Identity / status", "Profile bindings", "Utilization / reset", "Quota sample"], s.pools.map(p => [
-      `${p.id} / ${p.label}`, s.accountChanges.some(c => c.previousPoolIds?.includes(p.id)) ? `historical account / ${p.status}` : `${p.identity_state} / ${p.status}`, p.profiles.map(i => `${i.id} (${i.binding_confidence})`).join(", ") || "no current observers",
+    table(["Pool ID / label", "Identity / status", "Profile bindings", "Utilization / reset", "Quota sample"], currentPools.map(p => [
+      `${p.id} / ${p.label}`, `${p.identity_state} / ${p.status}`, p.profiles.filter(i => currentIds.has(i.id)).map(i => `${i.id} (${i.binding_confidence})`).join(", "),
       p.windows.map(w => `${w.label}: ${(w.utilization * 100).toFixed(0)}%; reset ${w.resets_at ?? "unknown"}`).join("; "), stamp(p.sampled_at, s.generatedAt),
-    ])) + "\n\n## Collector observations\n\n" + table(["Profile / edge", "Last receipt", "Last attempted sample", "Outcome / conflict"], s.doctor.map(d => [
+    ])) + "\n\n## Collector observations\n\n" + table(["Profile / edge", "Last receipt", "Last attempted sample", "Outcome / conflict"], currentReporters.map(d => [
       `${d.profile_id} / ${d.edge_id ?? "unknown"}`, stamp(d.last_received_at, s.generatedAt), stamp(d.last_sampled_at, s.generatedAt),
       `${d.last_outcome ?? "never"}; ${d.last_conflict ? `${d.last_conflict.kind} at ${d.last_conflict.at}` : "no recorded conflict"}`,
     ])) + "\n\n" + details.join("\n\n");

@@ -27,12 +27,12 @@ export class BrokerClient {
     private readonly token: string,
   ) {}
 
-  async healthProfiles(): Promise<Array<{ actor: string; provider: string; accountProfile: string }>> {
-    return this.json(await this.request("/v1/health/profiles", { method: "GET" }));
+  async healthProfiles(signal?: AbortSignal): Promise<Array<{ actor: string; provider: string; accountProfile: string; skillsDirectory: string | null }>> {
+    return this.json(await this.request("/v1/health/profiles", { method: "GET", signal: AbortSignal.any([AbortSignal.timeout(15_000), ...(signal ? [signal] : [])]) }));
   }
 
-  async reportHealth(report: unknown): Promise<void> {
-    await this.json(await this.request("/v1/health", { method: "POST", body: JSON.stringify(report) }));
+  async reportHealth(report: unknown, signal?: AbortSignal): Promise<void> {
+    await this.json(await this.request("/v1/health", { method: "POST", body: JSON.stringify(report), signal: AbortSignal.any([AbortSignal.timeout(15_000), ...(signal ? [signal] : [])]) }));
   }
 
   async claim(after: number, waitMs = 25_000, busyActors: readonly string[] = []): Promise<Delivery | null> {
