@@ -40,6 +40,8 @@ interface PortState {
   restartThrows: boolean;
   /** A genuine Slack event lands while the probe is waiting on the link. */
   eventArrivesDuringProbe: boolean;
+  /** Wall time the probe round consumes, so a short `staleMs` can outrun it. */
+  probeTakesMs: number;
 }
 
 function makePort(overrides: Partial<PortState> = {}): { port: WatchdogPort; state: PortState } {
@@ -59,6 +61,7 @@ function makePort(overrides: Partial<PortState> = {}): { port: WatchdogPort; sta
     restartHangs: false,
     restartThrows: false,
     eventArrivesDuringProbe: false,
+    probeTakesMs: 0,
     ...overrides,
   };
   const port: WatchdogPort = {
@@ -69,6 +72,7 @@ function makePort(overrides: Partial<PortState> = {}): { port: WatchdogPort; sta
       state.probes += 1;
       if (state.probeGate) await state.probeGate;
       if (state.eventArrivesDuringProbe) state.lastEventMs = state.nowMs;
+      state.nowMs += state.probeTakesMs;
       if (state.probeThrows) throw new Error("probe blew up");
       return state.probeOutcome;
     },
@@ -349,4 +353,22 @@ test("a wake that lands while the probe runs ends the cycle — even when the pr
   assert.equal(state.restarts, 0, "the link is demonstrably carrying events");
   assert.deepEqual(state.exits, []);
   assert.ok(state.logs.some((line) => line.includes("arrived while the link probe ran")));
+});
+
+test("an event that arrives during a probe longer than the stale window still counts", async () => {
+  // `HIVE_WATCHDOG_STALE_MS` is allowed down to 10s while a probe round can wait
+  // longer than that, so a wake landing early in the round is already "stale"
+  // again by the time the round ends. Movement of the event clock is the proof,
+  // not how recent it looks afterwards.
+  const SHORT_STALE_MS = 10_000;
+  const { port, state } = makePort({
+    lastEventMs: 1_000_000 - (SHORT_STALE_MS + 1_000),
+    probeOutcome: "silent",
+    eventArrivesDuringProbe: true,
+    probeTakesMs: 15_000,
+  });
+  const watchdog = new SlackDeafnessWatchdog(port, SHORT_STALE_MS);
+  assert.equal(await watchdog.check(), "healthy");
+  assert.equal(state.restarts, 0, "the link demonstrably carried an event");
+  assert.deepEqual(state.exits, []);
 });

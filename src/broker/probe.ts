@@ -44,6 +44,16 @@ export type ProbeOutcome = "alive" | "silent" | "unavailable";
 /** Canaries per probe round; the round is "alive" only if every one returns. */
 export const PROBE_CANARIES = 3;
 
+/**
+ * Gap between one canary and the next. `chat.postMessage` is limited to roughly
+ * one message per second per channel, and the canary client fails fast rather
+ * than waiting out a 429 — so an unpaced round on a healthy link (where each
+ * canary returns in well under a second) could rate-limit ITSELF, report
+ * `unavailable`, and escalate. The probe would then manufacture the false
+ * positive it exists to prevent.
+ */
+export const CANARY_SPACING_MS = 1_200;
+
 export interface ProbePoster {
   /** Post one canary carrying `nonce`, stamped `PROBE_EVENT_TYPE`; resolves its message ts. */
   postCanary(nonce: string): Promise<string>;
@@ -57,11 +67,13 @@ export class SlackLinkProbe {
     private readonly watcher: ProbeWatcher,
     private readonly log: (message: string) => void = (message) => console.error(message),
     private readonly newNonce: () => string = () => randomUUID(),
+    private readonly spacingMs: number = CANARY_SPACING_MS,
   ) {}
 
   /** Run one probe round. `timeoutMs` bounds each canary, not the round. */
   async run(timeoutMs: number): Promise<ProbeOutcome> {
     for (let canary = 1; canary <= PROBE_CANARIES; canary += 1) {
+      if (canary > 1) await pause(this.spacingMs);
       const outcome = await this.sendOne(canary, timeoutMs);
       // A single canary that never returned already falsifies the round.
       if (outcome !== "alive") return outcome;
@@ -113,4 +125,8 @@ export class SlackLinkProbe {
     }
     return "alive";
   }
+}
+
+function pause(ms: number): Promise<void> {
+  return new Promise((resolve) => { setTimeout(resolve, ms); });
 }

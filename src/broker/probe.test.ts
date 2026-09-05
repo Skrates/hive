@@ -1,13 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { CanaryRegistry } from "./canary.js";
-import { PROBE_CANARIES, SlackLinkProbe, type ProbePoster } from "./probe.js";
+import { CANARY_SPACING_MS, PROBE_CANARIES, SlackLinkProbe, type ProbePoster } from "./probe.js";
 
 /** Short enough to keep a lost canary cheap, long enough to survive a slow CI box. */
 const PROBE_MS = 200;
 
 interface PosterState {
   posted: string[];
+  /** Epoch-ms of each post, so the round's pacing is checkable. */
+  postedAt: number[];
   deleted: string[];
   logs: string[];
 }
@@ -26,8 +28,10 @@ function makeProbe(options: {
   /** Slack delivered the canary, then the post's own response was lost. */
   postFailsAfterDelivery?: boolean;
   deleteFails?: boolean;
+  /** Gap between canaries; tests use a few milliseconds, production ~1.2s. */
+  spacingMs?: number;
 }): { probe: SlackLinkProbe; state: PosterState; registry: CanaryRegistry } {
-  const state: PosterState = { posted: [], deleted: [], logs: [] };
+  const state: PosterState = { posted: [], postedAt: [], deleted: [], logs: [] };
   const registry = new CanaryRegistry();
   const poster: ProbePoster = {
     async postCanary(nonce) {
@@ -39,6 +43,7 @@ function makeProbe(options: {
         throw new Error("response lost");
       }
       state.posted.push(nonce);
+      state.postedAt.push(Date.now());
       if (typeof options.echo === "function") options.echo(nonce, registry);
       // Sync: the envelope beats chat.postMessage's own HTTP response home.
       if (options.echo === "sync") registry.observe({ event: { text: `canary ${nonce}` } });
@@ -53,7 +58,13 @@ function makeProbe(options: {
     },
   };
   return {
-    probe: new SlackLinkProbe(poster, registry, (message) => state.logs.push(message)),
+    probe: new SlackLinkProbe(
+      poster,
+      registry,
+      (message) => state.logs.push(message),
+      undefined,
+      options.spacingMs ?? 0,
+    ),
     state,
     registry,
   };
@@ -142,4 +153,21 @@ test("a canary that arrives while its own post fails is proof, not an outage", a
   await settle();
   assert.deepEqual(state.deleted, [], "no message ts came back, so nothing can be reaped");
   assert.ok(state.logs.some((line) => line.includes("although its post failed")));
+});
+
+test("canaries are paced so a round cannot rate-limit itself", async () => {
+  // chat.postMessage allows roughly one message per second per channel and the
+  // canary client fails fast rather than waiting out a 429. An unpaced round on
+  // a healthy link — where each canary returns in milliseconds — would trip that
+  // limit and report `unavailable`, manufacturing the false positive the probe
+  // exists to prevent.
+  assert.ok(CANARY_SPACING_MS >= 1_000, "the production gap clears the per-channel rate");
+  const SPACING_MS = 30;
+  const { probe, state } = makeProbe({ echo: "sync", spacingMs: SPACING_MS });
+  assert.equal(await probe.run(PROBE_MS), "alive");
+  assert.equal(state.postedAt.length, PROBE_CANARIES);
+  for (let i = 1; i < state.postedAt.length; i += 1) {
+    const gap = state.postedAt[i]! - state.postedAt[i - 1]!;
+    assert.ok(gap >= SPACING_MS, `canary ${i + 1} was posted ${gap}ms after the previous one`);
+  }
 });

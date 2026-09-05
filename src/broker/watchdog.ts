@@ -155,16 +155,21 @@ export class SlackDeafnessWatchdog {
 
     // A quiet channel and a stolen stream look identical from here. Ask the link
     // itself before spending a reconnect — let alone the process.
+    const eventClockBefore = this.port.lastEventAt();
     const probe = await this.probe();
 
     // The probe waits on the link, and a genuine wake can arrive while it does.
     // That arrival disproves the silence this cycle was reacting to and outranks
     // the probe's own verdict — including "unavailable", where the canary could
     // not be sent at all while the link was carrying traffic the whole time.
+    // The test is MOVEMENT of the event clock, not how recent it now looks: a
+    // probe window can outlast `staleMs` (which is allowed down to 10s), and an
+    // event that arrived during the wait is proof even once it is stale again.
+    const eventClockAfter = this.port.lastEventAt();
     const idleMs = this.idleMs();
     const idleLabel = describeIdle(idleMs);
     const staleLabel = `${Math.round(this.staleMs / 1_000)}s`;
-    if (idleMs < this.staleMs) {
+    if (eventClockAfter !== null && eventClockAfter !== eventClockBefore) {
       this.port.log(
         `[watchdog] a Slack event arrived while the link probe ran (idle now ${idleLabel}) — the silence is over`,
       );
