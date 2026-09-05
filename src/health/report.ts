@@ -2,7 +2,7 @@ import { z } from "zod";
 
 const Name = z.string().min(1).max(512);
 const State = z.enum(["unverified", "observed", "profile_missing", "inventory_incomplete", "check_failed", "reauth_required",
-  "local_login_present", "connected", "tools_available", "connection_failed", "configured_connection_unverified"]);
+  "local_login_present", "connected", "tools_available", "none_configured", "connection_failed", "configured_connection_unverified"]);
 const Check = z.object({ state: State, observedAt: z.iso.datetime() }).strict();
 export const ProfileReport = z.object({
   actor: Name, provider: z.enum(["claude", "codex", "grok"]), accountProfile: Name, sourceHost: Name,

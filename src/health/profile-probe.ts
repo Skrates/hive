@@ -7,7 +7,7 @@ import { execFileSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import type { z } from "zod";
 import type { ProfileReport } from "./report.js";
-import { CodexAppServerClient } from "../codex/app-server.js";
+import { providerStatus } from "./provider-status.js";
 
 export type ProfileObservation = z.infer<typeof ProfileReport>;
 
@@ -122,16 +122,23 @@ export async function probeProfile(actor: string, root: string, provider: Profil
         result.mcp.push({ name: match[1]!, state, observedAt: now() });
       }
     } catch { result.mcp.push({ name: "connection check", state: "check_failed", observedAt: now() }); }
-  } else if (provider === "codex") {
-    const client = new CodexAppServerClient(join(root, "app-server-control/app-server-control.sock"));
+  } else {
     try {
-      await client.connect();
-      const status = await client.readMaintenance();
+      if (provider === "grok") { env.HOME = root; delete env.GROK_HOME; }
+      const status = await providerStatus(provider === "codex" ? "codex" : process.env.HIVE_GROK_COMMAND ?? "grok", provider, env);
       result.auth = { state: status.loggedIn ? "local_login_present" : "reauth_required", observedAt: now() };
       for (const server of status.servers) result.mcp.push({ name: server.name,
         state: server.authStatus === "notLoggedIn" ? "reauth_required" : server.toolsAvailable ? "tools_available" : "unverified", observedAt: now() });
-    } catch { result.mcp.push({ name: "pinned app-server", state: "check_failed", observedAt: now() }); }
-    finally { await client.close().catch(() => undefined); }
+      if (provider === "codex" && !status.servers.length) result.mcp.push({ name: "MCP inventory", state: "none_configured", observedAt: now() });
+    } catch { result.auth = { state: "check_failed", observedAt: now() }; }
+    if (provider === "grok") {
+      try {
+        const report = JSON.parse(run([process.env.HIVE_GROK_COMMAND ?? "grok", "mcp", "doctor", "--json"], env));
+        if (!Array.isArray(report.servers)) throw new Error("invalid Grok MCP report");
+        for (const server of report.servers) result.mcp.push({ name: server.name, state: "unverified", observedAt: now() });
+        if (report.servers.length === 0 && report.failing_count === 0) result.mcp.push({ name: "MCP inventory", state: "none_configured", observedAt: now() });
+      } catch { result.mcp.push({ name: "MCP diagnostics", state: "check_failed", observedAt: now() }); }
+    }
   }
   if (!result.mcp.length) result.mcp.push({ name: "MCP inventory", state: "unverified", observedAt: now() });
   result.observedAt = now();

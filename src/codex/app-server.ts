@@ -141,22 +141,6 @@ export class CodexAppServerClient {
     return this.request("thread/read", { threadId, includeTurns: false });
   }
 
-  /** Read the pinned server's account and MCP inventory without starting/resuming a turn. */
-  async readMaintenance(): Promise<{ loggedIn: boolean; servers: Array<{ name: string; authStatus: string; toolsAvailable: boolean }> }> {
-    const account = await this.request("account/read", { refreshToken: false }) as { account: unknown };
-    const servers: Array<{ name: string; authStatus: string; toolsAvailable: boolean }> = [];
-    let cursor: string | null = null;
-    do {
-      const page = await this.request("mcpServerStatus/list", { cursor, limit: 100, detail: "toolsAndAuthOnly" }) as {
-        data: Array<{ name: string; authStatus: string; tools: Record<string, unknown> }>; nextCursor: string | null;
-      };
-      for (const server of page.data) servers.push({ name: server.name, authStatus: server.authStatus,
-        toolsAvailable: Object.keys(server.tools ?? {}).length > 0 });
-      cursor = page.nextCursor;
-    } while (cursor);
-    return { loggedIn: account.account !== null && account.account !== undefined, servers };
-  }
-
   async assertLiveThread(threadId: string): Promise<"active" | "idle"> {
     let result = await this.readThread(threadId) as { thread: CodexThread };
     if (result.thread.status.type === "notLoaded") {
