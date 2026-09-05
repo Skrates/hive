@@ -1,4 +1,4 @@
-# Edge: macbook — seat ariadne (Codex, ChatGPT Max 20x; formerly `ariadne`)
+# Edge: macbook — seat ariadne (Codex, ChatGPT Max 20x; formerly `codex-1`)
 
 1. Build the checkout; install the launchd plists from `deploy/launchd/` (edit paths inside):
    `launchctl bootstrap gui/$UID deploy/launchd/is.sokrates.hive-edge.plist`.
@@ -22,3 +22,8 @@
    because neither socket can be remote. Without the live daemon, wakes use the subscription's
    normal headless policy under the same pinned `CODEX_HOME`.
 5. Subscription: `deploy/subscriptions/ariadne.json`.
+   Actor rename (codex-1 → ariadne): `put-subscription` only ever *upserts*, so applying
+   `ariadne.json` leaves the old `codex-1` row live and thread-bound. After seating `ariadne`
+   and letting `codex-1`'s deliveries terminalize, retire it: `hive delete-subscription codex-1`
+   (needs `HIVE_BROKER_URL` + `HIVE_ADMIN_TOKEN`). Retirement fails closed while any delivery
+   for the old actor is still non-terminal.
