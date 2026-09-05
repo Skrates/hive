@@ -1,4 +1,9 @@
-# Edge: runpod — seat talos (Grok 4.6 via Grok Build, subscription auth)
+# Edge: runpod — pod recipe (no seat rides it)
+
+Talos rode this edge 2026-08-08 → 2026-08-16 and now lives on `cx43` (`../README.md`);
+the pod is deleted and no subscription names `runpod`. What follows is the recipe for
+standing a pod edge up again — GPU work, a new actuator — kept because the image and
+launcher are still the only tested shape for a network-volume HOME.
 
 The hive's actuator: primarily Sovereign development and local-model testing for the capability
 registry, occasionally the diffusion pipeline (LoRA training). The seat rides a cheap always-on

@@ -7,8 +7,9 @@ import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { AdmissionPolicySchema } from "./addressing.js";
 import { BrokerHttpServer } from "./broker/http.js";
+import { SlackLinkProbe } from "./broker/probe.js";
 import { BrokerService } from "./broker/service.js";
-import { SlackSocketIngress, SlackWebTransport } from "./broker/slack.js";
+import { SlackCanaryPoster, SlackSocketIngress, SlackWebTransport } from "./broker/slack.js";
 import { BrokerStore } from "./broker/store.js";
 import { SlackDeafnessWatchdog } from "./broker/watchdog.js";
 import { startHealthReporter } from "./health/edge-reporter.js";
@@ -73,12 +74,33 @@ program.command("broker")
     }, 5_000);
     // Deafness watchdog: a Socket Mode link that stays "connected" but stops
     // carrying events (half-open socket, or a second consumer stealing the
-    // stream) is invisible without this. First stale cycle forces a reconnect;
-    // a second consecutive silent cycle exits for a systemd restart.
+    // stream) is invisible without this. Silence alone never decides — the
+    // watchdog first probes the link with its own canaries (KRA-1357); only an
+    // unexplained silence forces a reconnect, and only a persistent one exits
+    // for a systemd restart.
+    const probeChannelId = config.HIVE_WATCHDOG_PROBE_CHANNEL ?? [...policy.channelIds][0] ?? null;
+    if (!probeChannelId) {
+      console.error(
+        "[watchdog] no admitted channel to probe (set HIVE_WATCHDOG_PROBE_CHANNEL) "
+        + "— quiet and deaf will be indistinguishable, as they were before KRA-1357",
+      );
+    }
+    let probe: SlackLinkProbe | null = null;
+    if (probeChannelId) {
+      const poster = new SlackCanaryPoster(config.HIVE_SLACK_BOT_TOKEN, probeChannelId);
+      // Bind the canary identity before the first cycle can run: only the
+      // broker's own bot user, in this channel, may settle a probe. A failure
+      // here is a startup failure — Socket Mode needs the same Slack reach.
+      const identity = await poster.identify();
+      slack.expectCanariesFrom(identity);
+      console.error(`[watchdog] canaries authenticated as bot user ${identity.userId} in ${identity.channelId}`);
+      probe = new SlackLinkProbe(poster, slack, (message) => console.error(message));
+    }
     const watchdog = new SlackDeafnessWatchdog({
       lastEventAt: () => slack.lastEventAt(),
       lastConnectAt: () => slack.lastConnectAt(),
       hasActiveSubscription: () => broker.hasActiveSubscription(),
+      probeLink: async (timeoutMs) => (probe ? probe.run(timeoutMs) : "unavailable"),
       restart: () => slack.restart(),
       exit: (code) => process.exit(code),
       now: () => Date.now(),
@@ -299,9 +321,14 @@ const BrokerConfig = z.object({
   HIVE_SLACK_BOT_TOKEN: z.string().startsWith("xoxb-"),
   HIVE_SLACK_WORKSPACE_ID: z.string().min(1),
   HIVE_ADMISSION_POLICY: z.string().min(2),
-  // Deafness threshold: silence past this while subscriptions are live forces a
-  // Socket Mode reconnect; a second consecutive silent cycle exits for systemd.
+  // Deafness threshold: silence past this while subscriptions are live opens a
+  // link probe; unexplained silence then forces a Socket Mode reconnect, and a
+  // second consecutive unexplained cycle exits for systemd.
   HIVE_WATCHDOG_STALE_MS: z.coerce.number().int().min(10_000).default(300_000),
+  // Channel the watchdog posts its link canaries to (they are hive_*-stamped, so
+  // admission drops them, and each is deleted once observed). Defaults to the
+  // first admitted channel — the commons.
+  HIVE_WATCHDOG_PROBE_CHANNEL: z.string().min(1).optional(),
 });
 
 const EdgeConfig = z.object({

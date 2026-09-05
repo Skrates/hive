@@ -15,6 +15,18 @@ stamps on wake messages). A missing `reactions:write` does not block delivery �
 as `missing_scope`, logged and dropped — so grant it up front rather than discovering the silence
 later.
 
+The deafness watchdog posts link canaries into an admitted channel and waits for each to come back
+over the Socket Mode link, so its channel must be one whose messages the app actually *receives* —
+posting into it is not enough. For the admitted private channel that already holds
+(`groups:history` plus the `message.groups` subscription is what carries every wake). If
+`HIVE_WATCHDOG_PROBE_CHANNEL` points the canaries at a channel of a different type, grant the
+matching pair — a public channel needs `channels:history` and `message.channels` — or every canary
+will post successfully and never return, which the watchdog reads as deafness and answers with a
+reconnect and then an exit. A canary proves the link only when it comes back as the original
+message from the broker's own bot user (`auth.test` on the bot token, resolved at startup) in the
+probe channel; a stamped message from any other sender, and the edit or delete echo of a canary,
+are kept off the activity clock but never settle a probe.
+
 ## Trust set (ADR-0003 R-1)
 
 The admission policy is the closed trust set: the operator's Slack user ID(s) plus each enrolled
@@ -252,9 +264,10 @@ The edge records; it does not verify and it does not refuse.
   `deploy/systemd/hive-edge.service` (cx53, linux laptop), `deploy/launchd/run-edge.zsh`
   (macbook), and `deploy/machines/edge-runpod/{Dockerfile,start-edge.sh}` (RunPod) — read as
   orientation, not as the authority; the authority is `src/edge/launchers.test.ts`, and the list
-  here may lag it. The RunPod entry is the one that matters most, not least: its seat HOME is on
-  `/workspace`, a network-backed volume, so it is the deployment the whole three-guard stack was
-  written for.
+  here may lag it. The RunPod launcher is the one the three-guard stack was written for — its
+  seat HOME sat on `/workspace`, a network-backed volume — and it stays in the set as the pod
+  recipe although no seat has ridden it since 2026-08-16 (Talos lives on cx43, whose launcher is
+  the shared systemd unit).
 
   **Adding a launcher without this line reintroduces the exhaustion on that machine alone, so the
   enumeration is derived, not written down.** `src/edge/launchers.test.ts` walks `deploy/`, finds
