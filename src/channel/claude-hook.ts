@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { attestationWire, readWakeAttestation } from "../edge/attestation.js";
 import { udsRequestJson } from "../local/uds.js";
-import { resolveEdgeSocketPath } from "../edge/providers.js";
+import { ingressInboxDirectory, resolveEdgeSocketPath } from "../edge/providers.js";
 
 /**
  * ADR-0003 R-4 steering matrix: Claude Code delivery is next-boundary.
@@ -105,7 +105,9 @@ async function main(): Promise<void> {
   const hiveHome = process.env.HIVE_HOME ?? join(homedir(), ".hive");
   const edgeSocket = resolveEdgeSocketPath();
   const ingressRoot = process.env.HIVE_INGRESS_DIR ?? join(hiveHome, "ingress");
-  const inboxDirectory = join(ingressRoot, actor);
+  // Canonical on purpose: the delivery writer derives the same path from the
+  // delivery's (canonical) actor, and the live registration below advertises it.
+  const inboxDirectory = ingressInboxDirectory(ingressRoot, actor);
 
   let input: HookInput = {};
   try {

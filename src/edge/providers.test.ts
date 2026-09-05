@@ -8,7 +8,8 @@ import type { Delivery, Subscription } from "../domain.js";
 import { prepareSocketPath } from "../local/uds.js";
 import type { LiveIngress } from "./live-registry.js";
 import { delimiter, dirname } from "node:path";
-import { ClaudeProvider, claudePromptSlotArgs, codexPermissionArgs, CodexProvider, composeChildEnv, GrokProvider, grokPermissionArgs, prependPathEntry, ProviderPreDispatchError, requireAccountProfile, resolveEdgeSocketPath } from "./providers.js";
+import { ingressInboxDirectory, ClaudeProvider, claudePromptSlotArgs, codexPermissionArgs, CodexProvider, composeChildEnv, GrokProvider, grokPermissionArgs, prependPathEntry, ProviderPreDispatchError, requireAccountProfile, resolveEdgeSocketPath } from "./providers.js";
+import { drainInbox } from "../channel/claude-hook.js";
 
 function subscription(overrides: Partial<Subscription> = {}): Subscription {
   return {
@@ -259,6 +260,25 @@ test("a missing account profile is a hard pre-dispatch failure, never a fallback
     () => claude.preflight(subscription({ provider: "claude", accountProfile: join(directory, "missing") })),
     (error: unknown) => error instanceof ProviderPreDispatchError && error.code === "account_profile_missing",
   );
+});
+
+test("the writer and the hook agree on one inbox address, whatever case HIVE_ACTOR carries", async (t) => {
+  // hive#41 park blocker 2: the live registry keys on the canonical actor, so a
+  // surface exporting HIVE_ACTOR=Ariadne IS found by the delivery's lowercase
+  // actor — and must then drain the directory the writer wrote to, not a
+  // sibling spelled the way the env var was. One derivation on both sides.
+  const root = mkdtempSync(join(tmpdir(), "hive-inbox-case-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const claude = new ClaudeProvider({ ingressRoot: root });
+  await claude.deliverLive({} as LiveIngress, delivery(11), "Message from U1: case test");
+
+  const hookSide = ingressInboxDirectory(root, "Ariadne");
+  assert.equal(hookSide, ingressInboxDirectory(root, "ariadne"));
+  assert.equal(hookSide, join(root, "ariadne"));
+  const drained = drainInbox(hookSide);
+  assert.equal(drained.length, 1, "the hook drains exactly the envelope the writer landed");
+  assert.match(drained[0]!.file, /delivery-11-attempt-2\.json$/);
+  assert.equal(drained[0]!.framed, "Message from U1: case test");
 });
 
 test("Claude boundary delivery lands a durable, self-identifying inbox file", async (t) => {

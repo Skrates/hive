@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
-import type { Delivery, Provider, Subscription } from "../domain.js";
+import { canonicalActor, type Delivery, type Provider, type Subscription } from "../domain.js";
 import { UdsHttpError, udsRequestJson } from "../local/uds.js";
 import type { LiveIngress } from "./live-registry.js";
 
@@ -241,7 +241,7 @@ export class ClaudeProvider implements ProviderAdapter {
   }
 
   writeInbox(delivery: Delivery, framed: string): string {
-    const directory = join(this.inbox.ingressRoot, delivery.actor);
+    const directory = ingressInboxDirectory(this.inbox.ingressRoot, delivery.actor);
     mkdirSync(directory, { recursive: true, mode: 0o700 });
     const finalPath = join(directory, `delivery-${delivery.id}-attempt-${delivery.attempts}.json`);
     const temporaryPath = `${finalPath}.tmp`;
@@ -319,6 +319,17 @@ export function prependPathEntry(pathValue: string | undefined, entry: string): 
  * The owner-local edge socket, resolved in the edge process — not in a provider
  * child whose `HOME` may have been pinned to an account profile.
  */
+/**
+ * The one address of an actor's live-ingress inbox. The writer (`deliverLive`)
+ * and the drainer (the Claude Stop hook, which also registers this path as its
+ * `socketPath`) both derive it here, so a mixed-case `HIVE_ACTOR` can never
+ * register a surface under the canonical key and then drain a directory the
+ * writer never wrote to (hive#41 park blocker 2: one address, one owner).
+ */
+export function ingressInboxDirectory(ingressRoot: string, actor: string): string {
+  return join(ingressRoot, canonicalActor(actor));
+}
+
 export function resolveEdgeSocketPath(
   env: NodeJS.ProcessEnv = process.env,
   home: string = homedir(),
