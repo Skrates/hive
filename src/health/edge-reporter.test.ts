@@ -29,13 +29,14 @@ test("native plugin inventory ignores disabled caches and reports active version
   writeFileSync(join(root, "settings.json"), JSON.stringify({ enabledPlugins: { "active@test": true, "disabled@test": false, "missing@test": true } }));
   const plugins = [{ id: "active@test", scope: "user", enabled: true, version: "1", installPath: root },
     { id: "disabled@test", scope: "user", enabled: false, version: "1", installPath: "/deleted-cache" }];
-  writeFileSync(command, `#!${process.execPath}\nconsole.log(process.argv[2]==='plugin' ? ${JSON.stringify(JSON.stringify(plugins))} : process.argv[2]==='auth' ? '{"loggedIn":true}' : 'context7: command - ⊘ Disabled for this project (re-enable via /mcp)');\n`, { mode: 0o755 });
+  writeFileSync(command, `#!${process.execPath}\nif(process.cwd()!==require('node:fs').realpathSync(${JSON.stringify(root)}))process.exit(1);\nconsole.log(process.argv[2]==='plugin' ? ${JSON.stringify(JSON.stringify(plugins))} : process.argv[2]==='auth' ? '{"loggedIn":true}' : 'claude.ai Named Connector: endpoint - ⊘ Disabled for this project (re-enable via /mcp)');\n`, { mode: 0o755 });
   const previous = process.env.HIVE_CLAUDE_COMMAND;
   process.env.HIVE_CLAUDE_COMMAND = command;
   t.after(() => { if (previous === undefined) delete process.env.HIVE_CLAUDE_COMMAND; else process.env.HIVE_CLAUDE_COMMAND = previous; rmSync(root, { recursive: true, force: true }); });
   const report = await probeProfile("test", root, "claude");
   assert.equal(report.inventory.state, "observed");
   assert.deepEqual(report.plugins.map(p => [p.name, p.state]), [["active@test", "version_differs"], ["missing@test", "missing"]]);
+  assert.equal(report.mcp[0]?.name, "claude.ai Named Connector");
   assert.equal(report.mcp[0]?.state, "disabled");
 });
 

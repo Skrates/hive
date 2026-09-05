@@ -41,6 +41,20 @@ test("receipt age cannot refresh a quota sample, and future/invalid dates never 
   assert.match(output, /2026-09-05T15:00:00.000Z \(0m ago\)/);
 });
 
+test("a healthy independent collector needs no artificial seat assignment", () => {
+  const s = snapshot();
+  s.seats = []; s.bindings = []; s.failedProbes = [];
+  s.doctor = [{ ...s.doctor[0]!, last_outcome: "accepted", last_conflict: null }];
+  s.pools[0] = { ...s.pools[0]!, status: "ok", sampled_at: now, windows: [{ label: "7d", utilization: 0.5, resets_at: null }] };
+  let output = renderCanvas(s);
+  assert.match(output, /collector: collector-one/);
+  assert.match(output, /no enrolled seat binding/);
+  assert.match(output, /No failures observed/);
+  s.doctor[0]!.last_received_at = null;
+  output = renderCanvas(s);
+  assert.match(output, /collector-one: collector receipt never observed/);
+});
+
 test("same actor under a different pinned profile cannot supply a health verdict", async () => {
   const s = snapshot();
   const p = await probeProfile("one", "/missing-health-test-profile", "claude");

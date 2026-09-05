@@ -6,7 +6,7 @@ export async function providerStatus(command: string, provider: "codex" | "grok"
   loggedIn: boolean; servers: Array<{ name: string; authStatus: string; toolsAvailable: boolean }>;
 }> {
   const child = spawn(command, provider === "codex" ? ["app-server"] : ["agent", "--no-leader", "stdio"], {
-    env, stdio: ["pipe", "pipe", "ignore"],
+    env, cwd: provider === "codex" ? env.CODEX_HOME : env.HOME, stdio: ["pipe", "pipe", "ignore"],
   });
   let next = 1;
   const pending = new Map<number, { resolve(value: any): void; reject(error: Error): void }>();

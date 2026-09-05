@@ -39,7 +39,9 @@ export function treeDigest(root: string): string {
 function run(command: string[], env: NodeJS.ProcessEnv): string {
   const [file, ...args] = command;
   if (!file) throw new Error("missing command");
-  return execFileSync(file, args, { env, encoding: "utf8", timeout: 45_000,
+  // Profile maintenance must not inherit project overrides from the edge's
+  // service checkout. Session/project-specific settings are separate evidence.
+  return execFileSync(file, args, { env, cwd: env.CLAUDE_CONFIG_DIR, encoding: "utf8", timeout: 45_000,
     maxBuffer: 2 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] });
 }
 
@@ -116,7 +118,7 @@ export async function probeProfile(actor: string, root: string, provider: Profil
     try {
       const output = run([claude, "mcp", "list"], env);
       for (const line of output.split("\n")) {
-        const match = line.match(/^([\w.@/:-]+):\s.*(?: - |—)(.*)$/u);
+        const match = line.match(/^(.+?):\s.*? - (.*)$/u);
         if (!match) continue;
         const verdict = match[2] ?? "";
         const state = /Disabled for this project/i.test(verdict) ? "disabled"

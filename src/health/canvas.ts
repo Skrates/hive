@@ -223,8 +223,14 @@ export function renderCanvas(s: CanvasSnapshot, refreshStatus = "Snapshot only. 
       ` ${receivingState}. Reported runtime attestation: ${cell(receiving?.attestation ?? "unverified")}; it is a session claim, not verification of loaded files. An edge heartbeat or past delivery is not current session readiness.`);
   }
   for (const d of currentReporters.filter(d => !joined.has(d.profile_id))) {
-    overview.push([`collector: ${d.profile_id}`, `${d.provider ?? "unknown"} / ${d.edge_id ?? "unknown edge"}`, d.profile_id, "unverified", "unverified", "seat binding unverified"]);
-    attention.push(`${d.profile_id}: configured collector; ${age(d.last_received_at, s.generatedAt)}; seat binding unverified.`);
+    overview.push([`collector: ${d.profile_id}`, `${d.provider ?? "unknown"} / ${d.edge_id ?? "unknown edge"}`, d.profile_id, "unverified", "unverified", "no enrolled seat binding"]);
+    // Collectors are also valid outside Hive seats. Their observations remain
+    // visible; absence of a seat is not itself a collector failure.
+    if (stale(d.last_received_at, s.generatedAt)) attention.push(`${d.profile_id}: collector receipt ${age(d.last_received_at, s.generatedAt)}.`);
+    if (d.last_outcome === "conflict") attention.push(`${d.profile_id}: latest usage rejected: ${d.last_conflict?.kind ?? "conflict"}.`);
+    const pool = currentPools.find(p => p.id === d.pool_id);
+    if (!pool || !pool.windows.length) attention.push(`${d.profile_id}: no usable quota sample.`);
+    else if (stale(pool.sampled_at, s.generatedAt)) attention.push(`${d.profile_id}: quota sample ${age(pool.sampled_at, s.generatedAt)}.`);
   }
   return `${refreshStatus}\n\nUpdated ${s.generatedAt}. Refresh target: every 5 minutes; treat this entire canvas as stale after 15 minutes without an update.\n\n` +
     `## Needs attention\n\n${attention.length ? attention.map(t => `- ${cell(t)}`).join("\n") : "No failures observed; unverified checks remain unverified."}\n\n` +
