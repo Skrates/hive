@@ -38,6 +38,8 @@ interface PortState {
   restartHangs: boolean;
   /** A reconnect that rejects outright. */
   restartThrows: boolean;
+  /** A genuine Slack event lands while the probe is waiting on the link. */
+  eventArrivesDuringProbe: boolean;
 }
 
 function makePort(overrides: Partial<PortState> = {}): { port: WatchdogPort; state: PortState } {
@@ -56,6 +58,7 @@ function makePort(overrides: Partial<PortState> = {}): { port: WatchdogPort; sta
     probeGate: null,
     restartHangs: false,
     restartThrows: false,
+    eventArrivesDuringProbe: false,
     ...overrides,
   };
   const port: WatchdogPort = {
@@ -65,6 +68,7 @@ function makePort(overrides: Partial<PortState> = {}): { port: WatchdogPort; sta
     probeLink: async () => {
       state.probes += 1;
       if (state.probeGate) await state.probeGate;
+      if (state.eventArrivesDuringProbe) state.lastEventMs = state.nowMs;
       if (state.probeThrows) throw new Error("probe blew up");
       return state.probeOutcome;
     },
@@ -329,4 +333,20 @@ test("a forced reconnect that rejects is reported, not swallowed", async () => {
   );
   state.nowMs += STALE_MS;
   assert.equal(await watchdog.check(), "exited");
+});
+
+test("a wake that lands while the probe runs ends the cycle — even when the probe proves nothing", async () => {
+  // The probe waits on the link for up to a full round. Real traffic arriving in
+  // that window disproves the silence directly, and outranks a probe that could
+  // not even be posted.
+  const { port, state } = makePort({
+    lastEventMs: 1_000_000 - (STALE_MS + 1_000),
+    probeOutcome: "unavailable",
+    eventArrivesDuringProbe: true,
+  });
+  const watchdog = new SlackDeafnessWatchdog(port, STALE_MS);
+  assert.equal(await watchdog.check(), "healthy");
+  assert.equal(state.restarts, 0, "the link is demonstrably carrying events");
+  assert.deepEqual(state.exits, []);
+  assert.ok(state.logs.some((line) => line.includes("arrived while the link probe ran")));
 });

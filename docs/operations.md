@@ -15,6 +15,15 @@ stamps on wake messages). A missing `reactions:write` does not block delivery �
 as `missing_scope`, logged and dropped — so grant it up front rather than discovering the silence
 later.
 
+The deafness watchdog posts link canaries into an admitted channel and waits for each to come back
+over the Socket Mode link, so its channel must be one whose messages the app actually *receives* —
+posting into it is not enough. For the admitted private channel that already holds
+(`groups:history` plus the `message.groups` subscription is what carries every wake). If
+`HIVE_WATCHDOG_PROBE_CHANNEL` points the canaries at a channel of a different type, grant the
+matching pair — a public channel needs `channels:history` and `message.channels` — or every canary
+will post successfully and never return, which the watchdog reads as deafness and answers with a
+reconnect and then an exit.
+
 ## Trust set (ADR-0003 R-1)
 
 The admission policy is the closed trust set: the operator's Slack user ID(s) plus each enrolled

@@ -148,19 +148,30 @@ export class SlackDeafnessWatchdog {
       return "idle_no_subscription";
     }
 
-    const last = this.port.lastEventAt();
-    const idleMs = last === null ? Number.POSITIVE_INFINITY : this.port.now() - last;
-    if (idleMs < this.staleMs) {
+    if (this.idleMs() < this.staleMs) {
       this.reset();
       return "healthy";
     }
 
-    const idleLabel = Number.isFinite(idleMs) ? `${Math.round(idleMs / 1_000)}s` : "∞ (no event since boot)";
-    const staleLabel = `${Math.round(this.staleMs / 1_000)}s`;
-
     // A quiet channel and a stolen stream look identical from here. Ask the link
     // itself before spending a reconnect — let alone the process.
     const probe = await this.probe();
+
+    // The probe waits on the link, and a genuine wake can arrive while it does.
+    // That arrival disproves the silence this cycle was reacting to and outranks
+    // the probe's own verdict — including "unavailable", where the canary could
+    // not be sent at all while the link was carrying traffic the whole time.
+    const idleMs = this.idleMs();
+    const idleLabel = describeIdle(idleMs);
+    const staleLabel = `${Math.round(this.staleMs / 1_000)}s`;
+    if (idleMs < this.staleMs) {
+      this.port.log(
+        `[watchdog] a Slack event arrived while the link probe ran (idle now ${idleLabel}) — the silence is over`,
+      );
+      this.reset();
+      return "healthy";
+    }
+
     if (probe === "alive") {
       this.port.log(
         `[watchdog] no Slack events for ${idleLabel} (≥ ${staleLabel}) but every canary returned over the link `
@@ -257,10 +268,20 @@ export class SlackDeafnessWatchdog {
     }
   }
 
+  /** Milliseconds since the last non-canary Slack envelope; ∞ if none ever arrived. */
+  private idleMs(): number {
+    const last = this.port.lastEventAt();
+    return last === null ? Number.POSITIVE_INFINITY : this.port.now() - last;
+  }
+
   private reset(): void {
     this.staleStreak = 0;
     this.lastRestartMs = null;
   }
+}
+
+function describeIdle(idleMs: number): string {
+  return Number.isFinite(idleMs) ? `${Math.round(idleMs / 1_000)}s` : "∞ (no event since boot)";
 }
 
 /**
