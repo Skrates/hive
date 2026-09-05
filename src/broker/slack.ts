@@ -2,6 +2,8 @@ import { SocketModeClient } from "@slack/socket-mode";
 import { WebClient } from "@slack/web-api";
 import { isAdmitted, parseAddressedWake, type AdmissionPolicy } from "../addressing.js";
 import { EVERYONE, type ReplaySnapshot, type SlackEventInput } from "../domain.js";
+import { CanaryRegistry, PROBE_EVENT_TYPE, type CanaryWatch, type ProbeWatcher } from "./canary.js";
+import type { ProbePoster } from "./probe.js";
 import type { BrokerService, SlackTransport } from "./service.js";
 
 interface SlackMessageEvent {
@@ -318,11 +320,43 @@ export class SlackWebTransport implements SlackTransport {
   }
 }
 
-export class SlackSocketIngress {
+/**
+ * Posts (and reaps) the deafness watchdog's canaries with the bot token. It owns
+ * its own WebClient rather than widening `SlackTransport`: a canary is a link
+ * liveness experiment, not a delivery act, and nothing on the delivery path may
+ * be able to reach it.
+ */
+export class SlackCanaryPoster implements ProbePoster {
+  private readonly web: WebClient;
+
+  constructor(botToken: string, private readonly channelId: string) {
+    this.web = new WebClient(botToken);
+  }
+
+  async postCanary(nonce: string): Promise<string> {
+    const result = await this.web.chat.postMessage({
+      channel: this.channelId,
+      // Deliberately envelope-free prose: even with the metadata stamp stripped,
+      // this text can never parse as a WAKE:/NEXT envelope.
+      text: `hive watchdog link canary ${nonce} — ignore`,
+      metadata: { event_type: PROBE_EVENT_TYPE, event_payload: { nonce } },
+    });
+    if (!result.ts) throw new Error("Slack canary post returned no timestamp");
+    return result.ts;
+  }
+
+  async deleteCanary(messageTs: string): Promise<void> {
+    await this.web.chat.delete({ channel: this.channelId, ts: messageTs });
+  }
+}
+
+export class SlackSocketIngress implements ProbeWatcher {
   private socket: SocketModeClient | null = null;
   private starting = false;
   private lastEventMs: number | null = null;
   private lastConnectMs: number | null = null;
+  /** The watchdog's canaries in flight — see {@link watchCanary}. */
+  private readonly canaries = new CanaryRegistry(() => this.clock());
 
   constructor(
     private readonly appToken: string,
@@ -345,6 +379,9 @@ export class SlackSocketIngress {
    * established yet deaf (a half-open socket, or a second Socket Mode consumer
    * stealing the event stream), so the deafness watchdog must read event flow,
    * not connection state, when deciding whether the link has gone silent.
+   *
+   * The watchdog's own canaries are excluded (see {@link watchCanary}): counting
+   * them would let the probe answer the very question it was sent to ask.
    */
   lastEventAt(): number | null {
     return this.lastEventMs;
@@ -359,6 +396,15 @@ export class SlackSocketIngress {
    */
   lastConnectAt(): number | null {
     return this.lastConnectMs;
+  }
+
+  /**
+   * Register a one-shot waiter for a canary the watchdog's probe is about to
+   * post. The ingress is the only place every inbound envelope is seen, so it is
+   * the only place a canary's return can be observed.
+   */
+  watchCanary(nonce: string, timeoutMs: number): CanaryWatch {
+    return this.canaries.watchCanary(nonce, timeoutMs);
   }
 
   async start(): Promise<void> {
@@ -379,7 +425,11 @@ export class SlackSocketIngress {
       // all-envelope signal. This is the true "events are flowing" evidence, so it
       // (and only it) stamps the event-activity clock. It never acks or processes;
       // durable ingestion runs off the unwrapped inner `message` event below.
-      socket.on("slack_event", () => {
+      socket.on("slack_event", (envelope?: { body?: unknown }) => {
+        // A canary of ours is transport evidence for the probe that sent it,
+        // never channel activity: stamping it would make the next watchdog cycle
+        // read the link as busy and skip the probe that proved it alive.
+        if (this.canaries.observe(envelope?.body)) return;
         this.lastEventMs = this.clock();
       });
       // @slack/socket-mode unwraps Events API envelopes and emits the inner event type ("message"),

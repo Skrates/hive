@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import type { ProbeOutcome } from "./probe.js";
 import { SlackDeafnessWatchdog, type WatchdogPort } from "./watchdog.js";
 
 const STALE_MS = 300_000;
@@ -21,6 +22,18 @@ interface PortState {
    *   "wedged"     — the reconnect never re-establishes (no `connected`).
    */
   restartOutcome: "reconnects" | "recovers" | "wedged";
+  /**
+   * What the link probe reports. The default is "silent" — the canaries were
+   * posted and never came home — which is the only silence the escalation is
+   * allowed to act on, so every deafness scenario below states it explicitly.
+   */
+  probeOutcome: ProbeOutcome;
+  /** Probe rounds run, so a cycle that must not probe can be pinned. */
+  probes: number;
+  /** A probe implementation that throws instead of reporting an outcome. */
+  probeThrows: boolean;
+  /** Held by a test that needs a probe round still running when the next cycle fires. */
+  probeGate: Promise<void> | null;
 }
 
 function makePort(overrides: Partial<PortState> = {}): { port: WatchdogPort; state: PortState } {
@@ -33,12 +46,22 @@ function makePort(overrides: Partial<PortState> = {}): { port: WatchdogPort; sta
     exits: [],
     logs: [],
     restartOutcome: "reconnects",
+    probeOutcome: "silent",
+    probes: 0,
+    probeThrows: false,
+    probeGate: null,
     ...overrides,
   };
   const port: WatchdogPort = {
     lastEventAt: () => state.lastEventMs,
     lastConnectAt: () => state.lastConnectMs,
     hasActiveSubscription: () => state.active,
+    probeLink: async () => {
+      state.probes += 1;
+      if (state.probeGate) await state.probeGate;
+      if (state.probeThrows) throw new Error("probe blew up");
+      return state.probeOutcome;
+    },
     restart: async () => {
       state.restarts += 1;
       // Production-faithful: SlackSocketIngress.start() stamps a `connected`
@@ -60,6 +83,7 @@ test("watchdog does nothing while no subscription is live — silence is expecte
   assert.equal(await watchdog.check(), "idle_no_subscription");
   assert.equal(state.restarts, 0);
   assert.deepEqual(state.exits, []);
+  assert.equal(state.probes, 0, "no subscription — nothing to probe for");
 });
 
 test("watchdog is healthy while events are recent", async () => {
@@ -67,6 +91,7 @@ test("watchdog is healthy while events are recent", async () => {
   const watchdog = new SlackDeafnessWatchdog(port, STALE_MS);
   assert.equal(await watchdog.check(), "healthy");
   assert.equal(state.restarts, 0);
+  assert.equal(state.probes, 0, "traffic is flowing — the link needs no canary");
 });
 
 test("watchdog forces a reconnect on the first deaf cycle", async () => {
@@ -149,4 +174,110 @@ test("a never-connected transport that also never received an event is exited", 
   state.nowMs += STALE_MS;
   assert.equal(await watchdog.check(), "exited");
   assert.deepEqual(state.exits, [1]);
+});
+
+test("a quiet channel whose canaries come home is not deaf — no reconnect, no exit (KRA-1357)", async () => {
+  // 2026-09-05 05:35Z: three of these windows in a row exited the broker while
+  // an addressed probe was answered in under a second. Silence is not evidence.
+  const { port, state } = makePort({
+    lastEventMs: 1_000_000 - (STALE_MS + 1_000),
+    probeOutcome: "alive",
+  });
+  const watchdog = new SlackDeafnessWatchdog(port, STALE_MS);
+  assert.equal(await watchdog.check(), "quiet_not_deaf");
+  assert.ok(state.logs.some((line) => line.includes("quiet, not deaf")));
+  // Two more silent windows: a quiet night must never accrue toward an exit.
+  state.nowMs += STALE_MS;
+  assert.equal(await watchdog.check(), "quiet_not_deaf");
+  state.nowMs += STALE_MS;
+  assert.equal(await watchdog.check(), "quiet_not_deaf");
+  assert.equal(state.restarts, 0, "a live link is never reconnected");
+  assert.deepEqual(state.exits, []);
+  assert.equal(state.probes, 3, "every stale cycle asks the link, none assumes");
+});
+
+test("a link that stops carrying our canaries still escalates to exit", async () => {
+  const { port, state } = makePort({
+    lastEventMs: 1_000_000 - (STALE_MS + 1_000),
+    restartOutcome: "reconnects",
+    probeOutcome: "silent",
+  });
+  const watchdog = new SlackDeafnessWatchdog(port, STALE_MS);
+  assert.equal(await watchdog.check(), "restarted");
+  state.nowMs += STALE_MS;
+  assert.equal(await watchdog.check(), "reconnected_still_deaf");
+  state.nowMs += STALE_MS;
+  assert.equal(await watchdog.check(), "exited");
+  assert.deepEqual(state.exits, [1]);
+  assert.equal(state.probes, 3, "each escalation step is probed first");
+});
+
+test("a canary that comes home mid-escalation resets the streak before the exit", async () => {
+  const { port, state } = makePort({
+    lastEventMs: 1_000_000 - (STALE_MS + 1_000),
+    probeOutcome: "silent",
+  });
+  const watchdog = new SlackDeafnessWatchdog(port, STALE_MS);
+  assert.equal(await watchdog.check(), "restarted");
+  // The link answers on the next window: whatever the silence was, it is over.
+  state.nowMs += STALE_MS;
+  state.probeOutcome = "alive";
+  assert.equal(await watchdog.check(), "quiet_not_deaf");
+  // A later unexplained silence starts a FRESH streak — a reconnect, not an exit.
+  state.nowMs += STALE_MS;
+  state.probeOutcome = "silent";
+  assert.equal(await watchdog.check(), "restarted");
+  assert.equal(state.restarts, 2);
+  assert.deepEqual(state.exits, [], "the streak was reset by live evidence");
+});
+
+test("a probe that cannot be posted proves nothing — escalation falls back to transport evidence", async () => {
+  // Slack's Web API being unreachable is not evidence of a deaf socket. The old
+  // behaviour is the honest fallback, and it says so in the log.
+  const { port, state } = makePort({
+    lastEventMs: 1_000_000 - (STALE_MS + 1_000),
+    restartOutcome: "reconnects",
+    probeOutcome: "unavailable",
+  });
+  const watchdog = new SlackDeafnessWatchdog(port, STALE_MS);
+  assert.equal(await watchdog.check(), "restarted");
+  assert.ok(state.logs.some((line) => line.includes("link probe was unavailable")));
+  state.nowMs += STALE_MS;
+  assert.equal(await watchdog.check(), "reconnected_still_deaf");
+  state.nowMs += STALE_MS;
+  assert.equal(await watchdog.check(), "exited");
+  assert.deepEqual(state.exits, [1]);
+});
+
+test("a throwing probe is unproven, never deaf — the cycle still decides", async () => {
+  // A probe that raises must not abort the cycle: that would leave a genuinely
+  // deaf broker undetected forever, which is the failure the watchdog exists for.
+  const { port, state } = makePort({
+    lastEventMs: 1_000_000 - (STALE_MS + 1_000),
+    probeThrows: true,
+  });
+  const watchdog = new SlackDeafnessWatchdog(port, STALE_MS);
+  assert.equal(await watchdog.check(), "restarted");
+  assert.equal(state.restarts, 1);
+  assert.ok(state.logs.some((line) => line.includes("link probe was unavailable")));
+});
+
+test("a cycle that is still probing refuses the next one — silence is never counted twice", async () => {
+  // The interval is `staleMs`, but a probe round waits on the link. Overlapping
+  // cycles would post two canary rounds and double-count one silence.
+  const { port, state } = makePort({
+    lastEventMs: 1_000_000 - (STALE_MS + 1_000),
+    probeOutcome: "alive",
+  });
+  let release!: () => void;
+  state.probeGate = new Promise<void>((resolve) => { release = resolve; });
+  const watchdog = new SlackDeafnessWatchdog(port, STALE_MS);
+  const first = watchdog.check();
+  assert.equal(await watchdog.check(), "cycle_in_flight");
+  assert.equal(state.probes, 1, "the overlapping cycle never probes");
+  assert.ok(state.logs.some((line) => line.includes("still in flight")));
+  release();
+  assert.equal(await first, "quiet_not_deaf");
+  assert.equal(state.restarts, 0);
+  assert.deepEqual(state.exits, []);
 });
