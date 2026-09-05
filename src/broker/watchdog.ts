@@ -107,8 +107,20 @@ export class SlackDeafnessWatchdog {
   private staleStreak = 0;
   /** True while a cycle is running — a probe round can outlast a short interval. */
   private cycleInFlight = false;
-  /** Epoch-ms of the watchdog's own last forced reconnect, or null if none pending. */
-  private lastRestartMs: number | null = null;
+  /**
+   * Epoch-ms the watchdog ASKED for its last reconnect, or null if none pending.
+   * The transport's `connected` stamp is compared against this: a connect older
+   * than the request is a leftover from the previous socket, not proof the new
+   * one came up.
+   */
+  private restartRequestedMs: number | null = null;
+  /**
+   * Epoch-ms the reconnect finished (or was abandoned at its deadline). The
+   * fresh link's window is measured from HERE, not from the request: a reconnect
+   * can itself consume much of a stale window, and the connection's chance to
+   * carry traffic only begins once it exists.
+   */
+  private restartSettledMs: number | null = null;
 
   constructor(
     private readonly port: WatchdogPort,
@@ -206,9 +218,9 @@ export class SlackDeafnessWatchdog {
     // eat a large part of it, so the next cycle may fire far less than a window
     // after the reconnect — and escalating there would condemn a fresh transport
     // for not having received traffic nobody sent yet.
-    const sinceRestartMs = this.lastRestartMs === null
+    const sinceRestartMs = this.restartSettledMs === null
       ? Number.POSITIVE_INFINITY
-      : this.port.now() - this.lastRestartMs;
+      : this.port.now() - this.restartSettledMs;
     if (sinceRestartMs < this.staleMs) {
       this.port.log(
         `[watchdog] the forced reconnect is only ${Math.round(sinceRestartMs / 1_000)}s old (< ${staleLabel}) `
@@ -222,7 +234,7 @@ export class SlackDeafnessWatchdog {
     if (this.staleStreak >= 2) {
       // A reconnect was already forced last cycle and events STILL haven't
       // resumed. The transport's own liveness decides the escalation.
-      const restartedAt = this.lastRestartMs;
+      const restartedAt = this.restartRequestedMs;
       const connectedAt = this.port.lastConnectAt();
       const reconnected = restartedAt !== null && connectedAt !== null && connectedAt >= restartedAt;
       if (!reconnected) {
@@ -274,7 +286,7 @@ export class SlackDeafnessWatchdog {
    * wedged by the next cycle, which exits for the supervisor.
    */
   private async forceRestart(): Promise<void> {
-    this.lastRestartMs = this.port.now();
+    this.restartRequestedMs = this.port.now();
     try {
       await withDeadline(this.port.restart(), this.restartTimeoutMs, "socket restart");
     } catch (error) {
@@ -283,6 +295,9 @@ export class SlackDeafnessWatchdog {
         + "clock stays stale, so the next cycle reads it as wedged and exits for the supervisor",
       );
     }
+    // Read the clock again: the reconnect may have taken a large part of a stale
+    // window, and the new link's window starts when the reconnect ends.
+    this.restartSettledMs = this.port.now();
   }
 
   /**
@@ -306,7 +321,8 @@ export class SlackDeafnessWatchdog {
 
   private reset(): void {
     this.staleStreak = 0;
-    this.lastRestartMs = null;
+    this.restartRequestedMs = null;
+    this.restartSettledMs = null;
   }
 }
 

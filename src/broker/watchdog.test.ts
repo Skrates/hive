@@ -44,6 +44,8 @@ interface PortState {
   probeTakesMs: number;
   /** The last live subscription goes away while the probe is running. */
   subscriptionEndsDuringProbe: boolean;
+  /** Wall time a reconnect consumes before the transport comes up. */
+  restartTakesMs: number;
 }
 
 function makePort(overrides: Partial<PortState> = {}): { port: WatchdogPort; state: PortState } {
@@ -65,6 +67,7 @@ function makePort(overrides: Partial<PortState> = {}): { port: WatchdogPort; sta
     eventArrivesDuringProbe: false,
     probeTakesMs: 0,
     subscriptionEndsDuringProbe: false,
+    restartTakesMs: 0,
     ...overrides,
   };
   const port: WatchdogPort = {
@@ -84,6 +87,8 @@ function makePort(overrides: Partial<PortState> = {}): { port: WatchdogPort; sta
       state.restarts += 1;
       if (state.restartHangs) return new Promise<void>(() => {});
       if (state.restartThrows) throw new Error("socket refused to come back");
+      // A reconnect is not instant: the clock moves before the socket is up.
+      state.nowMs += state.restartTakesMs;
       // Production-faithful: SlackSocketIngress.start() stamps a `connected`
       // transition when the transport re-establishes, and events (if any) stamp
       // a separate event clock. The reconnect on its own never advances events.
@@ -410,4 +415,29 @@ test("a subscription that ends during the probe stops the cycle — nobody is le
   assert.equal(await watchdog.check(), "idle_no_subscription");
   assert.equal(state.restarts, 0);
   assert.deepEqual(state.exits, [], "exiting a broker nobody listens through is pure damage");
+});
+
+test("the fresh link's window starts when the reconnect finishes, not when it was asked for", async () => {
+  // A reconnect can itself consume much of a stale window. Measuring the window
+  // from the request would hand the new connection a fraction of one — and the
+  // connect stamp must still be read against the REQUEST, or a good reconnect
+  // would look like a leftover from the previous socket and exit as wedged.
+  const RESTART_TAKES_MS = STALE_MS * 2 / 3;
+  const { port, state } = makePort({
+    lastEventMs: 1_000_000 - (STALE_MS + 1_000),
+    probeOutcome: "silent",
+    restartTakesMs: RESTART_TAKES_MS,
+  });
+  const watchdog = new SlackDeafnessWatchdog(port, STALE_MS);
+  assert.equal(await watchdog.check(), "restarted");
+  // A full window after the REQUEST is only a third of one after the connection
+  // actually came up.
+  state.nowMs = 1_000_000 + STALE_MS;
+  assert.equal(await watchdog.check(), "awaiting_reconnect");
+  assert.deepEqual(state.exits, []);
+  // A full window after the connection came up, the escalation resumes — and it
+  // still recognises the reconnect as having taken.
+  state.nowMs = 1_000_000 + RESTART_TAKES_MS + STALE_MS;
+  assert.equal(await watchdog.check(), "reconnected_still_deaf", "not read as a wedged transport");
+  assert.equal(state.restarts, 2);
 });

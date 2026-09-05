@@ -62,18 +62,30 @@ export interface ProbePoster {
 }
 
 export class SlackLinkProbe {
+  private readonly newNonce: () => string;
+  private readonly spacingMs: number;
+  private readonly sleep: (ms: number) => Promise<void>;
+
   constructor(
     private readonly poster: ProbePoster,
     private readonly watcher: ProbeWatcher,
     private readonly log: (message: string) => void = (message) => console.error(message),
-    private readonly newNonce: () => string = () => randomUUID(),
-    private readonly spacingMs: number = CANARY_SPACING_MS,
-  ) {}
+    options: {
+      newNonce?: () => string;
+      spacingMs?: number;
+      /** Injectable so a test can pace a round without waiting one out. */
+      sleep?: (ms: number) => Promise<void>;
+    } = {},
+  ) {
+    this.newNonce = options.newNonce ?? (() => randomUUID());
+    this.spacingMs = options.spacingMs ?? CANARY_SPACING_MS;
+    this.sleep = options.sleep ?? pause;
+  }
 
   /** Run one probe round. `timeoutMs` bounds each canary, not the round. */
   async run(timeoutMs: number): Promise<ProbeOutcome> {
     for (let canary = 1; canary <= PROBE_CANARIES; canary += 1) {
-      if (canary > 1) await pause(this.spacingMs);
+      if (canary > 1) await this.sleep(this.spacingMs);
       const outcome = await this.sendOne(canary, timeoutMs);
       // A single canary that never returned already falsifies the round.
       if (outcome !== "alive") return outcome;

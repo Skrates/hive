@@ -19,10 +19,12 @@ const PROBE_MS = 200;
 
 interface PosterState {
   posted: string[];
-  /** Epoch-ms of each post, so the round's pacing is checkable. */
+  /** Reading of the test's own clock at each post, so pacing is checkable exactly. */
   postedAt: number[];
   deleted: string[];
   logs: string[];
+  /** Advanced only by the injected pace — no wall clock, no flake. */
+  clockMs: number;
 }
 
 /**
@@ -42,7 +44,7 @@ function makeProbe(options: {
   /** Gap between canaries; tests use a few milliseconds, production ~1.2s. */
   spacingMs?: number;
 }): { probe: SlackLinkProbe; state: PosterState; registry: CanaryRegistry } {
-  const state: PosterState = { posted: [], postedAt: [], deleted: [], logs: [] };
+  const state: PosterState = { posted: [], postedAt: [], deleted: [], logs: [], clockMs: 0 };
   const registry = new CanaryRegistry();
   const poster: ProbePoster = {
     async postCanary(nonce) {
@@ -54,7 +56,7 @@ function makeProbe(options: {
         throw new Error("response lost");
       }
       state.posted.push(nonce);
-      state.postedAt.push(Date.now());
+      state.postedAt.push(state.clockMs);
       if (typeof options.echo === "function") options.echo(nonce, registry);
       // Sync: the envelope beats chat.postMessage's own HTTP response home.
       if (options.echo === "sync") registry.observe(canaryEnvelope(nonce));
@@ -69,13 +71,10 @@ function makeProbe(options: {
     },
   };
   return {
-    probe: new SlackLinkProbe(
-      poster,
-      registry,
-      (message) => state.logs.push(message),
-      undefined,
-      options.spacingMs ?? 0,
-    ),
+    probe: new SlackLinkProbe(poster, registry, (message) => state.logs.push(message), {
+      spacingMs: options.spacingMs ?? 0,
+      sleep: async (ms) => { state.clockMs += ms; },
+    }),
     state,
     registry,
   };
@@ -173,12 +172,12 @@ test("canaries are paced so a round cannot rate-limit itself", async () => {
   // limit and report `unavailable`, manufacturing the false positive the probe
   // exists to prevent.
   assert.ok(CANARY_SPACING_MS >= 1_000, "the production gap clears the per-channel rate");
-  const SPACING_MS = 30;
+  const SPACING_MS = 1_000;
   const { probe, state } = makeProbe({ echo: "sync", spacingMs: SPACING_MS });
   assert.equal(await probe.run(PROBE_MS), "alive");
-  assert.equal(state.postedAt.length, PROBE_CANARIES);
-  for (let i = 1; i < state.postedAt.length; i += 1) {
-    const gap = state.postedAt[i]! - state.postedAt[i - 1]!;
-    assert.ok(gap >= SPACING_MS, `canary ${i + 1} was posted ${gap}ms after the previous one`);
-  }
+  assert.deepEqual(
+    state.postedAt,
+    [0, SPACING_MS, SPACING_MS * 2],
+    "each canary waits out the gap before the next is posted",
+  );
 });
