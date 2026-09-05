@@ -1332,7 +1332,7 @@ test("an actor id obeys the addressing grammar, so every legal actor round-trips
   // `actor:slot` and `WAKE:` forms could not carry, and the busy parser matches
   // the same source, so a comma or colon inside a name can never split a claim
   // into `busy_malformed` and park an edge's co-tenants behind one turn.
-  for (const bad of ["ta,los", "ta:los", "ta los", "-talos", "tálos"]) {
+  for (const bad of ["ta,los", "ta:los", "ta los", "-talos", "tálos", "9gnomon"]) {
     assert.throws(() => SubscriptionInputSchema.parse(subscription({ actor: bad })), /actor id/, bad);
   }
   for (const actor of ["fable", "ariadne", "gnomon", "theoros", "talos", "Talos", "seat_2", "wave-notos"]) {
@@ -1340,4 +1340,5 @@ test("an actor id obeys the addressing grammar, so every legal actor round-trips
     assert.deepEqual(parseBusySlots(formatBusySlots([{ actor: enrolled, slot: 2 }])), [{ actor: enrolled, slot: 2 }]);
   }
   assert.throws(() => parseBusySlots("ta,los:1"), BusySlotFormatError);
+  assert.throws(() => parseBusySlots("9gnomon:1"), BusySlotFormatError);
 });

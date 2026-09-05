@@ -106,7 +106,7 @@ export class BusySlotFormatError extends Error {
  * and whitespace, so an id may contain none of them. Enrollment refuses the
  * rest; every parser downstream matches against this same source.
  */
-export const ACTOR_ID_PATTERN = /^[a-z0-9][a-z0-9_-]*$/i;
+export const ACTOR_ID_PATTERN = /^[a-z][a-z0-9_-]*$/i;
 
 const BUSY_SLOT_ENTRY = new RegExp(`^(${ACTOR_ID_PATTERN.source.slice(1, -1)}):([1-9]\\d*)$`, "i");
 
@@ -137,7 +137,7 @@ export function canonicalActor(actor: string): string {
 export const SubscriptionInputSchema = z.object({
   actor: z.string().min(1)
     .regex(ACTOR_ID_PATTERN, {
-      message: "an actor id is `[a-z0-9][a-z0-9_-]*`: it rides wire forms that split on `:`, `,` and whitespace",
+      message: "an actor id is `[a-z][a-z0-9_-]*`: it rides wire forms that split on `:`, `,` and whitespace",
     })
     .refine((value) => canonicalActor(value) !== EVERYONE, {
       message: "`everyone` is a reserved broadcast keyword and cannot be a subscription actor name",
