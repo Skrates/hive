@@ -180,6 +180,19 @@ export class EdgeService {
     return { done: tracked };
   }
 
+  /**
+   * KRA-1364: a multi-slot actor never takes the live route. A live session is
+   * one process; delivering two slots into it would run both turns in one
+   * checkout, which is exactly what the per-slot `cwd` exists to prevent. The
+   * edge learns `turnSlots` only from the claimed delivery — `/live/register`
+   * carries no subscription — so route selection is the one site that owns
+   * the rule; a registration such an actor makes is simply never consulted.
+   */
+  private liveRouteFor(delivery: Delivery): LiveIngress | null {
+    if (delivery.subscription.turnSlots > 1) return null;
+    return this.live.get(delivery.actor, delivery.subscription.provider);
+  }
+
   /** The full post-claim delivery lifecycle; never throws — all failures land in recordDeliveryFailure. */
   private async dispatchClaimed(delivery: Delivery, generation: number, slot: number): Promise<void> {
     let current = delivery;
@@ -202,7 +215,7 @@ export class EdgeService {
       // unreadable one is stored as a named absence, never as silence.
       // Capture the live route once so attestation and dispatch name the same
       // surface. A later expiry, deregister, or replacement must not re-select.
-      const live = this.live.get(delivery.actor, delivery.subscription.provider);
+      const live = this.liveRouteFor(delivery);
       // This read is now awaited, so `receive` — and with it the redelivery
       // dedupe below — no longer runs in the same synchronous turn as the
       // claim. That window is safe by three existing guards, and the

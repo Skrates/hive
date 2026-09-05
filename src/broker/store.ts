@@ -1013,9 +1013,10 @@ export class BrokerStore {
   /**
    * Take the lowest turn slot of `actor` this edge may hold right now. A slot
    * is takeable when it has never been leased, when its lease expired (any
-   * edge; the generation advances), or when this same edge holds it live and
-   * is not running a turn in it (the generation is shared — the sequential
-   * edge's next claim). A live lease on another edge, or a slot this edge
+   * edge; a fresh generation is minted), or when this same edge holds it live
+   * and is not running a turn in it (the generation is shared — the sequential
+   * edge's next claim). Generations come from `nextLeaseGeneration`, one
+   * counter per actor across its slots. A live lease on another edge, or a slot this edge
    * declared busy, is skipped. With `turnSlots = 1` this is exactly the
    * single-lease rule every seat ran under before slots existed.
    */
@@ -1031,22 +1032,39 @@ export class BrokerStore {
       if (busySlots.has(busySlotKey(actor, slot))) continue;
       const row = this.db.prepare("SELECT * FROM actor_leases WHERE actor=? AND slot=?").get(actor, slot) as Row | undefined;
       if (!row) {
+        const generation = this.nextLeaseGeneration(actor);
         this.db.prepare(`
           INSERT INTO actor_leases(actor, slot, edge_id, generation, expires_at, updated_at)
-          VALUES (?, ?, ?, 1, ?, ?)
-        `).run(actor, slot, edgeId, expiresAt, now.toISOString());
-        return { slot, generation: 1 };
+          VALUES (?, ?, ?, ?, ?, ?)
+        `).run(actor, slot, edgeId, generation, expiresAt, now.toISOString());
+        return { slot, generation };
       }
       const currentEdge = String(row.edge_id);
       const expired = new Date(String(row.expires_at)).getTime() <= now.getTime();
       if (currentEdge !== edgeId && !expired) continue;
-      const generation = currentEdge === edgeId && !expired ? Number(row.generation) : Number(row.generation) + 1;
+      const generation = currentEdge === edgeId && !expired ? Number(row.generation) : this.nextLeaseGeneration(actor);
       this.db.prepare(`
         UPDATE actor_leases SET edge_id=?, generation=?, expires_at=?, updated_at=? WHERE actor=? AND slot=?
       `).run(edgeId, generation, expiresAt, now.toISOString(), actor, slot);
       return { slot, generation };
     }
     return null;
+  }
+
+  /**
+   * Generations are minted per actor, not per slot: the next one is above every
+   * generation any of the actor's slots has ever held. Transitions are fenced on
+   * `(delivery, generation)` and the fence joins the delivery to whichever slot
+   * it holds *now*; if slots minted their own generations, a delivery whose
+   * slot-1 lease lapsed and was reclaimed into slot 2 could meet a slot-2
+   * generation equal to the stale slot-1 one, and the abandoned attempt's
+   * callbacks would satisfy the new attempt's fence. With one counter per
+   * actor no two slots ever share a generation, so the stale callback is
+   * refused at every transition without carrying the slot through the API.
+   */
+  private nextLeaseGeneration(actor: string): number {
+    const row = this.db.prepare("SELECT COALESCE(MAX(generation), 0) + 1 AS next FROM actor_leases WHERE actor=?").get(actor) as Row;
+    return Number(row.next);
   }
 
   renewLease(actor: string, slot: number, edgeId: string, generation: number, ttlMs: number): boolean {

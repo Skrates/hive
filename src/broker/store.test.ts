@@ -1164,7 +1164,8 @@ test("a two-slot actor is claimed and dispatched twice at once; a third delivery
   const second = store.claimNext("mac", 0, [{ actor: "ariadne", slot: 1 }])!;
   assert.equal(second.id, 2);
   assert.equal(second.leaseSlot, 2);
-  assert.equal(second.leaseGeneration, 1);
+  // Generations are per actor: slot 2's first lease is above slot 1's.
+  assert.equal(second.leaseGeneration, 2);
   toDispatching(store, second);
   // Acceptance shape from the ticket: two rows dispatching for one actor.
   const dispatching = store.listDeliveries().filter((item) => item.actor === "ariadne" && item.status === "dispatching");
@@ -1216,8 +1217,36 @@ test("a lease expiring on slot 1 frees slot 1 only (KRA-1364)", () => {
   const reclaimed = store.claimNext("mac", 0, [{ actor: "ariadne", slot: 2 }])!;
   assert.equal(reclaimed.id, first.id);
   assert.equal(reclaimed.leaseSlot, 1);
-  assert.equal(reclaimed.leaseGeneration, 2);
+  assert.equal(reclaimed.leaseGeneration, 3);
   assert.equal(reclaimed.attempts, 2);
+  store.close();
+});
+
+test("a stale callback from a lapsed slot cannot satisfy the fence of the slot that reclaimed its delivery (KRA-1364)", () => {
+  const { store, clock } = slotFixture(2);
+  // Attempt 1 runs in slot 1 and its provider call keeps going after the lease lapses.
+  const first = store.claimNext("mac", 0, [])!;
+  assert.equal(first.leaseSlot, 1);
+  const staleGeneration = first.leaseGeneration!;
+  toDispatching(store, first);
+  clock.advance(1_100);
+  assert.equal(store.requeueExpiredLeases(), 1);
+  // The same edge still declares slot 1 busy (the abandoned provider child is
+  // alive), so the redelivery lands in slot 2.
+  clock.advance(retryBackoffMs(1) + 1);
+  const reclaimed = store.claimNext("mac", 0, [{ actor: "ariadne", slot: 1 }])!;
+  assert.equal(reclaimed.id, first.id);
+  assert.equal(reclaimed.leaseSlot, 2);
+  assert.notEqual(reclaimed.leaseGeneration, staleGeneration);
+  // Attempt 1 reports in with the generation it was fenced at: refused on every transition.
+  assert.throws(() => store.transition(first.id, "mac", staleGeneration, "claimed", "accepted_local"));
+  assert.throws(() => store.markDispatched(first.id, "mac", staleGeneration));
+  assert.throws(() => store.finish(first.id, "mac", staleGeneration, "processed", []));
+  assert.throws(() => store.release(first.id, "mac", staleGeneration, { code: "lease_expired", detail: "stale" }));
+  assert.equal(store.getDelivery(first.id).status, "claimed");
+  // Attempt 2's own fence works.
+  toDispatching(store, reclaimed);
+  assert.equal(store.getDelivery(first.id).status, "dispatching");
   store.close();
 });
 

@@ -184,8 +184,12 @@ Silence is a defect — a delivered wake with no outcome post means the loop nev
 
 A subscription's `turnSlots` (integer ≥ 1, default 1) is how many turns the actor may run at once,
 fleet-wide. Leases are keyed `(actor, slot)`; a claim takes the actor's lowest free slot, and every
-transition is fenced on that slot's generation, so one slot's lease expiring requeues only the turn
-it held. The edge declares the `actor:slot` pairs it is running on every claim, and the broker
+transition is fenced on the generation that slot holds, so one slot's lease expiring requeues only
+the turn it held. Generations are minted per actor, never per slot, so no two slots ever share one:
+a turn whose slot lapsed and whose delivery was reclaimed into another slot cannot report in against
+the new slot's fence. A multi-slot actor never takes the live route — a live session is one process,
+and two slots delivered into it would share a checkout — so its live registration, if any, is never
+consulted. The edge declares the `actor:slot` pairs it is running on every claim, and the broker
 skips an actor whose slots are all declared; a `busy` entry without a slot is refused with
 `busy_malformed`. `turnSlots > 1` requires `wakePolicy: "spawn"`, no pinned `sessionId`, and a
 `{slot}` placeholder in every `edgeWorkspaces[].cwd` — slot `n` runs in that path with `{slot}`

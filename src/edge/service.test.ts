@@ -312,6 +312,38 @@ test("a completion-tracked Codex live injection commits its final response as th
   store.close();
 });
 
+test("a two-slot actor never takes the live route, even with a live registration standing (KRA-1364)", async () => {
+  const broker = new FakeBroker([delivery(9, {
+    leaseSlot: 2,
+    subscription: subscription({
+      sessionId: null,
+      turnSlots: 2,
+      edgeWorkspaces: [{ edgeId: "mac", cwd: "/work/taxis/slot-{slot}", worktree: null }],
+    }),
+  })]);
+  const store = new EdgeStore(":memory:");
+  const adapter = new StubAdapter({
+    liveResult: { receipt: JSON.stringify({ type: "hive.live.completed" }), outcome: "live completed", processed: true },
+  });
+  const live = new LiveIngressRegistry();
+  live.register({
+    actor: "ariadne",
+    provider: "codex",
+    socketPath: "/tmp/x.sock",
+    sessionId: "thread-1",
+    surfaceVersion: "test",
+    runtimeAttestation: { ok: false, absence: "attestation_unreported" },
+  }, 60_000);
+  const edge = new EdgeService(asBrokerClient(broker), store, live, [adapter]);
+
+  assert.equal(await edge.processOne(), true);
+  // The live session is one process; a slot is a headless spawn in its own checkout.
+  assert.deepEqual(adapter.liveDeliveries, []);
+  assert.equal(adapter.spawns.length, 1);
+  assert.equal(broker.finishes[0]?.result.status, "processed");
+  store.close();
+});
+
 test("a deterministic pre-dispatch failure finishes undeliverable, never released", async () => {
   const broker = new FakeBroker([delivery(3)]);
   const store = new EdgeStore(":memory:");
