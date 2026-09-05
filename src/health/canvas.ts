@@ -180,7 +180,7 @@ export function renderCanvas(s: CanvasSnapshot, refreshStatus = "Snapshot only. 
     const installation = !p ? "unverified" : `${probeFresh ? "" : "stale / "}${missing.length} missing; ${changed.length} differ from intended`;
     const ownAttention: string[] = [];
     const accountChange = s.accountChanges.find(change => change.actors.includes(seat.actor));
-    if (accountChange) ownAttention.push(`current account: ${accountChange.label} (operator confirmed); ${accountChange.note}`);
+    if (accountChange?.note) ownAttention.push(`current account: ${accountChange.label} (operator confirmed); ${accountChange.note}`);
     const receiving = p?.receiving;
     const expired = seat.subscription?.expiresAt != null && Date.parse(seat.subscription.expiresAt) <= Date.parse(s.generatedAt);
     const receivingState = receiving && receiving.expiresAt > Date.parse(s.generatedAt) ? `receiving session ${receiving.sessionId ?? "unnamed"}`

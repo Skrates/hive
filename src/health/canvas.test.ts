@@ -56,6 +56,10 @@ test("account replacement annotates history without fabricating or merging quota
   assert.match(output, /Shared personal Max, shared by one, never/);
   assert.match(output, /pool-shared \/ Max/);
   assert.equal(s.pools.length, 1);
+  s.accountChanges[0]!.note = "";
+  const resolved = renderCanvas(s);
+  assert.doesNotMatch(resolved.split("## Current seats")[0]!, /current account:/);
+  assert.match(resolved, /Shared personal Max, shared by one, never/);
 });
 
 test("retired reporters and pools are hidden without dropping current seats or mutating history", () => {
