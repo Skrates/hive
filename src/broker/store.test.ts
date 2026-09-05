@@ -6,6 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   ActorCaseCollisionError,
+  ActorGrammarError,
   BrokerStore,
   DISPATCHED_OUTCOME_GRACE_MS,
   InvalidTransitionError,
@@ -1103,6 +1104,58 @@ test("two case-variant enrollments stop the broker instead of being merged", (t)
     () => new BrokerStore(path),
     (error: unknown) => error instanceof ActorCaseCollisionError && /Gnomon/.test(error.message),
   );
+});
+
+test("a persisted actor outside the addressing grammar stops the broker instead of sitting live (KRA-1364)", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "hive-actor-grammar-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const path = join(directory, "broker.sqlite");
+
+  const first = new BrokerStore(path);
+  first.createEdge("mac");
+  first.upsertSubscription(subscription({ actor: "talos" }));
+  // Enrollment refuses this id; only a pre-grammar database or a hand edit can hold it.
+  first.db.prepare("UPDATE subscriptions SET actor='ta,los' WHERE actor='talos'").run();
+  first.close();
+
+  assert.throws(
+    () => new BrokerStore(path),
+    (error: unknown) => error instanceof ActorGrammarError && /"ta,los"/.test(error.message),
+  );
+});
+
+test("lowering turnSlots under a running high slot does not admit a second concurrent turn (KRA-1364)", () => {
+  const { store } = slotFixture(2);
+  const first = store.claimNext("mac", 0, [])!;
+  toDispatching(store, first);
+  const second = store.claimNext("mac", 0, [{ actor: "ariadne", slot: 1 }])!;
+  assert.equal(second.leaseSlot, 2);
+  toDispatching(store, second);
+  store.finish(first.id, "mac", first.leaseGeneration!, "processed", []);
+
+  // The operator lowers the ceiling while slot 2 is still mid-turn.
+  store.upsertSubscription(SubscriptionInputSchema.parse({
+    ...subscription({
+      sessionId: null,
+      edgeWorkspaces: [
+        { edgeId: "mac", cwd: "/work/taxis/slot-{slot}", worktree: null },
+        { edgeId: "dev", cwd: "/srv/taxis/slot-{slot}", worktree: null },
+      ],
+    }),
+    turnSlots: 1,
+  }));
+  assert.equal(store.getSubscription("ariadne")?.turnSlots, 1);
+
+  // One turn is running (in slot 2); the ceiling is one; nothing more is handed out.
+  assert.equal(store.claimNext("mac", 0, [{ actor: "ariadne", slot: 2 }]), null);
+  assert.equal(store.getDelivery(3).status, "pending");
+
+  // The running turn ends; the actor is back under its ceiling and claims in slot 1.
+  store.finish(second.id, "mac", second.leaseGeneration!, "processed", []);
+  const third = store.claimNext("mac", 0, [])!;
+  assert.equal(third.id, 3);
+  assert.equal(third.leaseSlot, 1);
+  store.close();
 });
 
 test("subscription actors are stored under the same canonical key wake targets use", () => {

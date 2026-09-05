@@ -14,7 +14,7 @@ import type {
   SubscriptionInput,
   TerminalDeliveryStatus,
 } from "../domain.js";
-import { busySlotKey, canonicalActor, EVERYONE, isSlackMessageTs, retryBackoffMs } from "../domain.js";
+import { ACTOR_ID_PATTERN, busySlotKey, canonicalActor, EVERYONE, isSlackMessageTs, retryBackoffMs } from "../domain.js";
 import type { Clock } from "../time.js";
 import { iso, systemClock } from "../time.js";
 
@@ -57,6 +57,15 @@ export class LegacyDatabaseError extends Error {}
  * decision belongs to the operator, never to a migration (R-3).
  */
 export class ActorCaseCollisionError extends Error {}
+
+/**
+ * A persisted subscription whose actor id the addressing grammar
+ * (`ACTOR_ID_PATTERN`) cannot carry. Enrollment refuses such ids; a row
+ * written before the grammar existed would otherwise stay live and unclaimable
+ * (its busy wire form is `busy_malformed` on every claim), so the broker refuses
+ * to boot and names the row — the operator retires it (R-3).
+ */
+export class ActorGrammarError extends Error {}
 
 /**
  * KRA-1097 / ADR-0003 R-3: a seat's deliberate address that cannot be delivered
@@ -304,6 +313,25 @@ export class BrokerStore {
     this.ensureOutboxReactionColumns();
     this.ensureTurnSlotSchema();
     this.canonicalizePersistedActors();
+    this.refusePersistedActorsOutsideGrammar();
+  }
+
+  /**
+   * Every persisted actor must satisfy the one addressing grammar. Enrollment
+   * checks it (`SubscriptionInputSchema`), so this only ever fires on a database
+   * written before the grammar, or edited by hand — and then loudly: a row the
+   * WAKE/busy wire forms cannot name would sit live and undeliverable forever.
+   */
+  private refusePersistedActorsOutsideGrammar(): void {
+    const outside = (this.db.prepare("SELECT actor FROM subscriptions").all() as Row[])
+      .map((row) => String(row.actor))
+      .filter((actor) => !ACTOR_ID_PATTERN.test(actor));
+    if (outside.length === 0) return;
+    throw new ActorGrammarError(
+      `broker database holds subscription actor(s) outside the addressing grammar (${
+        outside.map((actor) => JSON.stringify(actor)).join(", ")
+      }); the wire forms cannot name them — delete the rows (hive delete-subscription) and restart`,
+    );
   }
 
   /**
@@ -942,7 +970,7 @@ export class BrokerStore {
         const actor = String(row.actor);
         const subscription = this.getSubscription(actor);
         if (!subscription) continue;
-        if (this.everySlotBusy(actor, subscription.turnSlots, busySlots)) continue;
+        if (this.atCapacity(actor, subscription.turnSlots, busySlots)) continue;
         const now = this.clock.now().getTime();
         if (row.next_attempt_at !== null && new Date(String(row.next_attempt_at)).getTime() > now) {
           continue;
@@ -1003,11 +1031,22 @@ export class BrokerStore {
       : { disposition: "skip", code: "home_grace_active" };
   }
 
-  private everySlotBusy(actor: string, turnSlots: number, busySlots: ReadonlySet<string>): boolean {
-    for (let slot = 1; slot <= turnSlots; slot += 1) {
-      if (!busySlots.has(busySlotKey(actor, slot))) return false;
+  /**
+   * An actor is at capacity when the edge declares at least `turnSlots` turns
+   * running for it — counted over every declared slot, not over `1..turnSlots`.
+   * The ceiling can move under a running turn (an operator lowers `turnSlots`
+   * from 2 to 1 while slot 2 is mid-turn); enumerating the current ceiling
+   * would stop seeing slot 2 and admit a second concurrent turn the moment
+   * slot 1 is free. Counting declared turns keeps the promise the ceiling
+   * makes: never more than `turnSlots` at once, whichever slots hold them.
+   */
+  private atCapacity(actor: string, turnSlots: number, busySlots: ReadonlySet<string>): boolean {
+    const prefix = `${actor}:`;
+    let running = 0;
+    for (const key of busySlots) {
+      if (key.startsWith(prefix)) running += 1;
     }
-    return true;
+    return running >= turnSlots;
   }
 
   /**
