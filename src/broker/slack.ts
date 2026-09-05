@@ -364,7 +364,7 @@ export class SlackSocketIngress implements ProbeWatcher {
   private lastEventMs: number | null = null;
   private lastConnectMs: number | null = null;
   /** The watchdog's canaries in flight — see {@link watchCanary}. */
-  private readonly canaries = new CanaryRegistry(() => this.clock());
+  private readonly canaries = new CanaryRegistry();
 
   constructor(
     private readonly appToken: string,

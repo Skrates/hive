@@ -69,6 +69,7 @@ export interface WatchdogPort {
 
 export type WatchdogAction =
   | "cycle_in_flight"
+  | "awaiting_reconnect"
   | "idle_no_subscription"
   | "healthy"
   | "quiet_not_deaf"
@@ -177,6 +178,14 @@ export class SlackDeafnessWatchdog {
       return "healthy";
     }
 
+    // The last subscription can expire or be deleted while the probe waits. With
+    // no agent left to wake there is nothing for silence to cost, and exiting a
+    // broker nobody is listening through is pure damage.
+    if (!this.port.hasActiveSubscription()) {
+      this.reset();
+      return "idle_no_subscription";
+    }
+
     if (probe === "alive") {
       this.port.log(
         `[watchdog] no Slack events for ${idleLabel} (≥ ${staleLabel}) but every canary returned over the link `
@@ -190,6 +199,22 @@ export class SlackDeafnessWatchdog {
         `[watchdog] the link probe was unavailable this cycle (idle ${idleLabel} ≥ ${staleLabel}) `
         + "— silence stays unexplained; escalating on transport evidence alone",
       );
+    }
+
+    // A forced reconnect is judged after a full stale window, never sooner. The
+    // driving interval is fixed while a cycle's own probing and restarting can
+    // eat a large part of it, so the next cycle may fire far less than a window
+    // after the reconnect — and escalating there would condemn a fresh transport
+    // for not having received traffic nobody sent yet.
+    const sinceRestartMs = this.lastRestartMs === null
+      ? Number.POSITIVE_INFINITY
+      : this.port.now() - this.lastRestartMs;
+    if (sinceRestartMs < this.staleMs) {
+      this.port.log(
+        `[watchdog] the forced reconnect is only ${Math.round(sinceRestartMs / 1_000)}s old (< ${staleLabel}) `
+        + "— giving it the rest of its window before judging it",
+      );
+      return "awaiting_reconnect";
     }
 
     this.staleStreak += 1;

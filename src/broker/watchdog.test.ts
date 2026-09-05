@@ -42,6 +42,8 @@ interface PortState {
   eventArrivesDuringProbe: boolean;
   /** Wall time the probe round consumes, so a short `staleMs` can outrun it. */
   probeTakesMs: number;
+  /** The last live subscription goes away while the probe is running. */
+  subscriptionEndsDuringProbe: boolean;
 }
 
 function makePort(overrides: Partial<PortState> = {}): { port: WatchdogPort; state: PortState } {
@@ -62,6 +64,7 @@ function makePort(overrides: Partial<PortState> = {}): { port: WatchdogPort; sta
     restartThrows: false,
     eventArrivesDuringProbe: false,
     probeTakesMs: 0,
+    subscriptionEndsDuringProbe: false,
     ...overrides,
   };
   const port: WatchdogPort = {
@@ -73,6 +76,7 @@ function makePort(overrides: Partial<PortState> = {}): { port: WatchdogPort; sta
       if (state.probeGate) await state.probeGate;
       if (state.eventArrivesDuringProbe) state.lastEventMs = state.nowMs;
       state.nowMs += state.probeTakesMs;
+      if (state.subscriptionEndsDuringProbe) state.active = false;
       if (state.probeThrows) throw new Error("probe blew up");
       return state.probeOutcome;
     },
@@ -371,4 +375,39 @@ test("an event that arrives during a probe longer than the stale window still co
   assert.equal(await watchdog.check(), "healthy");
   assert.equal(state.restarts, 0, "the link demonstrably carried an event");
   assert.deepEqual(state.exits, []);
+});
+
+test("a reconnect is judged after a full window, never on an early interval", async () => {
+  // The driving interval is fixed while a cycle's own probing and restarting can
+  // eat much of a stale window, so the next cycle can fire far less than a window
+  // after the reconnect. Escalating there condemns a fresh transport for not
+  // having received traffic nobody sent yet.
+  const { port, state } = makePort({
+    lastEventMs: 1_000_000 - (STALE_MS + 1_000),
+    probeOutcome: "silent",
+  });
+  const watchdog = new SlackDeafnessWatchdog(port, STALE_MS);
+  assert.equal(await watchdog.check(), "restarted");
+  // Half a window later the fixed interval fires again.
+  state.nowMs += STALE_MS / 2;
+  assert.equal(await watchdog.check(), "awaiting_reconnect");
+  assert.equal(state.restarts, 1, "no second reconnect while the first is young");
+  assert.deepEqual(state.exits, []);
+  assert.ok(state.logs.some((line) => line.includes("giving it the rest of its window")));
+  // Once the window is spent, the escalation proceeds exactly as before.
+  state.nowMs += STALE_MS / 2;
+  assert.equal(await watchdog.check(), "reconnected_still_deaf");
+  assert.equal(state.restarts, 2);
+});
+
+test("a subscription that ends during the probe stops the cycle — nobody is left to wake", async () => {
+  const { port, state } = makePort({
+    lastEventMs: 1_000_000 - (STALE_MS + 1_000),
+    probeOutcome: "silent",
+    subscriptionEndsDuringProbe: true,
+  });
+  const watchdog = new SlackDeafnessWatchdog(port, STALE_MS);
+  assert.equal(await watchdog.check(), "idle_no_subscription");
+  assert.equal(state.restarts, 0);
+  assert.deepEqual(state.exits, [], "exiting a broker nobody listens through is pure damage");
 });

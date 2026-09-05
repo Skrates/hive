@@ -7,17 +7,14 @@
 /**
  * Metadata stamp carried by every canary. It MUST keep the `hive_` prefix:
  * Slack admission drops `hive_*`-stamped messages before an envelope is parsed,
- * which is what keeps a canary from ever being read as a wake.
+ * which is what keeps a canary from ever being read as a wake. It is also the
+ * canary's identity — an envelope is one of ours because it carries this stamp
+ * and a nonce in its metadata, never because its text mentions one. Message
+ * text is quotable by anyone in the channel, and a quoted nonce that could
+ * settle a probe would let an unrelated message mask a canary that a competing
+ * Socket Mode consumer actually swallowed.
  */
 export const PROBE_EVENT_TYPE = "hive_watchdog_probe";
-
-/**
- * How long past its waiter's deadline a canary nonce stays recognisable. It only
- * has to outlive the echoes one canary produces after it is observed — chiefly
- * the `message_deleted` event from reaping it — so that none of them are ever
- * counted as channel activity.
- */
-export const CANARY_MEMORY_MS = 60_000;
 
 /**
  * Hard bound on one canary's HTTP call. The probe's own deadline is the
@@ -45,14 +42,6 @@ export interface ProbeWatcher {
 export class CanaryRegistry implements ProbeWatcher {
   /** Pending waiters, keyed by nonce. */
   private readonly waiters = new Map<string, (arrived: boolean) => void>();
-  /**
-   * Nonces still recognisable as ours, with their expiry. Kept past the waiter
-   * itself so a canary's whole footprint — its arrival, and the
-   * `message_deleted` echo of reaping it — stays out of the event clock.
-   */
-  private readonly nonces = new Map<string, number>();
-
-  constructor(private readonly clock: () => number = () => Date.now()) {}
 
   /**
    * Register a one-shot waiter for a canary nonce. The probe calls this BEFORE
@@ -75,41 +64,42 @@ export class CanaryRegistry implements ProbeWatcher {
     // the loop, which is exactly what a test harness looks like.
     const timer = setTimeout(() => finish(false), timeoutMs);
     this.waiters.set(nonce, finish);
-    this.nonces.set(nonce, this.clock() + timeoutMs + CANARY_MEMORY_MS);
     return { arrived };
   }
 
   /**
-   * True when this envelope carries one of our own canary nonces — settling its
-   * waiter if one is still pending. Matching runs over the whole raw payload so
-   * it holds for every shape a canary comes back in: the message itself, and the
-   * `message_deleted` echo whose nonce sits in `previous_message`.
+   * True when this envelope is one of the app's own canaries — settling its
+   * waiter if one is still pending. True for ANY canary-stamped envelope, not
+   * only a nonce we are waiting on, because a canary is never channel activity:
+   * the arrival, a late one past its deadline, and one left over from a previous
+   * broker process all belong to the probe, not to the conversation.
    */
   observe(body: unknown): boolean {
-    this.prune();
-    if (this.nonces.size === 0) return false;
-    let payload: string;
-    try {
-      payload = JSON.stringify(body) ?? "";
-    } catch {
-      // An envelope that will not serialise cannot be matched. Treat it as
-      // ordinary traffic rather than silently discounting it.
-      return false;
-    }
-    let matched = false;
-    for (const nonce of this.nonces.keys()) {
-      if (!payload.includes(nonce)) continue;
-      matched = true;
-      this.waiters.get(nonce)?.(true);
-    }
-    return matched;
+    const nonce = canaryNonceOf(body);
+    if (nonce === null) return false;
+    this.waiters.get(nonce)?.(true);
+    return true;
   }
+}
 
-  private prune(): void {
-    if (this.nonces.size === 0) return;
-    const now = this.clock();
-    for (const [nonce, expiresAt] of this.nonces) {
-      if (expiresAt <= now) this.nonces.delete(nonce);
-    }
+/**
+ * The canary nonce this envelope carries in its metadata, or null if it is not
+ * a canary. Slack repeats a message's metadata under `message` and
+ * `previous_message` for the edit and delete shapes, so reaping a canary is
+ * recognised as canary traffic too.
+ */
+function canaryNonceOf(body: unknown): string | null {
+  const event = record(record(body)?.event);
+  if (!event) return null;
+  for (const candidate of [event, record(event.message), record(event.previous_message)]) {
+    const metadata = record(candidate?.metadata);
+    if (metadata?.event_type !== PROBE_EVENT_TYPE) continue;
+    const nonce = record(metadata.event_payload)?.nonce;
+    if (typeof nonce === "string" && nonce.length > 0) return nonce;
   }
+  return null;
+}
+
+function record(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null ? value as Record<string, unknown> : null;
 }

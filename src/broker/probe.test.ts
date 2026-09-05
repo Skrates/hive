@@ -1,7 +1,18 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { CanaryRegistry } from "./canary.js";
+import { CanaryRegistry, PROBE_EVENT_TYPE } from "./canary.js";
 import { CANARY_SPACING_MS, PROBE_CANARIES, SlackLinkProbe, type ProbePoster } from "./probe.js";
+
+/** The envelope Slack sends back for a canary the app posted. */
+function canaryEnvelope(nonce: string): unknown {
+  return {
+    event: {
+      type: "message",
+      text: `hive watchdog link canary ${nonce} — ignore`,
+      metadata: { event_type: PROBE_EVENT_TYPE, event_payload: { nonce } },
+    },
+  };
+}
 
 /** Short enough to keep a lost canary cheap, long enough to survive a slow CI box. */
 const PROBE_MS = 200;
@@ -39,16 +50,16 @@ function makeProbe(options: {
       if (options.postFails) throw new Error("slack said no");
       if (options.postFailsAfterDelivery) {
         state.posted.push(nonce);
-        registry.observe({ event: { text: `canary ${nonce}` } });
+        registry.observe(canaryEnvelope(nonce));
         throw new Error("response lost");
       }
       state.posted.push(nonce);
       state.postedAt.push(Date.now());
       if (typeof options.echo === "function") options.echo(nonce, registry);
       // Sync: the envelope beats chat.postMessage's own HTTP response home.
-      if (options.echo === "sync") registry.observe({ event: { text: `canary ${nonce}` } });
+      if (options.echo === "sync") registry.observe(canaryEnvelope(nonce));
       if (options.echo === "async") {
-        setTimeout(() => registry.observe({ event: { text: `canary ${nonce}` } }), 1);
+        setTimeout(() => registry.observe(canaryEnvelope(nonce)), 1);
       }
       return `ts-${state.posted.length}`;
     },
@@ -104,7 +115,7 @@ test("a stream a thief wins half of fails the round", async () => {
   const { probe, state } = makeProbe({
     echo: (nonce, registry) => {
       seen += 1;
-      if (seen % 2 === 1) registry.observe({ event: { text: `canary ${nonce}` } });
+      if (seen % 2 === 1) registry.observe(canaryEnvelope(nonce));
     },
   });
   assert.equal(await probe.run(PROBE_MS), "silent");
