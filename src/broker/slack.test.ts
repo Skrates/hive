@@ -6,6 +6,7 @@ import test from "node:test";
 import type { AdmissionPolicy } from "../addressing.js";
 import type { SlackEventInput, SubscriptionInput } from "../domain.js";
 import { BrokerService, type SlackTransport } from "./service.js";
+import { PROBE_EVENT_TYPE } from "./canary.js";
 import {
   handleSlackEnvelope,
   MISSING_SLACK_EVENT_ID_DIAGNOSTIC,
@@ -778,4 +779,30 @@ test("thread affinity survives a broker restart — bindings derive from the per
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("a watchdog link canary is dropped at admission — a probe can never mint a delivery (KRA-1357)", async () => {
+  const { store, broker } = affinityFixture(["ariadne"]);
+  // ariadne is bound to the thread, so affinity would route anything admitted
+  // into it — and the canary is posted by the same trusted bot user.
+  await deliver(broker, messageBody({ eventId: "Ev-seed", text: "WAKE: ariadne | start", ts: "1500.1", threadTs: "1500.1" }));
+  store.recordOutcome(1, "done");
+  assert.ok(PROBE_EVENT_TYPE.startsWith("hive_"), "the stamp is what admission keys on");
+  await deliver(broker, messageBody({
+    eventId: "Ev-canary",
+    text: "hive watchdog link canary 0f3c-nonce — ignore",
+    ts: "1500.2",
+    threadTs: "1500.1",
+    metadataType: PROBE_EVENT_TYPE,
+  }));
+  // The canary is a link liveness experiment, not traffic: no delivery, and the
+  // channel root case (no thread) is the same drop.
+  await deliver(broker, messageBody({
+    eventId: "Ev-canary-root",
+    text: "hive watchdog link canary 91ab-nonce — ignore",
+    ts: "1501.1",
+    metadataType: PROBE_EVENT_TYPE,
+  }));
+  assert.equal(store.listDeliveries().length, 1, "only the seed wake exists");
+  store.close();
 });
