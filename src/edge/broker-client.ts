@@ -1,4 +1,5 @@
 import type {
+  BusySlot,
   Delivery,
   DeliveryResultInput,
   Reason,
@@ -7,6 +8,7 @@ import type {
   SeatWakeReceipt,
   SubscriptionInput,
 } from "../domain.js";
+import { formatBusySlots } from "../domain.js";
 
 /**
  * A non-2xx broker answer, carrying the status and raw body so a caller can
@@ -35,8 +37,8 @@ export class BrokerClient {
     await this.json(await this.request("/v1/health", { method: "POST", body: JSON.stringify(report), signal: AbortSignal.any([AbortSignal.timeout(15_000), ...(signal ? [signal] : [])]) }));
   }
 
-  async claim(after: number, waitMs = 25_000, busyActors: readonly string[] = []): Promise<Delivery | null> {
-    const busy = busyActors.length > 0 ? `&busy=${encodeURIComponent(busyActors.join(","))}` : "";
+  async claim(after: number, waitMs = 25_000, busySlots: readonly BusySlot[] = []): Promise<Delivery | null> {
+    const busy = busySlots.length > 0 ? `&busy=${encodeURIComponent(formatBusySlots(busySlots))}` : "";
     const response = await this.request(`/v1/deliveries?after=${after}&wait_ms=${waitMs}${busy}`, { method: "GET" });
     if (response.status === 204) return null;
     return this.json<Delivery>(response);

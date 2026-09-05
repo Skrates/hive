@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { frameWakeInstruction, type Delivery, type Provider, type Reason, type ReplaySnapshot } from "../domain.js";
+import { busySlotKey, frameWakeInstruction, workspaceCwd, type BusySlot, type Delivery, type Provider, type Reason, type ReplaySnapshot } from "../domain.js";
 import { BrokerClient } from "./broker-client.js";
 import { LiveIngressRegistry, type LiveIngress } from "./live-registry.js";
 import {
@@ -48,8 +48,13 @@ export class EdgeService {
   private running = false;
   /** Live background dispatches; each promise settles (never rejects) when its delivery reaches a disposition. */
   private readonly inFlight = new Set<Promise<void>>();
-  /** Actors with a dispatch currently running — declared to the broker on claim so it never hands out a second concurrent turn for the same actor. */
-  private readonly busyActors = new Set<string>();
+  /**
+   * Turn slots with a dispatch currently running, keyed `actor:slot` —
+   * declared to the broker on every claim so it never hands out a second
+   * concurrent turn in the same slot (KRA-1364: an actor with `turnSlots > 1`
+   * legitimately runs several turns at once, each in its own slot and cwd).
+   */
+  private readonly busySlots = new Map<string, BusySlot>();
   /**
    * KRA-1097: the mint capability of each headless dispatch this edge is
    * currently running, `token → the delivery that token speaks for`.
@@ -155,26 +160,41 @@ export class EdgeService {
    * rejects — every failure path inside dispatch records a disposition.
    */
   private async claimNext(waitMs: number): Promise<{ done: Promise<void> } | null> {
-    const delivery = await this.broker.claim(this.after, waitMs, [...this.busyActors]);
+    const delivery = await this.broker.claim(this.after, waitMs, [...this.busySlots.values()]);
     if (!delivery) return null;
     this.after = Math.max(this.after, delivery.id);
     const generation = delivery.leaseGeneration;
-    if (generation === null) {
-      console.error("hive edge delivery rejected", "claimed_delivery_missing_generation");
+    const slot = delivery.leaseSlot;
+    if (generation === null || slot === null) {
+      console.error("hive edge delivery rejected", "claimed_delivery_missing_lease");
       return { done: Promise.resolve() };
     }
-    this.busyActors.add(delivery.actor);
-    const tracked: Promise<void> = this.dispatchClaimed(delivery, generation)
+    const busyKey = busySlotKey(delivery.actor, slot);
+    this.busySlots.set(busyKey, { actor: delivery.actor, slot });
+    const tracked: Promise<void> = this.dispatchClaimed(delivery, generation, slot)
       .finally(() => {
         this.inFlight.delete(tracked);
-        this.busyActors.delete(delivery.actor);
+        this.busySlots.delete(busyKey);
       });
     this.inFlight.add(tracked);
     return { done: tracked };
   }
 
+  /**
+   * KRA-1364: a multi-slot actor never takes the live route. A live session is
+   * one process; delivering two slots into it would run both turns in one
+   * checkout, which is exactly what the per-slot `cwd` exists to prevent. The
+   * edge learns `turnSlots` only from the claimed delivery — `/live/register`
+   * carries no subscription — so route selection is the one site that owns
+   * the rule; a registration such an actor makes is simply never consulted.
+   */
+  private liveRouteFor(delivery: Delivery): LiveIngress | null {
+    if (delivery.subscription.turnSlots > 1) return null;
+    return this.live.get(delivery.actor, delivery.subscription.provider);
+  }
+
   /** The full post-claim delivery lifecycle; never throws — all failures land in recordDeliveryFailure. */
-  private async dispatchClaimed(delivery: Delivery, generation: number): Promise<void> {
+  private async dispatchClaimed(delivery: Delivery, generation: number, slot: number): Promise<void> {
     let current = delivery;
     let providerStarted = false;
     // ONE subscription governs the whole turn. Every broker transition rebuilds
@@ -195,13 +215,13 @@ export class EdgeService {
       // unreadable one is stored as a named absence, never as silence.
       // Capture the live route once so attestation and dispatch name the same
       // surface. A later expiry, deregister, or replacement must not re-select.
-      const live = this.live.get(delivery.actor, delivery.subscription.provider);
+      const live = this.liveRouteFor(delivery);
       // This read is now awaited, so `receive` — and with it the redelivery
       // dedupe below — no longer runs in the same synchronous turn as the
       // claim. That window is safe by three existing guards, and the
       // alternative (write a row with neither an id nor a named absence, then
       // rebind) would mint exactly the silence this binding exists to
-      // eliminate: (1) `claimNext` adds the actor to `busyActors` synchronously
+      // eliminate: (1) `claimNext` adds the turn slot to `busySlots` synchronously
       // before calling this method and passes that set to `broker.claim`, so
       // this edge cannot re-claim the same actor while the read is in flight;
       // (2) `receive`'s upsert is guarded in SQL on (generation, attempts) and
@@ -225,7 +245,7 @@ export class EdgeService {
 
       const dispatch = await this.withLeaseHeartbeat(
         current,
-        () => this.dispatch(current, replay, live, generation, async () => {
+        () => this.dispatch(current, replay, live, generation, slot, async () => {
           providerStarted = true;
           // The last uncovered cell of {live, headless} × {claim, provider-start}:
           // a headless child reads its profile when it spawns, which is several
@@ -397,6 +417,7 @@ export class EdgeService {
     replay: ReplaySnapshot | null,
     live: LiveIngress | null,
     generation: number,
+    slot: number,
     // Awaited: the headless branch re-reads the profile attestation here, and
     // that read is now off the event loop. The rebind must land before the
     // provider starts, so the start waits for it.
@@ -420,6 +441,9 @@ export class EdgeService {
 
     const workspace = subscription.edgeWorkspaces.find((item) => item.edgeId === this.broker.edgeId);
     if (!workspace) throw new PreDispatchError("workspace_not_mapped");
+    // KRA-1364: the turn runs in its slot's directory, so two concurrent turns
+    // of one actor on this edge never share a checkout.
+    const cwd = workspaceCwd(workspace, slot);
     const framed = frameWakeInstruction(delivery, replay, "edge");
     // The mint capability is scoped to this provider turn and revoked the
     // moment it ends — a child that outlives its dispatch cannot mint from a
@@ -430,12 +454,12 @@ export class EdgeService {
     try {
       if (subscription.sessionId && this.broker.edgeId === subscription.homeEdge) {
         await onProviderStart();
-        return await adapter.resume(subscription, workspace.cwd, framed, context);
+        return await adapter.resume(subscription, cwd, framed, context);
       }
       if (subscription.wakePolicy === "resume") throw new PreDispatchError("resume_target_missing");
       if (!await this.broker.reserveSpawn(delivery)) throw new PreDispatchError("spawn_rate_limited");
       await onProviderStart();
-      return await adapter.spawn(subscription, workspace.cwd, framed, context);
+      return await adapter.spawn(subscription, cwd, framed, context);
     } finally {
       this.dispatchTokens.delete(token);
     }

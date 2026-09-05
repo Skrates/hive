@@ -19,6 +19,7 @@ function delivery(generation: number, attempts = generation): Delivery {
     status: "claimed",
     reasons: [],
     leaseGeneration: generation,
+    leaseSlot: 1,
     claimedBy: "mac",
     attempts,
     nextAttemptAt: null,
@@ -34,7 +35,7 @@ function delivery(generation: number, attempts = generation): Delivery {
       sessionId: "thread-1", homeEdge: "mac", workspace: "hive",
       edgeWorkspaces: [{ edgeId: "mac", cwd: "/tmp", worktree: null }], wakePolicy: "resume",
       permissionProfile: "read-only", accountProfile: "/profiles/ariadne", leaseTtlMs: 1_000, deliveryTtlMs: 5_000, homeGraceMs: 0,
-      spawnRateLimit: 1, maxAttempts: 5, expiresAt: null, updatedAt: "2026-07-12T00:00:00.000Z",
+      spawnRateLimit: 1, maxAttempts: 5, turnSlots: 1, expiresAt: null, updatedAt: "2026-07-12T00:00:00.000Z",
     },
     event: {
       eventId: "Ev1", workspaceId: "T1", channelId: "C1", threadTs: "1.0", messageTs: "1.1",

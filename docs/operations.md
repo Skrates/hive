@@ -157,7 +157,7 @@ Desktop injection and terminalizes it as undeliverable.
 
 Install the repository-owned Codex command once with `hive install-codex-skill`. Codex lists it
 as **Hive Attach** in the `/` menu (its explicit skill token is `$hive-attach`). The command defaults
-to the checked-in Codex actor `codex-1`, reads `CODEX_THREAD_ID` only from the invoking task, resolves that task's physical cwd,
+to the checked-in Codex actor `ariadne`, reads `CODEX_THREAD_ID` only from the invoking task, resolves that task's physical cwd,
 and runs the same revision-confirmed `hive attach` path above. It is marked explicit-only, so ordinary
 conversation cannot silently change the foreground binding.
 
@@ -191,6 +191,26 @@ thread through the durable outbox: delivery receipt, retry notices, failure noti
 notices, and the agent's outcome. Completion-tracked Codex live and headless outcomes are relayed
 by the edge from the provider's final response; Claude live boundary delivery uses `hive reply`.
 Silence is a defect — a delivered wake with no outcome post means the loop never closed.
+
+### Turn slots (KRA-1364)
+
+A subscription's `turnSlots` (integer ≥ 1, default 1) is how many turns the actor may run at once,
+fleet-wide. Leases are keyed `(actor, slot)`; a claim takes the actor's lowest free slot, and every
+transition is fenced on the generation that slot holds, so one slot's lease expiring requeues only
+the turn it held. Generations are minted per actor, never per slot, so no two slots ever share one:
+a turn whose slot lapsed and whose delivery was reclaimed into another slot cannot report in against
+the new slot's fence. A multi-slot actor never takes the live route — a live session is one process,
+and two slots delivered into it would share a checkout — so its live registration, if any, is never
+consulted. The edge declares the `actor:slot` pairs it is running on every claim, and the broker
+skips an actor whose slots are all declared; a `busy` entry without a slot is refused with
+`busy_malformed`. `turnSlots > 1` requires `wakePolicy: "spawn"`, no pinned `sessionId`, and a
+`{slot}` placeholder in every `edgeWorkspaces[].cwd` — slot `n` runs in that path with `{slot}`
+replaced by `n`, so two concurrent turns never share a checkout. Those directories must exist on
+the edge before the first wake lands. A seat that declares nothing runs exactly the one-slot path it
+always did. Lowering `turnSlots` is refused (`turn_slots_leased`, 409) while a turn is still running
+in any slot above the new ceiling, on any edge: capacity is counted from the claiming edge's own busy
+declaration, so a running high slot elsewhere would otherwise be invisible to the lowered ceiling.
+Let those turns finish, then retry the upsert.
 
 There is no reconciliation surface. If a delivery failed, the thread says so; send the message
 again or fix the edge.

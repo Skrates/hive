@@ -6,6 +6,8 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   ActorCaseCollisionError,
+  ActorGrammarError,
+  TurnSlotReductionError,
   BrokerStore,
   DISPATCHED_OUTCOME_GRACE_MS,
   InvalidTransitionError,
@@ -13,7 +15,7 @@ import {
   SeatWakeRefusedError,
   StaleLeaseError,
 } from "./store.js";
-import { frameWakeInstruction, retryBackoffMs, SubscriptionInputSchema, type SlackEventInput, type SubscriptionInput } from "../domain.js";
+import { BusySlotFormatError, formatBusySlots, frameWakeInstruction, parseBusySlots, retryBackoffMs, SubscriptionInputSchema, workspaceCwd, type SlackEventInput, type SubscriptionInput } from "../domain.js";
 import type { Clock } from "../time.js";
 
 class FakeClock implements Clock {
@@ -60,6 +62,7 @@ function subscription(overrides: Partial<SubscriptionInput> = {}): SubscriptionI
     homeGraceMs: 2_000,
     spawnRateLimit: 1,
     maxAttempts: 3,
+    turnSlots: 1,
     expiresAt: null,
     ...overrides,
   };
@@ -706,7 +709,7 @@ test("claimNext skips actors the claiming edge declared busy", () => {
   const { store } = fixture();
   store.ingestEvent(event());
   // The edge is mid-turn for this actor: its declaration must hide the delivery.
-  assert.equal(store.claimNext("mac", 0, ["ariadne"]), null);
+  assert.equal(store.claimNext("mac", 0, [{ actor: "ariadne", slot: 1 }]), null);
   assert.equal(store.getDelivery(1).status, "pending");
   // Once the turn ends the same claim succeeds.
   assert.equal(store.claimNext("mac", 0, [])?.claimedBy, "mac");
@@ -1092,7 +1095,7 @@ test("two case-variant enrollments stop the broker instead of being merged", (t)
   first.upsertSubscription(subscription({ actor: "gnomon" }));
   first.db.prepare("INSERT INTO subscriptions SELECT 'Gnomon', provider, provider_surface, provider_version, "
     + "session_id, home_edge, workspace, edge_workspaces_json, wake_policy, permission_profile, account_profile, "
-    + "lease_ttl_ms, delivery_ttl_ms, home_grace_ms, spawn_rate_limit, max_attempts, expires_at, updated_at "
+    + "lease_ttl_ms, delivery_ttl_ms, home_grace_ms, spawn_rate_limit, max_attempts, turn_slots, expires_at, updated_at "
     + "FROM subscriptions WHERE actor='gnomon'").run();
   first.close();
 
@@ -1102,6 +1105,60 @@ test("two case-variant enrollments stop the broker instead of being merged", (t)
     () => new BrokerStore(path),
     (error: unknown) => error instanceof ActorCaseCollisionError && /Gnomon/.test(error.message),
   );
+});
+
+test("a persisted actor outside the addressing grammar stops the broker instead of sitting live (KRA-1364)", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "hive-actor-grammar-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const path = join(directory, "broker.sqlite");
+
+  const first = new BrokerStore(path);
+  first.createEdge("mac");
+  first.upsertSubscription(subscription({ actor: "talos" }));
+  // Enrollment refuses this id; only a pre-grammar database or a hand edit can hold it.
+  first.db.prepare("UPDATE subscriptions SET actor='ta,los' WHERE actor='talos'").run();
+  first.close();
+
+  assert.throws(
+    () => new BrokerStore(path),
+    (error: unknown) => error instanceof ActorGrammarError && /"ta,los"/.test(error.message),
+  );
+});
+
+test("turnSlots cannot be lowered under a slot that still holds a lease; it can once that turn finishes (KRA-1364)", () => {
+  const { store } = slotFixture(2);
+  const first = store.claimNext("mac", 0, [])!;
+  toDispatching(store, first);
+  const second = store.claimNext("mac", 0, [{ actor: "ariadne", slot: 1 }])!;
+  assert.equal(second.leaseSlot, 2);
+  toDispatching(store, second);
+  store.finish(first.id, "mac", first.leaseGeneration!, "processed", []);
+
+  // The operator lowers the ceiling while slot 2 is still mid-turn: refused, naming the running slot and edge.
+  const lowered = SubscriptionInputSchema.parse({
+    ...subscription({
+      sessionId: null,
+      edgeWorkspaces: [
+        { edgeId: "mac", cwd: "/work/taxis/slot-{slot}", worktree: null },
+        { edgeId: "dev", cwd: "/srv/taxis/slot-{slot}", worktree: null },
+      ],
+    }),
+    turnSlots: 1,
+  });
+  assert.throws(
+    () => store.upsertSubscription(lowered),
+    (error: unknown) => error instanceof TurnSlotReductionError && /2@mac/.test(error.message) && /turnSlots=1/.test(error.message),
+  );
+  assert.equal(store.getSubscription("ariadne")?.turnSlots, 2);
+
+  // Slot 2 finishes; the reduction lands; the next turn runs alone in slot 1.
+  store.finish(second.id, "mac", second.leaseGeneration!, "processed", []);
+  store.upsertSubscription(lowered);
+  assert.equal(store.getSubscription("ariadne")?.turnSlots, 1);
+  const third = store.claimNext("mac", 0, [])!;
+  assert.equal(third.leaseSlot, 1);
+  assert.equal(store.claimNext("mac", 0, [{ actor: "ariadne", slot: 1 }]), null);
+  store.close();
 });
 
 test("subscription actors are stored under the same canonical key wake targets use", () => {
@@ -1125,4 +1182,219 @@ test("subscription actors are stored under the same canonical key wake targets u
   });
   assert.equal(receipt.actor, "theoros");
   store.close();
+});
+
+/**
+ * KRA-1364 fixture: a two-slot spawn actor. Each pending delivery sits in its
+ * own thread so nothing coalesces; the ticket's terminal state is that two of
+ * them dispatch at once and a third waits.
+ */
+function slotFixture(turnSlots = 2) {
+  const fixtureResult = fixture({
+    sessionId: null,
+    turnSlots,
+    edgeWorkspaces: [
+      { edgeId: "mac", cwd: "/work/taxis/slot-{slot}", worktree: null },
+      { edgeId: "dev", cwd: "/srv/taxis/slot-{slot}", worktree: null },
+    ],
+  });
+  const { store } = fixtureResult;
+  store.ingestEvent(event({ eventId: "Ev1", threadTs: "100.1", messageTs: "100.2" }));
+  store.ingestEvent(event({ eventId: "Ev2", threadTs: "101.1", messageTs: "101.2" }));
+  store.ingestEvent(event({ eventId: "Ev3", threadTs: "102.1", messageTs: "102.2" }));
+  return fixtureResult;
+}
+
+function toDispatching(store: BrokerStore, delivery: { id: number; leaseGeneration: number | null }, edge = "mac"): void {
+  store.transition(delivery.id, edge, delivery.leaseGeneration!, "claimed", "accepted_local");
+  store.transition(delivery.id, edge, delivery.leaseGeneration!, "accepted_local", "dispatching");
+}
+
+test("a two-slot actor is claimed and dispatched twice at once; a third delivery waits (KRA-1364)", () => {
+  const { store } = slotFixture(2);
+  const first = store.claimNext("mac", 0, [])!;
+  assert.equal(first.leaseSlot, 1);
+  assert.equal(first.leaseGeneration, 1);
+  toDispatching(store, first);
+  // The edge declares the slot it is running; the broker hands out the next one.
+  const second = store.claimNext("mac", 0, [{ actor: "ariadne", slot: 1 }])!;
+  assert.equal(second.id, 2);
+  assert.equal(second.leaseSlot, 2);
+  // Generations are per actor: slot 2's first lease is above slot 1's.
+  assert.equal(second.leaseGeneration, 2);
+  toDispatching(store, second);
+  // Acceptance shape from the ticket: two rows dispatching for one actor.
+  const dispatching = store.listDeliveries().filter((item) => item.actor === "ariadne" && item.status === "dispatching");
+  assert.deepEqual(dispatching.map((item) => item.leaseSlot).sort(), [1, 2]);
+  // Both slots busy: the third stays pending, whichever edge asks.
+  const busy = [{ actor: "ariadne", slot: 1 }, { actor: "ariadne", slot: 2 }];
+  assert.equal(store.claimNext("mac", 0, busy), null);
+  assert.equal(store.claimNext("dev", 0, busy), null);
+  assert.equal(store.getDelivery(3).status, "pending");
+  // Each slot's fence is its own: finishing slot 1 does not touch slot 2.
+  store.finish(first.id, "mac", first.leaseGeneration!, "processed", []);
+  assert.equal(store.getDelivery(second.id).status, "dispatching");
+  const third = store.claimNext("mac", 0, [{ actor: "ariadne", slot: 2 }])!;
+  assert.equal(third.id, 3);
+  assert.equal(third.leaseSlot, 1);
+  store.close();
+});
+
+test("a one-slot actor behaves exactly as before slots existed (KRA-1364)", () => {
+  const { store } = slotFixture(1);
+  const first = store.claimNext("mac", 0, [])!;
+  assert.equal(first.leaseSlot, 1);
+  // The only slot is busy: nothing else is handed out for this actor.
+  assert.equal(store.claimNext("mac", 0, [{ actor: "ariadne", slot: 1 }]), null);
+  assert.equal(store.getDelivery(2).status, "pending");
+  // A live lease on another edge still refuses a foreign claim.
+  assert.equal(store.claimNext("dev", 0, []), null);
+  store.close();
+});
+
+test("a lease expiring on slot 1 frees slot 1 only (KRA-1364)", () => {
+  const { store, clock } = slotFixture(2);
+  const first = store.claimNext("mac", 0, [])!;
+  toDispatching(store, first);
+  const second = store.claimNext("mac", 0, [{ actor: "ariadne", slot: 1 }])!;
+  toDispatching(store, second);
+  // Slot 2 keeps heartbeating; slot 1 goes quiet.
+  clock.advance(800);
+  store.renewDeliveryLease(second.id, "mac", second.leaseGeneration!);
+  clock.advance(300);
+  assert.equal(store.requeueExpiredLeases(), 1);
+  assert.equal(store.getDelivery(first.id).status, "pending");
+  assert.equal(store.getDelivery(first.id).leaseSlot, null);
+  assert.equal(store.getDelivery(second.id).status, "dispatching");
+  // Slot 2's fence survived: its turn can still transition.
+  store.transition(second.id, "mac", second.leaseGeneration!, "dispatching", "dispatched");
+  // The freed slot is slot 1, at the next generation, while slot 2 is still held.
+  clock.advance(retryBackoffMs(1) + 1);
+  const reclaimed = store.claimNext("mac", 0, [{ actor: "ariadne", slot: 2 }])!;
+  assert.equal(reclaimed.id, first.id);
+  assert.equal(reclaimed.leaseSlot, 1);
+  assert.equal(reclaimed.leaseGeneration, 3);
+  assert.equal(reclaimed.attempts, 2);
+  store.close();
+});
+
+test("a stale callback from a lapsed slot cannot satisfy the fence of the slot that reclaimed its delivery (KRA-1364)", () => {
+  const { store, clock } = slotFixture(2);
+  // Attempt 1 runs in slot 1 and its provider call keeps going after the lease lapses.
+  const first = store.claimNext("mac", 0, [])!;
+  assert.equal(first.leaseSlot, 1);
+  const staleGeneration = first.leaseGeneration!;
+  toDispatching(store, first);
+  clock.advance(1_100);
+  assert.equal(store.requeueExpiredLeases(), 1);
+  // The same edge still declares slot 1 busy (the abandoned provider child is
+  // alive), so the redelivery lands in slot 2.
+  clock.advance(retryBackoffMs(1) + 1);
+  const reclaimed = store.claimNext("mac", 0, [{ actor: "ariadne", slot: 1 }])!;
+  assert.equal(reclaimed.id, first.id);
+  assert.equal(reclaimed.leaseSlot, 2);
+  assert.notEqual(reclaimed.leaseGeneration, staleGeneration);
+  // Attempt 1 reports in with the generation it was fenced at: refused on every transition.
+  assert.throws(() => store.transition(first.id, "mac", staleGeneration, "claimed", "accepted_local"));
+  assert.throws(() => store.markDispatched(first.id, "mac", staleGeneration));
+  assert.throws(() => store.finish(first.id, "mac", staleGeneration, "processed", []));
+  assert.throws(() => store.release(first.id, "mac", staleGeneration, { code: "lease_expired", detail: "stale" }));
+  assert.equal(store.getDelivery(first.id).status, "claimed");
+  // Attempt 2's own fence works.
+  toDispatching(store, reclaimed);
+  assert.equal(store.getDelivery(first.id).status, "dispatching");
+  store.close();
+});
+
+test("a pre-slot database migrates its live lease and claimed delivery to slot 1 in place (KRA-1364)", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "hive-turn-slots-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const path = join(directory, "broker.sqlite");
+  const clock = new FakeClock(new Date("2026-09-05T00:00:00.000Z"));
+  const first = new BrokerStore(path, clock);
+  first.createEdge("mac");
+  first.upsertSubscription(subscription({ sessionId: null, leaseTtlMs: 60_000 }));
+  first.ingestEvent(event());
+  const claimed = first.claimNext("mac", 0)!;
+  toDispatching(first, claimed);
+  first.close();
+
+  // Rewind the file to the one-lease-per-actor shape a running broker holds
+  // at the moment this revision deploys: no slot columns, `actor` the key.
+  const raw = new Database(path);
+  raw.exec(`
+    CREATE TABLE actor_leases_old (
+      actor TEXT PRIMARY KEY,
+      edge_id TEXT NOT NULL,
+      generation INTEGER NOT NULL,
+      expires_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(edge_id) REFERENCES edges(edge_id)
+    );
+    INSERT INTO actor_leases_old SELECT actor, edge_id, generation, expires_at, updated_at FROM actor_leases;
+    DROP TABLE actor_leases;
+    ALTER TABLE actor_leases_old RENAME TO actor_leases;
+    ALTER TABLE deliveries DROP COLUMN lease_slot;
+    ALTER TABLE subscriptions DROP COLUMN turn_slots;
+  `);
+  raw.close();
+
+  const second = new BrokerStore(path, clock);
+  assert.equal(second.getSubscription("ariadne")?.turnSlots, 1);
+  const carried = second.getDelivery(claimed.id);
+  assert.equal(carried.status, "dispatching");
+  assert.equal(carried.leaseSlot, 1);
+  // The in-flight turn still holds its fence across the schema move.
+  second.renewDeliveryLease(claimed.id, "mac", claimed.leaseGeneration!);
+  second.transition(claimed.id, "mac", claimed.leaseGeneration!, "dispatching", "dispatched");
+  const lease = second.db.prepare("SELECT actor, slot, generation FROM actor_leases").all() as Array<{ actor: string; slot: number; generation: number }>;
+  assert.deepEqual(lease, [{ actor: "ariadne", slot: 1, generation: 1 }]);
+  second.close();
+});
+
+test("turnSlots > 1 demands a spawn-only actor whose every workspace cwd names its slot (KRA-1364)", () => {
+  const twoSlots = { ...subscription({ sessionId: null }), turnSlots: 2 };
+  assert.throws(() => SubscriptionInputSchema.parse(twoSlots), /carry \{slot\}/);
+  const slotted = {
+    ...twoSlots,
+    edgeWorkspaces: [
+      { edgeId: "mac", cwd: "/work/taxis/slot-{slot}", worktree: null },
+      { edgeId: "dev", cwd: "/srv/taxis/slot-{slot}", worktree: null },
+    ],
+  };
+  assert.doesNotThrow(() => SubscriptionInputSchema.parse(slotted));
+  assert.throws(() => SubscriptionInputSchema.parse({ ...slotted, wakePolicy: "resume" }), /requires wakePolicy/);
+  assert.throws(() => SubscriptionInputSchema.parse({ ...slotted, sessionId: "thread-1" }), /no pinned sessionId/);
+  assert.throws(() => SubscriptionInputSchema.parse({ ...slotted, turnSlots: 0 }));
+  // The default is the one-turn behaviour, and a one-slot cwd needs no placeholder.
+  const { turnSlots: _omitted, ...undeclared } = subscription();
+  assert.equal(SubscriptionInputSchema.parse(undeclared).turnSlots, 1);
+  assert.equal(workspaceCwd({ edgeId: "mac", cwd: "/work/taxis", worktree: null }, 1), "/work/taxis");
+  assert.equal(workspaceCwd({ edgeId: "mac", cwd: "/work/taxis/slot-{slot}", worktree: null }, 2), "/work/taxis/slot-2");
+});
+
+test("a busy declaration is `actor:slot` per running turn; anything else is refused (KRA-1364)", () => {
+  assert.deepEqual(parseBusySlots(null), []);
+  assert.deepEqual(parseBusySlots(""), []);
+  assert.deepEqual(parseBusySlots("talos:1,Talos:2"), [{ actor: "talos", slot: 1 }, { actor: "talos", slot: 2 }]);
+  assert.throws(() => parseBusySlots("talos"), BusySlotFormatError);
+  assert.throws(() => parseBusySlots("talos:0"), BusySlotFormatError);
+  assert.throws(() => parseBusySlots("talos:1,"), BusySlotFormatError);
+  assert.equal(formatBusySlots([{ actor: "talos", slot: 2 }, { actor: "gnomon", slot: 1 }]), "talos:2,gnomon:1");
+});
+
+test("an actor id obeys the addressing grammar, so every legal actor round-trips the busy wire form (KRA-1364)", () => {
+  // The grammar is owned once (`ACTOR_ID_PATTERN`): enrollment refuses an id the
+  // `actor:slot` and `WAKE:` forms could not carry, and the busy parser matches
+  // the same source, so a comma or colon inside a name can never split a claim
+  // into `busy_malformed` and park an edge's co-tenants behind one turn.
+  for (const bad of ["ta,los", "ta:los", "ta los", "-talos", "tálos", "9gnomon"]) {
+    assert.throws(() => SubscriptionInputSchema.parse(subscription({ actor: bad })), /actor id/, bad);
+  }
+  for (const actor of ["fable", "ariadne", "gnomon", "theoros", "talos", "Talos", "seat_2", "wave-notos"]) {
+    const enrolled = SubscriptionInputSchema.parse(subscription({ actor })).actor;
+    assert.deepEqual(parseBusySlots(formatBusySlots([{ actor: enrolled, slot: 2 }])), [{ actor: enrolled, slot: 2 }]);
+  }
+  assert.throws(() => parseBusySlots("ta,los:1"), BusySlotFormatError);
+  assert.throws(() => parseBusySlots("9gnomon:1"), BusySlotFormatError);
 });

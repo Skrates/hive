@@ -1,13 +1,13 @@
 ---
 name: hive-attach
-description: Attach a Hive actor, usually codex-1, to the exact current foreground Codex Desktop task and verify the revision-confirmed binding. Use when explicitly invoked from the slash menu or when the user asks to attach this Codex task to Hive. Do not use for merely explaining Hive.
+description: Attach a Hive actor, usually ariadne, to the exact current foreground Codex Desktop task and verify the revision-confirmed binding. Use when explicitly invoked from the slash menu or when the user asks to attach this Codex task to Hive. Do not use for merely explaining Hive.
 ---
 
 # Hive Attach
 
 Attach one Hive actor to this exact local Codex Desktop task.
 
-1. Read the actor from the invocation. Use `codex-1` when the user did not name one. Accept exactly one actor.
+1. Read the actor from the invocation. Use `ariadne` when the user did not name one. Accept exactly one actor.
 2. Confirm `CODEX_THREAD_ID` is present without printing its value. If it is absent, stop and explain that attachment must run from a local Codex task; never infer or select the newest task.
 3. Resolve the task working directory with `pwd -P`.
 4. Run `hive attach <actor> --cwd <resolved-directory>` through the local shell. Do not add `--session`; the CLI must consume the current task's `CODEX_THREAD_ID` itself.

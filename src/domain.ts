@@ -56,12 +56,73 @@ export const ReasonSchema = z.object({
 });
 export type Reason = z.infer<typeof ReasonSchema>;
 
+/**
+ * KRA-1364: the placeholder an `edgeWorkspaces[].cwd` carries when the actor
+ * runs more than one turn at once. Slot `n` runs in the entry's `cwd` with
+ * every `{slot}` replaced by `n`, so two concurrent turns of one actor on one
+ * edge never share a checkout. The entry itself names the derivation; there is
+ * no second field and no second rule for a single-slot actor — its `cwd`
+ * simply carries no placeholder and slot 1 runs in it verbatim.
+ */
+export const SLOT_PLACEHOLDER = "{slot}";
+
 export const EdgeWorkspaceSchema = z.object({
   edgeId: z.string().min(1),
   cwd: z.string().min(1),
   worktree: z.string().min(1).nullable().default(null),
 });
 export type EdgeWorkspace = z.infer<typeof EdgeWorkspaceSchema>;
+
+/** The working directory turn slot `slot` of an actor runs in on this edge mapping. */
+export function workspaceCwd(workspace: EdgeWorkspace, slot: number): string {
+  return workspace.cwd.replaceAll(SLOT_PLACEHOLDER, String(slot));
+}
+
+/**
+ * One turn slot an edge is currently running: declared to the broker on every
+ * claim so it never hands out the same (actor, slot) twice. Wire form is
+ * `actor:slot`, one entry per running turn.
+ */
+export interface BusySlot {
+  actor: string;
+  slot: number;
+}
+
+export function busySlotKey(actor: string, slot: number): string {
+  return `${actor}:${slot}`;
+}
+
+export class BusySlotFormatError extends Error {
+  constructor(readonly entry: string) {
+    super(`busy entry ${JSON.stringify(entry)} is not \`actor:slot\``);
+    this.name = "BusySlotFormatError";
+  }
+}
+
+/**
+ * The addressing grammar of an actor id, and the one site that owns it: the
+ * wire forms that carry actors alongside other tokens — `actor:slot` in the
+ * claim's `busy` list, `WAKE: <actor>` in the commons — all split on `:`, `,`
+ * and whitespace, so an id may contain none of them. Enrollment refuses the
+ * rest; every parser downstream matches against this same source.
+ */
+export const ACTOR_ID_PATTERN = /^[a-z][a-z0-9_-]*$/i;
+
+const BUSY_SLOT_ENTRY = new RegExp(`^(${ACTOR_ID_PATTERN.source.slice(1, -1)}):([1-9]\\d*)$`, "i");
+
+/** Parse the claim's `busy` declaration; a malformed entry is a caller defect, never a silent no-op. */
+export function parseBusySlots(value: string | null): BusySlot[] {
+  if (value === null || value.length === 0) return [];
+  return value.split(",").map((entry) => {
+    const match = BUSY_SLOT_ENTRY.exec(entry);
+    if (!match) throw new BusySlotFormatError(entry);
+    return { actor: canonicalActor(match[1]!), slot: Number(match[2]) };
+  });
+}
+
+export function formatBusySlots(slots: readonly BusySlot[]): string {
+  return slots.map((entry) => busySlotKey(entry.actor, entry.slot)).join(",");
+}
 
 /**
  * The one canonical form of an actor id. Enrollment, every lookup, and the
@@ -75,6 +136,9 @@ export function canonicalActor(actor: string): string {
 
 export const SubscriptionInputSchema = z.object({
   actor: z.string().min(1)
+    .regex(ACTOR_ID_PATTERN, {
+      message: "an actor id is `[a-z][a-z0-9_-]*`: it rides wire forms that split on `:`, `,` and whitespace",
+    })
     .refine((value) => canonicalActor(value) !== EVERYONE, {
       message: "`everyone` is a reserved broadcast keyword and cannot be a subscription actor name",
     })
@@ -103,7 +167,35 @@ export const SubscriptionInputSchema = z.object({
   homeGraceMs: z.number().int().nonnegative().default(30_000),
   spawnRateLimit: z.number().int().positive().default(1),
   maxAttempts: z.number().int().positive().default(MAX_DELIVERY_ATTEMPTS),
+  /**
+   * KRA-1364: how many turns this actor may run at once, fleet-wide. Each
+   * turn holds one lease slot `1..turnSlots`; the broker hands a claim the
+   * lowest free slot. The default is the one-turn behaviour every seat had
+   * before the field existed — there is one code path, and a seat that does
+   * not declare the field walks it with `turnSlots = 1`.
+   */
+  turnSlots: z.number().int().min(1).default(1),
   expiresAt: z.string().datetime().nullable().default(null),
+}).superRefine((value, context) => {
+  if (value.turnSlots === 1) return;
+  // Two concurrent turns of one actor are two headless spawns: a resumed or
+  // live session is one process, and running it twice at once is not a slot,
+  // it is a collision.
+  if (value.wakePolicy !== "spawn" || value.sessionId !== null) {
+    context.addIssue({
+      code: "custom",
+      path: ["turnSlots"],
+      message: "turnSlots > 1 requires wakePolicy \"spawn\" and no pinned sessionId",
+    });
+  }
+  value.edgeWorkspaces.forEach((workspace, index) => {
+    if (workspace.cwd.includes(SLOT_PLACEHOLDER)) return;
+    context.addIssue({
+      code: "custom",
+      path: ["edgeWorkspaces", index, "cwd"],
+      message: `turnSlots > 1 requires every edgeWorkspaces cwd to carry ${SLOT_PLACEHOLDER} so slots never share a checkout`,
+    });
+  });
 });
 export type SubscriptionInput = z.infer<typeof SubscriptionInputSchema>;
 
@@ -226,6 +318,8 @@ export interface Delivery {
   status: DeliveryStatus;
   reasons: Reason[];
   leaseGeneration: number | null;
+  /** KRA-1364: the actor turn slot this claim holds (`1..turnSlots`); null while unclaimed. */
+  leaseSlot: number | null;
   claimedBy: string | null;
   attempts: number;
   nextAttemptAt: string | null;

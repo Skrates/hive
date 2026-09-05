@@ -1,8 +1,9 @@
 import { z } from "zod";
 import type { AddressedWake } from "./domain.js";
-import { canonicalActor } from "./domain.js";
+import { ACTOR_ID_PATTERN, canonicalActor } from "./domain.js";
 
-// The envelope grammar. An actor token is `[a-z][a-z0-9_-]*`; a recipient LIST is
+// The envelope grammar. An actor token is ACTOR_ID_PATTERN (the same source
+// enrollment and the busy-slot wire form use); a recipient LIST is
 // one or more tokens separated by commas. Separators are HORIZONTAL whitespace
 // only (`H`) so the list stays on the first envelope line — a comma cannot reach
 // across a newline into body text. The trailing `(H*,)` group is a malformed
@@ -11,7 +12,7 @@ import { canonicalActor } from "./domain.js";
 // an envelope (malformed ≠ unknown — an unknown but well-formed name still routes,
 // and dead-letters through the KRA-925 notice).
 const H = "[^\\S\\r\\n]";
-const ACTOR = "[a-z][a-z0-9_-]*";
+const ACTOR = ACTOR_ID_PATTERN.source.slice(1, -1);
 const LIST = `${ACTOR}(?:${H}*,${H}*${ACTOR})*`;
 const WAKE_PATTERN = new RegExp(`^\\s*WAKE:${H}*(${LIST})(${H}*,)?`, "im");
 const NEXT_PATTERN = new RegExp(`^\\s*NEXT${H}+(${LIST})(${H}*,)?`, "im");

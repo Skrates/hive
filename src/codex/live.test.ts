@@ -245,8 +245,8 @@ test("a Desktop delivery is refused unless its home is the pinned account profil
 });
 
 test("a foreground Desktop attachment binds to the Desktop home, not the pinned profile", () => {
-  assert.equal(liveRuntimeHome("desktop", "/Users/hakon/.codex", "/Users/hakon/.hive/profiles/codex-1"), "/Users/hakon/.codex");
-  assert.equal(liveRuntimeHome("dedicated", "/Users/hakon/.codex", "/Users/hakon/.hive/profiles/codex-1"), "/Users/hakon/.hive/profiles/codex-1");
+  assert.equal(liveRuntimeHome("desktop", "/Users/hakon/.codex", "/Users/hakon/.hive/profiles/ariadne"), "/Users/hakon/.codex");
+  assert.equal(liveRuntimeHome("dedicated", "/Users/hakon/.codex", "/Users/hakon/.hive/profiles/ariadne"), "/Users/hakon/.hive/profiles/ariadne");
 });
 
 function delivery(now: number, createdAt: number = now): Delivery {
@@ -267,6 +267,7 @@ function delivery(now: number, createdAt: number = now): Delivery {
     homeGraceMs: 0,
     spawnRateLimit: 1,
     maxAttempts: 5,
+    turnSlots: 1,
     expiresAt: null,
     updatedAt: new Date(now).toISOString(),
   };
@@ -277,6 +278,7 @@ function delivery(now: number, createdAt: number = now): Delivery {
     status: "dispatching",
     reasons: [],
     leaseGeneration: 1,
+    leaseSlot: 1,
     claimedBy: "mac",
     attempts: 1,
     nextAttemptAt: null,
