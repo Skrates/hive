@@ -1,5 +1,5 @@
 {
-  "actor": "codex-1",
+  "actor": "ariadne",
   "provider": "codex",
   "providerSurface": "app-server",
   "providerVersion": "0.x",
@@ -9,7 +9,7 @@
   "edgeWorkspaces": [{ "edgeId": "mac", "cwd": "/Users/hakon/projects", "worktree": null }],
   "wakePolicy": "spawn",
   "permissionProfile": "workspace-write",
-  "accountProfile": "/Users/hakon/.hive/profiles/codex-1",
+  "accountProfile": "/Users/hakon/.hive/profiles/ariadne",
   "leaseTtlMs": 60000,
   "deliveryTtlMs": 86400000,
   "homeGraceMs": 30000,

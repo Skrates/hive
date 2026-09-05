@@ -99,11 +99,22 @@ export class BusySlotFormatError extends Error {
   }
 }
 
+/**
+ * The addressing grammar of an actor id, and the one site that owns it: the
+ * wire forms that carry actors alongside other tokens — `actor:slot` in the
+ * claim's `busy` list, `WAKE: <actor>` in the commons — all split on `:`, `,`
+ * and whitespace, so an id may contain none of them. Enrollment refuses the
+ * rest; every parser downstream matches against this same source.
+ */
+export const ACTOR_ID_PATTERN = /^[a-z0-9][a-z0-9_-]*$/i;
+
+const BUSY_SLOT_ENTRY = new RegExp(`^(${ACTOR_ID_PATTERN.source.slice(1, -1)}):([1-9]\\d*)$`, "i");
+
 /** Parse the claim's `busy` declaration; a malformed entry is a caller defect, never a silent no-op. */
 export function parseBusySlots(value: string | null): BusySlot[] {
   if (value === null || value.length === 0) return [];
   return value.split(",").map((entry) => {
-    const match = /^(.+):([1-9]\d*)$/.exec(entry);
+    const match = BUSY_SLOT_ENTRY.exec(entry);
     if (!match) throw new BusySlotFormatError(entry);
     return { actor: canonicalActor(match[1]!), slot: Number(match[2]) };
   });
@@ -125,6 +136,9 @@ export function canonicalActor(actor: string): string {
 
 export const SubscriptionInputSchema = z.object({
   actor: z.string().min(1)
+    .regex(ACTOR_ID_PATTERN, {
+      message: "an actor id is `[a-z0-9][a-z0-9_-]*`: it rides wire forms that split on `:`, `,` and whitespace",
+    })
     .refine((value) => canonicalActor(value) !== EVERYONE, {
       message: "`everyone` is a reserved broadcast keyword and cannot be a subscription actor name",
     })

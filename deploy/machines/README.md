@@ -16,8 +16,8 @@ default and the example subscriptions in `../subscriptions/` encode it.
 ## Network prerequisite (the only plumbing)
 
 The broker sits behind home NAT. Slack Socket Mode dials out, so the broker needs no public
-ingress — but the cx53 VM and runpod need a path to the broker's HTTP listener. Install Tailscale
-on the dev box, the cx53 VM, and the runpod pod; set each edge's `HIVE_BROKER_URL` to the tailnet
+ingress — but the Hetzner boxes (cx53, cx43) need a path to the broker's HTTP listener. Install
+Tailscale on the dev box and on every edge host; set each edge's `HIVE_BROKER_URL` to the tailnet
 address. Plain off-box HTTP is forbidden (the edge token is bearer authority) — the tailnet
 (WireGuard) or a mutually controlled HTTPS tunnel is the transport.
 
@@ -29,7 +29,7 @@ address. Plain off-box HTTP is forbidden (the edge token is bearer authority) �
    (both operator IDs `U0AQM4YL9HS` + `U0AND2JSHV1`, plus the Hive app ID), restart
    `hive-broker`.
 3. Each machine: pull this revision, install the env file from its directory here, restart the
-   edge (systemd unit, launchd plist, or runpod autostart).
+   edge (systemd unit or launchd plist).
 4. `hive create-edge <edge-id>` per machine (rotates the bearer), `hive put-subscription` for each
    seat from `../subscriptions/`.
 5. Verify: post a wake in #hive to each agent; the thread must show the delivery receipt and the

@@ -1326,3 +1326,18 @@ test("a busy declaration is `actor:slot` per running turn; anything else is refu
   assert.throws(() => parseBusySlots("talos:1,"), BusySlotFormatError);
   assert.equal(formatBusySlots([{ actor: "talos", slot: 2 }, { actor: "gnomon", slot: 1 }]), "talos:2,gnomon:1");
 });
+
+test("an actor id obeys the addressing grammar, so every legal actor round-trips the busy wire form (KRA-1364)", () => {
+  // The grammar is owned once (`ACTOR_ID_PATTERN`): enrollment refuses an id the
+  // `actor:slot` and `WAKE:` forms could not carry, and the busy parser matches
+  // the same source, so a comma or colon inside a name can never split a claim
+  // into `busy_malformed` and park an edge's co-tenants behind one turn.
+  for (const bad of ["ta,los", "ta:los", "ta los", "-talos", "tálos"]) {
+    assert.throws(() => SubscriptionInputSchema.parse(subscription({ actor: bad })), /actor id/, bad);
+  }
+  for (const actor of ["fable", "ariadne", "gnomon", "theoros", "talos", "Talos", "seat_2", "wave-notos"]) {
+    const enrolled = SubscriptionInputSchema.parse(subscription({ actor })).actor;
+    assert.deepEqual(parseBusySlots(formatBusySlots([{ actor: enrolled, slot: 2 }])), [{ actor: enrolled, slot: 2 }]);
+  }
+  assert.throws(() => parseBusySlots("ta,los:1"), BusySlotFormatError);
+});

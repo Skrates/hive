@@ -145,7 +145,7 @@ Desktop injection and terminalizes it as undeliverable.
 
 Install the repository-owned Codex command once with `hive install-codex-skill`. Codex lists it
 as **Hive Attach** in the `/` menu (its explicit skill token is `$hive-attach`). The command defaults
-to the checked-in Codex actor `codex-1`, reads `CODEX_THREAD_ID` only from the invoking task, resolves that task's physical cwd,
+to the checked-in Codex actor `ariadne`, reads `CODEX_THREAD_ID` only from the invoking task, resolves that task's physical cwd,
 and runs the same revision-confirmed `hive attach` path above. It is marked explicit-only, so ordinary
 conversation cannot silently change the foreground binding.
 
