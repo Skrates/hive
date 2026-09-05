@@ -1,13 +1,18 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { CanaryRegistry, PROBE_EVENT_TYPE } from "./canary.js";
+import { CanaryRegistry, PROBE_EVENT_TYPE, type CanaryIdentity } from "./canary.js";
 import { CANARY_SPACING_MS, PROBE_CANARIES, SlackLinkProbe, type ProbePoster } from "./probe.js";
+
+/** The broker's own bot user in the probe channel — what the registry is bound to at startup. */
+const SELF: CanaryIdentity = { userId: "UBOT", channelId: "C1" };
 
 /** The envelope Slack sends back for a canary the app posted. */
 function canaryEnvelope(nonce: string): unknown {
   return {
     event: {
       type: "message",
+      channel: SELF.channelId,
+      user: SELF.userId,
       text: `hive watchdog link canary ${nonce} — ignore`,
       metadata: { event_type: PROBE_EVENT_TYPE, event_payload: { nonce } },
     },
@@ -46,6 +51,7 @@ function makeProbe(options: {
 }): { probe: SlackLinkProbe; state: PosterState; registry: CanaryRegistry } {
   const state: PosterState = { posted: [], postedAt: [], deleted: [], logs: [], clockMs: 0 };
   const registry = new CanaryRegistry();
+  registry.bind(SELF);
   const poster: ProbePoster = {
     async postCanary(nonce) {
       if (options.postHangs) return new Promise<string>(() => {});

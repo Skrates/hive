@@ -22,7 +22,10 @@ posting into it is not enough. For the admitted private channel that already hol
 `HIVE_WATCHDOG_PROBE_CHANNEL` points the canaries at a channel of a different type, grant the
 matching pair — a public channel needs `channels:history` and `message.channels` — or every canary
 will post successfully and never return, which the watchdog reads as deafness and answers with a
-reconnect and then an exit.
+reconnect and then an exit. A canary proves the link only when it comes back as the original
+message from the broker's own bot user (`auth.test` on the bot token, resolved at startup) in the
+probe channel; a stamped message from any other sender, and the edit or delete echo of a canary,
+are kept off the activity clock but never settle a probe.
 
 ## Trust set (ADR-0003 R-1)
 

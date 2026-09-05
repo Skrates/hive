@@ -2,7 +2,7 @@ import { SocketModeClient } from "@slack/socket-mode";
 import { WebClient } from "@slack/web-api";
 import { isAdmitted, parseAddressedWake, type AdmissionPolicy } from "../addressing.js";
 import { EVERYONE, type ReplaySnapshot, type SlackEventInput } from "../domain.js";
-import { CANARY_REQUEST_TIMEOUT_MS, CanaryRegistry, PROBE_EVENT_TYPE, type CanaryWatch, type ProbeWatcher } from "./canary.js";
+import { CANARY_REQUEST_TIMEOUT_MS, CanaryRegistry, PROBE_EVENT_TYPE, type CanaryIdentity, type CanaryWatch, type ProbeWatcher } from "./canary.js";
 import type { ProbePoster } from "./probe.js";
 import type { BrokerService, SlackTransport } from "./service.js";
 
@@ -341,6 +341,17 @@ export class SlackCanaryPoster implements ProbePoster {
     });
   }
 
+  /**
+   * The principal the canaries will come back from: this token's bot user and
+   * the probe channel. Resolved once at startup so the ingress can refuse to
+   * let any other sender's stamped message settle a probe.
+   */
+  async identify(): Promise<CanaryIdentity> {
+    const result = await this.web.auth.test();
+    if (!result.user_id) throw new Error("Slack auth.test returned no bot user id for the canary token");
+    return { userId: result.user_id, channelId: this.channelId };
+  }
+
   async postCanary(nonce: string): Promise<string> {
     const result = await this.web.chat.postMessage({
       channel: this.channelId,
@@ -413,6 +424,15 @@ export class SlackSocketIngress implements ProbeWatcher {
    */
   watchCanary(nonce: string, timeoutMs: number): CanaryWatch {
     return this.canaries.watchCanary(nonce, timeoutMs);
+  }
+
+  /**
+   * Name the only principal whose canaries may settle a probe: the broker's
+   * own bot user in the probe channel. Until this is called a waiter cannot be
+   * registered at all, so a probe can never be silently unprovable.
+   */
+  expectCanariesFrom(identity: CanaryIdentity): void {
+    this.canaries.bind(identity);
   }
 
   async start(): Promise<void> {

@@ -39,9 +39,51 @@ export interface ProbeWatcher {
   watchCanary(nonce: string, timeoutMs: number): CanaryWatch;
 }
 
+/**
+ * The principal a canary must come back FROM before it can prove anything:
+ * the broker's own Slack bot user (`auth.test` on the bot token that posts the
+ * canaries) and the channel it posts them to. The stamp and the nonce are
+ * content — quotable, copyable by any app in the channel — so they identify
+ * canary *traffic* but never settle a probe on their own.
+ */
+export interface CanaryIdentity {
+  userId: string;
+  channelId: string;
+}
+
+export class CanaryIdentityUnboundError extends Error {
+  constructor() {
+    super("the canary registry has no bound identity — bind the broker's Slack principal before probing");
+    this.name = "CanaryIdentityUnboundError";
+  }
+}
+
+/**
+ * One registry, two consumers with opposite error costs (hive#54's
+ * retrospective, `scar-split-the-predicate-by-consumer`):
+ *
+ * - {@link observe}'s RETURN VALUE classifies traffic — "is this envelope a
+ *   canary?" — so the ingress can keep it off the event clock. That must be
+ *   WIDE: the edit and delete echoes of a canary are still not conversation,
+ *   and counting one would make the next cycle read the link as busy and skip
+ *   the probe that would have proved it alive.
+ * - {@link observe}'s SIDE EFFECT settles a waiter, which is the watchdog's
+ *   entire liveness proof. That must be NARROW and fail closed: only the
+ *   original delivery of a message we posted, from our own principal, in our
+ *   probe channel, while a waiter for that nonce is still pending. A deletion
+ *   echo is not an arrival — a competing consumer may have taken the creation
+ *   event while this connection was handed the independently distributed
+ *   deletion — and a stamped envelope from any other sender is a forgery.
+ */
 export class CanaryRegistry implements ProbeWatcher {
   /** Pending waiters, keyed by nonce. */
   private readonly waiters = new Map<string, (arrived: boolean) => void>();
+  private identity: CanaryIdentity | null = null;
+
+  /** Name the principal whose original messages may settle a waiter. */
+  bind(identity: CanaryIdentity): void {
+    this.identity = identity;
+  }
 
   /**
    * Register a one-shot waiter for a canary nonce. The probe calls this BEFORE
@@ -49,6 +91,9 @@ export class CanaryRegistry implements ProbeWatcher {
    * before `chat.postMessage`'s own HTTP response returns.
    */
   watchCanary(nonce: string, timeoutMs: number): CanaryWatch {
+    // A waiter nobody can settle would time out as `silent` every round and
+    // escalate a healthy link — the failure this whole probe exists to prevent.
+    if (this.identity === null) throw new CanaryIdentityUnboundError();
     let settle!: (arrived: boolean) => void;
     const arrived = new Promise<boolean>((resolve) => { settle = resolve; });
     const finish = (seen: boolean): void => {
@@ -68,18 +113,39 @@ export class CanaryRegistry implements ProbeWatcher {
   }
 
   /**
-   * True when this envelope is one of the app's own canaries — settling its
-   * waiter if one is still pending. True for ANY canary-stamped envelope, not
+   * True when this envelope is canary traffic — ANY canary-stamped shape, not
    * only a nonce we are waiting on, because a canary is never channel activity:
-   * the arrival, a late one past its deadline, and one left over from a previous
-   * broker process all belong to the probe, not to the conversation.
+   * the arrival, a late one past its deadline, one left over from a previous
+   * broker process, and the echo of reaping one all belong to the probe, not
+   * to the conversation.
+   *
+   * A pending waiter is settled only by the original posted-message shape
+   * from the bound principal in the bound channel (see the class doc).
    */
   observe(body: unknown): boolean {
     const nonce = canaryNonceOf(body);
     if (nonce === null) return false;
-    this.waiters.get(nonce)?.(true);
+    if (this.identity !== null && isOwnOriginalCanary(body, nonce, this.identity)) {
+      this.waiters.get(nonce)?.(true);
+    }
     return true;
   }
+}
+
+/**
+ * The narrow shape that may settle a waiter: a plain `message` event (no
+ * subtype — `message_changed` and `message_deleted` carry the stamp under
+ * `message`/`previous_message`, never at the top level), in the probe channel,
+ * from the broker's own bot user, whose own top-level metadata carries `nonce`.
+ */
+function isOwnOriginalCanary(body: unknown, nonce: string, identity: CanaryIdentity): boolean {
+  const event = record(record(body)?.event);
+  if (!event) return false;
+  if (event.type !== "message" || event.subtype !== undefined) return false;
+  if (event.channel !== identity.channelId || event.user !== identity.userId) return false;
+  const metadata = record(event.metadata);
+  if (metadata?.event_type !== PROBE_EVENT_TYPE) return false;
+  return record(metadata.event_payload)?.nonce === nonce;
 }
 
 /**

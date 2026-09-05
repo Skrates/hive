@@ -84,13 +84,17 @@ program.command("broker")
         + "— quiet and deaf will be indistinguishable, as they were before KRA-1357",
       );
     }
-    const probe = probeChannelId
-      ? new SlackLinkProbe(
-        new SlackCanaryPoster(config.HIVE_SLACK_BOT_TOKEN, probeChannelId),
-        slack,
-        (message) => console.error(message),
-      )
-      : null;
+    let probe: SlackLinkProbe | null = null;
+    if (probeChannelId) {
+      const poster = new SlackCanaryPoster(config.HIVE_SLACK_BOT_TOKEN, probeChannelId);
+      // Bind the canary identity before the first cycle can run: only the
+      // broker's own bot user, in this channel, may settle a probe. A failure
+      // here is a startup failure — Socket Mode needs the same Slack reach.
+      const identity = await poster.identify();
+      slack.expectCanariesFrom(identity);
+      console.error(`[watchdog] canaries authenticated as bot user ${identity.userId} in ${identity.channelId}`);
+      probe = new SlackLinkProbe(poster, slack, (message) => console.error(message));
+    }
     const watchdog = new SlackDeafnessWatchdog({
       lastEventAt: () => slack.lastEventAt(),
       lastConnectAt: () => slack.lastConnectAt(),
