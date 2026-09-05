@@ -5,10 +5,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  ActorCaseCollisionError,
   BrokerStore,
   DISPATCHED_OUTCOME_GRACE_MS,
   InvalidTransitionError,
   LegacyDatabaseError,
+  SeatWakeRefusedError,
   StaleLeaseError,
 } from "./store.js";
 import { frameWakeInstruction, retryBackoffMs, SubscriptionInputSchema, type SlackEventInput, type SubscriptionInput } from "../domain.js";
@@ -708,5 +710,419 @@ test("claimNext skips actors the claiming edge declared busy", () => {
   assert.equal(store.getDelivery(1).status, "pending");
   // Once the turn ends the same claim succeeds.
   assert.equal(store.claimNext("mac", 0, [])?.claimedBy, "mac");
+  store.close();
+});
+
+/**
+ * KRA-1097 fixture: `ariadne` is executing a delivery (the minting seat) and
+ * `gnomon` is enrolled as a peer she can address.
+ */
+function mintFixture() {
+  const { store, clock } = fixture();
+  store.upsertSubscription(subscription({
+    actor: "gnomon",
+    provider: "claude",
+    homeEdge: "dev",
+    sessionId: null,
+    wakePolicy: "spawn",
+    accountProfile: "/home/hive/.hive/profiles/gnomon",
+  }));
+  store.ingestEvent(event());
+  const source = store.claimNext("mac", 0)!;
+  const mint = (
+    input: { sourceDeliveryId: number; actor: string; text: string; threadTs: string | null; generation?: number },
+    edgeId = "mac",
+  ) => store.mintSeatWake(
+    { ...input, generation: input.generation ?? source.leaseGeneration! },
+    edgeId,
+  );
+  return { store, clock, sourceId: source.id, generation: source.leaseGeneration!, mint };
+}
+
+test("a seat mint commits the delivery and its commons render in one transaction", () => {
+  const { store, sourceId, mint } = mintFixture();
+
+  const receipt = mint({
+    sourceDeliveryId: sourceId,
+    actor: "gnomon",
+    text: "please verify the KRA-1056 gate set",
+    threadTs: null,
+  });
+
+  // Attribution is read from the ledger — the caller never names a sender.
+  assert.equal(receipt.from, "ariadne");
+  assert.equal(receipt.actor, "gnomon");
+  assert.equal(receipt.created, true);
+  // The wake lands in the minting seat's own thread by default, which is what
+  // makes the receiver's outcome relay back to where the handoff happened.
+  assert.equal(receipt.channelId, "C1");
+  assert.equal(receipt.threadTs, "100.1");
+
+  // The delivery is authoritative in the ledger (INV-48 spirit) ...
+  const minted = store.getDelivery(receipt.deliveryId);
+  assert.equal(minted.actor, "gnomon");
+  assert.equal(minted.status, "pending");
+  assert.equal(minted.event.senderId, "ariadne");
+  assert.equal(minted.event.senderKind, "seat");
+  assert.equal(minted.event.text, "please verify the KRA-1056 gate set");
+
+  // ... and the human-visible render is already queued in the same commit,
+  // naming both ends. It goes out through the ordinary outbox, which stamps
+  // every post `hive_*` — so Slack admission drops it and it can never be
+  // re-ingested as a wake.
+  const render = store.listUnsentOutbox().find((entry) => entry.deliveryId === receipt.deliveryId)!;
+  assert.match(render.text, /wake minted by ariadne → gnomon/);
+  assert.match(render.text, /please verify the KRA-1056 gate set/);
+  assert.equal(render.channelId, "C1");
+  assert.equal(render.threadTs, "100.1");
+  store.close();
+});
+
+test("a minted wake frames its sender as a seat, not as an operator", () => {
+  const { store, sourceId, mint } = mintFixture();
+  const receipt = mint({
+    sourceDeliveryId: sourceId,
+    actor: "gnomon",
+    text: "burn the findings on #1069",
+    threadTs: null,
+  });
+
+  const framed = frameWakeInstruction(store.getDelivery(receipt.deliveryId), null, "edge");
+  assert.match(framed, /^Message from seat ariadne in Slack thread C1\/100\.1/);
+  // Completion-tracking is the same contract operator wakes get: the receiver's
+  // final response is relayed, so it must not also run `hive reply`.
+  assert.match(framed, /make your final response a concise outcome summary/);
+  store.close();
+});
+
+test("a replayed mint is a no-op that names the original delivery", () => {
+  const { store, sourceId, mint } = mintFixture();
+  const input = { sourceDeliveryId: sourceId, actor: "gnomon", text: "same text", threadTs: null };
+
+  const first = mint(input);
+  const second = mint(input);
+
+  assert.equal(second.deliveryId, first.deliveryId);
+  assert.equal(second.created, false);
+  // Exactly one render — a lost CLI response must not double-post the handoff.
+  const renders = store.listUnsentOutbox().filter((entry) => /wake minted by/.test(entry.text));
+  assert.equal(renders.length, 1);
+
+  // Different text from the same source is a genuinely new wake, and coalesces
+  // into the still-pending delivery exactly as a second Slack wake would.
+  const third = mint({ ...input, text: "different text" });
+  assert.equal(third.created, true);
+  assert.equal(third.deliveryId, first.deliveryId);
+  assert.equal(store.listUnsentOutbox().filter((entry) => /wake minted by/.test(entry.text)).length, 2);
+  store.close();
+});
+
+test("a replayed mint still answers after the source delivery terminalizes", () => {
+  const { store, sourceId, mint } = mintFixture();
+  const input = { sourceDeliveryId: sourceId, actor: "gnomon", text: "same text", threadTs: null };
+
+  const first = mint(input);
+  const source = store.getDelivery(sourceId);
+  store.finish(sourceId, "mac", source.leaseGeneration!, "processed", []);
+
+  // The guarantee exists precisely for this retry: the CLI response was lost,
+  // and by the time the seat replays the command its own source delivery has
+  // terminalized. The custody fences guard fresh mints only.
+  const second = mint(input);
+  assert.equal(second.deliveryId, first.deliveryId);
+  assert.equal(second.created, false);
+  const renders = store.listUnsentOutbox().filter((entry) => /wake minted by/.test(entry.text));
+  assert.equal(renders.length, 1);
+  store.close();
+});
+
+test("a coalesced seat wake is framed as seat text, not operator text", () => {
+  const { store, sourceId, mint } = mintFixture();
+  const input = { sourceDeliveryId: sourceId, actor: "gnomon", text: "first wake", threadTs: null };
+  const first = mint(input);
+  const second = mint({ ...input, text: "second wake, coalesced" });
+  assert.equal(second.deliveryId, first.deliveryId);
+
+  const framed = frameWakeInstruction(store.getDelivery(first.deliveryId), null, "edge");
+  assert.match(framed, /^Message from seat ariadne /);
+  assert.match(framed, /Additional message from seat ariadne in the same thread/);
+  store.close();
+});
+
+test("an undeliverable mint throws and leaves no trace of itself", () => {
+  const { store, sourceId, mint } = mintFixture();
+
+  // R-3: no live subscription means this wake would reach no one. It fails to
+  // the minting seat instead of dead-lettering as a notice nobody is waiting on.
+  assert.throws(
+    () => mint({ sourceDeliveryId: sourceId, actor: "theoros", text: "hi", threadTs: null }),
+    (error: unknown) => error instanceof SeatWakeRefusedError && error.code === "unroutable_actor",
+  );
+  // The whole transaction rolled back: a refused mint never leaves an orphan
+  // event row behind to be counted, coalesced into, or rendered later.
+  assert.equal(store.listUnsentOutbox().length, 0);
+  assert.equal(
+    (store as unknown as { db: { prepare(sql: string): { get(): { n: number } } } }).db
+      .prepare("SELECT COUNT(*) AS n FROM slack_events WHERE sender_kind='seat'").get().n,
+    0,
+  );
+
+  // A seat cannot broadcast: `everyone` expansion stays a human-sender act.
+  assert.throws(
+    () => mint({ sourceDeliveryId: sourceId, actor: "everyone", text: "all hands", threadTs: null }),
+    (error: unknown) => error instanceof SeatWakeRefusedError && error.code === "broadcast_forbidden",
+  );
+  // A seat cannot wake itself: each minted run could mint again, forever, with
+  // no operator in the loop.
+  assert.throws(
+    () => mint({ sourceDeliveryId: sourceId, actor: "ariadne", text: "again", threadTs: null }),
+    (error: unknown) => error instanceof SeatWakeRefusedError && error.code === "self_mint_forbidden",
+  );
+  // A source delivery that is not in the ledger resolves no minting seat.
+  assert.throws(
+    () => mint({ sourceDeliveryId: 9_999, actor: "gnomon", text: "hi", threadTs: null }),
+    (error: unknown) => error instanceof SeatWakeRefusedError && error.code === "unknown_source_delivery",
+  );
+  // A malformed --thread is refused here, before Slack is asked.
+  assert.throws(
+    () => mint({ sourceDeliveryId: sourceId, actor: "gnomon", text: "hi", threadTs: "not-a-thread" }),
+    (error: unknown) => error instanceof SeatWakeRefusedError && error.code === "invalid_thread",
+  );
+  store.close();
+});
+
+test("a minted delivery stamps no reaction, but still stamps a real message it absorbs", () => {
+  const { store, sourceId, mint } = mintFixture();
+  const receipt = mint({
+    sourceDeliveryId: sourceId,
+    actor: "gnomon",
+    text: "take KRA-1099",
+    threadTs: null,
+  });
+
+  const claimed = store.claimNext("dev", 0)!;
+  assert.equal(claimed.id, receipt.deliveryId);
+  store.transition(claimed.id, "dev", claimed.leaseGeneration!, "claimed", "accepted_local");
+  store.transition(claimed.id, "dev", claimed.leaseGeneration!, "accepted_local", "dispatching");
+  store.markDispatched(claimed.id, "dev", claimed.leaseGeneration!);
+
+  // The mint's ledger row predates its commons render, so it carries a `mint:`
+  // pseudo-ts rather than a Slack `ts`. Stamping that would be a guaranteed
+  // reactions.add failure against a message that does not exist, so the receipt
+  // posts its text with no stamp at all.
+  const dispatched = store.listUnsentOutbox().find((entry) => /delivered to gnomon/.test(entry.text))!;
+  assert.equal(dispatched.reaction, null);
+  assert.deepEqual(dispatched.reactionTargets, []);
+
+  // The receiver's outcome still relays to the minting seat's thread — that is
+  // what makes a seat→seat handoff answerable in the place it was asked.
+  store.recordOutcome(claimed.id, "verified: gate set holds");
+  const outcome = store.listUnsentOutbox().find((entry) => /verified: gate set holds/.test(entry.text))!;
+  assert.equal(outcome.channelId, "C1");
+  assert.equal(outcome.threadTs, "100.1");
+  store.close();
+});
+
+test("a real Slack message coalesced into a minted delivery is still stamped", () => {
+  const { store, sourceId, mint } = mintFixture();
+  const receipt = mint({
+    sourceDeliveryId: sourceId,
+    actor: "gnomon",
+    text: "take KRA-1099",
+    threadTs: null,
+  });
+  // An operator follows up in the thread while the minted wake is still pending.
+  store.ingestEvent(event({ eventId: "Ev-followup", messageTs: "100.9", actor: "gnomon", text: "and check CI" }));
+
+  const claimed = store.claimNext("dev", 0)!;
+  assert.equal(claimed.id, receipt.deliveryId);
+  store.transition(claimed.id, "dev", claimed.leaseGeneration!, "claimed", "accepted_local");
+  store.transition(claimed.id, "dev", claimed.leaseGeneration!, "accepted_local", "dispatching");
+  store.markDispatched(claimed.id, "dev", claimed.leaseGeneration!);
+
+  // Only the pseudo-ts is filtered; the operator's real message is stamped as always.
+  const dispatched = store.listUnsentOutbox().find((entry) => /delivered to gnomon/.test(entry.text))!;
+  assert.equal(dispatched.reaction, "eyes");
+  assert.deepEqual(dispatched.reactionTargets, ["100.9"]);
+  store.close();
+});
+
+test("a mint can target another thread in the same channel", () => {
+  const { store, sourceId, mint } = mintFixture();
+  const receipt = mint({
+    sourceDeliveryId: sourceId,
+    actor: "gnomon",
+    text: "picking this up over here",
+    threadTs: "200.1",
+  });
+
+  assert.equal(receipt.threadTs, "200.1");
+  assert.equal(receipt.channelId, "C1");
+  const minted = store.getDelivery(receipt.deliveryId);
+  assert.equal(minted.event.threadTs, "200.1");
+  // The render follows the delivery, so the commons sees the handoff where it lands.
+  const render = store.listUnsentOutbox().find((entry) => entry.deliveryId === receipt.deliveryId)!;
+  assert.equal(render.threadTs, "200.1");
+  // Thread affinity now routes follow-ups in that thread to the woken seat.
+  assert.deepEqual(store.actorsBoundToThread("C1", "200.1"), ["gnomon"]);
+  store.close();
+});
+
+test("a mint binds the source delivery to the calling edge's current fence", () => {
+  const { store, sourceId, mint } = mintFixture();
+  const input = { sourceDeliveryId: sourceId, actor: "gnomon", text: "from this fence", threadTs: null };
+
+  // Another authenticated edge cannot mint from this delivery, even though
+  // the id is in the ledger — attribution would otherwise be stolen.
+  assert.throws(
+    () => mint(input, "dev"),
+    (error: unknown) => error instanceof SeatWakeRefusedError && error.code === "source_not_held",
+  );
+
+  // An unclaimed delivery is not a fenced execution.
+  store.ingestEvent(event({ eventId: "Ev-pending", messageTs: "100.8", text: "WAKE: ariadne | later" }));
+  const pendingId = store.listDeliveries().find((delivery) => delivery.status === "pending")!.id;
+  assert.throws(
+    () => mint({ ...input, sourceDeliveryId: pendingId }),
+    (error: unknown) => error instanceof SeatWakeRefusedError && error.code === "source_not_held",
+  );
+
+  // A terminal delivery can no longer name a minting seat.
+  const source = store.getDelivery(sourceId);
+  store.transition(sourceId, "mac", source.leaseGeneration!, "claimed", "accepted_local");
+  store.transition(sourceId, "mac", source.leaseGeneration!, "accepted_local", "dispatching");
+  store.markDispatched(sourceId, "mac", source.leaseGeneration!);
+  store.finish(sourceId, "mac", source.leaseGeneration!, "processed", []);
+  assert.throws(
+    () => mint(input),
+    (error: unknown) => error instanceof SeatWakeRefusedError && error.code === "source_not_held",
+  );
+  store.close();
+});
+
+test("a mint is bound to one live dispatch, not merely to the calling machine", () => {
+  const { store, clock, sourceId, generation, mint } = mintFixture();
+  const input = { sourceDeliveryId: sourceId, actor: "gnomon", text: "from this dispatch", threadTs: null };
+
+  // The r4 finding: `claimed_by === edgeId` authenticates the machine, and one
+  // edge claims for many actors by design. Custody now goes through
+  // assertLease, so a generation this dispatch does not hold is refused even
+  // though the delivery IS claimed, by this edge, in a fenced status — the
+  // exact state the old predicate accepted.
+  assert.throws(
+    () => mint({ ...input, generation: generation + 1 }),
+    (error: unknown) => error instanceof SeatWakeRefusedError && error.code === "source_not_held",
+  );
+
+  // The stale-child half: the turn's own generation stops minting once the
+  // lease behind it has expired, rather than staying good for as long as the
+  // row sits in a fenced status.
+  clock.advance(30_001);
+  assert.throws(
+    () => mint(input),
+    (error: unknown) => error instanceof SeatWakeRefusedError && error.code === "source_not_held",
+  );
+
+  // And nothing was written on the way to either refusal.
+  assert.equal(store.listDeliveries().filter((delivery) => delivery.actor === "gnomon").length, 0);
+  assert.equal(store.listUnsentOutbox().length, 0);
+  store.close();
+});
+
+test("a persisted mixed-case actor is canonicalized in place, across every table that keys by it", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "hive-actor-case-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const path = join(directory, "broker.sqlite");
+
+  const clock = new FakeClock(new Date("2026-07-12T00:00:00.000Z"));
+  const first = new BrokerStore(path, clock);
+  first.createEdge("mac");
+  first.upsertSubscription(subscription({ actor: "gnomon" }));
+  first.ingestEvent(event({ actor: "gnomon", text: "WAKE: gnomon | hello" }));
+  const deliveryId = first.listDeliveries()[0]!.id;
+  first.claimNext("mac", 0);
+  // Rewrite the enrolled name to the shape a pre-canonicalization broker wrote:
+  // the schema cannot produce it any more, but a live v5 database can hold it.
+  first.db.pragma("foreign_keys = OFF");
+  for (const table of ["subscriptions", "deliveries", "slack_events", "actor_leases"]) {
+    first.db.prepare(`UPDATE ${table} SET actor='Gnomon' WHERE actor='gnomon'`).run();
+  }
+  first.db.prepare("UPDATE deliveries SET coalesce_key='Gnomon:C1:100.1'").run();
+  first.db.prepare("INSERT INTO event_targets(raw_event_id, actors_json, frozen_at) VALUES (?, ?, ?)")
+    .run("Ev-frozen", JSON.stringify(["Gnomon"]), "2026-07-12T00:00:00.000Z");
+  first.close();
+
+  const reopened = new BrokerStore(path, clock);
+  t.after(() => reopened.close());
+
+  // The row the lookups can now reach — before this migration it was live,
+  // unroutable and undeletable, and re-enrolling made a second row.
+  assert.ok(reopened.getSubscription("gnomon"));
+  assert.equal(reopened.getDelivery(deliveryId).actor, "gnomon");
+  // Every actor-keyed table moves together: a subscription-only rewrite would
+  // leave the same defect one table over.
+  const leases = reopened.db.prepare("SELECT actor FROM actor_leases").all() as { actor: string }[];
+  assert.deepEqual(leases.map((row) => row.actor), ["gnomon"]);
+  const events = reopened.db.prepare("SELECT actor FROM slack_events").all() as { actor: string }[];
+  assert.deepEqual(events.map((row) => row.actor), ["gnomon"]);
+  // Derived data moves with it: a stale coalesce key would stop this thread's
+  // next message folding into its own pending delivery.
+  assert.equal(reopened.getDelivery(deliveryId).coalesceKey, "gnomon:C1:100.1");
+  const frozen = reopened.db.prepare("SELECT actors_json FROM event_targets WHERE raw_event_id='Ev-frozen'")
+    .get() as { actors_json: string };
+  assert.deepEqual(JSON.parse(frozen.actors_json), ["gnomon"]);
+  // Re-enrolling updates the row instead of writing a lowercase twin beside it.
+  reopened.upsertSubscription(subscription({ actor: "gnomon" }));
+  assert.equal((reopened.db.prepare("SELECT count(*) AS n FROM subscriptions").get() as { n: number }).n, 1);
+  // And the retire path reaches it again: before the migration it found no row
+  // and answered `false` — an actor that could not be deleted by any name.
+  assert.throws(
+    () => reopened.deleteSubscription("gnomon"),
+    (error: unknown) => error instanceof InvalidTransitionError && new RegExp(`delivery ${deliveryId}`).test(error.message),
+  );
+});
+
+test("two case-variant enrollments stop the broker instead of being merged", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "hive-actor-collision-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const path = join(directory, "broker.sqlite");
+
+  const first = new BrokerStore(path);
+  first.createEdge("mac");
+  first.upsertSubscription(subscription({ actor: "gnomon" }));
+  first.db.prepare("INSERT INTO subscriptions SELECT 'Gnomon', provider, provider_surface, provider_version, "
+    + "session_id, home_edge, workspace, edge_workspaces_json, wake_policy, permission_profile, account_profile, "
+    + "lease_ttl_ms, delivery_ttl_ms, home_grace_ms, spawn_rate_limit, max_attempts, expires_at, updated_at "
+    + "FROM subscriptions WHERE actor='gnomon'").run();
+  first.close();
+
+  // Two enrollments differing only by case are two rows a human made. Merging
+  // them is a data decision a migration has no standing to take (R-3).
+  assert.throws(
+    () => new BrokerStore(path),
+    (error: unknown) => error instanceof ActorCaseCollisionError && /Gnomon/.test(error.message),
+  );
+});
+
+test("subscription actors are stored under the same canonical key wake targets use", () => {
+  const parsed = SubscriptionInputSchema.parse(subscription({ actor: "Gnomon" }));
+  assert.equal(parsed.actor, "gnomon");
+
+  const { store, sourceId, mint } = mintFixture();
+  store.upsertSubscription(SubscriptionInputSchema.parse(subscription({
+    actor: "Theoros",
+    provider: "claude",
+    homeEdge: "dev",
+    sessionId: null,
+    wakePolicy: "spawn",
+    accountProfile: "/home/hive/.hive/profiles/theoros",
+  })));
+  const receipt = mint({
+    sourceDeliveryId: sourceId,
+    actor: "Theoros",
+    text: "mixed-case target must resolve",
+    threadTs: null,
+  });
+  assert.equal(receipt.actor, "theoros");
   store.close();
 });

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { frameWakeInstruction, type Delivery, type Provider, type Reason, type ReplaySnapshot } from "../domain.js";
 import { BrokerClient } from "./broker-client.js";
 import { LiveIngressRegistry, type LiveIngress } from "./live-registry.js";
@@ -8,6 +9,12 @@ import {
 } from "./providers.js";
 import { readWakeAttestation, type AttestationRead } from "./attestation.js";
 import { EdgeStore, bindingFor } from "./store.js";
+
+/** The delivery a live dispatch token speaks for, and the lease generation it is fenced at. */
+export interface MintSource {
+  deliveryId: number;
+  generation: number;
+}
 
 export interface EdgeTimers {
   set(callback: () => void, delayMs: number): unknown;
@@ -43,6 +50,22 @@ export class EdgeService {
   private readonly inFlight = new Set<Promise<void>>();
   /** Actors with a dispatch currently running — declared to the broker on claim so it never hands out a second concurrent turn for the same actor. */
   private readonly busyActors = new Set<string>();
+  /**
+   * KRA-1097: the mint capability of each headless dispatch this edge is
+   * currently running, `token → the delivery that token speaks for`.
+   *
+   * A child asks to mint by presenting the token its own dispatch was issued;
+   * it never names a delivery id. One edge runs turns for many actors over one
+   * owner-only socket, so an id in the request body would let any co-tenant
+   * seat — or a child still alive from a finished turn — mint under a peer's
+   * attribution. The entry lives exactly as long as the provider turn: issued
+   * before spawn, dropped when that turn settles, so a stale child's mint is
+   * refused rather than resolved against whatever the ledger now holds.
+   *
+   * In memory, deliberately: an edge restart releases every dispatch it was
+   * running, so a token that outlived the process must not survive either.
+   */
+  private readonly dispatchTokens = new Map<string, MintSource>();
 
   constructor(
     readonly broker: BrokerClient,
@@ -202,7 +225,7 @@ export class EdgeService {
 
       const dispatch = await this.withLeaseHeartbeat(
         current,
-        () => this.dispatch(current, replay, live, async () => {
+        () => this.dispatch(current, replay, live, generation, async () => {
           providerStarted = true;
           // The last uncovered cell of {live, headless} × {claim, provider-start}:
           // a headless child reads its profile when it spawns, which is several
@@ -359,10 +382,21 @@ export class EdgeService {
     return result as T;
   }
 
+  /**
+   * KRA-1097: resolve a child's mint capability to the delivery it may mint
+   * from. Null for an unknown or already-settled token — the control plane
+   * turns that into a loud refusal rather than falling back to a caller-named
+   * delivery.
+   */
+  resolveMintSource(token: string): MintSource | null {
+    return this.dispatchTokens.get(token) ?? null;
+  }
+
   private async dispatch(
     delivery: Delivery,
     replay: ReplaySnapshot | null,
     live: LiveIngress | null,
+    generation: number,
     // Awaited: the headless branch re-reads the profile attestation here, and
     // that read is now off the event loop. The rebind must land before the
     // provider starts, so the start waits for it.
@@ -387,14 +421,24 @@ export class EdgeService {
     const workspace = subscription.edgeWorkspaces.find((item) => item.edgeId === this.broker.edgeId);
     if (!workspace) throw new PreDispatchError("workspace_not_mapped");
     const framed = frameWakeInstruction(delivery, replay, "edge");
-    if (subscription.sessionId && this.broker.edgeId === subscription.homeEdge) {
+    // The mint capability is scoped to this provider turn and revoked the
+    // moment it ends — a child that outlives its dispatch cannot mint from a
+    // delivery the edge no longer holds.
+    const token = randomUUID();
+    this.dispatchTokens.set(token, { deliveryId: delivery.id, generation });
+    const context = { deliveryId: delivery.id, token };
+    try {
+      if (subscription.sessionId && this.broker.edgeId === subscription.homeEdge) {
+        await onProviderStart();
+        return await adapter.resume(subscription, workspace.cwd, framed, context);
+      }
+      if (subscription.wakePolicy === "resume") throw new PreDispatchError("resume_target_missing");
+      if (!await this.broker.reserveSpawn(delivery)) throw new PreDispatchError("spawn_rate_limited");
       await onProviderStart();
-      return adapter.resume(subscription, workspace.cwd, framed);
+      return await adapter.spawn(subscription, workspace.cwd, framed, context);
+    } finally {
+      this.dispatchTokens.delete(token);
     }
-    if (subscription.wakePolicy === "resume") throw new PreDispatchError("resume_target_missing");
-    if (!await this.broker.reserveSpawn(delivery)) throw new PreDispatchError("spawn_rate_limited");
-    await onProviderStart();
-    return adapter.spawn(subscription, workspace.cwd, framed);
   }
 }
 

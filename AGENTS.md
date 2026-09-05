@@ -19,6 +19,12 @@ invariants.
   thread-visible notice. Duplicates are tolerated and self-identifying (dedupe key + attempt).
 - Every wake produces two thread-visible events through the durable outbox: a delivery status and
   the agent's outcome (`hive reply`). Silence is a defect.
+- A seat addresses a peer with an explicit act (`hive wake <actor> "<text>"`), never by writing a
+  `WAKE:` line into an outcome — every Hive post is `hive_*`-stamped and dropped at admission, so
+  text position can never carry intent. The seat never names its source: the edge issues each turn a
+  capability, resolves the delivery itself, and the broker reads attribution from that ledger row
+  under the same lease fence every delivery act uses. The ledger commits before the commons render,
+  and an undeliverable mint fails loudly.
 - A wake executes under the subscription's pinned account profile; a missing profile is a hard
   pre-dispatch failure, never a fallback.
 - `resume` never escalates to `spawn`.

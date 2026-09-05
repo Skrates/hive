@@ -11,16 +11,16 @@ import { BrokerService } from "./broker/service.js";
 import { SlackSocketIngress, SlackWebTransport } from "./broker/slack.js";
 import { BrokerStore } from "./broker/store.js";
 import { SlackDeafnessWatchdog } from "./broker/watchdog.js";
-import { SubscriptionInputSchema, type Delivery } from "./domain.js";
+import { SubscriptionInputSchema, type Delivery, type SeatWakeReceipt } from "./domain.js";
 import { ensureEdgeStateDirs } from "./edge/bootstrap.js";
 import { BrokerClient } from "./edge/broker-client.js";
 import { EdgeControlServer } from "./edge/control.js";
 import { LiveIngressRegistry } from "./edge/live-registry.js";
 import { ProxyAgent, setGlobalDispatcher } from "undici";
-import { ClaudeProvider, CodexProvider, GrokProvider } from "./edge/providers.js";
+import { ClaudeProvider, CodexProvider, GrokProvider, resolveEdgeSocketPath } from "./edge/providers.js";
 import { EdgeService } from "./edge/service.js";
 import { EdgeStore } from "./edge/store.js";
-import { udsRequestJson } from "./local/uds.js";
+import { udsRequestJson, UdsHttpError } from "./local/uds.js";
 import {
   assertCodexAttachmentActor,
   CODEX_ATTACHMENT_CONFIRMATION_TIMEOUT_MS,
@@ -107,7 +107,7 @@ program.command("edge")
     const config = EdgeConfig.parse(process.env);
     if (config.HIVE_BROKER_PROXY) setGlobalDispatcher(new ProxyAgent(config.HIVE_BROKER_PROXY));
     const ingressRoot = config.HIVE_INGRESS_DIR ?? join(hiveHome(), "ingress");
-    const socketPath = config.HIVE_EDGE_SOCKET ?? join(hiveHome(), "edge.sock");
+    const socketPath = resolveEdgeSocketPath();
     // A fresh machine has no ~/.hive/ tree; better-sqlite3 and the control
     // socket both refuse to open into a missing directory. Bootstrap the state
     // dirs before anything opens them.
@@ -139,9 +139,49 @@ program.command("reply")
   .action(async (deliveryId: string, text: string[]) => {
     const id = Number(deliveryId);
     if (!Number.isInteger(id) || id < 1) throw new Error("delivery-id must be a positive integer");
-    const socketPath = process.env.HIVE_EDGE_SOCKET ?? join(hiveHome(), "edge.sock");
+    const socketPath = resolveEdgeSocketPath();
     await udsRequestJson(socketPath, "POST", "/outcome", { deliveryId: id, text: text.join(" ") });
     process.stdout.write(`outcome recorded for delivery ${id}\n`);
+  });
+
+program.command("wake")
+  .argument("<actor>", "the peer seat to wake")
+  .argument("<text...>", "the instruction to deliver")
+  .option("--thread <thread-ts>", "target thread in the source delivery's channel (default: that delivery's thread)")
+  .description("mint a wake for a peer seat (KRA-1097)")
+  .action(async (actor: string, text: string[], options: { thread?: string }) => {
+    // The minting seat is named by the delivery it is executing, and that
+    // delivery is named by the EDGE, not by this command: the turn's capability
+    // is all the caller presents. A seat therefore cannot name a source at all,
+    // so it can neither forge an attribution nor lose one — on a box where
+    // several seats share one edge and one socket, an id in the request would
+    // have been exactly that forgery.
+    const token = process.env.HIVE_DELIVERY_TOKEN;
+    if (!token) {
+      throw new Error(
+        "no dispatch token: `hive wake` mints from a turn this edge is running, which exports "
+        + "HIVE_DELIVERY_TOKEN. A live-delivered turn holds no per-dispatch capability and cannot mint "
+        + "(KRA-1118); ask the human in the thread instead.",
+      );
+    }
+    const socketPath = resolveEdgeSocketPath();
+    let receipt: SeatWakeReceipt;
+    try {
+      receipt = await udsRequestJson<SeatWakeReceipt>(socketPath, "POST", "/wake", {
+        token,
+        actor,
+        text: text.join(" "),
+        threadTs: options.thread ?? null,
+      });
+    } catch (error) {
+      // R-3: a mint that could not be delivered says so, loudly and non-zero.
+      // Never "posted" with nothing behind it.
+      if (error instanceof UdsHttpError) throw new Error(`hive wake refused: ${refusalDetail(error.responseBody)}`);
+      throw error;
+    }
+    process.stdout.write(receipt.created
+      ? `minted delivery ${receipt.deliveryId}: ${receipt.from} → ${receipt.actor} in ${receipt.channelId}/${receipt.threadTs}\n`
+      : `already minted as delivery ${receipt.deliveryId}: ${receipt.from} → ${receipt.actor} (identical text, nothing re-sent)\n`);
   });
 
 program.command("attach")
@@ -279,6 +319,23 @@ const EdgeConfig = z.object({
    */
   HIVE_BROKER_PROXY: z.string().url().optional(),
 });
+
+/**
+ * The reason a mint was refused, taken from the edge's relayed error envelope.
+ * A body that is not that envelope is surfaced raw rather than guessed at — the
+ * seat must always be able to see what actually happened.
+ */
+function refusalDetail(body: string): string {
+  try {
+    const value = JSON.parse(body) as { error?: unknown; detail?: unknown };
+    if (typeof value.error === "string") {
+      return typeof value.detail === "string" ? `${value.error} — ${value.detail}` : value.error;
+    }
+  } catch {
+    // fall through to the raw body below
+  }
+  return body.slice(0, 500);
+}
 
 function requiredEnv(name: string): string {
   const value = process.env[name];

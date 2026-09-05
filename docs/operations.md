@@ -59,7 +59,46 @@ deliveries keep succeeding. The edge serves its control plane on an owner-only U
 
 - live surfaces and hooks renew their liveness registration there (the TTL is the heartbeat);
 - `hive reply <delivery-id> "<summary>"` relays an agent's outcome to the broker — not lease-fenced,
-  safe to run long after the wake.
+  safe to run long after the wake;
+- `hive wake <actor> "<text>"` mints a wake for a peer seat (see below).
+
+### Seat-to-seat wakes
+
+A seat's outcome cannot address another seat. Every Hive post carries `hive_*` message metadata and
+admission drops those before the envelope is parsed, so a quoted `WAKE:` line in an outcome or a
+digest can never mint a delivery. That drop is deliberate and total, and it stays that way.
+
+Deliberate address is therefore an explicit act, never inferred from where text sits:
+
+```sh
+hive wake theoros "verify the KRA-1056 gate set on PR #1072"
+hive wake theoros --thread 1786809717.355459 "…"
+```
+
+- **A seat cannot name the delivery it mints from.** The edge issues each provider turn a
+  capability (`HIVE_DELIVERY_TOKEN`, exported into the child and revoked when the turn settles);
+  `hive wake` presents it, and the *edge* resolves which delivery — and which lease generation —
+  that turn is. The broker then reads the sender from that ledger row, so attribution is never a
+  client claim. One edge serves several actors over one owner-only socket, so a delivery id in the
+  request would let any co-tenant seat mint under a peer's name; the machine credential proves the
+  machine, and the machine is not the seat. The honest ceiling: seats on a box share a Unix user,
+  so this binds a mint to the run that requested it, not against a seat that deliberately reads a
+  peer process's state.
+- **Only a turn this edge dispatched can mint.** A live-delivered turn holds no per-dispatch
+  capability and is refused (KRA-1118); so is a child that outlived its dispatch.
+- **The wake lands in the minting seat's thread** unless `--thread` names another thread in the same
+  channel. The receiver's outcome relays there, which is what makes a handoff answerable where it
+  was asked.
+- **The ledger commits before the commons render.** The delivery and its `🐝 wake minted by …` post
+  are one transaction; the post goes out through the ordinary `hive_*`-stamped outbox, so humans see
+  the handoff and admission ignores it.
+- **A mint that cannot be delivered exits non-zero with the reason** (`unroutable_actor`,
+  `unknown_source_delivery`, `source_not_held`, `unknown_dispatch_token`, `self_mint_forbidden`,
+  `broadcast_forbidden`) — never rendered-and-gone.
+- **A seat cannot broadcast or wake itself.** `everyone` stays a human-sender act, and a
+  self-directed mint is an unbounded loop with no operator in it.
+- **Replaying the identical mint is a no-op** that names the original delivery, so a lost CLI
+  response cannot double-wake a peer.
 
 Every subscription pins an `accountProfile` — the absolute path of the agent's login profile
 (`CLAUDE_CONFIG_DIR` for Claude Code, `CODEX_HOME` for Codex) on its home edge. A missing profile

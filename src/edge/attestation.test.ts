@@ -90,6 +90,17 @@ test("empty attestation fields are incomplete, matching the wire parser's strict
   }
 });
 
+test("a mixed-case attestation actor binds to the migrated canonical delivery actor", async () => {
+  // hive#41 round-8 P2: the broker canonicalizes stored actor keys, but a
+  // pinned profile's attestation may still spell the seat as enrolled. The
+  // identity is the actor, not its spelling — no mismatch is recorded.
+  const read = await readWakeAttestation(profileWith(record({ actor: "Gnomon" })));
+  assert.equal(read.ok, true);
+  const binding = bindingFor(read, "gnomon");
+  assert.equal(binding.absence, null);
+  assert.equal(bindingFor(read, "theoros").absence, "attestation_actor_mismatch");
+});
+
 test("a profile installed for another seat keeps its evidence and flags the mismatch", async () => {
   // The 2026-08-15 scar: a seat dispatched from the wrong config dir. The id
   // is exactly what identifies the profile it actually ran, so it must be
