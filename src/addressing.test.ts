@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { isAdmitted, parseAddressedWake } from "./addressing.js";
+import { ACTOR_ID_PATTERN } from "./domain.js";
 
 test("WAKE envelope addresses exactly one normalized actor", () => {
   assert.deepEqual(parseAddressedWake("WAKE: Fable | review this\nbody"), {
@@ -46,7 +47,12 @@ test("a malformed token rejects the whole line — malformed is not an envelope,
   // A well-formed-but-unknown name still parses (it dead-letters downstream); a
   // token that fails the grammar after a comma poisons the whole envelope.
   assert.equal(parseAddressedWake("WAKE: fable, 9gnomon"), null);
+  assert.equal(parseAddressedWake("WAKE: 9gnomon | go"), null);
   assert.equal(parseAddressedWake("WAKE: fable,"), null);
+  // Enrollment and Slack addressing share ACTOR_ID_PATTERN, so a leading digit
+  // is not an enrolled actor the wake parser then drops.
+  assert.equal(ACTOR_ID_PATTERN.test("9gnomon"), false);
+  assert.equal(ACTOR_ID_PATTERN.test("gnomon"), true);
   // Unknown-but-well-formed still resolves — the routing layer decides its fate.
   assert.deepEqual(parseAddressedWake("WAKE: ghost")?.actors, ["ghost"]);
 });

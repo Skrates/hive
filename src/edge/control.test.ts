@@ -76,7 +76,7 @@ test("a live register carries the surface's runtime attestation", async (t) => {
   await server.start();
 
   await udsRequestJson(socketPath, "POST", "/live/register", {
-    actor: "codex-1",
+    actor: "ariadne",
     provider: "codex",
     socketPath: join(root, "codex-live.sock"),
     sessionId: "desktop-task",
@@ -86,10 +86,10 @@ test("a live register carries the surface's runtime attestation", async (t) => {
       ok: true,
       attestationId: "sha256:" + "d".repeat(64),
       doctrineCommit: "2".repeat(40),
-      actor: "codex-1",
+      actor: "ariadne",
     },
   });
-  const ingress = live.get("codex-1", "codex");
+  const ingress = live.get("ariadne", "codex");
   assert.ok(ingress);
   assert.equal(ingress.runtimeAttestation?.ok, true);
   if (ingress.runtimeAttestation?.ok) {
@@ -110,7 +110,7 @@ test("a register with no attestation field is recorded as having reported nothin
   await server.start();
 
   await udsRequestJson(socketPath, "POST", "/live/register", {
-    actor: "codex-1",
+    actor: "ariadne",
     provider: "codex",
     socketPath: join(root, "codex-live.sock"),
     sessionId: "rollout-task",
@@ -118,7 +118,7 @@ test("a register with no attestation field is recorded as having reported nothin
     ttlMs: 120_000,
   });
   assert.deepEqual(
-    live.get("codex-1", "codex")?.runtimeAttestation,
+    live.get("ariadne", "codex")?.runtimeAttestation,
     { ok: false, absence: "attestation_unreported" },
   );
 
@@ -127,7 +127,7 @@ test("a register with no attestation field is recorded as having reported nothin
   // session spanning a hook rollout is the shape; if the profile was replaced
   // in between, that id is not what the running turn loaded.
   await udsRequestJson(socketPath, "POST", "/live/register", {
-    actor: "codex-1",
+    actor: "ariadne",
     provider: "codex",
     socketPath: join(root, "codex-live.sock"),
     sessionId: "rollout-task",
@@ -137,11 +137,11 @@ test("a register with no attestation field is recorded as having reported nothin
       ok: true,
       attestationId: "sha256:" + "d".repeat(64),
       doctrineCommit: "2".repeat(40),
-      actor: "codex-1",
+      actor: "ariadne",
     },
   });
   assert.deepEqual(
-    live.get("codex-1", "codex")?.runtimeAttestation,
+    live.get("ariadne", "codex")?.runtimeAttestation,
     { ok: false, absence: "attestation_ambiguous" },
   );
 });
