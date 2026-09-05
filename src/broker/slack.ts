@@ -2,7 +2,7 @@ import { SocketModeClient } from "@slack/socket-mode";
 import { WebClient } from "@slack/web-api";
 import { isAdmitted, parseAddressedWake, type AdmissionPolicy } from "../addressing.js";
 import { EVERYONE, type ReplaySnapshot, type SlackEventInput } from "../domain.js";
-import { CanaryRegistry, PROBE_EVENT_TYPE, type CanaryWatch, type ProbeWatcher } from "./canary.js";
+import { CANARY_REQUEST_TIMEOUT_MS, CanaryRegistry, PROBE_EVENT_TYPE, type CanaryWatch, type ProbeWatcher } from "./canary.js";
 import type { ProbePoster } from "./probe.js";
 import type { BrokerService, SlackTransport } from "./service.js";
 
@@ -330,7 +330,15 @@ export class SlackCanaryPoster implements ProbePoster {
   private readonly web: WebClient;
 
   constructor(botToken: string, private readonly channelId: string) {
-    this.web = new WebClient(botToken);
+    this.web = new WebClient(botToken, {
+      // A canary is an experiment with a deadline, so none of the WebClient's
+      // patient defaults apply: a retried post is a new canary anyway, a
+      // rate-limited one has already missed its window, and an unbounded request
+      // would hold the watchdog cycle open long past it.
+      retryConfig: { retries: 0 },
+      rejectRateLimitedCalls: true,
+      timeout: CANARY_REQUEST_TIMEOUT_MS,
+    });
   }
 
   async postCanary(nonce: string): Promise<string> {

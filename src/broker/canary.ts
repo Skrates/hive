@@ -19,6 +19,14 @@ export const PROBE_EVENT_TYPE = "hive_watchdog_probe";
  */
 export const CANARY_MEMORY_MS = 60_000;
 
+/**
+ * Hard bound on one canary's HTTP call. The probe's own deadline is the
+ * authority on how long a canary may take; this only guarantees the socket
+ * underneath it cannot outlive that decision, since the Slack WebClient ships
+ * with no request timeout and a ~30-minute retry policy.
+ */
+export const CANARY_REQUEST_TIMEOUT_MS = 10_000;
+
 export interface CanaryWatch {
   /** Resolves true when the canary arrives over the link, false at `timeoutMs`. Never rejects. */
   arrived: Promise<boolean>;

@@ -21,13 +21,23 @@ interface PosterState {
 function makeProbe(options: {
   echo: "sync" | "async" | "never" | ((nonce: string, registry: CanaryRegistry) => void);
   postFails?: boolean;
+  /** The post never settles — the Slack SDK retrying for half an hour. */
+  postHangs?: boolean;
+  /** Slack delivered the canary, then the post's own response was lost. */
+  postFailsAfterDelivery?: boolean;
   deleteFails?: boolean;
 }): { probe: SlackLinkProbe; state: PosterState; registry: CanaryRegistry } {
   const state: PosterState = { posted: [], deleted: [], logs: [] };
   const registry = new CanaryRegistry();
   const poster: ProbePoster = {
     async postCanary(nonce) {
+      if (options.postHangs) return new Promise<string>(() => {});
       if (options.postFails) throw new Error("slack said no");
+      if (options.postFailsAfterDelivery) {
+        state.posted.push(nonce);
+        registry.observe({ event: { text: `canary ${nonce}` } });
+        throw new Error("response lost");
+      }
       state.posted.push(nonce);
       if (typeof options.echo === "function") options.echo(nonce, registry);
       // Sync: the envelope beats chat.postMessage's own HTTP response home.
@@ -109,4 +119,27 @@ test("a canary that cannot be reaped is logged and does not change the verdict",
   assert.equal(await probe.run(PROBE_MS), "alive");
   await settle();
   assert.ok(state.logs.some((line) => line.includes("could not be removed from the commons")));
+});
+
+test("a canary post that never settles is bounded by the probe window", async () => {
+  // The Slack WebClient retries for about half an hour by default. An unbounded
+  // post would hold the watchdog cycle in flight across many intervals and skip
+  // every one of them — disabling the detector this probe exists to serve.
+  const { probe, state } = makeProbe({ echo: "never", postHangs: true });
+  const startedAt = Date.now();
+  assert.equal(await probe.run(PROBE_MS), "unavailable");
+  assert.ok(Date.now() - startedAt < PROBE_MS * 4, "the round returns on its own deadline");
+  assert.deepEqual(state.posted, [], "the post never completed");
+  assert.ok(state.logs.some((line) => line.includes("could not be posted")));
+});
+
+test("a canary that arrives while its own post fails is proof, not an outage", async () => {
+  // Slack accepted the post and delivered the event; only the HTTP response was
+  // lost. Direct evidence that the link carried our traffic outranks that.
+  const { probe, state } = makeProbe({ echo: "never", postFailsAfterDelivery: true });
+  assert.equal(await probe.run(PROBE_MS), "alive");
+  assert.equal(state.posted.length, PROBE_CANARIES);
+  await settle();
+  assert.deepEqual(state.deleted, [], "no message ts came back, so nothing can be reaped");
+  assert.ok(state.logs.some((line) => line.includes("although its post failed")));
 });
