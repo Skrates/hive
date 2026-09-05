@@ -28,10 +28,13 @@ export const CANARY_MEMORY_MS = 60_000;
 export const CANARY_REQUEST_TIMEOUT_MS = 10_000;
 
 export interface CanaryWatch {
-  /** Resolves true when the canary arrives over the link, false at `timeoutMs`. Never rejects. */
+  /**
+   * Resolves true when the canary arrives over the link, false at `timeoutMs`.
+   * Never rejects, and there is deliberately no way to abandon it early: a
+   * canary keeps its whole window even when its own post failed, because Slack
+   * may have accepted that post and the event may still be in flight.
+   */
   arrived: Promise<boolean>;
-  /** Abandon the wait — the post failed, so nothing will ever arrive. */
-  cancel(): void;
 }
 
 export interface ProbeWatcher {
@@ -73,7 +76,7 @@ export class CanaryRegistry implements ProbeWatcher {
     const timer = setTimeout(() => finish(false), timeoutMs);
     this.waiters.set(nonce, finish);
     this.nonces.set(nonce, this.clock() + timeoutMs + CANARY_MEMORY_MS);
-    return { arrived, cancel: () => finish(false) };
+    return { arrived };
   }
 
   /**

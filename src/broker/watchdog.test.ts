@@ -34,6 +34,10 @@ interface PortState {
   probeThrows: boolean;
   /** Held by a test that needs a probe round still running when the next cycle fires. */
   probeGate: Promise<void> | null;
+  /** A reconnect that never returns — a hung disconnect or Socket Mode handshake. */
+  restartHangs: boolean;
+  /** A reconnect that rejects outright. */
+  restartThrows: boolean;
 }
 
 function makePort(overrides: Partial<PortState> = {}): { port: WatchdogPort; state: PortState } {
@@ -50,6 +54,8 @@ function makePort(overrides: Partial<PortState> = {}): { port: WatchdogPort; sta
     probes: 0,
     probeThrows: false,
     probeGate: null,
+    restartHangs: false,
+    restartThrows: false,
     ...overrides,
   };
   const port: WatchdogPort = {
@@ -64,6 +70,8 @@ function makePort(overrides: Partial<PortState> = {}): { port: WatchdogPort; sta
     },
     restart: async () => {
       state.restarts += 1;
+      if (state.restartHangs) return new Promise<void>(() => {});
+      if (state.restartThrows) throw new Error("socket refused to come back");
       // Production-faithful: SlackSocketIngress.start() stamps a `connected`
       // transition when the transport re-establishes, and events (if any) stamp
       // a separate event clock. The reconnect on its own never advances events.
@@ -280,4 +288,45 @@ test("a cycle that is still probing refuses the next one — silence is never co
   assert.equal(await first, "quiet_not_deaf");
   assert.equal(state.restarts, 0);
   assert.deepEqual(state.exits, []);
+});
+
+/** Short bounds so the deadline tests run in milliseconds, not seconds. */
+const FAST_PROBE_MS = 20;
+const FAST_RESTART_MS = 20;
+
+test("a forced reconnect that never returns does not wedge the cycle", async () => {
+  // `restart()` awaits a WebSocket disconnect and a Socket Mode handshake,
+  // neither bounded by the SDK. An unbounded await inside the single-flight
+  // cycle would leave `cycleInFlight` true forever and skip every later
+  // interval — the watchdog silently switched off.
+  const { port, state } = makePort({
+    lastEventMs: 1_000_000 - (STALE_MS + 1_000),
+    lastConnectMs: 1_000_000 - (STALE_MS + 1_000),
+    restartHangs: true,
+  });
+  const watchdog = new SlackDeafnessWatchdog(port, STALE_MS, FAST_PROBE_MS, FAST_RESTART_MS);
+  assert.equal(await watchdog.check(), "restarted");
+  assert.ok(state.logs.some((line) => line.includes("did not complete")));
+  // The cycle released, so the next one runs — and the hung reconnect left the
+  // connect clock stale, which is the wedged-transport evidence it exits on.
+  state.nowMs += STALE_MS;
+  assert.equal(await watchdog.check(), "exited");
+  assert.deepEqual(state.exits, [1]);
+});
+
+test("a forced reconnect that rejects is reported, not swallowed", async () => {
+  const { port, state } = makePort({
+    lastEventMs: 1_000_000 - (STALE_MS + 1_000),
+    lastConnectMs: 1_000_000 - (STALE_MS + 1_000),
+    restartThrows: true,
+  });
+  const watchdog = new SlackDeafnessWatchdog(port, STALE_MS, FAST_PROBE_MS, FAST_RESTART_MS);
+  assert.equal(await watchdog.check(), "restarted");
+  assert.ok(state.logs.some((line) => line.includes("did not complete")));
+  assert.ok(
+    state.logs.every((line) => !line.includes("socket refused to come back")),
+    "the error TYPE only — a transport error can carry body text",
+  );
+  state.nowMs += STALE_MS;
+  assert.equal(await watchdog.check(), "exited");
 });

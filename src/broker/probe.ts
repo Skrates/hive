@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { ProbeWatcher } from "./canary.js";
+import { withDeadline } from "./deadline.js";
 import { safeErrorName } from "./slack.js";
 
 /**
@@ -75,13 +76,12 @@ export class SlackLinkProbe {
     const watch = this.watcher.watchCanary(nonce, timeoutMs);
     let messageTs: string;
     try {
-      messageTs = await withDeadline(this.poster.postCanary(nonce), timeoutMs);
+      messageTs = await withDeadline(this.poster.postCanary(nonce), timeoutMs, "canary post");
     } catch (error) {
-      // The post failed — but Slack may still have accepted it and delivered the
-      // event before the response was lost. `cancel()` cannot overwrite a waiter
-      // that already settled, so an arrival survives it, and direct proof that
-      // the link carried our traffic outranks a failed HTTP call.
-      watch.cancel();
+      // The post failed — but Slack may have accepted it anyway, and the event
+      // may still be in flight. Abandoning the waiter here would forfeit the
+      // rest of its window, so the canary keeps its full deadline: an arrival is
+      // direct proof the link carried our traffic and outranks a failed call.
       if (await watch.arrived) {
         this.log(
           `[watchdog] canary ${index}/${PROBE_CANARIES} returned over the link although its post failed `
@@ -112,34 +112,5 @@ export class SlackLinkProbe {
       return "silent";
     }
     return "alive";
-  }
-}
-
-/** A canary post that outran the window its arrival was given. */
-class CanaryPostTimeout extends Error {
-  constructor() {
-    super("canary post exceeded the probe window");
-  }
-}
-
-/**
- * Bound one canary post by the same short window its arrival gets. The Slack
- * WebClient retries for about half an hour by default and has no request
- * timeout, so an unbounded post can outlive many watchdog intervals — and while
- * it is pending the cycle stays in flight and every later cycle is skipped,
- * silently disabling the very detector this probe serves.
- */
-async function withDeadline<T>(work: Promise<T>, ms: number): Promise<T> {
-  let timer: NodeJS.Timeout | undefined;
-  const deadline = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new CanaryPostTimeout()), ms);
-  });
-  // A rejection arriving after the deadline won the race must not surface as an
-  // unhandled rejection; the race already carried the outcome.
-  work.catch(() => {});
-  try {
-    return await Promise.race([work, deadline]);
-  } finally {
-    clearTimeout(timer);
   }
 }

@@ -42,11 +42,11 @@ test("the reaping echo of a settled canary is still recognised as ours", async (
   assert.equal(registry.observe(deletion), true, "the echo belongs to the canary, not to the channel");
 });
 
-test("a canary is forgotten once its memory window passes", () => {
+test("a canary is forgotten once its memory window passes", async () => {
   let nowMs = 1_000_000;
   const registry = new CanaryRegistry(() => nowMs);
   const watch = registry.watchCanary("nonce-1", TIMEOUT_MS);
-  watch.cancel();
+  assert.equal(await watch.arrived, false, "it never came home");
   nowMs += TIMEOUT_MS + CANARY_MEMORY_MS + 1;
   assert.equal(
     registry.observe(envelope("nonce-1")),
@@ -55,13 +55,12 @@ test("a canary is forgotten once its memory window passes", () => {
   );
 });
 
-test("a cancelled waiter resolves false and a late arrival cannot contradict it", async () => {
+test("a waiter that timed out is never rewritten by a late arrival", async () => {
   const registry = new CanaryRegistry();
   const watch = registry.watchCanary("nonce-1", TIMEOUT_MS);
-  watch.cancel();
-  assert.equal(await watch.arrived, false);
-  // The canary turns up anyway (its post failed but Slack delivered it): the
-  // registry still recognises it as ours, and settles nothing twice.
+  assert.equal(await watch.arrived, false, "the deadline passed");
+  // The canary turns up after its window: the registry still recognises it as
+  // ours (so it is not counted as channel activity) and settles nothing twice.
   assert.equal(registry.observe(envelope("nonce-1")), true);
   assert.equal(await watch.arrived, false, "a settled verdict is never rewritten");
 });

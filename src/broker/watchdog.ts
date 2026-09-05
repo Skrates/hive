@@ -1,3 +1,4 @@
+import { withDeadline } from "./deadline.js";
 import type { ProbeOutcome } from "./probe.js";
 
 /**
@@ -91,6 +92,16 @@ const MAX_DEAF_RECONNECTS = 2;
  */
 export const PROBE_TIMEOUT_MS = 15_000;
 
+/**
+ * How long a forced reconnect gets before the watchdog stops waiting on it.
+ * `restart()` awaits a WebSocket disconnect and a Socket Mode handshake, neither
+ * of which is bounded by the SDK; a hung one would hold the single-flight cycle
+ * open forever and skip every later interval. Abandoning the await is safe: it
+ * leaves the connect clock stale, which is exactly the wedged-transport evidence
+ * the next cycle exits on.
+ */
+export const RESTART_TIMEOUT_MS = 30_000;
+
 export class SlackDeafnessWatchdog {
   private staleStreak = 0;
   /** True while a cycle is running — a probe round can outlast a short interval. */
@@ -102,6 +113,7 @@ export class SlackDeafnessWatchdog {
     private readonly port: WatchdogPort,
     private readonly staleMs: number,
     private readonly probeTimeoutMs: number = PROBE_TIMEOUT_MS,
+    private readonly restartTimeoutMs: number = RESTART_TIMEOUT_MS,
   ) {}
 
   /**
@@ -202,8 +214,7 @@ export class SlackDeafnessWatchdog {
         + "— up-but-deaf (half-open recovered, or a second consumer is stealing the stream); reconnecting again "
         + `(attempt ${this.staleStreak} of ${MAX_DEAF_RECONNECTS} before exit)`,
       );
-      this.lastRestartMs = this.port.now();
-      await this.port.restart();
+      await this.forceRestart();
       return "reconnected_still_deaf";
     }
 
@@ -211,9 +222,26 @@ export class SlackDeafnessWatchdog {
       `[watchdog] no Slack events for ${idleLabel} (≥ ${staleLabel}) while subscriptions are live, and the link `
       + "did not carry our own canaries — forcing a Socket Mode reconnect",
     );
-    this.lastRestartMs = this.port.now();
-    await this.port.restart();
+    await this.forceRestart();
     return "restarted";
+  }
+
+  /**
+   * Force one reconnect, and never wait on it forever. A reconnect that hangs or
+   * throws is not a reason to hold the cycle open — the transport clock records
+   * what actually happened, and a reconnect that never re-established is read as
+   * wedged by the next cycle, which exits for the supervisor.
+   */
+  private async forceRestart(): Promise<void> {
+    this.lastRestartMs = this.port.now();
+    try {
+      await withDeadline(this.port.restart(), this.restartTimeoutMs, "socket restart");
+    } catch (error) {
+      this.port.log(
+        `[watchdog] the forced reconnect did not complete (${errorName(error)}) — abandoning it; the transport `
+        + "clock stays stale, so the next cycle reads it as wedged and exits for the supervisor",
+      );
+    }
   }
 
   /**
@@ -233,4 +261,13 @@ export class SlackDeafnessWatchdog {
     this.staleStreak = 0;
     this.lastRestartMs = null;
   }
+}
+
+/**
+ * The exception TYPE only. A restart or probe failure can carry Slack body text,
+ * so the message is dropped entirely rather than truncated.
+ */
+function errorName(error: unknown): string {
+  if (error instanceof Error) return error.constructor.name;
+  return "non-error thrown";
 }
