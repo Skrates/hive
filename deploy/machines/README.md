@@ -6,9 +6,9 @@ Ratified topology, 2026-08-02/03. One broker, four edges, all links outbound-onl
 | -- | -- | -- | -- |
 | dev box (`192.168.1.238`) | broker | — | joins the tailnet; edges dial in over it |
 | linux laptop | edge `laptop` | `fable` (Claude Max, rationallyprime@gmail.com) | sleep = dark agent; failures stay thread-visible |
-| macbook | edge `mac` | `codex-1` (ChatGPT Max) | app-server socket must be same-machine for mid-turn steering |
+| macbook | edge `mac` | `ariadne` (ChatGPT Max) | app-server socket must be same-machine for mid-turn steering |
 | cx53 (`agent-cx53`, hel1, 62.238.51.63) | edge `cx53` | `gnomon` (Claude Team, rationallyprime@gmail.com — name self-chosen) | dedicated agent VM + self-hosted CI runner — deliberately NOT the Coolify demo box (see its README) |
-| runpod (EUR-IS-1) | edge `runpod` | `claude-3` (Claude Team, hakon@sokrates.is) | the hive's actuator: Sovereign dev, capability-registry model tests, LoRA runs; seat = custom-image CPU pod spawning sibling GPU pods; durable state on network volume `w65u1o4qbn` (100 GB) |
+| cx43 (`coolify-fsn1`, fsn1, 167.233.120.83) | edge `cx43` | `talos` (Grok Build, SuperGrok subscription; `hive` user beside the Coolify demo stack) | moved off the RunPod pod 2026-08-16, subscription cutover 2026-09-05 (KRA-1322); two turn slots at `/home/hive/work/slot-{1,2}` (KRA-1364); no burns during a live demo. `edge-runpod/` stays as the pod recipe — no subscription names that edge |
 
 Seat-to-machine assignment is a subscription-time decision; the mapping above is the ratified
 default and the example subscriptions in `../subscriptions/` encode it.
