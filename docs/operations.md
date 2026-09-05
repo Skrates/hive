@@ -180,6 +180,19 @@ notices, and the agent's outcome. Completion-tracked Codex live and headless out
 by the edge from the provider's final response; Claude live boundary delivery uses `hive reply`.
 Silence is a defect — a delivered wake with no outcome post means the loop never closed.
 
+### Turn slots (KRA-1364)
+
+A subscription's `turnSlots` (integer ≥ 1, default 1) is how many turns the actor may run at once,
+fleet-wide. Leases are keyed `(actor, slot)`; a claim takes the actor's lowest free slot, and every
+transition is fenced on that slot's generation, so one slot's lease expiring requeues only the turn
+it held. The edge declares the `actor:slot` pairs it is running on every claim, and the broker
+skips an actor whose slots are all declared; a `busy` entry without a slot is refused with
+`busy_malformed`. `turnSlots > 1` requires `wakePolicy: "spawn"`, no pinned `sessionId`, and a
+`{slot}` placeholder in every `edgeWorkspaces[].cwd` — slot `n` runs in that path with `{slot}`
+replaced by `n`, so two concurrent turns never share a checkout. Those directories must exist on
+the edge before the first wake lands. A seat that declares nothing runs exactly the one-slot path it
+always did.
+
 There is no reconciliation surface. If a delivery failed, the thread says so; send the message
 again or fix the edge.
 

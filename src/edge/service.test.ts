@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { ATTESTATION_FILENAME } from "./attestation.js";
-import type { Delivery, DeliveryResultInput, Reason, ReplaySnapshot, Subscription } from "../domain.js";
+import type { BusySlot, Delivery, DeliveryResultInput, Reason, ReplaySnapshot, Subscription } from "../domain.js";
+import { busySlotKey } from "../domain.js";
 import type { BrokerClient } from "./broker-client.js";
 import { LiveIngressRegistry, type LiveIngress } from "./live-registry.js";
 import {
@@ -71,6 +72,7 @@ function subscription(overrides: Partial<Subscription> = {}): Subscription {
     homeGraceMs: 0,
     spawnRateLimit: 10,
     maxAttempts: 5,
+    turnSlots: 1,
     expiresAt: null,
     updatedAt: "2026-08-01T00:00:00.000Z",
     ...overrides,
@@ -85,6 +87,7 @@ function delivery(id: number, overrides: Partial<Delivery> = {}): Delivery {
     status: "claimed",
     reasons: [],
     leaseGeneration: 1,
+    leaseSlot: 1,
     claimedBy: "mac",
     attempts: 1,
     nextAttemptAt: null,
@@ -126,11 +129,19 @@ class FakeBroker {
 
   constructor(private readonly queue: Delivery[]) {}
 
-  async claim(_after?: number, _waitMs?: number, busyActors: readonly string[] = []): Promise<Delivery | null> {
-    // Mirrors the broker: deliveries for actors the edge declared busy are skipped.
-    const index = this.queue.findIndex((item) => !busyActors.includes(item.actor));
-    if (index === -1) return null;
-    return this.queue.splice(index, 1)[0] ?? null;
+  async claim(_after?: number, _waitMs?: number, busy: readonly BusySlot[] = []): Promise<Delivery | null> {
+    // Mirrors the broker: a delivery is handed the lowest slot of its actor
+    // the edge did not declare busy; an actor with every slot busy is skipped.
+    const taken = new Set(busy.map((entry) => busySlotKey(entry.actor, entry.slot)));
+    for (let index = 0; index < this.queue.length; index += 1) {
+      const item = this.queue[index]!;
+      for (let slot = 1; slot <= item.subscription.turnSlots; slot += 1) {
+        if (taken.has(busySlotKey(item.actor, slot))) continue;
+        this.queue.splice(index, 1);
+        return { ...item, leaseSlot: slot };
+      }
+    }
+    return null;
   }
 
   async accept(value: Delivery): Promise<Delivery> { return { ...value, status: "accepted_local" }; }
@@ -924,4 +935,60 @@ test("a mixed-case live registration is found under the canonical actor key", ()
   assert.ok(live.get("gnomon", "claude"), "canonical lookup finds the mixed-case registration");
   live.deregister("GNOMON", "claude");
   assert.equal(live.get("gnomon", "claude"), null);
+});
+
+test("an actor with two turn slots runs two turns at once in separate slot directories; a third waits (KRA-1364)", async () => {
+  // Talos on 2026-09-05: one slot made the sole burn seat the belt's
+  // bottleneck. With `turnSlots: 2` the edge runs two of his turns
+  // concurrently, each in its own cwd, and still never a third.
+  let releaseTurns!: () => void;
+  const turns = new Promise<void>((resolve) => { releaseTurns = resolve; });
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const cwds: string[] = [];
+  class CountingAdapter extends StubAdapter {
+    override async spawn(_sub: Subscription, cwd: string): Promise<ProviderDispatch> {
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      cwds.push(cwd);
+      try {
+        await turns;
+        return { receipt: JSON.stringify({ type: "result", result: "done" }), outcome: "done", processed: true };
+      } finally {
+        inFlight -= 1;
+      }
+    }
+  }
+  const talos = subscription({
+    actor: "talos",
+    sessionId: null,
+    turnSlots: 2,
+    edgeWorkspaces: [{ edgeId: "mac", cwd: "/work/slot-{slot}", worktree: null }],
+  });
+  const broker = new FakeBroker([1, 2, 3].map((id) => delivery(id, {
+    actor: "talos",
+    coalesceKey: `talos:C1:100.${id}`,
+    subscription: talos,
+    event: { ...delivery(id).event, actor: "talos" },
+  })));
+  const store = new EdgeStore(":memory:");
+  const edge = new EdgeService(asBrokerClient(broker), store, new LiveIngressRegistry(), [new CountingAdapter()]);
+
+  const controller = new AbortController();
+  const run = edge.run(controller.signal);
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.equal(maxInFlight, 2, "exactly two talos turns run at once");
+  assert.deepEqual([...cwds].sort(), ["/work/slot-1", "/work/slot-2"]);
+  releaseTurns();
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline && broker.finishes.length < 3) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(broker.finishes.filter((f) => f.result.status === "processed").length, 3);
+  assert.equal(maxInFlight, 2);
+  // The third turn reused the first slot to free up.
+  assert.equal(cwds.length, 3);
+  assert.ok(cwds[2] === "/work/slot-1" || cwds[2] === "/work/slot-2");
+  controller.abort();
+  await run;
 });

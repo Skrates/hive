@@ -53,6 +53,7 @@ function subscription(): SubscriptionInput {
     homeGraceMs: 0,
     spawnRateLimit: 1,
     maxAttempts: 5,
+    turnSlots: 1,
     expiresAt: null,
   };
 }

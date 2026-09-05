@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { URL } from "node:url";
-import { canonicalActor, DeliveryResultInputSchema, ReasonSchema, SeatWakeMintSchema, SubscriptionInputSchema } from "../domain.js";
+import { canonicalActor, DeliveryResultInputSchema, ReasonSchema, SeatWakeMintSchema, SubscriptionInputSchema, BusySlotFormatError, parseBusySlots, type BusySlot } from "../domain.js";
 import { BrokerService } from "./service.js";
 import { InvalidTransitionError, SeatWakeRefusedError, StaleLeaseError } from "./store.js";
 
@@ -86,9 +86,19 @@ export class BrokerHttpServer {
     if (request.method === "GET" && url.pathname === "/v1/deliveries") {
       const after = integerParam(url.searchParams.get("after"), 0);
       const waitMs = integerParam(url.searchParams.get("wait_ms"), 0);
-      const busy = url.searchParams.get("busy");
-      const busyActors = busy ? busy.split(",").filter((item) => item.length > 0) : [];
-      const delivery = await this.broker.claim(edgeId, after, waitMs, busyActors);
+      // KRA-1364: the edge declares the (actor, slot) turns it is running. A
+      // malformed entry is refused with its reason — silently widening or
+      // narrowing the declaration is how one actor runs twice in one slot.
+      let busy: BusySlot[];
+      try {
+        busy = parseBusySlots(url.searchParams.get("busy"));
+      } catch (error) {
+        if (error instanceof BusySlotFormatError) {
+          return json(response, 400, { error: "busy_malformed", detail: error.message });
+        }
+        throw error;
+      }
+      const delivery = await this.broker.claim(edgeId, after, waitMs, busy);
       return delivery ? json(response, 200, delivery) : json(response, 204, null);
     }
 

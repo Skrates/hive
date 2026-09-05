@@ -267,6 +267,7 @@ function delivery(now: number, createdAt: number = now): Delivery {
     homeGraceMs: 0,
     spawnRateLimit: 1,
     maxAttempts: 5,
+    turnSlots: 1,
     expiresAt: null,
     updatedAt: new Date(now).toISOString(),
   };
@@ -277,6 +278,7 @@ function delivery(now: number, createdAt: number = now): Delivery {
     status: "dispatching",
     reasons: [],
     leaseGeneration: 1,
+    leaseSlot: 1,
     claimedBy: "mac",
     attempts: 1,
     nextAttemptAt: null,
