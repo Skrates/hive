@@ -269,9 +269,10 @@ The edge records; it does not verify and it does not refuse.
   `deploy/systemd/hive-edge.service` (cx53, linux laptop), `deploy/launchd/run-edge.zsh`
   (macbook), and `deploy/machines/edge-runpod/{Dockerfile,start-edge.sh}` (RunPod) — read as
   orientation, not as the authority; the authority is `src/edge/launchers.test.ts`, and the list
-  here may lag it. The RunPod entry is the one that matters most, not least: its seat HOME is on
-  `/workspace`, a network-backed volume, so it is the deployment the whole three-guard stack was
-  written for.
+  here may lag it. The RunPod launcher is the one the three-guard stack was written for — its
+  seat HOME sat on `/workspace`, a network-backed volume — and it stays in the set as the pod
+  recipe although no seat has ridden it since 2026-08-16 (Talos lives on cx43, whose launcher is
+  the shared systemd unit).
 
   **Adding a launcher without this line reintroduces the exhaustion on that machine alone, so the
   enumeration is derived, not written down.** `src/edge/launchers.test.ts` walks `deploy/`, finds
