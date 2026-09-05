@@ -190,11 +190,11 @@ export function renderCanvas(s: CanvasSnapshot, refreshStatus = "Snapshot only. 
       if (!probeFresh) ownAttention.push("maintenance observation stale");
       if (p.auth.state !== "local_login_present") ownAttention.push(`provider auth: ${auth}`);
       if (p.inventory.state !== "observed") ownAttention.push(p.inventory.state);
-      const mcp = p.mcp.filter(c => !["connected", "tools_available", "none_configured"].includes(c.state));
+      const mcp = p.mcp.filter(c => !["connected", "tools_available", "none_configured", "disabled"].includes(c.state));
       if (mcp.length) ownAttention.push(`MCP: ${mcp.map(c => `${c.name} ${c.state}`).join(", ")}`);
       if (missing.length || changed.length) ownAttention.push(`skills: ${missing.length} missing, ${changed.length} differ from intended source`);
       if (missingPlugins.length) ownAttention.push(`plugins missing: ${missingPlugins.join(", ")}`);
-      const badPlugins = p.plugins.filter(i => ["missing", "missing_files", "version_differs"].includes(i.state));
+      const badPlugins = p.plugins.filter(i => ["missing", "missing_files", "disabled_but_intended", "version_differs"].includes(i.state));
       if (badPlugins.length) ownAttention.push(`plugin inventory: ${badPlugins.map(i => `${i.name} ${i.state}`).join(", ")}`);
     }
     if (!d) ownAttention.push("usage collector binding unverified / no matched report");

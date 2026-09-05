@@ -50,8 +50,11 @@ export async function probeProfile(actor: string, root: string, provider: Profil
     usageProfileId: null, usageEdgeId: null, auth: { state: "unverified", observedAt: now() },
     mcp: [], skills: {}, doctrineCommit: null, plugins: [], inventory: { state: "observed", observedAt: now() } };
   if (!existsSync(root)) { result.inventory.state = "profile_missing"; return result; }
+  const env: NodeJS.ProcessEnv = { ...process.env, CLAUDE_CONFIG_DIR: root, CODEX_HOME: root };
+  delete env.ANTHROPIC_API_KEY; delete env.OPENAI_API_KEY; delete env.CLAUDE_CODE_OAUTH_TOKEN;
+  const claude = process.env.HIVE_CLAUDE_COMMAND ?? "claude";
   try {
-    const collector = optionalJson(join(root, "ai-usage/config.json"));
+    const collector = optionalJson(join(root, provider === "grok" ? ".grok/ai-usage/config.json" : "ai-usage/config.json"));
     result.usageProfileId = typeof collector.profile_id === "string" ? collector.profile_id : null;
     result.usageEdgeId = typeof collector.edge_id === "string" ? collector.edge_id : null;
     const manifest = skillsRoot ? optionalJson(join(skillsRoot, ".weave-doctrine-manifest.json")) : {};
@@ -62,12 +65,14 @@ export async function probeProfile(actor: string, root: string, provider: Profil
       catch { result.skills[name] = "unverified"; }
     }
     const settings = optionalJson(join(root, "settings.json"));
-    const installed = optionalJson(join(root, "plugins/installed_plugins.json")).plugins ?? {};
     const expected = settings.enabledPlugins ?? {};
-    for (const name of [...new Set([...Object.keys(installed), ...Object.keys(expected)])].sort()) {
-      const entries = installed[name];
-      const userEntries = Array.isArray(entries) ? entries.filter(e => e.scope === "user") : [];
-      const entry = userEntries.length === 1 ? userEntries[0] : null;
+    const native = provider === "claude" ? JSON.parse(run([claude, "plugin", "list", "--json"], env)) : [];
+    if (!Array.isArray(native)) throw new Error("invalid native plugin inventory");
+    for (const name of [...new Set([...native.map((p: any) => p.id), ...Object.keys(expected)])].sort()) {
+      const entry = native.find((p: any) => p.id === name && p.scope === "user");
+      // Disabled caches are not installation defects. Only enabled or locally
+      // intended plugins participate in maintenance/version comparisons.
+      if (expected[name] !== true && entry?.enabled !== true) continue;
       let intended: string | null = null;
       const [pluginName, market] = name.split("@");
       const catalog = market ? optionalJson(join(root, "plugins/marketplaces", market, ".claude-plugin/marketplace.json")) : {};
@@ -76,7 +81,8 @@ export async function probeProfile(actor: string, root: string, provider: Profil
       const version = typeof entry?.version === "string" ? entry.version : null;
       result.plugins.push({ name, installed: version, intended,
         state: expected[name] === true && !entry ? "missing" : entry && !existsSync(entry.installPath) ? "missing_files"
-          : intended && version !== intended ? "version_differs" : "version_unverified" });
+          : entry?.enabled === false ? "disabled_but_intended"
+          : intended && version !== intended ? "version_differs" : intended ? "matches_cached_catalog" : "version_unverified" });
     }
     // Codex cache directories prove disk presence only, never which version a session loaded.
     const cache = join(root, "plugins/cache");
@@ -92,11 +98,8 @@ export async function probeProfile(actor: string, root: string, provider: Profil
     }
   } catch { result.inventory = { state: "inventory_incomplete", observedAt: now() }; }
 
-  const env: NodeJS.ProcessEnv = { ...process.env, CLAUDE_CONFIG_DIR: root, CODEX_HOME: root };
   // Do not use an inherited API key to declare the pinned subscription authenticated.
-  delete env.ANTHROPIC_API_KEY; delete env.OPENAI_API_KEY; delete env.CLAUDE_CODE_OAUTH_TOKEN;
   if (provider === "claude") {
-    const claude = process.env.HIVE_CLAUDE_COMMAND ?? "claude";
     try {
       let raw: string;
       try { raw = run([claude, "auth", "status", "--json"], env); }
@@ -116,7 +119,8 @@ export async function probeProfile(actor: string, root: string, provider: Profil
         const match = line.match(/^([\w.@/:-]+):\s.*(?: - |—)(.*)$/u);
         if (!match) continue;
         const verdict = match[2] ?? "";
-        const state = /Needs authentication|Needs auth/i.test(verdict) ? "reauth_required"
+        const state = /Disabled for this project/i.test(verdict) ? "disabled"
+          : /Needs authentication|Needs auth/i.test(verdict) ? "reauth_required"
           : /✓ Connected|Connected$/u.test(verdict) ? "connected"
           : /Failed to connect/i.test(verdict) ? "connection_failed" : "unverified";
         result.mcp.push({ name: match[1]!, state, observedAt: now() });

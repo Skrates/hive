@@ -16,7 +16,7 @@ Checks run sequentially per edge, with bounded child lifetime, followed by a fiv
 
 Claude checks honor the same `HIVE_CLAUDE_COMMAND` override as delivery and use the pinned `CLAUDE_CONFIG_DIR`, `claude auth status --json`, and the connection-checking `claude mcp list`. A local login is labeled local login presence, not successful remote authentication. Codex starts a bounded, profile-pinned app-server subprocess and reads `account/read` plus paginated `mcpServerStatus/list`. This removes dependence on an obsolete control socket. Grok uses its read-only `_x.ai/auth/info` method and `grok mcp doctor --json`; zero configured servers is reported as `none_configured`, not an unknown connection. Neither probe starts or resumes a model turn.
 
-The broker reads `skills_dir` from the same intended Weave registry used by the canvas and passes it to the edge; an explicit null disables personal-skill inventory, and an omitted value defaults to `<accountProfile>/skills` as in the Weave installer. The edge resolves `~/` on its own machine and reports the exact inspected root. Skill drift compares whole directory content and executable bits against intended source files. It reports missing skills and differences from the intended revision; it does not guess whether differences came from an old install or local edits. Claude plugin inventory compares user-scope installation records to enabled intent and the locally cached marketplace version when declared. Codex cache versions are explicitly **cached only**: they do not prove activation or the version loaded by an existing session. Live marketplace version checks, and verification of all session-loaded files, remain unverified.
+The broker reads `skills_dir` from the same intended Weave registry used by the canvas and passes it to the edge; an explicit null disables personal-skill inventory, and an omitted value defaults to `<accountProfile>/skills` as in the Weave installer. The edge resolves `~/` on its own machine and reports the exact inspected root. Skill drift compares whole directory content and executable bits against intended source files. It reports missing skills and differences from the intended revision; it does not guess whether differences came from an old install or local edits. Claude plugin inventory uses `claude plugin list --json` to compare active user-scope installations to enabled intent and the locally cached marketplace version when declared. Disabled caches are excluded; missing files and enabled intent without an installation remain defects. Deliberately disabled MCP servers are shown as `disabled` without a reconnect alert. Grok collector bindings are read from `<accountProfile>/.grok/ai-usage/config.json`. Codex cache versions are explicitly **cached only**: they do not prove activation or the version loaded by an existing session. Live marketplace version checks, and verification of all session-loaded files, remain unverified.
 
 ## Broker configuration
 
@@ -35,7 +35,7 @@ Create `~/.config/hive/health-canvas.json` on the broker, keeping secrets out of
   "accountChanges": [{
     "actors": ["gnomon", "theoros"],
     "label": "Shared personal Max",
-    "note": "Hákon confirms these seats moved from separate Team subscriptions. Awaiting usage observations for the current shared account.",
+    "note": "",
     "previousPoolIds": [
       "claude-YhOSo0fqwv94-WK7w7s-FMP9WHw2KkAEa-sM2zHGE2c",
       "claude-yajd8TgdOY23-QOx2iIw0mHbX_UgOkoIM8wcCTgbpog"
@@ -78,3 +78,7 @@ systemctl --user status hive-health-canvas.service hive-health-canvas.timer
 The initial [AI usage & profile health canvas](https://skrates.slack.com/docs/T0ANP1RUACU/F0BUSRNGSJK) was published from actual observations on 2026-09-05. At first publication it explicitly labeled automatic refresh blocked. At that time, the broker token lacked `canvases:write`; no broker/edge deployment or running refresh timer was claimed. The existing manual State of the Weave canvas was preserved.
 
 Initial coverage: five enrolled seats, nine usage reporters, live disk/MCP probes for Gnomon and Theoros, and an Ariadne disk probe whose pinned app-server health endpoint was unavailable. Fable/Talos maintenance, Grok auth/MCP health, fresh usage for the shared personal Max account, and session-loaded installations remain unverified. These are visible gaps, not healthy defaults.
+
+## Repair verification, 2026-09-05
+
+Maintenance reporters now run for all five seats across the Mac, cx53, cx43, and Fable’s laptop. Gnomon and Theoros collectors again submit fresh samples bound to the same personal Max quota pool, and Fable’s Claude collector is recovered. Their stale version-specific executable paths were replaced by the stable Claude launcher. Talos has an enrolled, profile-pinned Grok collector on cx43. Native provider checks report local login presence for all five seats; Fable’s four Cloudflare MCP logins require human authentication. Skill installations were refreshed with the canonical Weave installer and preserved backups. Plugin catalog refreshes and an active plugin update were performed as explicit repair work, separate from read-only periodic monitoring.
