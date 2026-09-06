@@ -1,0 +1,69 @@
+{
+  "url": "https://api.github.com/repos/Skrates/sokrates/pulls/comments/3944312498",
+  "pull_request_review_id": 5125698267,
+  "id": 3944312498,
+  "node_id": "PRRC_kwDORtnEfM7rGW6y",
+  "diff_hunk": "@@ -0,0 +1,68 @@\n+# Checkpoint ladder, rung 2 — two acts, one join. Decided in advance (2026-09-06);\n+# NOTHING here is authored by hand downstream: Aristotle formalizes the Law from the\n+# three approved values, Aristotle authors the recipe from the intent, an unnamed\n+# agent executes it, and the Law fires on the terminal state. See ../README.md.\n+#\n+# What this rung proves over rung 1: a recipe with TWO governed acts, the second\n+# depending on the first's effect (the receipt names the item the declaration\n+# minted), so the run needs a readiness receipt per act; and a Law that grounds\n+# on TWO relations joined on a key. The kernel already refuses a lot-tracked\n+# receipt without a lot (apotheke INV-7), so the Law asks for what the kernel does\n+# NOT enforce: the supplier's own lot reference on every received lot.\n+#\n+# Live baseline (apotheke.sokrates.is, 2026-09-06 15:00Z): one warehouse\n+# (\"Krates warehouse\"), one supplier (\"Nordtæki Dreifing ehf.\"), nine items all\n+# lot-tracked, seven lots all carrying a supplier_lot_ref — so a correct run\n+# leaves the set empty and rung 3's defect (omit the reference) yields one row.\n+\n+terminal_law_name: received_lot_without_supplier_ref\n+goal_statement: >-\n+  Every lot received into the apotheke inventory record for a lot-tracked item\n+  carries the supplier's own lot reference.\n+definition_of_done: >-\n+  The work is complete when every lot in the apotheke lot projection whose item is\n+  lot-tracked in the apotheke item projection carries a supplier lot reference. A\n+  lot of a lot-tracked item whose supplier lot reference is absent is a violation,\n+  and the violation names the lot by its lot_id and its item by item_id. When the\n+  condition holds the violation set is empty.\n+\n+# The operator intent Aristotle authors the recipe from\n+# (polis-ergon author-hypernode --intent ... --terminal-law-name received_lot_without_supplier_ref).\n+recipe_intent: >-\n+  Declare one inventory item and receive its first delivery into the apotheke\n+  inventory record, as two governed acts in order. First, one apotheke append\n+  carrying exactly one item_declared event for the item the kickoff names (name,\n+  base unit, scale, optional sku and tags), tracking lot, effective from today, a\n+  fresh item id, and an idempotency key derived from the kickoff. Second, once the\n+  declared item can be read back from the apotheke item projection, one apotheke\n+  append carrying exactly one goods_received event for that item: the quantity the\n+  kickoff gives, into the location and from the supplier counterparty the kickoff\n+  names (their ids resolved by reading the apotheke location and counterparty\n+  projections, never invented), cause purchase, the unit cost and currency the\n+  kickoff gives with the extended cost as their product, occurred now, a fresh\n+  movement id, and a new lot with a fresh lot id carrying the supplier lot\n+  reference the kickoff gives; idempotency key derived from the kickoff so a retry\n+  never receives the delivery twice. Appends nothing else. Completion is attested\n+  from the record: read the new lot back from the apotheke lot projection and\n+  confirm it belongs to the declared item and carries the supplier lot reference.\n+\n+# The kickoff handed to the run (polis-ergon dispatch --kickoff ...).\n+kickoff: >-\n+  Declare the item \"Thermal pad, 40 mm square\": base unit \"unit\", scale 0, sku\n+  \"TG-40\", tags [\"consumable\", \"workshop\"]. Then receive 12 units of it into the\n+  location \"Krates warehouse\" from the supplier \"Nordtæki Dreifing ehf.\" at a unit\n+  cost of 1250 ISK, supplier lot reference \"ND-TG-2026-09\", no expiry.\n+\n+# The benchmark shape — what a correct pass looks like, checked against the artifacts\n+# Aristotle produces and the run's verification, never against exact text.\n+expected:\n+  law:\n+    relations: [apotheke_lot_projection, apotheke_item_projection]  # joined on item_id\n+    predicates: 2                           # item is lot-tracked; the reference is absent\n+    absence_shaped: false                   # a missing column value, not a negated subquery\n+  recipe:\n+    erga: [apotheke/append_events, apotheke/append_events]  # declare, then receive\n+    reads: 3                                # location + counterparty lookups, one attesting read",
+  "path": "demo/ladder/rung-02/pair.yaml",
+  "commit_id": "977929d1c5fbf91ec14d6c69ef0ea69515c40d69",
+  "original_commit_id": "977929d1c5fbf91ec14d6c69ef0ea69515c40d69",
+  "user": {
+    "login": "chatgpt-codex-connector[bot]",
+    "id": 199175422,
+    "node_id": "BOT_kgDOC98s_g",
+    "avatar_url": "https://avatars.githubusercontent.com/in/1144995?v=4",
+    "gravatar_id": "",
+    "url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D",
+    "html_url": "https://github.com/apps/chatgpt-codex-connector",
+    "followers_url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D/followers",
+    "following_url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D/following{/other_user}",
+    "gists_url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D/gists{/gist_id}",
+    "starred_url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D/starred{/owner}{/repo}",
+    "subscriptions_url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D/subscriptions",
+    "organizations_url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D/orgs",
+    "repos_url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D/repos",
+    "events_url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D/events{/privacy}",
+    "received_events_url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D/received_events",
+    "type": "Bot",
+    "user_view_type": "public",
+    "site_admin": false
+  },
+  "body": "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Include the item read-back in the read count**\n\nWhen grading an executor that follows this intent, three reads omit the required item-projection check at lines 36–38. Apotheke exposes separate `list_items`, `list_locations`, `list_counterparties`, and `list_lots` operations in `hyle/tests/fixtures/krepis_sources/apotheke_source.yaml`, so the prescribed item readiness check, two ID lookups, and final lot attestation require four read calls. Leaving `reads: 3` either fails a correct run or rewards one that skips the inter-act dependency this rung is meant to prove.\n\nUseful? React with 👍 / 👎.",
+  "created_at": "2026-09-06T14:53:46Z",
+  "updated_at": "2026-09-06T14:53:46Z",
+  "html_url": "https://github.com/Skrates/sokrates/pull/1198#discussion_r3944312498",
+  "pull_request_url": "https://api.github.com/repos/Skrates/sokrates/pulls/1198",
+  "_links": {
+    "self": {
+      "href": "https://api.github.com/repos/Skrates/sokrates/pulls/comments/3944312498"
+    },
+    "html": {
+      "href": "https://github.com/Skrates/sokrates/pull/1198#discussion_r3944312498"
+    },
+    "pull_request": {
+      "href": "https://api.github.com/repos/Skrates/sokrates/pulls/1198"
+    }
+  },
+  "reactions": {
+    "url": "https://api.github.com/repos/Skrates/sokrates/pulls/comments/3944312498/reactions",
+    "total_count": 0,
+    "+1": 0,
+    "-1": 0,
+    "laugh": 0,
+    "hooray": 0,
+    "confused": 0,
+    "heart": 0,
+    "rocket": 0,
+    "eyes": 0
+  },
+  "start_line": null,
+  "original_start_line": null,
+  "start_side": null,
+  "line": null,
+  "original_line": 65,
+  "side": "RIGHT",
+  "author_association": "NONE",
+  "original_position": 65,
+  "position": 1,
+  "subject_type": "line"
+}
