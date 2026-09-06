@@ -1,17 +1,17 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { validateEffect } from "./contract.js";
-import { applicability, deliveryPayload, formatTarget, parseTarget, targetKind, type EffectTarget } from "./effects.js";
+import { applicability, deliveryPayload, formatTarget, noticePayload, parseTarget, targetKind, type EffectTarget } from "./effects.js";
 import { hold, request, review, SHA_A, SHA_B } from "./fixtures.js";
 
 const TARGETS: Array<[string, EffectTarget]> = [
-  [`conflict:ariadne:${SHA_A}:main`, { kind: "conflict", actor: "ariadne", subjectKey: `${SHA_A}:main` }],
   [`check:skrates/hive:${SHA_A}`, { kind: "check", repo: "skrates/hive", headSha: SHA_A }],
   ["board:rev_obs:run_1", { kind: "board", reviewId: "rev_obs:run_1" }],
   ["thread:9001", { kind: "thread", commentId: 9001 }],
   ["delivery:talos:req_obs:run_1_1", { kind: "delivery", actor: "talos", requestId: "req_obs:run_1_1" }],
   ["summon:req_obs:run_1_1", { kind: "summon", requestId: "req_obs:run_1_1" }],
   ["announce:rev_obs:run_1", { kind: "announce", reviewId: "rev_obs:run_1" }],
+  [`notice:talos:${SHA_A}:main`, { kind: "notice", actor: "talos", subjectKey: `${SHA_A}:main` }],
 ];
 
 // §8.1: the grammar round-trips, tolerates colons inside ids (module map §1), and agrees
@@ -26,7 +26,7 @@ test("target grammar parses and formats every §8.1 kind, colons in ids included
 });
 
 test("target grammar refuses what the contract refuses", () => {
-  for (const bad of ["check:skrates/hive:abc", "thread:0", "thread:x", "delivery:Talos:req_1", "gate:rev_1", "board:"]) {
+  for (const bad of ["check:skrates/hive:abc", "thread:0", "thread:x", "delivery:Talos:req_1", "gate:rev_1", "board:", "notice:Talos:x", "notice:talos"]) {
     assert.throws(() => parseTarget(bad), /grammar/, bad);
     assert.equal(validateEffect({ effect_id: "e", kind: "refresh", target: bad, payload: null }).ok, false, bad);
   }
@@ -39,6 +39,24 @@ test("refresh vs actionable follows the target kind (§8.1)", () => {
   assert.equal(targetKind({ kind: "delivery", actor: "a", requestId: "r" }), "actionable");
   assert.equal(targetKind({ kind: "summon", requestId: "r" }), "actionable");
   assert.equal(targetKind({ kind: "announce", reviewId: "r" }), "actionable");
+  assert.equal(targetKind({ kind: "notice", actor: "talos", subjectKey: `${SHA_A}:main` }), "actionable");
+});
+
+// §6.D8: the notice explains the pause, so no pause withholds it; it names a subject, and
+// goes obsolete only once the Review has left that subject.
+test("applicability: a notice is never withheld — not by a conflict, a closed PR, or a hold", () => {
+  const notice: EffectTarget = { kind: "notice", actor: "talos", subjectKey: `${SHA_A}:main` };
+  const conflicting = review({ requests: [request()] });
+  conflicting.observed = { ...conflicting.observed, mergeable: false };
+  assert.equal(applicability(notice, conflicting), "applicable");
+  assert.equal(applicability({ kind: "summon", requestId: "req_obs:run_1_1" }, conflicting), "withheld");
+  assert.equal(applicability(notice, review({ lifecycle: "closed" })), "applicable");
+  const held = review({ holds: [hold({ kind: "exhaustion", blocks: { readiness: true, summons: true } })] });
+  assert.equal(applicability(notice, held), "applicable");
+  assert.equal(applicability(notice, review({ requests: [] })), "applicable", "the notice is not a request's transport");
+  const moved = review();
+  moved.subject = { ...moved.subject, key: `${SHA_B}:main`, head_sha: SHA_B };
+  assert.equal(applicability(notice, moved), "obsolete");
 });
 
 // §6.D7: a summon (and a delivery) is applicable only while its request is pending at the
@@ -109,5 +127,11 @@ test("payload readers return null for anything but the documented shape", () => 
   assert.deepEqual(
     deliveryPayload({ actor: "talos", request_id: "req_1", text: "burn", dedupe_key: "eff_1" }),
     { actor: "talos", request_id: "req_1", text: "burn", dedupe_key: "eff_1" },
+  );
+  assert.equal(noticePayload(null), null);
+  assert.equal(noticePayload({ actor: "talos", text: "conflicting" }), null);
+  assert.deepEqual(
+    noticePayload({ actor: "talos", text: "conflicting", dedupe_key: "conflicting:rev_1:sha:main" }),
+    { actor: "talos", text: "conflicting", dedupe_key: "conflicting:rev_1:sha:main" },
   );
 });

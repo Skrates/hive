@@ -8,7 +8,7 @@
       "subject_key": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:main",
       "text": "Resolve the conflict"
     },
-    "target": "conflict:ariadne:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:main"
+    "target": "notice:ariadne:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:main"
   },
   "model": "effect"
 }

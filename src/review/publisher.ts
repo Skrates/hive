@@ -20,7 +20,7 @@ import { iso } from "../time.js";
 import type { Effect, Policy, ReviewState, TransportRef } from "./contract.js";
 import {
   announcePayload,
-  conflictPayload,
+  noticePayload,
   applicability,
   deliveryPayload,
   parseTarget,
@@ -289,7 +289,7 @@ export class ReviewPublisher {
       case "delivery":
       case "summon":
       case "announce":
-      case "conflict":
+      case "notice":
         throw new DispatchError(`${target.kind} is not a refresh target`);
     }
   }
@@ -303,8 +303,8 @@ export class ReviewPublisher {
     state: ReviewState,
   ): Promise<"sent" | "obsolete"> {
     switch (target.kind) {
-      case "conflict": {
-        const payload = conflictPayload(row.payload);
+      case "notice": {
+        const payload = noticePayload(row.payload);
         if (payload === null) throw new DispatchError("conflict notice carries no payload");
         const slack = this.slackPolicy(state);
         if (slack === null) throw new DispatchError("conflict notice has no Slack channel");
