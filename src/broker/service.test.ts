@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { ReplaySnapshot } from "../domain.js";
-import { BrokerService, type SlackTransport } from "./service.js";
+import { BrokerService, housekeepingTick, type SlackTransport } from "./service.js";
 import { BrokerStore, SeatWakeRefusedError } from "./store.js";
 
 test("overlapping outbox drains share one healthy in-process pass", async (t) => {
@@ -316,4 +316,57 @@ test("a replayed alternate-thread mint answers from the ledger while Slack is do
   assert.equal(retry.deliveryId, first.deliveryId);
   assert.equal(retry.created, false);
   store.close();
+});
+
+// Bundle-1 #9: the review publisher used to run first and the outbox drain only after it, so a
+// GitHub port that hung or was slow delayed every Hive wake — none of which has anything to do
+// with review. One tick, two independent jobs.
+test("the housekeeping tick drains the outbox while a review publication pass is still hung", async () => {
+  const log: Array<[string, string]> = [];
+  let published = false;
+  let drained = false;
+  let releasePublish!: () => void;
+  const hung = new Promise<void>((resolve) => { releasePublish = resolve; });
+
+  const tick = housekeepingTick({
+    sweep: () => {},
+    publish: async () => { await hung; published = true; },
+    drainOutbox: async () => { drained = true; return 1; },
+    log: (what, error) => log.push([what, String(error)]),
+  });
+
+  // The publisher's pass is still in flight — a GitHub port that never answers — and the
+  // outbox has already gone out.
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(drained, true, "the outbox drained without waiting on publication");
+  assert.equal(published, false);
+  releasePublish();
+  await tick;
+  assert.equal(published, true);
+  assert.deepEqual(log, []);
+});
+
+test("the housekeeping tick reports each job's failure on its own and still runs the others", async () => {
+  const log: Array<[string, string]> = [];
+  let drained = false;
+  await housekeepingTick({
+    sweep: () => { throw new Error("sweep boom"); },
+    publish: () => Promise.reject(new Error("github is down")),
+    drainOutbox: async () => { drained = true; return 0; },
+    log: (what, error) => log.push([what, error instanceof Error ? error.message : String(error)]),
+  });
+  assert.equal(drained, true, "a failing publication pass costs no Hive wake");
+  assert.deepEqual(log, [["hive broker sweep failed", "sweep boom"], ["hive review publish failed", "github is down"]]);
+});
+
+test("a job that throws before returning a promise is reported, not thrown out of the tick", async () => {
+  const log: string[] = [];
+  await housekeepingTick({
+    sweep: () => {},
+    publish: () => { throw new Error("synchronous defect"); },
+    drainOutbox: () => Promise.resolve(0),
+    log: (what) => log.push(what),
+  });
+  assert.deepEqual(log, ["hive review publish failed"]);
 });

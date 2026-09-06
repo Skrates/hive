@@ -1234,7 +1234,7 @@
           ]
         },
         "target": {
-          "pattern": "^(check:\\S+:[0-9a-f]{40}|board:\\S+|thread:[1-9][0-9]*|delivery:[a-z0-9-]+:\\S+|summon:\\S+|announce:\\S+|notice:[a-z0-9-]+:\\S+)$",
+          "pattern": "^(check:\\S+:[0-9a-f]{40}|board:(github|slack):\\S+|thread:[1-9][0-9]*|delivery:[a-z0-9-]+:\\S+|summon:\\S+|announce:\\S+|notice:[a-z0-9-]+:\\S+)$",
           "type": "string"
         }
       },
@@ -1495,7 +1495,7 @@
     },
     "ExplicitHold": {
       "additionalProperties": false,
-      "description": "\u00a76.G3: exhaustion, owner_decision, transport_exhausted and operator release only explicitly.",
+      "description": "\u00a76.G3: exhaustion, owner_decision, transport_exhausted and operator release only\nexplicitly.",
       "properties": {
         "at": {
           "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$",

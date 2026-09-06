@@ -1,7 +1,7 @@
 /* eslint-disable */
 /**
  * GENERATED — do not edit. Source: contracts/schemas/review-contract.schema.json,
- * vendored from weave-doctrine@4bd10dfb2c38f5753eaffe44659542c7c751cbf3 (see contracts/SOURCE).
+ * vendored from weave-doctrine@5431513babe1d552b07d55ead9be45323fcf9fa0 (see contracts/SOURCE).
  * Regenerate with `bun run check:contracts`.
  */
 
@@ -1467,7 +1467,8 @@ export interface HoldRelease {
   reason: string;
 }
 /**
- * §6.G3: exhaustion, owner_decision, transport_exhausted and operator release only explicitly.
+ * §6.G3: exhaustion, owner_decision, transport_exhausted and operator release only
+ * explicitly.
  *
  * This interface was referenced by `ReviewContract`'s JSON-Schema
  * via the `definition` "ExplicitHold".

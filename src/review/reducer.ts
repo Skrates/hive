@@ -43,7 +43,7 @@ import type {
   ReviewState,
   Testimony,
 } from "./contract.js";
-import { transportState } from "./effects.js";
+import { BOARD_SINKS, transportState } from "./effects.js";
 
 // ---------------------------------------------------------------------------------------------
 // Context and identity
@@ -680,7 +680,10 @@ export function decide(state: Review | null, action: Action, ctx: DecideContext)
     }
   }
   // Module map §2: every applied batch refreshes the board and the check at the current head.
-  tx.effect("refresh", `board:${tx.review.id}`, null);
+  // §8.1: the board has one row per sink, always both — the reducer is pure and cannot know
+  // which sinks this broker has, so the publisher marks an unconfigured sink's row obsolete
+  // (the GitHub comment in M0) exactly as it already does for a check without a GitHub port.
+  for (const sink of BOARD_SINKS) tx.effect("refresh", `board:${sink}:${tx.review.id}`, null);
   tx.effect("refresh", `check:${repoOf(tx.review.display)}:${tx.review.subject.head_sha}`, null);
   return tx.batch(action);
 }

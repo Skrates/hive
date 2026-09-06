@@ -477,8 +477,8 @@ test("opening mints rev_/bat_/req_/eff_ ids from the act id and records the open
   assert.deepEqual(kinds(batch), ["subject_changed", "exemption_set", "mergeable_observed", "request_opened"].filter((k) => k !== "exemption_set"));
   assert.equal(review.requests[0]?.id, "req_obs:run1_1");
   assert.equal(review.requests[0]?.assignee, "codex");
-  assert.deepEqual(targets(batch), ["summon:req_obs:run1_1", "board:rev_obs:run1", `check:Owner/repo:${H1}`]);
-  assert.deepEqual(batch.effects.map((e) => e.effect_id), ["eff_obs:run1_1", "eff_obs:run1_2", "eff_obs:run1_3"]);
+  assert.deepEqual(targets(batch), ["summon:req_obs:run1_1", "board:github:rev_obs:run1", "board:slack:rev_obs:run1", `check:Owner/repo:${H1}`]);
+  assert.deepEqual(batch.effects.map((e) => e.effect_id), ["eff_obs:run1_1", "eff_obs:run1_2", "eff_obs:run1_3", "eff_obs:run1_4"]);
   assert.equal(batch.effects.find((e) => e.target.startsWith("summon"))?.kind, "actionable");
   assert.equal(batch.effects.find((e) => e.target.startsWith("board"))?.payload, null);
 });
@@ -522,7 +522,7 @@ test("§C1 an unchanged subject preserves judgments and never suppresses the oth
   // The same observation again changes nothing but still refreshes the projections.
   const again = apply(next, observe({ lifecycle: "closed", draft: true, mergeable: null, seenAt: T1, baseShaNow: BASE2 }), ADAPTER);
   assert.deepEqual(kinds(again.batch), []);
-  assert.deepEqual(targets(again.batch), [`board:${next.id}`, `check:Owner/repo:${H1}`]);
+  assert.deepEqual(targets(again.batch), [`board:github:${next.id}`, `board:slack:${next.id}`, `check:Owner/repo:${H1}`]);
 });
 
 test("§C2 a subject change cancels pending requests at the old subject, releases subject_change holds and opens the initial request", () => {
@@ -1536,7 +1536,7 @@ test("§8.1 a comment-sourced finding whose status changes refreshes its thread;
   const codexFinding = withCodex.findings[0];
   assert.ok(codexFinding);
   const closed = apply(withCodex, { kind: "ResolveFinding", finding_id: codexFinding.id, resolution: { kind: "fixed", evidence: "e", commits: [H2] } }, seat("talos"));
-  assert.deepEqual(targets(closed.batch), ["thread:777", `board:${review.id}`, `check:Owner/repo:${H1}`]);
+  assert.deepEqual(targets(closed.batch), ["thread:777", `board:github:${review.id}`, `board:slack:${review.id}`, `check:Owner/repo:${H1}`]);
   assert.equal(closed.batch.effects[0]?.kind, "refresh");
   const classified = apply(closed.state, { kind: "ClassifyFinding", finding_id: codexFinding.id, priority: "P3" }, OPERATOR);
   assert.ok(!targets(classified.batch).includes("thread:777"), "a classification is not a status change");
@@ -1666,7 +1666,9 @@ test("effects: every applied batch refreshes board and check; refresh payloads a
   const review = opened();
   const { batch } = apply(review, { kind: "GrantRounds", n: 1, reason: "r" }, OPERATOR, { actId: "01J" });
   assert.deepEqual(batch.effects, [
-    { effect_id: "eff_01J_1", kind: "refresh", target: `board:${review.id}`, payload: null },
-    { effect_id: "eff_01J_2", kind: "refresh", target: `check:Owner/repo:${H1}`, payload: null },
+    // §8.1: one row per board sink, so a failing GitHub comment never gates the Slack line.
+    { effect_id: "eff_01J_1", kind: "refresh", target: `board:github:${review.id}`, payload: null },
+    { effect_id: "eff_01J_2", kind: "refresh", target: `board:slack:${review.id}`, payload: null },
+    { effect_id: "eff_01J_3", kind: "refresh", target: `check:Owner/repo:${H1}`, payload: null },
   ] satisfies Effect[]);
 });
