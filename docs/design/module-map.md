@@ -118,7 +118,8 @@ already ran Ajv, so `decide` may assume shape. `decide` on `state === null` admi
 
 Effects `decide` emits (ids `eff_<actId>_<n>`): on every applied batch one `refresh` for
 `board:<review_id>` and one for `check:<display-repo>:<head_sha>`; `thread:<comment_id>` refresh
-when a finding with a comment source changes status; `delivery:<assignee>:<request_id>` on
+when a finding whose source container is a `review_comment` changes status (the target is the
+container, not the finding; an `issue_comment` container has no review thread); `delivery:<assignee>:<request_id>` on
 `request_opened` to a seat; `summon:<request_id>` on `request_opened` to `codex`;
 `announce:<review_id>` on `lifecycle_changed → merged`. G4's episode emits exactly one
 `delivery:<author>:<request_id>` (author seat) plus the retrospective request's own delivery.
@@ -272,6 +273,9 @@ export interface AnnouncePayload { review_id: string; text: string }
 export function checkRun(state: ReviewState): { name: "weave/review"; conclusion: "success" | "failure"; title: string; summary: string };
 export function boardComment(state: ReviewState, unknownRecords?: readonly UnknownSourceRecord[]): string;   // §7 step 3: unreadable Codex records, ahead of the findings
 export function slackBoardLine(state: ReviewState, unknownRecords?: readonly UnknownSourceRecord[]): string;
+// One op per `review_comment` *container* whose all-findings state flipped (§8.1): resolve once
+// every finding in it is closed, unresolve as soon as any is open or contested. An `issue_comment`
+// container has no review thread and yields none.
 export function threadOps(before: Review | null, after: Review): Array<{ comment_id: number; op: "resolve" | "unresolve" }>;
 
 // publisher.ts

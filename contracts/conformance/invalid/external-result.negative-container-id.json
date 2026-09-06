@@ -1,16 +1,18 @@
 {
   "expect": {
     "code": "malformed",
-    "why": "GitHub ids are positive"
+    "why": "GitHub container ids are positive"
   },
   "instance": {
     "findings": [
       {
         "body": "The loop skips the last record.",
+        "container_id": -1,
+        "container_kind": "review_comment",
         "line": 12,
+        "locator": 0,
         "path": "src/x.py",
         "priority": "P1",
-        "source_comment_id": -1,
         "title": "Off-by-one in replay window"
       }
     ],

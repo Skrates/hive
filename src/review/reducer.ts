@@ -612,9 +612,14 @@ export function decide(state: Review | null, action: Action, ctx: DecideContext)
   const verb = applyVerb(tx, action);
   if (verb !== null) return verb;
 
-  // §8.1: a finding with a comment source whose status changed refreshes its thread.
+  // §8.1: a finding whose status changed refreshes its container's thread — but only a
+  // `review_comment` container has a GitHub review thread. An `issue_comment` container (the
+  // shape that carries several inline findings) has none, so it is never a `thread:` target.
+  // The target is the container, not the finding: `tx.effect` dedupes, so a container whose
+  // several findings all changed is refreshed once, and `threadState` re-reads all of them.
   for (const finding of tx.review.findings) {
     if (!("comment_id" in finding.source)) continue;
+    if (finding.source.container_kind !== "review_comment") continue;
     const prior = tx.before?.findings.find((f) => f.id === finding.id);
     if (prior === undefined) continue;
     if (JSON.stringify(prior.status) !== JSON.stringify(finding.status)) {
@@ -1030,8 +1035,12 @@ function admitExternal(tx: Transaction, action: Extract<Action, { kind: "AdmitEx
   // The head must be one the Review has seen; the newest subject at that head is its key.
   const subject = [...review.subjects].reverse().find((s) => s.head_sha === result.reviewed_head);
   if (subject === undefined) return refuse("unknown_subject", `head ${result.reviewed_head} was never observed on ${review.display}`);
-  const ids = result.findings.map((f) => f.source_comment_id);
-  if (new Set(ids).size !== ids.length) return refuse("malformed", "external findings must carry distinct source comment ids");
+  // §2.3/§3.5: the container is not the identity — one issue comment routinely carries several
+  // inline findings — so it is (container kind, container id, locator) that must be distinct.
+  const locators = result.findings.map((f) => `${f.container_kind}:${f.container_id}#${f.locator}`);
+  if (new Set(locators).size !== locators.length) {
+    return refuse("malformed", "external findings must carry distinct source locators within their container");
+  }
 
   // §D3: an admitted signal from Codex clears its recorded unavailability.
   clearAvailabilityOnSignal(tx, "codex");
@@ -1048,7 +1057,7 @@ function admitExternal(tx: Transaction, action: Extract<Action, { kind: "AdmitEx
       subject_key: subject.key,
       raised_by: "codex",
       answer_id: answerId,
-      source: { comment_id: f.source_comment_id },
+      source: { container_kind: f.container_kind, comment_id: f.container_id, locator: f.locator },
       priority: f.priority,
       reviewer_disposition: null,
       title: f.title,

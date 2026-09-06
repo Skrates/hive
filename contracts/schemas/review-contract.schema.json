@@ -865,14 +865,24 @@
     },
     "CommentFindingSource": {
       "additionalProperties": false,
+      "description": "\u00a73.5 \u2014 the source *container* the finding was read out of, plus its source-local locator.\n\nOne GitHub record can carry several findings, so a comment id alone does not identify one.\n``container_kind`` and ``comment_id`` name the record; ``locator`` is the finding's\nzero-based ordinal block within that record's body at the ``SourceRef.version`` it was read\nat \u2014 the one locator a re-read of the same version reproduces without consulting Hive state.\nOnly a ``review_comment`` container can carry a GitHub review thread, so only it is a\n``thread:<comment_id>`` target (\u00a78.1).",
       "properties": {
         "comment_id": {
           "minimum": 1,
           "type": "integer"
+        },
+        "container_kind": {
+          "$ref": "#/$defs/SourceRecordKind"
+        },
+        "locator": {
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "required": [
-        "comment_id"
+        "container_kind",
+        "comment_id",
+        "locator"
       ],
       "title": "CommentFindingSource",
       "type": "object"
@@ -1582,10 +1592,17 @@
     },
     "ExternalFinding": {
       "additionalProperties": false,
-      "description": "No fingerprint, falsifier or evidence is invented for Codex; provenance is the comment.",
+      "description": "No fingerprint, falsifier or evidence is invented for Codex; provenance is the container.\n\n``container_kind``/``container_id`` name the GitHub record the finding was read out of and\n``locator`` is its zero-based ordinal block within that record's body. A container is not\nunique across a result \u2014 one issue comment routinely carries several inline findings \u2014 so it\nis ``(container_kind, container_id, locator)`` that the reducer requires to be distinct, and\neach finding still gets its own Hive id (\u00a72.3, \u00a76.F).",
       "properties": {
         "body": {
           "type": "string"
+        },
+        "container_id": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "container_kind": {
+          "$ref": "#/$defs/SourceRecordKind"
         },
         "line": {
           "anyOf": [
@@ -1597,22 +1614,24 @@
             }
           ]
         },
+        "locator": {
+          "minimum": 0,
+          "type": "integer"
+        },
         "path": {
           "type": "string"
         },
         "priority": {
           "$ref": "#/$defs/FindingPriority"
         },
-        "source_comment_id": {
-          "minimum": 1,
-          "type": "integer"
-        },
         "title": {
           "type": "string"
         }
       },
       "required": [
-        "source_comment_id",
+        "container_kind",
+        "container_id",
+        "locator",
         "path",
         "line",
         "priority",

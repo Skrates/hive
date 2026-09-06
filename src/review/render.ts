@@ -121,7 +121,8 @@ function findingLocation(finding: AdmittedFinding): string {
 }
 
 function findingLine(finding: AdmittedFinding): string {
-  const source = "comment_id" in finding.source ? ` (comment ${finding.source.comment_id})` : "";
+  // The container and the finding's place in it: five findings can share one comment (§3.5).
+  const source = "comment_id" in finding.source ? ` (comment ${finding.source.comment_id}#${finding.source.locator})` : "";
   const links = finding.links.length === 0
     ? ""
     : ` — same as ${finding.links.map((link) => link.other).join(", ")}`;
@@ -369,33 +370,61 @@ export function slackBoardLine(state: ReviewState, unknownRecords: readonly Unkn
 
 export interface ThreadOp { comment_id: number; op: "resolve" | "unresolve" }
 
+/** The findings a `review_comment` container carries — the unit a GitHub review thread stands for. */
+function containerFindings(review: Review, commentId: number): AdmittedFinding[] {
+  return review.findings.filter(
+    (candidate) =>
+      "comment_id" in candidate.source &&
+      candidate.source.container_kind === "review_comment" &&
+      candidate.source.comment_id === commentId,
+  );
+}
+
 /**
- * §8.1 (ruled): a finding with a GitHub source comment gets its thread resolved when its
- * status becomes closed and un-resolved when it becomes contested or re-opened. Only
- * comment-sourced findings; reviewkit-sourced findings have no thread.
+ * §8.1 (ruled): the *container* is the thread, not the finding. A container's thread is
+ * resolved when every finding it carries is closed, and un-resolved when any one of them is
+ * open or contested. `null` when the container carries no finding at all.
+ */
+function containerState(findings: AdmittedFinding[]): "resolve" | "unresolve" | null {
+  if (findings.length === 0) return null;
+  return findings.every((finding) => !finding.status.open) ? "resolve" : "unresolve";
+}
+
+/** Every `review_comment` container the Review's findings name, in first-finding order. */
+function threadContainers(review: Review): number[] {
+  const seen: number[] = [];
+  for (const finding of review.findings) {
+    if (!("comment_id" in finding.source)) continue;
+    if (finding.source.container_kind !== "review_comment") continue;
+    if (!seen.includes(finding.source.comment_id)) seen.push(finding.source.comment_id);
+  }
+  return seen;
+}
+
+/**
+ * §8.1 (ruled): one op per *container* whose all-findings state flipped — resolved once every
+ * finding in it is closed, un-resolved as soon as any is open or contested. Only
+ * `review_comment` containers: an `issue_comment` has no review thread and a reviewkit-sourced
+ * finding has no comment at all.
  */
 export function threadOps(before: Review | null, after: Review): ThreadOp[] {
   const ops: ThreadOp[] = [];
-  for (const finding of after.findings) {
-    if (!("comment_id" in finding.source)) continue;
-    const prior = before?.findings.find((candidate) => candidate.id === finding.id) ?? null;
-    const wasClosed = prior !== null && !prior.status.open;
-    const isClosed = !finding.status.open;
-    if (isClosed && !wasClosed) ops.push({ comment_id: finding.source.comment_id, op: "resolve" });
-    else if (!isClosed && wasClosed) ops.push({ comment_id: finding.source.comment_id, op: "unresolve" });
+  for (const commentId of threadContainers(after)) {
+    const now = containerState(containerFindings(after, commentId));
+    const then = before === null ? null : containerState(containerFindings(before, commentId));
+    if (now === null || now === then) continue;
+    if (now === "resolve") ops.push({ comment_id: commentId, op: "resolve" });
+    else if (then === "resolve") ops.push({ comment_id: commentId, op: "unresolve" });
   }
   return ops;
 }
 
 /**
- * The thread refresh's own view: what the thread for `commentId` should look like given the
- * Review *now* (§8.1 — a refresh re-renders, it never carries the verdict that queued it).
- * `null` when no finding is sourced from that comment.
+ * The thread refresh's own view: what the thread for the container `commentId` should look
+ * like given the Review *now* (§8.1 — a refresh re-renders, it never carries the verdict that
+ * queued it). Every finding in the container decides it, never the first match. `null` when no
+ * finding names that `review_comment` container.
  */
 export function threadState(review: Review, commentId: number): "resolve" | "unresolve" | null {
-  const finding = review.findings.find(
-    (candidate) => "comment_id" in candidate.source && candidate.source.comment_id === commentId,
-  );
-  if (finding === undefined) return null;
-  return finding.status.open ? "unresolve" : "resolve";
+  return containerState(containerFindings(review, commentId));
 }

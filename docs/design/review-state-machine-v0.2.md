@@ -133,13 +133,18 @@ interface ExternalResult {
   submitted_at: string;
 }
 interface ExternalFinding {
-  source_comment_id: number; path: string; line: number | null;
+  container_kind: "review" | "review_comment" | "issue_comment";   // the record it was read out of
+  container_id: number; locator: number;         // container + zero-based block ordinal within it
+  path: string; line: number | null;
   priority: "P0" | "P1" | "P2" | "P3" | "unknown";   // badge-less ⇒ unknown, admitted, visible, blocking (§6.F5)
   title: string; body: string;
 }
 ```
 
-No fingerprint, falsifier or evidence is invented for Codex. Provenance is the comment.
+No fingerprint, falsifier or evidence is invented for Codex. Provenance is the container record.
+A container is **not** an identity: one issue comment routinely carries several inline findings, so
+what identifies a finding at its source is `(container_kind, container_id, locator)` — distinct
+across a result, and each finding still gets its own Hive id (§3.5).
 
 ---
 
@@ -239,7 +244,9 @@ interface AdmittedFinding {
   id: string;                                     // immutable, minted at admission
   review_id: ReviewId; subject_key: string;       // where it was raised
   raised_by: ActorId | "codex"; answer_id: string | null;   // null for unsolicited external evidence
-  source: { fingerprint: string; semantic_key: string } | { comment_id: number };   // native identity, retained
+  source: { fingerprint: string; semantic_key: string }
+        | { container_kind: "review" | "review_comment" | "issue_comment"; comment_id: number; locator: number };
+                                                  // native identity, retained: source container + item
   priority: "P0" | "P1" | "P2" | "P3" | "unknown";
   reviewer_disposition: "must-fix" | "owner-decision" | "follow-up" | "noise" | null;   // reviewkit only
   title: string; path: string; line: number | null;
@@ -468,6 +475,9 @@ type RefusalCode = "stale_revision" | "unauthorized" | "lifecycle" | "unknown_su
 ### F. Findings — identity, resolution, classification
 
 - **F1** Every admitted finding gets an immutable id and keeps its native source identity (§3.5).
+  Source identity is a **container** (the GitHub record it was read out of, by kind and id) plus a
+  source-local **locator** (its zero-based block ordinal within that record). Findings sharing a
+  container are not duplicates; admission refuses only a repeated `(container, locator)`.
   Fingerprints, semantic keys and normalized titles populate `correlation_hints` — evidence shown to
   reviewers, never authority to move a resolution.
 - **F2** `ResolveFinding(same_as: F-old)` links explicitly. If `F-old` is resolved, the link marks it
@@ -576,6 +586,10 @@ reads the policy by the Review's version; the batch records it (§B3).
 - A `notice` is a standing message to an actor about a subject, named by the subject rather than by a
   request. It is **not request transport**: the §D8 pause never withholds it (it is what explains the
   pause), and it goes obsolete only when the Review has left the subject it names.
+- `thread:<comment_id>` names the **container**, and only a `review_comment` container has a GitHub
+  review thread: a finding whose container is an `issue_comment` never queues a `thread:` effect. The
+  thread renders from every finding in that container — resolved once all of them are closed,
+  un-resolved as soon as any is open or contested — never from the first one found.
 - A refresh job means "re-render this target from `read()` now"; per-target publication is serialized and
   pending refreshes for the same target coalesce into the newest. A delayed worker can never publish an
   older verdict because it never carries one.

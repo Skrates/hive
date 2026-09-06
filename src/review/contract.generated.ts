@@ -1,7 +1,7 @@
 /* eslint-disable */
 /**
  * GENERATED — do not edit. Source: contracts/schemas/review-contract.schema.json,
- * vendored from weave-doctrine@a3c93f62d608d57cb45697ed39284e0fef922259 (see contracts/SOURCE).
+ * vendored from weave-doctrine@0a887ada7ea8caa8b976d3472f6cd7dd1b6208ad (see contracts/SOURCE).
  * Regenerate with `bun run check:contracts`.
  */
 
@@ -36,19 +36,19 @@ export type ExemptionReason = "skill_only" | "exempt_paths" | "verbatim_copy";
  */
 export type Lifecycle = "open" | "closed" | "merged";
 /**
- * §3.5 / §6.F5: ``unknown`` is admitted, visible and blocking until classified.
- *
- * This interface was referenced by `ReviewContract`'s JSON-Schema
- * via the `definition` "FindingPriority".
- */
-export type FindingPriority = "P0" | "P1" | "P2" | "P3" | "unknown";
-/**
  * §7 source records: GitHub reviews, review comments, issue comments.
  *
  * This interface was referenced by `ReviewContract`'s JSON-Schema
  * via the `definition` "SourceRecordKind".
  */
 export type SourceRecordKind = "review" | "review_comment" | "issue_comment";
+/**
+ * §3.5 / §6.F5: ``unknown`` is admitted, visible and blocking until classified.
+ *
+ * This interface was referenced by `ReviewContract`'s JSON-Schema
+ * via the `definition` "FindingPriority".
+ */
+export type FindingPriority = "P0" | "P1" | "P2" | "P3" | "unknown";
 /**
  * This interface was referenced by `ReviewContract`'s JSON-Schema
  * via the `definition` "ExternalVerdict".
@@ -439,17 +439,25 @@ export interface ExternalResult {
   verdict: ExternalVerdict;
 }
 /**
- * No fingerprint, falsifier or evidence is invented for Codex; provenance is the comment.
+ * No fingerprint, falsifier or evidence is invented for Codex; provenance is the container.
+ *
+ * ``container_kind``/``container_id`` name the GitHub record the finding was read out of and
+ * ``locator`` is its zero-based ordinal block within that record's body. A container is not
+ * unique across a result — one issue comment routinely carries several inline findings — so it
+ * is ``(container_kind, container_id, locator)`` that the reducer requires to be distinct, and
+ * each finding still gets its own Hive id (§2.3, §6.F).
  *
  * This interface was referenced by `ReviewContract`'s JSON-Schema
  * via the `definition` "ExternalFinding".
  */
 export interface ExternalFinding {
   body: string;
+  container_id: number;
+  container_kind: SourceRecordKind;
   line: number | null;
+  locator: number;
   path: string;
   priority: FindingPriority;
-  source_comment_id: number;
   title: string;
 }
 /**
@@ -1242,11 +1250,22 @@ export interface ReviewkitFindingSource {
   semantic_key: string;
 }
 /**
+ * §3.5 — the source *container* the finding was read out of, plus its source-local locator.
+ *
+ * One GitHub record can carry several findings, so a comment id alone does not identify one.
+ * ``container_kind`` and ``comment_id`` name the record; ``locator`` is the finding's
+ * zero-based ordinal block within that record's body at the ``SourceRef.version`` it was read
+ * at — the one locator a re-read of the same version reproduces without consulting Hive state.
+ * Only a ``review_comment`` container can carry a GitHub review thread, so only it is a
+ * ``thread:<comment_id>`` target (§8.1).
+ *
  * This interface was referenced by `ReviewContract`'s JSON-Schema
  * via the `definition` "CommentFindingSource".
  */
 export interface CommentFindingSource {
   comment_id: number;
+  container_kind: SourceRecordKind;
+  locator: number;
 }
 /**
  * This interface was referenced by `ReviewContract`'s JSON-Schema

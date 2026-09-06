@@ -3,10 +3,12 @@
     "findings": [
       {
         "body": "The loop skips the last record.",
+        "container_id": 9001,
+        "container_kind": "review_comment",
         "line": null,
+        "locator": 0,
         "path": "src/x.py",
         "priority": "unknown",
-        "source_comment_id": 9001,
         "title": "Off-by-one in replay window"
       }
     ],

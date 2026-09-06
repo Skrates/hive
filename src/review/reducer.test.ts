@@ -278,7 +278,9 @@ function external(o: Partial<ExternalResult> & { comments?: Array<{ id: number; 
       reviewed_head: H1,
       verdict: comments === undefined || comments.length === 0 ? "clean" : "findings",
       findings: (comments ?? []).map((c) => ({
-        source_comment_id: c.id,
+        container_kind: "review_comment",
+        container_id: c.id,
+        locator: 0,
         path: "src/x.py",
         line: 12,
         priority: c.priority ?? "P1",
@@ -1041,7 +1043,7 @@ test("§E4 an external result answers the Codex request pending at that subject 
   const finding = answered.state.findings[0];
   assert.ok(finding);
   assert.equal(finding.id, "fnd_src:review:5001:v1_1");
-  assert.deepEqual(finding.source, { comment_id: 9001 });
+  assert.deepEqual(finding.source, { container_kind: "review_comment", comment_id: 9001, locator: 0 }, "the source names its container and the finding's place in it");
   assert.equal(finding.answer_id, "ans_src:review:5001:v1_1");
   assert.equal(finding.raised_by, "codex");
   assert.equal(finding.reviewer_disposition, null);
@@ -1182,7 +1184,7 @@ test("§F3 resolution kinds: fixed (unconfirmed), refuted, withdrawn, follow_up,
 
 test("§F5 blocking ⇔ open ∧ priority ∈ {P0,P1,P2,unknown} ∧ disposition ∈ {must-fix, owner-decision, null}", () => {
   const base: AdmittedFinding = {
-    id: "f", review_id: "r", subject_key: `${H1}:main`, raised_by: "codex", answer_id: null, source: { comment_id: 1 },
+    id: "f", review_id: "r", subject_key: `${H1}:main`, raised_by: "codex", answer_id: null, source: { container_kind: "review_comment", comment_id: 1, locator: 0 },
     priority: "P1", reviewer_disposition: null, title: "t", path: "p", line: null, status: { open: true }, links: [], correlation_hints: [],
   };
   const table: Array<[AdmittedFinding["priority"], AdmittedFinding["reviewer_disposition"], boolean]> = [

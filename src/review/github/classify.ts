@@ -209,11 +209,18 @@ function splitFinding(text: string): { title: string; body: string } | null {
   return { title, body };
 }
 
+/**
+ * A finding read out of a whole record: the record is the container and the record's body is
+ * one block, so the locator is `0`. Used for a member `review_comment` of a findings envelope,
+ * a standalone `review_comment`, and a task-channel `## Review Finding` issue comment.
+ */
 function memberFinding(member: GitHubRecord): ExternalFinding | null {
   const split = splitFinding(member.body);
   if (split === null) return null;
   return {
-    source_comment_id: member.id,
+    container_kind: member.kind,
+    container_id: member.id,
+    locator: 0,
     path: member.path ?? "",
     line: member.line,
     priority: findingPriority(member.body),
@@ -222,18 +229,29 @@ function memberFinding(member: GitHubRecord): ExternalFinding | null {
   };
 }
 
-/** Inline findings in an issue comment: blocks separated by `---`, each `permalink\n**title**\nbody`. */
+/**
+ * Inline findings in an issue comment: blocks separated by `---`, each `permalink\n**title**\nbody`.
+ *
+ * One comment, many findings (the wild's `sokrates#5420521329` carries five), so the comment id
+ * is the *container* and each finding's locator is its zero-based block ordinal in the split —
+ * counted over every block including the unreadable ones, so a locator depends only on the
+ * comment body at this version and is reproduced by any re-read of it. An issue comment has no
+ * GitHub review thread; §8.1 reads `container_kind` to know that.
+ */
 function inlineFindings(body: string, repository: string, commentId: number): ExternalFinding[] {
   const afterHeading = body.slice(body.indexOf(FINDINGS_REVIEW_HEADING) + FINDINGS_REVIEW_HEADING.length);
   const withoutDetails = afterHeading.replace(/<details>[\s\S]*$/u, "");
   const findings: ExternalFinding[] = [];
-  for (const block of withoutDetails.split(/\n---\n/u)) {
+  const blocks = withoutDetails.split(/\n---\n/u);
+  for (const [locator, block] of blocks.entries()) {
     const anchor = ownPermalinks(block, repository)[0];
     const rest = block.replace(PERMALINK, "").trim();
     const split = splitFinding(rest);
     if (split === null) continue;
     findings.push({
-      source_comment_id: commentId,
+      container_kind: "issue_comment",
+      container_id: commentId,
+      locator,
       path: anchor?.path ?? "",
       line: anchor?.line ?? null,
       priority: findingPriority(rest),
@@ -352,7 +370,9 @@ function classifyIssueComment(record: GitHubRecord, body: string, context: Class
     if (split === null) return unknown("task finding without a title line");
     if (head === null) return unknown("task finding pins no single head");
     const finding: ExternalFinding = {
-      source_comment_id: record.id,
+      container_kind: "issue_comment",
+      container_id: record.id,
+      locator: 0,
       path: anchor?.path ?? "",
       line: anchor?.line ?? null,
       priority: findingPriority(rest),

@@ -279,8 +279,8 @@ test("thread refresh resolves a closed comment-sourced finding and unresolves a 
   const { store, github, publisher } = fixture({ github: true });
   store.put(state({
     findings: [
-      finding({ id: "fnd_1", source: { comment_id: 9001 }, status: { open: false, resolution: fixedClaim() } }),
-      finding({ id: "fnd_2", source: { comment_id: 9002 }, status: { open: true, contested: { by: "codex", at: AT, prior: fixedClaim() } } }),
+      finding({ id: "fnd_1", source: { container_kind: "review_comment", comment_id: 9001, locator: 0 }, status: { open: false, resolution: fixedClaim() } }),
+      finding({ id: "fnd_2", source: { container_kind: "review_comment", comment_id: 9002, locator: 0 }, status: { open: true, contested: { by: "codex", at: AT, prior: fixedClaim() } } }),
     ],
   }));
   store.add({ effect_id: "eff_1", kind: "refresh", target: "thread:9001" });

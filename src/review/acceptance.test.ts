@@ -32,10 +32,12 @@ import type {
   ReviewState,
 } from "./contract.js";
 import { validateReview, validateReviewState } from "./contract.js";
-import { issueCommentRecord, type GitHubChangedFile, type GitHubPort, type GitHubPullRequest, type GitHubRecord } from "./github/port.js";
+import { classifyCodexRecord } from "./github/classify.js";
+import { issueCommentRecord, reviewCommentRecord, reviewRecord, type GitHubChangedFile, type GitHubPort, type GitHubPullRequest, type GitHubRecord } from "./github/port.js";
 import { ReconcileScheduler, reconcile } from "./github/reconcile.js";
 import { handleWebhook } from "./github/webhook.js";
 import { ReviewPublisher, type ReviewGitHubPort, type SystemWakePort } from "./publisher.js";
+import { threadState } from "./render.js";
 import { decide, fold, read } from "./reducer.js";
 import { ReviewStore } from "./store.js";
 
@@ -94,6 +96,29 @@ class FakeClock implements Clock {
 
 function codexFixture(name: string): GitHubRecord {
   return issueCommentRecord(JSON.parse(readFileSync(join(FIXTURES, `${name}.json`), "utf8")) as Record<string, unknown>);
+}
+
+/** Any captured source-record fixture, read by the reader its `-<kind>-` segment names. */
+function codexRecord(name: string): GitHubRecord {
+  const raw = JSON.parse(readFileSync(join(FIXTURES, `${name}.json`), "utf8")) as Record<string, unknown>;
+  switch (name.split("-").at(-2)) {
+    case "review": return reviewRecord(raw);
+    case "review_comment": return reviewCommentRecord(raw);
+    default: return issueCommentRecord(raw);
+  }
+}
+
+/** The one classification, as the reconciler runs it: the record's own `ExternalResult`. */
+function classified(name: string, o: { repository: string; head: string; members?: GitHubRecord[] }): ExternalResult {
+  const result = classifyCodexRecord(codexRecord(name), {
+    headSha: o.head,
+    heads: [o.head],
+    repository: o.repository,
+    members: o.members ?? [],
+  });
+  assert.equal(result.classification, "findings", result.detail);
+  assert.ok(result.external !== undefined);
+  return result.external;
 }
 
 interface ObserveOverrides {
@@ -203,7 +228,7 @@ function external(o: Partial<ExternalResult> & { comments?: Array<{ id: number; 
       source: "codex",
       reviewed_head: H1,
       verdict: comments === undefined || comments.length === 0 ? "clean" : "findings",
-      findings: (comments ?? []).map((c) => ({ source_comment_id: c.id, path: "src/x.py", line: 12, priority: "P1", title: c.title ?? `Codex ${c.id}`, body: "…" })),
+      findings: (comments ?? []).map((c) => ({ container_kind: "review_comment" as const, container_id: c.id, locator: 0, path: "src/x.py", line: 12, priority: "P1" as const, title: c.title ?? `Codex ${c.id}`, body: "…" })),
       source_record: { kind: "review", id: 5001, version: T0 },
       submitted_at: T0,
       ...rest,
@@ -958,3 +983,103 @@ test("§6.C6 through the reconciler: a verbatim template copy is exempt in the R
   assert.equal(core.state().requirement.status, "unsatisfied");
   core.close();
 });
+
+// ---------------------------------------------------------------------------------------
+// §3.5 / §8.1 — source *container* vs source *item*: one comment, many findings
+// ---------------------------------------------------------------------------------------
+
+/** The head `sokrates-issue_comment-5420521329`'s own permalinks pin (V-6 capture). */
+const INLINE_HEAD = "b21a0e215207df98c7761e8e27d9f4b4af553c72";
+/** The head the `hive-review-5125461304` envelope was submitted at (V-6 capture). */
+const ENVELOPE_HEAD = "9ae793d86be8a73a29717e55cb978ee120e72ad9";
+
+test("§3.5 five inline findings in one issue comment are five findings, and §8.1 refreshes no thread", () => {
+  const core = new Core();
+  core.applied(observe({ head: INLINE_HEAD }), ADAPTER, { actId: "obs:inline" });
+  assert.equal(core.pending("codex").length, 1, "the initial round routes to codex (§D2)");
+
+  const external = classified("sokrates-issue_comment-5420521329", { repository: "Skrates/sokrates", head: INLINE_HEAD });
+  assert.equal(external.findings.length, 5, "the wild's comment carries five findings");
+  const applied = core.applied({ kind: "AdmitExternalResult", result: external }, ADAPTER, { actId: "src:issue_comment:5420521329:v1" });
+
+  // Every finding is retained: one container, five distinct locators, five distinct Hive ids.
+  const findings = core.review().findings;
+  assert.equal(findings.length, 5, "admission keeps all five; a shared comment id is not a duplicate");
+  assert.equal(new Set(findings.map((f) => f.id)).size, 5, "each finding has its own immutable id");
+  const sources = findings.map((f) => {
+    assert.ok("comment_id" in f.source);
+    return f.source;
+  });
+  assert.deepEqual(sources.map((s) => s.comment_id), Array<number>(5).fill(5420521329), "one container");
+  assert.deepEqual(sources.map((s) => s.container_kind), Array<string>(5).fill("issue_comment"));
+  assert.equal(new Set(sources.map((s) => s.locator)).size, 5, "distinct source-local locators");
+  assert.equal(core.state().blocking_findings.length, 5, "all five are read back as blocking (P1/P1/P2/P2/P2)");
+  assert.deepEqual(core.pending("codex"), [], "the five-finding result answers the pending codex request (§E4)");
+
+  // §8.1: an issue comment has no GitHub review thread, so the batch names no `thread:` target.
+  const rows = new Map(core.effectRows().map((r) => [r.effect_id, r.target]));
+  const emitted = applied.effects.map((id) => rows.get(id) ?? id);
+  assert.ok(emitted.length > 0);
+  assert.ok(!emitted.some((t) => t.startsWith("thread:")), `an issue-comment container is never a thread target: ${emitted.join(" ")}`);
+  core.close();
+});
+
+test("§8.1 a review envelope's member comments are thread containers: one refresh each, resolved only when every finding in the container is closed", () => {
+  const core = new Core();
+  core.applied(observe({ head: ENVELOPE_HEAD }), ADAPTER, { actId: "obs:envelope" });
+
+  const members = [codexRecord("hive-review_comment-3944094503"), codexRecord("hive-review_comment-3944094508")];
+  const envelope = classified("hive-review-5125461304", { repository: "Skrates/hive", head: ENVELOPE_HEAD, members });
+  assert.deepEqual(
+    envelope.findings.map((f) => [f.container_kind, f.container_id, f.locator]),
+    [["review_comment", 3944094503, 0], ["review_comment", 3944094508, 0]],
+    "each member comment is its own container",
+  );
+  core.applied({ kind: "AdmitExternalResult", result: envelope }, ADAPTER, { actId: "src:review:5125461304:v1" });
+
+  // A second finding in the *first* member's container — the case `threadState` must not decide
+  // off the first match. The connector writes one finding per member comment; the state machine
+  // must still be right when a container carries two.
+  const second: ExternalResult = {
+    ...envelope,
+    findings: [{ ...(envelope.findings[0] as ExternalResult["findings"][number]), locator: 1, title: "A second finding in the same member comment" }],
+    source_record: { ...envelope.source_record, version: "2026-09-06T13:00:00Z" },
+  };
+  core.applied({ kind: "AdmitExternalResult", result: second }, ADAPTER, { actId: "src:review:5125461304:v2" });
+
+  const byContainer = (commentId: number) =>
+    core.review().findings.filter((f) => "comment_id" in f.source && f.source.comment_id === commentId);
+  assert.equal(byContainer(3944094503).length, 2, "two findings share the first member's container");
+  assert.equal(byContainer(3944094508).length, 1);
+
+  const close = (findingId: string, actId: string) =>
+    core.applied({ kind: "ResolveFinding", finding_id: findingId, resolution: { kind: "fixed", evidence: "repaired", commits: [H2] } }, seat("talos"), { actId });
+  const targetsOf = (effects: string[]): string[] => {
+    const rows = new Map(core.effectRows().map((r) => [r.effect_id, r.target]));
+    return effects.map((id) => rows.get(id) ?? id);
+  };
+
+  // Closing the first of the container's two findings refreshes its thread — the refresh is the
+  // container's, and the container is not yet resolvable.
+  const first = byContainer(3944094503)[0];
+  assert.ok(first !== undefined);
+  const firstClose = close(first.id, "01JCLOSE1");
+  assert.deepEqual(targetsOf(firstClose.effects).filter((t) => t.startsWith("thread:")), ["thread:3944094503"], "one refresh, for the container");
+  assert.equal(threadState(core.review(), 3944094503), "unresolve", "one finding still open keeps the whole container un-resolved");
+
+  const remaining = byContainer(3944094503).find((f) => f.status.open);
+  assert.ok(remaining !== undefined);
+  const secondClose = close(remaining.id, "01JCLOSE2");
+  assert.deepEqual(targetsOf(secondClose.effects).filter((t) => t.startsWith("thread:")), ["thread:3944094503"]);
+  assert.equal(threadState(core.review(), 3944094503), "resolve", "every finding in the container is closed");
+  assert.equal(threadState(core.review(), 3944094508), "unresolve", "the other container is untouched");
+
+  // The other member container refreshes on its own status change, and the publisher resolves
+  // exactly the two threads the containers stand for.
+  const other = byContainer(3944094508)[0];
+  assert.ok(other !== undefined);
+  const otherClose = close(other.id, "01JCLOSE3");
+  assert.deepEqual(targetsOf(otherClose.effects).filter((t) => t.startsWith("thread:")), ["thread:3944094508"]);
+  core.close();
+});
+
