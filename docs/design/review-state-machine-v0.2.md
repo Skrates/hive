@@ -239,7 +239,7 @@ interface AdmittedFinding {
   id: string;                                     // immutable, minted at admission
   review_id: ReviewId; subject_key: string;       // where it was raised
   raised_by: ActorId | "codex"; answer_id: string | null;   // null for unsolicited external evidence
-  source: { fingerprint: string; semantic_key: string } | { comment_id: number };   // native identity, retained
+  source: { fingerprint: string; semantic_key: string } | { record_kind: "review_comment" | "issue_comment"; comment_id: number };   // native identity, retained
   priority: "P0" | "P1" | "P2" | "P3" | "unknown";
   reviewer_disposition: "must-fix" | "owner-decision" | "follow-up" | "noise" | null;   // reviewkit only
   title: string; path: string; line: number | null;
@@ -388,13 +388,15 @@ type RefusalCode = "stale_revision" | "unauthorized" | "lifecycle" | "unknown_su
 - **C1** `ObservePR` is a whole-state observation: the reducer diffs it against the Review and derives
   each consequence independently — a subject change, a lifecycle transition, a draft flip, a metadata
   refresh. An unchanged subject preserves judgments; it never suppresses the other consequences (the v0.1
-  no-op defect).
+  no-op defect). When only the observation time changes, the audit batch records the observation
+  without refreshing projections or renewing the Review's activity window.
 - **C2** Subject change: pending requests at the old subject are cancelled (`subject_changed`); holds with
   `release_on: subject_change` release; the exemption is recomputed; then, unless draft, exempt, closed,
   merged, or a summons-blocking hold is active, the system opens the initial required request per policy
   and routing (§D).
 - **C3** Lifecycle: `open → closed` pauses (pending requests stay pending, transport paused, readiness
-  false); `closed → open` resumes with history intact; `→ merged` is terminal for new work: every act but
+  false); `closed → open` resumes with history intact and opens the initial request if the Review
+  was first observed closed and has never had a review request at this subject; `→ merged` is terminal for new work: every act but
   `read`, `Release`, `ResolveFinding(follow_up)` and `RetractAnswer` (lineage hygiene) is refused
   `lifecycle`.
 - **C4** Draft: no auto-request while draft; `draft → ready-for-review` at an unchanged subject opens the
@@ -575,12 +577,16 @@ reads the policy by the Review's version; the batch records it (§B3).
   (delivery, summon, announce, notice).
 - A `notice` is a standing message to an actor about a subject, named by the subject rather than by a
   request. It is **not request transport**: the §D8 pause never withholds it (it is what explains the
-  pause), and it goes obsolete only when the Review has left the subject it names.
+  pause), and it goes obsolete only when the Review has left the subject it names. Its payload is
+  exactly `actor`, `text`, and `dedupe_key`; the subject is carried by the target.
 - A refresh job means "re-render this target from `read()` now"; per-target publication is serialized and
   pending refreshes for the same target coalesce into the newest. A delayed worker can never publish an
   older verdict because it never carries one.
 - An actionable job re-checks applicability against the current Review before dispatch (§D7) and marks
-  itself `obsolete` otherwise. At-least-once remains; duplicates are self-identifying by `effect_id`.
+  itself `obsolete` otherwise. At-least-once remains; summon comments identify the request,
+  `effect_id`, and attempt. Interrupted claims retry after backoff; the 50th failed attempt
+  atomically queues a durable failure notice in the Review's Slack thread (or the broker channel
+  when the Review has no Slack channel).
 - **Check run `weave/review`** at the current head: `success` ⇔ `readiness.ready`; otherwise `failure`
   with the first reason in precedence order: merged > closed > hold > exhausted > required request pending
   > requirement unsatisfied > blocking findings > draft. **`neutral`/`skipped` are never published**
@@ -589,10 +595,12 @@ reads the policy by the Review's version; the batch records it (§B3).
   only comment the belt writes and it carries no marker. It renders open and resolved findings with their
   resolutions (including "fixed, claimed by talos @ sha, unconfirmed"), requests with transport
   references, holds, charges, the exhaustion gate text, and unknown-severity findings prominently.
-- **Thread resolution** (ruled): a finding with a GitHub source comment gets its review thread resolved
+- **Thread resolution** (ruled): a finding whose source is a GitHub `review_comment` gets its review thread resolved
   when its status becomes closed and un-resolved when it becomes contested or re-opened — GraphQL
   `resolveReviewThread`/`unresolveReviewThread` under the App. The merge skill's "zero open threads" limb
-  stays and now agrees with the Review by construction.
+  stays and now agrees with the Review by construction. `issue_comment` findings never emit a
+  review-thread operation. Slack thread and opener handles are keyed by channel, so adopting a
+  policy with a different channel opens a thread in that channel.
 - **Slack**: deliveries to seats (burn digest, clean wake, gate, retrospective) are Hive deliveries minted
   with a `system` origin — a small `ingestEvent` extension, otherwise the ordinary ledger, outbox, R-3/R-6.
   The merge announcement (today's `announce-machine-merge` job) is the `announce` effect of

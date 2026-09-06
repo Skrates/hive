@@ -38,6 +38,7 @@ export interface ReviewRuntimeInput {
   broker: BrokerStore;
   clock: Clock;
   adminToken: string;
+  failureChannelId?: string | undefined;
   env: ReviewRuntimeEnv;
   log: (line: string) => void;
   /** Test seam for the App port; production uses undici. */
@@ -95,7 +96,13 @@ function readSecret(name: string, path: string): string {
 
 export function bootReviewRuntime(input: ReviewRuntimeInput): ReviewRuntime {
   const { broker, clock, log } = input;
-  const store = new ReviewStore(broker.db, { decide, fold, read, clock });
+  const store = new ReviewStore(broker.db, { decide, fold, read, clock,
+    onEffectExhausted: notice => {
+      const channelId = notice.channelId ?? input.failureChannelId;
+      if (channelId === undefined) throw new Error("no channel configured for review failure notices");
+      broker.postBoardLine({ channelId, threadTs: notice.channelId === null ? null : notice.threadTs, text: notice.text });
+    },
+  });
   const resolved = githubConfig(input.env);
 
   if (resolved.config === null) {

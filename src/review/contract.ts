@@ -20,6 +20,7 @@ import type {
   Action,
   Batch,
   Consequence,
+  Command,
   Effect,
   ExternalResult,
   NormalizedResult,
@@ -88,6 +89,7 @@ export function contractValidator<T>(definition: string): ContractValidator<T> {
   };
 }
 
+export const validateCommand = contractValidator<Command>("Command");
 export const validateAction = contractValidator<Action>("Action");
 export const validateBatch = contractValidator<Batch>("Batch");
 export const validateConsequence = contractValidator<Consequence>("Consequence");

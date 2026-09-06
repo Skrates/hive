@@ -116,6 +116,7 @@
           "anyOf": [
             {
               "minLength": 1,
+              "pattern": "^\\S+$(?![\\s\\S])",
               "type": "string"
             },
             {
@@ -131,6 +132,7 @@
         },
         "id": {
           "minLength": 1,
+          "pattern": "^\\S+$(?![\\s\\S])",
           "type": "string"
         },
         "line": {
@@ -162,6 +164,7 @@
         },
         "review_id": {
           "minLength": 1,
+          "pattern": "^\\S+$(?![\\s\\S])",
           "type": "string"
         },
         "reviewer_disposition": {
@@ -253,6 +256,7 @@
         },
         "id": {
           "minLength": 1,
+          "pattern": "^\\S+$(?![\\s\\S])",
           "type": "string"
         },
         "normalized": {
@@ -283,6 +287,7 @@
         },
         "request_id": {
           "minLength": 1,
+          "pattern": "^\\S+$(?![\\s\\S])",
           "type": "string"
         },
         "status": {
@@ -315,6 +320,7 @@
         },
         "request_id": {
           "minLength": 1,
+          "pattern": "^\\S+$(?![\\s\\S])",
           "type": "string"
         },
         "subject_key": {
@@ -364,6 +370,7 @@
       "properties": {
         "answer_id": {
           "minLength": 1,
+          "pattern": "^\\S+$(?![\\s\\S])",
           "type": "string"
         },
         "kind": {
@@ -410,11 +417,13 @@
         },
         "batch_id": {
           "minLength": 1,
+          "pattern": "^\\S+$(?![\\s\\S])",
           "type": "string"
         },
         "effects": {
           "items": {
             "minLength": 1,
+            "pattern": "^\\S+$(?![\\s\\S])",
             "type": "string"
           },
           "type": "array"
@@ -512,6 +521,7 @@
         },
         "batch_id": {
           "minLength": 1,
+          "pattern": "^\\S+$(?![\\s\\S])",
           "type": "string"
         },
         "command": {
@@ -635,6 +645,7 @@
         "blocking_findings": {
           "items": {
             "minLength": 1,
+            "pattern": "^\\S+$(?![\\s\\S])",
             "type": "string"
           },
           "type": "array"
@@ -677,6 +688,7 @@
         },
         "request_id": {
           "minLength": 1,
+          "pattern": "^\\S+$(?![\\s\\S])",
           "type": "string"
         }
       },
@@ -694,6 +706,7 @@
       "properties": {
         "answer_id": {
           "minLength": 1,
+          "pattern": "^\\S+$(?![\\s\\S])",
           "type": "string"
         },
         "at": {
@@ -737,6 +750,7 @@
       "properties": {
         "finding_id": {
           "minLength": 1,
+          "pattern": "^\\S+$(?![\\s\\S])",
           "type": "string"
         },
         "kind": {
@@ -832,6 +846,7 @@
       "properties": {
         "act_id": {
           "minLength": 1,
+          "pattern": "^\\S+$(?![\\s\\S])",
           "type": "string"
         },
         "action": {
@@ -940,9 +955,17 @@
         "comment_id": {
           "minimum": 1,
           "type": "integer"
+        },
+        "record_kind": {
+          "enum": [
+            "review_comment",
+            "issue_comment"
+          ],
+          "type": "string"
         }
       },
       "required": [
+        "record_kind",
         "comment_id"
       ],
       "title": "CommentFindingSource",
@@ -1057,6 +1080,7 @@
         },
         "by": {
           "minLength": 1,
+          "pattern": "^\\S+$(?![\\s\\S])",
           "type": "string"
         },
         "prior": {
@@ -1272,6 +1296,7 @@
       "properties": {
         "effect_id": {
           "minLength": 1,
+          "pattern": "^\\S+$(?![\\s\\S])",
           "type": "string"
         },
         "kind": {
@@ -1350,6 +1375,7 @@
         },
         "episode_id": {
           "minLength": 1,
+          "pattern": "^\\S+$(?![\\s\\S])",
           "type": "string"
         },
         "kind": {
@@ -1528,10 +1554,12 @@
         },
         "hold_id": {
           "minLength": 1,
+          "pattern": "^\\S+$(?![\\s\\S])",
           "type": "string"
         },
         "id": {
           "minLength": 1,
+          "pattern": "^\\S+$(?![\\s\\S])",
           "type": "string"
         },
         "opened_at": {
@@ -1577,6 +1605,7 @@
         },
         "id": {
           "minLength": 1,
+          "pattern": "^\\S+$(?![\\s\\S])",
           "type": "string"
         },
         "kind": {
@@ -1921,6 +1950,7 @@
         },
         "finding_id": {
           "minLength": 1,
+          "pattern": "^\\S+$(?![\\s\\S])",
           "type": "string"
         }
       },
@@ -1948,6 +1978,7 @@
       "properties": {
         "finding_id": {
           "minLength": 1,
+          "pattern": "^\\S+$(?![\\s\\S])",
           "type": "string"
         },
         "kind": {
@@ -2010,6 +2041,7 @@
         },
         "finding_id": {
           "minLength": 1,
+          "pattern": "^\\S+$(?![\\s\\S])",
           "type": "string"
         },
         "kind": {
@@ -2050,6 +2082,7 @@
         },
         "other": {
           "minLength": 1,
+          "pattern": "^\\S+$(?![\\s\\S])",
           "type": "string"
         },
         "relation": {
@@ -2071,6 +2104,7 @@
       "properties": {
         "finding_id": {
           "minLength": 1,
+          "pattern": "^\\S+$(?![\\s\\S])",
           "type": "string"
         },
         "kind": {
@@ -2193,6 +2227,7 @@
       "properties": {
         "finding_id": {
           "minLength": 1,
+          "pattern": "^\\S+$(?![\\s\\S])",
           "type": "string"
         },
         "kind": {
@@ -2497,6 +2532,7 @@
       "properties": {
         "hold_id": {
           "minLength": 1,
+          "pattern": "^\\S+$(?![\\s\\S])",
           "type": "string"
         },
         "kind": {
@@ -2874,6 +2910,7 @@
         "names": {
           "items": {
             "minLength": 1,
+            "pattern": "^\\S+$(?![\\s\\S])",
             "type": "string"
           },
           "type": "array"
@@ -2923,6 +2960,7 @@
         "names": {
           "items": {
             "minLength": 1,
+            "pattern": "^\\S+$(?![\\s\\S])",
             "type": "string"
           },
           "type": "array"
@@ -3283,6 +3321,7 @@
       "properties": {
         "act_id": {
           "minLength": 1,
+          "pattern": "^\\S+$(?![\\s\\S])",
           "type": "string"
         },
         "outcome": {
@@ -3302,6 +3341,7 @@
           "anyOf": [
             {
               "minLength": 1,
+              "pattern": "^\\S+$(?![\\s\\S])",
               "type": "string"
             },
             {
@@ -3445,6 +3485,7 @@
       "properties": {
         "hold_id": {
           "minLength": 1,
+          "pattern": "^\\S+$(?![\\s\\S])",
           "type": "string"
         },
         "kind": {
@@ -3477,6 +3518,7 @@
       "properties": {
         "batch_id": {
           "minLength": 1,
+          "pattern": "^\\S+$(?![\\s\\S])",
           "type": "string"
         },
         "replayed": {
@@ -3526,6 +3568,7 @@
           "anyOf": [
             {
               "minLength": 1,
+              "pattern": "^\\S+$(?![\\s\\S])",
               "type": "string"
             },
             {
@@ -3539,6 +3582,7 @@
         },
         "id": {
           "minLength": 1,
+          "pattern": "^\\S+$(?![\\s\\S])",
           "type": "string"
         },
         "kind": {
@@ -3557,6 +3601,7 @@
         "names": {
           "items": {
             "minLength": 1,
+            "pattern": "^\\S+$(?![\\s\\S])",
             "type": "string"
           },
           "type": "array"
@@ -3605,6 +3650,7 @@
           "anyOf": [
             {
               "minLength": 1,
+              "pattern": "^\\S+$(?![\\s\\S])",
               "type": "string"
             },
             {
@@ -3651,6 +3697,7 @@
       "properties": {
         "answer_id": {
           "minLength": 1,
+          "pattern": "^\\S+$(?![\\s\\S])",
           "type": "string"
         },
         "kind": {
@@ -3659,6 +3706,7 @@
         },
         "request_id": {
           "minLength": 1,
+          "pattern": "^\\S+$(?![\\s\\S])",
           "type": "string"
         }
       },
@@ -3682,6 +3730,7 @@
         },
         "request_id": {
           "minLength": 1,
+          "pattern": "^\\S+$(?![\\s\\S])",
           "type": "string"
         }
       },
@@ -3737,6 +3786,7 @@
         },
         "request_id": {
           "minLength": 1,
+          "pattern": "^\\S+$(?![\\s\\S])",
           "type": "string"
         }
       },
@@ -3771,6 +3821,7 @@
         },
         "request_id": {
           "minLength": 1,
+          "pattern": "^\\S+$(?![\\s\\S])",
           "type": "string"
         }
       },
@@ -3788,6 +3839,7 @@
         "required_request_pending": {
           "items": {
             "minLength": 1,
+            "pattern": "^\\S+$(?![\\s\\S])",
             "type": "string"
           },
           "type": "array"
@@ -3838,6 +3890,7 @@
         "by": {
           "items": {
             "minLength": 1,
+            "pattern": "^\\S+$(?![\\s\\S])",
             "type": "string"
           },
           "type": "array"
@@ -3865,6 +3918,7 @@
         "pending": {
           "items": {
             "minLength": 1,
+            "pattern": "^\\S+$(?![\\s\\S])",
             "type": "string"
           },
           "type": "array"
@@ -3892,6 +3946,7 @@
         "requirement_unsatisfied": {
           "items": {
             "minLength": 1,
+            "pattern": "^\\S+$(?![\\s\\S])",
             "type": "string"
           },
           "type": "array"
@@ -3938,6 +3993,7 @@
           "anyOf": [
             {
               "minLength": 1,
+              "pattern": "^\\S+$(?![\\s\\S])",
               "type": "string"
             },
             {
@@ -4041,6 +4097,7 @@
       "properties": {
         "finding_id": {
           "minLength": 1,
+          "pattern": "^\\S+$(?![\\s\\S])",
           "type": "string"
         },
         "kind": {
@@ -4086,6 +4143,7 @@
       "properties": {
         "answer_id": {
           "minLength": 1,
+          "pattern": "^\\S+$(?![\\s\\S])",
           "type": "string"
         },
         "kind": {
@@ -4180,6 +4238,7 @@
         },
         "id": {
           "minLength": 1,
+          "pattern": "^\\S+$(?![\\s\\S])",
           "type": "string"
         },
         "key": {
@@ -4623,6 +4682,7 @@
         },
         "id": {
           "minLength": 1,
+          "pattern": "^\\S+$(?![\\s\\S])",
           "type": "string"
         },
         "key": {
@@ -4817,6 +4877,7 @@
         },
         "other": {
           "minLength": 1,
+          "pattern": "^\\S+$(?![\\s\\S])",
           "type": "string"
         }
       },
@@ -5124,6 +5185,7 @@
         },
         "id": {
           "minLength": 1,
+          "pattern": "^\\S+$(?![\\s\\S])",
           "type": "string"
         },
         "kind": {

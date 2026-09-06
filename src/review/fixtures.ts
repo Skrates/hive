@@ -115,7 +115,7 @@ export function finding(overrides: Partial<AdmittedFinding> = {}): AdmittedFindi
     subject_key: `${SHA_A}:main`,
     raised_by: "codex",
     answer_id: null,
-    source: { comment_id: 9001 },
+    source: { record_kind: "review_comment", comment_id: 9001 },
     priority: "P1",
     reviewer_disposition: null,
     title: "Off-by-one in pagination",

@@ -892,7 +892,8 @@ test("§8.1 one board comment and one check run per head, created once and edite
   await core.publisher.drainOnce();
   assert.deepEqual(github.boardEdits, [null], "the first board refresh creates");
   assert.deepEqual(github.checkEdits, [null]);
-  assert.deepEqual(github.comments, ["@codex review"]);
+  assert.equal(github.comments.length, 1);
+  assert.match(github.comments[0]!, /^@codex review\n\nHive request req_obs:run1_1; effect eff_obs:run1_1; attempt 1\./u);
   assert.deepEqual(core.review().projection_handles, { board_comment_id: 500, check_run_ids: { [H1]: 1 }, slack_thread_ts: null });
   assert.deepEqual(core.pending("codex")[0]?.transport, [{ summon_comment_id: 701 }], "the summon comment id is the request's reference");
   assert.equal(core.slack.lines.length, 1);
@@ -956,5 +957,47 @@ test("§6.C6 through the reconciler: a verbatim template copy is exempt in the R
   assert.equal(core.review().exemption, null);
   assert.equal(core.pending("codex").length, 1, "a code subject gets its initial request");
   assert.equal(core.state().requirement.status, "unsatisfied");
+  core.close();
+});
+
+test("quiet sweep observations age out without republishing; source activity remains visible", async () => {
+  const core = new Core();
+  core.applied(observe(), ADAPTER);
+  core.applied(external(), ADAPTER);
+  await core.publisher.drainOnce();
+  const before = core.effectRows().length;
+  core.clock.advance(25 * 60 * MINUTE);
+  const observed = observe();
+  observed.observed.seen_at = core.clock.now().toISOString();
+  core.applied(observed, ADAPTER);
+  assert.equal(core.effectRows().length, before, "polling alone creates no publication");
+  assert.deepEqual(core.store.active(new Date(core.clock.now().getTime() - 24 * 60 * MINUTE).toISOString()), []);
+  core.store.sourceRecords.upsert({ recordKey: "issue_comment:123", version: core.clock.now().toISOString(), reviewId: core.review().id, authorLogin: CODEX_LOGIN, body: { text: "new unknown record" } });
+  core.store.sourceRecords.setClassification("issue_comment:123", core.clock.now().toISOString(), "unknown");
+  assert.deepEqual(core.store.active(core.clock.now().toISOString()), [KEY], "a new source record is real activity");
+  assert.equal(core.effectRows().length, before + 1, "unknown records queue their own board refresh");
+  core.store.sourceRecords.setClassification("issue_comment:123", core.clock.now().toISOString(), "unknown");
+  assert.equal(core.effectRows().length, before + 1, "resampling the same classification adds nothing");
+  core.close();
+});
+
+test("adopting a new Slack channel starts a new thread and later publications use its parent", async () => {
+  const core = new Core();
+  core.applied(observe(), ADAPTER);
+  await core.publisher.drainOnce();
+  core.applied({ kind: "GrantRounds", n: 1, reason: "record old parent" }, OPERATOR);
+  await core.publisher.drainOnce();
+  assert.equal(core.review().projection_handles.slack_thread_ts, "1700.1");
+  core.store.putPolicy(KEY.repository_id, { ...POLICY, version: 2, slack: { channel_id: "C_NEW" } });
+  core.applied({ kind: "AdoptPolicy", version: 2 }, OPERATOR);
+  assert.equal(core.review().projection_handles.slack_thread_ts, null);
+  await core.publisher.drainOnce();
+  assert.equal(core.slack.lines.at(-1)?.channelId, "C_NEW");
+  assert.equal(core.slack.lines.at(-1)?.threadTs, null);
+  core.applied({ kind: "GrantRounds", n: 1, reason: "record new parent" }, OPERATOR);
+  await core.publisher.drainOnce();
+  assert.equal(core.slack.lines.at(-1)?.threadTs, "1700.3");
+  assert.equal(core.store.projections.slackBoardOutboxId(core.review().id, "C0123ABCD"), 1);
+  assert.equal(core.store.projections.slackBoardOutboxId(core.review().id, "C_NEW"), 3);
   core.close();
 });

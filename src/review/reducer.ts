@@ -354,7 +354,6 @@ function observedEqual(a: Observed, b: Observed): boolean {
     a.base_sha_now === b.base_sha_now &&
     a.head_ref === b.head_ref &&
     a.mergeable === b.mergeable &&
-    a.seen_at === b.seen_at &&
     a.title === b.title
   );
 }
@@ -614,16 +613,18 @@ export function decide(state: Review | null, action: Action, ctx: DecideContext)
 
   // §8.1: a finding with a comment source whose status changed refreshes its thread.
   for (const finding of tx.review.findings) {
-    if (!("comment_id" in finding.source)) continue;
+    if (!("comment_id" in finding.source) || finding.source.record_kind !== "review_comment") continue;
     const prior = tx.before?.findings.find((f) => f.id === finding.id);
     if (prior === undefined) continue;
     if (JSON.stringify(prior.status) !== JSON.stringify(finding.status)) {
       tx.effect("refresh", `thread:${finding.source.comment_id}`, null);
     }
   }
-  // Module map §2: every applied batch refreshes the board and the check at the current head.
-  tx.effect("refresh", `board:${tx.review.id}`, null);
-  tx.effect("refresh", `check:${repoOf(tx.review.display)}:${tx.review.subject.head_sha}`, null);
+  // Observations with unchanged facts are audit batches, not new publication work.
+  if (tx.consequences.length > 0) {
+    tx.effect("refresh", `board:${tx.review.id}`, null);
+    tx.effect("refresh", `check:${repoOf(tx.review.display)}:${tx.review.subject.head_sha}`, null);
+  }
   return tx.batch(action);
 }
 
@@ -906,6 +907,10 @@ function observe(tx: Transaction, action: ObservePRAction): Refusal | null {
   // §C2 / §C4: the initial request opens on a subject change or on the draft flip at an unchanged subject.
   if (subjectChanged) openInitialIfDue(tx, "subject_changed");
   else if (before !== null && before.draft && !action.draft) openInitialIfDue(tx, "ready_for_review");
+  else if (before?.lifecycle === "closed" && action.lifecycle === "open" &&
+    !tx.review.requests.some(r => r.kind === "review" && r.subject_key === tx.review.subject.key)) {
+    openInitialIfDue(tx, "reopened");
+  }
 
   // §C3: → merged announces. A reopen queues nothing: the paused transport rows resume at dispatch (§8.1).
   if (before !== null && before.lifecycle !== "merged" && action.lifecycle === "merged") {
@@ -1048,7 +1053,7 @@ function admitExternal(tx: Transaction, action: Extract<Action, { kind: "AdmitEx
       subject_key: subject.key,
       raised_by: "codex",
       answer_id: answerId,
-      source: { comment_id: f.source_comment_id },
+      source: { comment_id: f.source_comment_id, record_kind: result.source_record.kind === "issue_comment" ? "issue_comment" : "review_comment" },
       priority: f.priority,
       reviewer_disposition: null,
       title: f.title,

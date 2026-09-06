@@ -78,9 +78,9 @@ export interface PublisherStore {
   readonly projections: {
     recordBoardComment(reviewId: string, commentId: number): void;
     recordCheckRun(reviewId: string, headSha: string, checkRunId: number): void;
-    recordSlackThread(reviewId: string, threadTs: string): void;
-    recordSlackBoardOutbox(reviewId: string, outboxId: number): void;
-    slackBoardOutboxId(reviewId: string): number | null;
+    recordSlackThread(reviewId: string, channelId: string, threadTs: string): void;
+    recordSlackBoardOutbox(reviewId: string, channelId: string, outboxId: number): void;
+    slackBoardOutboxId(reviewId: string, channelId: string): number | null;
     recordTransport(reviewId: string, effectId: string, requestId: string, ref: TransportRef): void;
   };
   /** §7 step 3: Codex records classified `unknown`, surfaced on the board and never promoted. */
@@ -256,8 +256,8 @@ export class ReviewPublisher {
           const threadTs = this.slackThread(state);
           const { outboxId } = this.ports.slack.postBoardLine({ channelId: slack.channel_id, threadTs, text: slackBoardLine(state, unknown) });
           // The first line opens the Review's thread; its ts is learned once the outbox drains it.
-          if (threadTs === null && this.store.projections.slackBoardOutboxId(state.id) === null) {
-            this.store.projections.recordSlackBoardOutbox(state.id, outboxId);
+          if (threadTs === null && this.store.projections.slackBoardOutboxId(state.id, slack.channel_id) === null) {
+            this.store.projections.recordSlackBoardOutbox(state.id, slack.channel_id, outboxId);
           }
         }
         return "sent";
@@ -340,7 +340,7 @@ export class ReviewPublisher {
         const { commentId } = await github.postComment({
           repositoryId: state.key.repository_id,
           prNumber: state.key.pr_number,
-          body: payload.text,
+          body: `${payload.text}\n\nHive request ${target.requestId}; effect ${row.effect_id}; attempt ${row.attempts + 1}. Repeated delivery of this request is a retry of the same review obligation.`,
         });
         this.store.projections.recordTransport(state.id, row.effect_id, target.requestId, { summon_comment_id: this.positiveId(commentId, "summon comment") });
         return "sent";
@@ -367,13 +367,15 @@ export class ReviewPublisher {
    * than waiting on the outbox).
    */
   private slackThread(state: ReviewState): string | null {
+    const channel = this.slackPolicy(state)?.channel_id;
+    if (channel === undefined) return null;
     const recorded = state.projection_handles.slack_thread_ts;
     if (recorded !== null) return recorded;
-    const outboxId = this.store.projections.slackBoardOutboxId(state.id);
+    const outboxId = this.store.projections.slackBoardOutboxId(state.id, channel);
     if (outboxId === null) return null;
     const ts = this.ports.slack.outboxMessageTs(outboxId);
     if (ts === null) return null;
-    this.store.projections.recordSlackThread(state.id, ts);
+    this.store.projections.recordSlackThread(state.id, channel, ts);
     return ts;
   }
 

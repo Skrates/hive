@@ -8,6 +8,7 @@ import { BrokerStore } from "../broker/store.js";
 import { systemClock } from "../time.js";
 import { SecretFileError } from "./secret-file.js";
 import { bootReviewRuntime, ReviewRuntimeConfigError, type ReviewRuntimeEnv } from "./runtime.js";
+import { policy, review } from "./fixtures.js";
 
 const ADMIN = "admin-token-that-is-long-enough-for-the-schema";
 const FAKE_SECRET = "obviously-fake-webhook-secret";
@@ -34,6 +35,34 @@ function tables(broker: BrokerStore): string[] {
   return (broker.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all() as Array<{ name: string }>)
     .map((row) => row.name);
 }
+
+test("effect exhaustion and its failure notice commit together in the broker outbox", () => {
+  const { broker, runtime } = boot({});
+  const initial = review();
+  runtime.store.putPolicy(initial.key.repository_id, policy());
+  runtime.store.apply(initial.key, {
+    actId: "obs:failure-notice", expectedRevision: null, display: initial.display,
+    principal: { kind: "adapter", source: "github", reconcile_run: "failure-notice", event_login: "weave-review[bot]" },
+    action: { kind: "ObservePR", lifecycle: initial.lifecycle, draft: initial.draft, subject: initial.subject, observed: initial.observed, exemption: null },
+  });
+  const effect = broker.db.prepare("SELECT effect_id, review_id FROM review_effects WHERE target LIKE 'board:%'").get() as { effect_id: string; review_id: string };
+  runtime.store.projections.recordSlackThread(effect.review_id, "C0123ABCD", "1700.1");
+  broker.db.prepare("UPDATE review_effects SET status='claimed', attempts=49 WHERE effect_id=?").run(effect.effect_id);
+  broker.db.exec("CREATE TRIGGER refuse_notice BEFORE INSERT ON outbox BEGIN SELECT RAISE(ABORT, 'outbox unavailable'); END");
+  assert.throws(() => runtime.store.effects.markFailed(effect.effect_id, new Date().toISOString()), /outbox unavailable/u);
+  assert.deepEqual(broker.db.prepare("SELECT status, attempts FROM review_effects WHERE effect_id=?").get(effect.effect_id), { status: "claimed", attempts: 49 }, "failure cannot commit without the notice");
+  broker.db.exec("DROP TRIGGER refuse_notice");
+  runtime.store.effects.markFailed(effect.effect_id, new Date().toISOString());
+  runtime.store.effects.markFailed(effect.effect_id, new Date().toISOString());
+  assert.deepEqual(broker.db.prepare("SELECT status, attempts, next_attempt_at FROM review_effects WHERE effect_id=?").get(effect.effect_id), { status: "failed", attempts: 50, next_attempt_at: null });
+  const notices = broker.db.prepare("SELECT channel_id, thread_ts, text FROM outbox").all() as Array<{ channel_id: string; thread_ts: string; text: string }>;
+  assert.equal(notices.length, 1);
+  assert.equal(notices[0]!.channel_id, "C0123ABCD");
+  assert.equal(notices[0]!.thread_ts, "1700.1");
+  assert.match(notices[0]!.text, /failed after 50 attempts/u);
+  assert.ok(notices[0]!.text.includes(effect.effect_id));
+  broker.close();
+});
 
 // Module map §8 / task brief: no App yet ⇒ the broker boots with the adapter disabled and says so once.
 test("without GitHub configuration the runtime boots the store and publisher, disables the adapter, and logs it once", async () => {

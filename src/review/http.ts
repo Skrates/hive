@@ -3,7 +3,7 @@ import type { IncomingHttpHeaders, IncomingMessage, ServerResponse } from "node:
 import type { URL } from "node:url";
 import { StaleLeaseError, type BrokerStore } from "../broker/store.js";
 import {
-  validateAction,
+  validateCommand,
   validatePolicy,
   type Action,
   type Policy,
@@ -165,7 +165,7 @@ export async function routeReview(
     : seatPrincipal(body.custody, caller.edgeId, deps.broker);
   if ("error" in principal) return json(response, principal.status, { error: principal.error, detail: principal.detail });
   // §E2: shape is proven before the reducer sees the act; the refusal is `malformed`.
-  const validated = validateAction(body.action);
+  const validated = validateCommand({ act_id: actId, action: body.action, principal, expected_revision: expectedRevision });
   if (!validated.ok) return json(response, 400, { error: validated.code, detail: validated.detail });
   const key = resolveKey(parsedKey, deps.store);
   if (key === null) return notFound(response);
@@ -173,7 +173,7 @@ export async function routeReview(
     actId,
     principal,
     expectedRevision: Number(expectedRevision),
-    action: validated.value,
+    action: validated.value.action,
   });
   return json(response, "refused" in receipt.outcome ? 409 : 200, receipt);
 }

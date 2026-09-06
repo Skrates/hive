@@ -176,11 +176,11 @@ test("slack board line is one line naming the review, head, readiness, rounds an
 
 // §8.1 (ruled): closed ⇒ resolve, contested or re-opened ⇒ unresolve, comment-sourced only.
 test("thread ops: resolve on close, unresolve on contest or re-open, nothing for reviewkit sources", () => {
-  const open = finding({ id: "fnd_1", source: { comment_id: 9001 } });
-  const closed = finding({ id: "fnd_1", source: { comment_id: 9001 }, status: { open: false, resolution: fixedClaim() } });
+  const open = finding({ id: "fnd_1", source: { record_kind: "review_comment", comment_id: 9001 } });
+  const closed = finding({ id: "fnd_1", source: { record_kind: "review_comment", comment_id: 9001 }, status: { open: false, resolution: fixedClaim() } });
   const contested = finding({
     id: "fnd_1",
-    source: { comment_id: 9001 },
+    source: { record_kind: "review_comment", comment_id: 9001 },
     status: { open: true, contested: { by: "codex", at: AT, prior: fixedClaim() } },
   });
   const kitOpen = finding({ id: "fnd_k", source: { fingerprint: "fp", semantic_key: "sk" } });

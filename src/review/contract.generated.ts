@@ -1,7 +1,7 @@
 /* eslint-disable */
 /**
  * GENERATED — do not edit. Source: contracts/schemas/review-contract.schema.json,
- * vendored from weave-doctrine@597182589b5d3b3d67af7b089785127631ab2713 (see contracts/SOURCE).
+ * vendored from weave-doctrine@f5818affa272edae104dbb8d5aaff76f1cb804ab (see contracts/SOURCE).
  * Regenerate with `bun run check:contracts`.
  */
 
@@ -1292,6 +1292,7 @@ export interface ReviewkitFindingSource {
  */
 export interface CommentFindingSource {
   comment_id: number;
+  record_kind: "review_comment" | "issue_comment";
 }
 /**
  * This interface was referenced by `ReviewContract`'s JSON-Schema

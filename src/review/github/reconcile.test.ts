@@ -394,6 +394,9 @@ test("§6.C6: exemption evidence is computed when the subject changes, from skil
   const blobs = new Map([[".github/scripts/review_loop.py", "7".repeat(40)]]);
   assert.equal(exemptionEvidence([{ path: ".github/scripts/review_loop.py", sha: "7".repeat(40), status: "modified" }], POLICY.exempt_roots, blobs)?.reason, "verbatim_copy");
   assert.equal(exemptionEvidence([{ path: ".github/scripts/review_loop.py", sha: "8".repeat(40), status: "modified" }], POLICY.exempt_roots, blobs), null, "a drifted blob is not verbatim");
+  for (const status of ["removed", "renamed"]) {
+    assert.equal(exemptionEvidence([{ path: ".github/scripts/review_loop.py", sha: "7".repeat(40), status }], POLICY.exempt_roots, blobs), null, "the old blob cannot exempt a removal or rename");
+  }
 
   const { store, github, deps } = setup(H1);
   github.files = [{ path: ".github/scripts/review_loop.py", sha: "7".repeat(40), status: "modified" }];

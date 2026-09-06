@@ -55,6 +55,7 @@ program.command("broker")
       clock: systemClock,
       adminToken: config.HIVE_ADMIN_TOKEN,
       env: config,
+      failureChannelId: policy.channelIds.values().next().value,
       log: (line) => console.error(line),
     });
     const http = new BrokerHttpServer(broker, {

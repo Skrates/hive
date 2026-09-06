@@ -517,10 +517,10 @@ test("§C1 an unchanged subject preserves judgments and never suppresses the oth
   assert.deepEqual(pending(next).map((r) => r.id), pending(review).map((r) => r.id));
   assert.equal(next.observed.base_sha_now, BASE2);
   assert.equal(next.observed.mergeable, null);
-  // The same observation again changes nothing but still refreshes the projections.
+  // The same facts, even at a later observation time, cause no new publication.
   const again = apply(next, observe({ lifecycle: "closed", draft: true, mergeable: null, seenAt: T1, baseShaNow: BASE2 }), ADAPTER);
   assert.deepEqual(kinds(again.batch), []);
-  assert.deepEqual(targets(again.batch), [`board:${next.id}`, `check:Owner/repo:${H1}`]);
+  assert.deepEqual(targets(again.batch), []);
 });
 
 test("§C2 a subject change cancels pending requests at the old subject, releases subject_change holds and opens the initial request", () => {
@@ -848,6 +848,7 @@ test("§D8 mergeable=false withholds transport at dispatch and tells the author 
   const notice = batch.effects.find((e) => e.target === `notice:talos:${H1}:main`);
   assert.ok(notice, "the author seat is told");
   const payload = notice.payload as { actor: string; dedupe_key: string; text: string };
+  assert.deepEqual(Object.keys(payload).sort(), ["actor", "dedupe_key", "text"]);
   assert.equal(payload.actor, "talos");
   assert.equal(payload.dedupe_key, `conflicting:${conflicting.id}:${H1}:main`);
   assert.match(payload.text, /conflicting against main/);
@@ -1041,7 +1042,7 @@ test("§E4 an external result answers the Codex request pending at that subject 
   const finding = answered.state.findings[0];
   assert.ok(finding);
   assert.equal(finding.id, "fnd_src:review:5001:v1_1");
-  assert.deepEqual(finding.source, { comment_id: 9001 });
+  assert.deepEqual(finding.source, { record_kind: "review_comment", comment_id: 9001 });
   assert.equal(finding.answer_id, "ans_src:review:5001:v1_1");
   assert.equal(finding.raised_by, "codex");
   assert.equal(finding.reviewer_disposition, null);
@@ -1182,7 +1183,7 @@ test("§F3 resolution kinds: fixed (unconfirmed), refuted, withdrawn, follow_up,
 
 test("§F5 blocking ⇔ open ∧ priority ∈ {P0,P1,P2,unknown} ∧ disposition ∈ {must-fix, owner-decision, null}", () => {
   const base: AdmittedFinding = {
-    id: "f", review_id: "r", subject_key: `${H1}:main`, raised_by: "codex", answer_id: null, source: { comment_id: 1 },
+    id: "f", review_id: "r", subject_key: `${H1}:main`, raised_by: "codex", answer_id: null, source: { record_kind: "review_comment", comment_id: 1 },
     priority: "P1", reviewer_disposition: null, title: "t", path: "p", line: null, status: { open: true }, links: [], correlation_hints: [],
   };
   const table: Array<[AdmittedFinding["priority"], AdmittedFinding["reviewer_disposition"], boolean]> = [
@@ -1387,6 +1388,22 @@ test("§8.1 a comment-sourced finding whose status changes refreshes its thread;
   const { review: rk, finding } = withFinding();
   const rkClosed = apply(rk, { kind: "ResolveFinding", finding_id: finding, resolution: { kind: "refuted", evidence: "e" } }, OPERATOR, { policy: SEAT_POLICY });
   assert.ok(!targets(rkClosed.batch).some((t) => t.startsWith("thread:")));
+  const issue = apply(review, external({ comments: [{ id: 888 }], source_record: { kind: "issue_comment", id: 888, version: T0 } }), ADAPTER).state;
+  const issueFinding = issue.findings[0]!;
+  assert.deepEqual(issueFinding.source, { record_kind: "issue_comment", comment_id: 888 });
+  const issueClosed = apply(issue, { kind: "ResolveFinding", finding_id: issueFinding.id, resolution: { kind: "fixed", evidence: "e", commits: [H2] } }, seat("talos"));
+  assert.ok(!targets(issueClosed.batch).some(t => t.startsWith("thread:")), "issue comments have no resolvable review thread");
+});
+
+test("a PR first observed closed opens its initial request on reopening at the same subject", () => {
+  const closed = apply(null, observe({ lifecycle: "closed" }), ADAPTER).state;
+  assert.equal(closed.requests.length, 0);
+  const reopened = apply(closed, observe({ lifecycle: "open" }), ADAPTER);
+  assert.equal(pending(reopened.state, "codex").length, 1);
+  assert.equal(reopened.batch.effects.filter(e => e.target.startsWith("summon:")).length, 1);
+  const repeated = apply(reopened.state, observe(), ADAPTER);
+  assert.equal(repeated.state.requests.length, 1);
+  assert.deepEqual(repeated.batch.effects, []);
 });
 
 // ---------------------------------------------------------------------------------------------

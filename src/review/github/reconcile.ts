@@ -166,7 +166,7 @@ export function exemptionEvidence(
   const paths = files.map((file) => file.path);
   if (underRoots(paths, SKILL_ROOTS)) return { reason: "skill_only", evidence: `every changed path under ${SKILL_ROOTS.join(", ")}: ${paths.join(", ")}` };
   if (underRoots(paths, exemptRoots)) return { reason: "exempt_paths", evidence: `every changed path under policy exempt_roots ${exemptRoots.join(", ")}: ${paths.join(", ")}` };
-  if (templateBlobs !== null && files.length > 0 && files.every((file) => templateBlobs.get(file.path) === file.sha)) {
+  if (templateBlobs !== null && files.length > 0 && files.every((file) => (file.status === "added" || file.status === "modified") && templateBlobs.get(file.path) === file.sha)) {
     return { reason: "verbatim_copy", evidence: `every changed blob equals the canonical template blob: ${files.map((f) => `${f.path}@${f.sha}`).join(", ")}` };
   }
   return null;
