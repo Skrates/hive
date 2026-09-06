@@ -55,6 +55,8 @@ export interface GitHubRecord {
   raw: unknown;
 }
 
+export interface GitHubReaction { id: number; content: string; authorLogin: string; createdAt: string }
+
 export interface GitHubChangedFile { path: string; sha: string; status: string }
 
 export interface GitHubPort {
@@ -63,6 +65,7 @@ export interface GitHubPort {
   listReviewComments(repositoryId: number, prNumber: number): Promise<GitHubRecord[]>;
   listIssueComments(repositoryId: number, prNumber: number): Promise<GitHubRecord[]>;
   listFiles(repositoryId: number, prNumber: number): Promise<GitHubChangedFile[]>;
+  listIssueReactions(repositoryId: number, prNumber: number): Promise<GitHubReaction[]>;
   /** §6.C6 `verbatim_copy`: the blob sha of `path` at `ref`, null when absent. */
   getBlobSha?(repositoryId: number, ref: string, path: string): Promise<string | null>;
   /** §7 "Gaps": failed deliveries since `since` (ISO), asked on broker start. */
@@ -374,6 +377,11 @@ export class AppGitHubPort implements GitHubPort {
   async listIssueComments(repositoryId: number, prNumber: number): Promise<GitHubRecord[]> {
     const rows = await this.repoPages(repositoryId, `/issues/${prNumber}/comments`);
     return rows.filter(isRecord).map(issueCommentRecord);
+  }
+
+  async listIssueReactions(repositoryId: number, prNumber: number): Promise<GitHubReaction[]> {
+    const rows = await this.repoPages(repositoryId, `/issues/${prNumber}/reactions`);
+    return rows.filter(isRecord).map(row => ({ id: num(row.id) ?? 0, content: str(row.content), authorLogin: isRecord(row.user) ? str(row.user.login) : "", createdAt: str(row.created_at) }));
   }
 
   async listFiles(repositoryId: number, prNumber: number): Promise<GitHubChangedFile[]> {

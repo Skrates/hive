@@ -544,6 +544,10 @@ export class ReviewStore {
     });
   }
 
+  publishedSummon(commentId: number): boolean {
+    return this.db.prepare("SELECT 1 FROM review_transport WHERE json_extract(ref_json, '$.summon_comment_id') = ? LIMIT 1").get(commentId) !== undefined;
+  }
+
   /** §7 bounded reconcile: Reviews with a pending request, or any activity since `since`. */
   active(since: string): ReviewKey[] {
     const rows = this.db.prepare(`

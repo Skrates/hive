@@ -234,6 +234,13 @@ test("a non-2xx answer is a GitHubApiError naming the status and the URL, never 
   await assert.rejects(() => p.getPullRequest(9999, 1), (error: unknown) => error instanceof GitHubApiError && error.status === 404);
 });
 
+test("PR reactions are read under App authentication with author identity", async () => {
+  const { port: p, calls } = port(call => call.url.includes("/issues/66/reactions?")
+    ? { json: [{ id: 7, content: "+1", user: { login: "chatgpt-codex-connector[bot]" }, created_at: "2026-09-06T12:00:00Z" }] } : undefined);
+  assert.deepEqual(await p.listIssueReactions(1054, 66), [{ id: 7, content: "+1", authorLogin: "chatgpt-codex-connector[bot]", createdAt: "2026-09-06T12:00:00Z" }]);
+  assert.equal(calls.at(-1)?.headers.authorization, `Bearer ${FAKE_INSTALLATION_TOKEN}`);
+});
+
 
 test("a check-run response without a positive id fails before recording a fake handle", async () => {
   const { port: p } = port(call => call.url.endsWith("/check-runs") ? { status: 201, json: {} } : undefined);

@@ -138,6 +138,7 @@ export class ReviewPublisher {
 
   private async pass(): Promise<number> {
     const rows = this.store.effects.pendingByTarget(iso(this.clock));
+    rows.sort((a, b) => Number(b.target.startsWith("board:")) - Number(a.target.startsWith("board:")));
     let handled = 0;
     for (const row of rows) {
       if (await this.handle(row)) handled += 1;
@@ -169,6 +170,11 @@ export class ReviewPublisher {
       if (applicability(target, review) === "withheld") return false;
       // M0 has no GitHub port; a summon must neither be lost nor marked, so it waits.
       if (target.kind === "summon" && this.ports.github === null) return false;
+      // Slack actionables wait unclaimed for the channel's board opener to drain.
+      // The broker drains its outbox after this pass; waiting here must never block it.
+      if (applicability(target, review) === "applicable" &&
+        (target.kind === "delivery" || target.kind === "notice" || target.kind === "announce") &&
+        this.slackPolicy(review) !== null && this.slackThread(review) === null) return false;
     }
 
     if (row.kind === "refresh") {
@@ -363,8 +369,7 @@ export class ReviewPublisher {
   /**
    * The Review's Slack thread: the recorded ts, or — the first board line having been queued
    * but its ts not yet recorded — the ts the outbox posted it as, recorded now. Null while the
-   * first line is still unsent (that post then lands at the channel top level, visibly, rather
-   * than waiting on the outbox).
+   * first line is still unsent; Slack actionables remain pending until its coordinate is known.
    */
   private slackThread(state: ReviewState): string | null {
     const channel = this.slackPolicy(state)?.channel_id;

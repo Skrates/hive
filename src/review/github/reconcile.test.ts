@@ -6,7 +6,7 @@ import test from "node:test";
 import type { Action, Policy, Receipt, Review, ReviewKey } from "../contract.js";
 import { validateAction } from "../contract.js";
 import type { Clock } from "../../time.js";
-import { issueCommentRecord, reviewCommentRecord, reviewRecord, type GitHubChangedFile, type GitHubPort, type GitHubPullRequest, type GitHubRecord, type MeterPort } from "./port.js";
+import { issueCommentRecord, reviewCommentRecord, reviewRecord, type GitHubChangedFile, type GitHubPort, type GitHubPullRequest, type GitHubRecord, type GitHubReaction, type MeterPort } from "./port.js";
 import {
   ReconcileScheduler,
   buildObservePR,
@@ -62,6 +62,8 @@ class FakeStore implements ReconcileStore {
   readonly deliveries: InboxDelivery[] = [];
   readonly reconciled: Array<{ ids: string[]; runId: string }> = [];
   activeKeys: ReviewKey[] = [];
+  publishedComments = new Set<number>();
+  publishedSummon(commentId: number): boolean { return this.publishedComments.has(commentId); }
 
   apply(key: ReviewKey, input: ApplyInput): Receipt {
     this.applies.push({ key, input });
@@ -159,6 +161,7 @@ class FakePort implements GitHubPort {
   reviews: GitHubRecord[] = [];
   reviewComments: GitHubRecord[] = [];
   issueComments: GitHubRecord[] = [];
+  prReactions: GitHubReaction[] = [];
   blobs = new Map<string, string>();
   failed: Array<{ id: number; guid: string }> = [];
   redelivered: number[] = [];
@@ -183,6 +186,7 @@ class FakePort implements GitHubPort {
   async listReviews(): Promise<GitHubRecord[]> { return this.reviews; }
   async listReviewComments(): Promise<GitHubRecord[]> { return this.reviewComments; }
   async listIssueComments(): Promise<GitHubRecord[]> { return this.issueComments; }
+  async listIssueReactions(): Promise<GitHubReaction[]> { return this.prReactions; }
   async listFiles(): Promise<GitHubChangedFile[]> { return this.files; }
   async getBlobSha(_r: number, _ref: string, path: string): Promise<string | null> { return this.blobs.get(path) ?? null; }
   async listFailedDeliveries(): Promise<Array<{ id: number; guid: string }>> { return this.failed; }
@@ -531,6 +535,8 @@ test("scheduler records own publication webhooks as skipped without reconciling"
   const { store, github, deps } = setup(H2);
   store.deliveries.push({ deliveryId: "own-board", event: "issue_comment", repositoryId: 1054, prNumber: 66,
     payload: { sender: { login: "weave-review[bot]" }, action: "edited" }, receivedAt: "t" });
+  store.publishedComments.add(777);
+  store.deliveries.push({ deliveryId: "own-user-summon", event: "issue_comment", repositoryId: 1054, prNumber: 66, payload: { sender: { login: "RationallyPrime" }, comment: { id: 777 } }, receivedAt: "t" });
   const scheduler = new ReconcileScheduler({ ...deps, log: () => undefined });
   scheduler.drainInbox();
   await scheduler.idle();

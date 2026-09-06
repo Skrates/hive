@@ -808,3 +808,9 @@ as a cutover verification line (§10.2 step 4), not a ticket.
 - **F-12 Conflict-aware summons (D8, from KRA-1362)** — ruled (a). (b) summon and charge, and (c) summon
   without charging, were declined; (c) would have created a second uncharged-head class beside G2.
 - **wd#167 (KRA-1289 + KRA-1121)** — closed by Hákon; tickets cancelled as superseded.
+
+### Live completion and publication clarifications (2026-09-06)
+
+Current Codex clean completion can consist of a completed summary at the current head plus a Codex-authored PR approval reaction, with no review envelope or inline findings at that head. Either signal alone is status. The pending-request sweep observes a reaction that arrives after the summary webhook; the summary version is admitted once.
+
+Slack actionables remain unclaimed until the channel's board opener has a posted timestamp. Board refreshes run first; the normal broker outbox drains before the next publisher pass. Connected-user summon webhooks whose comment IDs are already recorded are skipped as own publications. An uncertain POST without a recorded response can still cause one bounded reconciliation; no-op observations create no feedback cycle.

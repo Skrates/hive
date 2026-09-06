@@ -35,6 +35,7 @@ export interface ReconcileStore {
   get(key: ReviewKey): Review | null;
   policy(repositoryId: number, version: number | "latest"): Policy | null;
   active(since: string): ReviewKey[];
+  publishedSummon(commentId: number): boolean;
   readonly inbox: {
     unreconciled(limit?: number): InboxDelivery[];
     markReconciled(deliveryIds: string[], runId: string): void;
@@ -241,10 +242,11 @@ export async function reconcile(deps: ReconcileDeps, key: ReviewKey, runId: stri
   if (review === null) return finish();
 
   // 2. import source records
-  const [reviews, reviewComments, issueComments] = await Promise.all([
+  const [reviews, reviewComments, issueComments, prReactions] = await Promise.all([
     deps.github.listReviews(key.repository_id, key.pr_number),
     deps.github.listReviewComments(key.repository_id, key.pr_number),
     deps.github.listIssueComments(key.repository_id, key.pr_number),
+    deps.github.listIssueReactions(key.repository_id, key.pr_number),
   ]);
   const records = [...reviews, ...reviewComments, ...issueComments];
   const live = new Map<string, GitHubRecord>();
@@ -259,7 +261,7 @@ export async function reconcile(deps: ReconcileDeps, key: ReviewKey, runId: stri
   for (const record of reviews) if (isCodex(record.authorLogin)) codexReviews.set(record.id, record);
   const membersOf = (reviewId: number): GitHubRecord[] => reviewComments.filter((c) => isCodex(c.authorLogin) && reviewIdOf(c) === reviewId);
   const heads = [...new Set([review.subject.head_sha, ...review.subjects.map((s) => s.head_sha)])];
-  const context = { headSha: review.subject.head_sha, heads, repository: `${pr.owner}/${pr.repo}` };
+  const context = { headSha: review.subject.head_sha, heads, repository: `${pr.owner}/${pr.repo}`, reviews, reviewComments, prReactions };
   const unadmitted = deps.store.sourceRecords.unadmitted(review.id).filter((row) => isCodex(row.authorLogin));
   const rank = (row: SourceRecordRow): number => (row.recordKey.startsWith("review:") ? 0 : 1);
   unadmitted.sort((a, b) => rank(a) - rank(b));
@@ -389,8 +391,9 @@ export class ReconcileScheduler {
     const ownPublications: string[] = [];
     const unenrolled: string[] = [];
     for (const delivery of deliveries) {
-      const payload = delivery.payload as { sender?: { login?: string } };
-      if (delivery.event === "issue_comment" && payload?.sender?.login === REVIEW_APP_LOGIN) {
+      const payload = delivery.payload as { sender?: { login?: string }; comment?: { id?: number } };
+      if (delivery.event === "issue_comment" && (payload?.sender?.login === REVIEW_APP_LOGIN ||
+        (typeof payload?.comment?.id === "number" && this.deps.store.publishedSummon(payload.comment.id)))) {
         ownPublications.push(delivery.deliveryId);
         continue;
       }

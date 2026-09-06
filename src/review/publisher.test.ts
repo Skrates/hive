@@ -178,13 +178,14 @@ class FakeGitHub implements ReviewGitHubPort {
   }
 }
 
-function fixture(options: { github?: boolean } = {}) {
+function fixture(options: { github?: boolean; threadReady?: boolean } = {}) {
   const store = new FakeReviewStore();
   const slack = new FakeSlack();
   const github = options.github === true ? new FakeGitHub() : null;
   const clock = new FakeClock();
   store.policies.set("42:1", policy());
   store.put(state());
+  if (options.threadReady !== false) store.projections.recordSlackThread("rev_obs:run_1", "C0123ABCD", "1700.1");
   const publisher = new ReviewPublisher(store, { github, slack }, clock);
   return { store, slack, github, clock, publisher };
 }
@@ -244,7 +245,7 @@ test("refreshes are serialized per target: one row per target per pass, and pass
 });
 
 test("board refresh in M0 (github: null) posts the Slack board line to the policy channel", async () => {
-  const { store, slack, publisher } = fixture();
+  const { store, slack, publisher } = fixture({ threadReady: false });
   store.add({ effect_id: "eff_1", kind: "refresh", target: "board:rev_obs:run_1" });
   assert.equal(await publisher.drainOnce(), 1);
   assert.equal(slack.lines.length, 1);
@@ -255,7 +256,7 @@ test("board refresh in M0 (github: null) posts the Slack board line to the polic
 });
 
 test("board refresh with a GitHub port edits the board comment in place and still posts the Slack line", async () => {
-  const { store, slack, github, publisher } = fixture({ github: true });
+  const { store, slack, github, publisher } = fixture({ github: true, threadReady: false });
   store.put(state({ projection_handles: { board_comment_id: 314, check_run_ids: {}, slack_thread_ts: "1700.5" } }));
   store.add({ effect_id: "eff_1", kind: "refresh", target: "board:rev_obs:run_1" });
   await publisher.drainOnce();
@@ -376,7 +377,7 @@ test("the conflict notice is dispatched while the summons and deliveries it expl
   assert.deepEqual(slack.wakes, [{
     actor: "talos",
     channelId: "C0123ABCD",
-    threadTs: null,
+    threadTs: "1700.1",
     text: "conflicting against main tip abc",
     dedupeKey: `conflicting:${conflicting.id}:${SHA_A}:main`,
   }]);
@@ -398,7 +399,7 @@ test("the conflict notice is dispatched while the summons and deliveries it expl
 // §8.1 / R-3: a delivery is a system-origin Hive wake, self-identifying by its dedupe key;
 // a redelivery of the same effect is a replay at the port, never a second wake.
 test("a delivery mints a system wake with the payload's dedupe key, and re-dispatch is a replay", async () => {
-  const { store, slack, publisher } = fixture();
+  const { store, slack, publisher } = fixture({ threadReady: false });
   store.put(state({ requests: [request({ id: "req_2", assignee: "talos" })], projection_handles: { board_comment_id: null, check_run_ids: {}, slack_thread_ts: "1700.5" } }));
   store.add({ effect_id: "eff_2", kind: "actionable", target: "delivery:talos:req_2", payload: { actor: "talos", request_id: "req_2", text: "please burn", dedupe_key: "eff_2" } });
   assert.equal(await publisher.drainOnce(), 1);
@@ -521,7 +522,7 @@ test("check-run ids are recorded per head: POST once, PATCH after, and a new hea
 });
 
 test("the Slack thread: the first board line opens it; once the outbox has posted it, later lines and deliveries thread under it", async () => {
-  const { store, slack, publisher } = fixture();
+  const { store, slack, publisher } = fixture({ threadReady: false });
   store.put(state({ requests: [request({ id: "req_2", assignee: "talos" })] }));
   store.add({ effect_id: "eff_1", kind: "refresh", target: "board:rev_obs:run_1" });
   await publisher.drainOnce();
@@ -563,7 +564,7 @@ test("a dispatched delivery records {delivery_id} and a summon records {summon_c
 });
 
 test("a port that answers without an id fails the row visibly instead of recording nothing", async () => {
-  const { store, github, publisher } = fixture({ github: true });
+  const { store, github, publisher } = fixture({ github: true, threadReady: false });
   github!.noIds = true;
   store.add({ effect_id: "eff_1", kind: "refresh", target: "board:rev_obs:run_1" });
   const quiet = console.error;
@@ -648,4 +649,25 @@ test("an uncertain summon retry carries the same request and effect identity wit
   assert.equal(github!.comments.length, 2, "at-least-once permits a duplicate after uncertainty");
   assert.match(github!.comments[0]!, /request req_1; effect eff_retry; attempt 1\./u);
   assert.match(github!.comments[1]!, /request req_1; effect eff_retry; attempt 2\./u);
+});
+
+test("a rerouted wake waits for the replacement channel's board parent without spending attempts", async () => {
+  const { store, slack, publisher } = fixture();
+  store.policies.set("42:2", { ...policy(), version: 2, slack: { channel_id: "C_NEW" } });
+  store.put(state({ policy_version: 2, requests: [request({ id: "req_new", assignee: "ariadne" })] }));
+  store.add({ effect_id: "eff_wake", kind: "actionable", target: "delivery:ariadne:req_new", payload: { actor: "ariadne", request_id: "req_new", text: "review", dedupe_key: "eff_wake" } });
+  store.add({ effect_id: "eff_board", kind: "refresh", target: "board:rev_obs:run_1" });
+  await publisher.drainOnce();
+  assert.equal(slack.lines.length, 1);
+  assert.equal(slack.lines[0]!.channelId, "C_NEW");
+  assert.equal(slack.lines[0]!.threadTs, null);
+  assert.equal(slack.wakes.length, 0);
+  assert.equal(store.row("eff_wake").status, "pending");
+  assert.equal(store.row("eff_wake").attempts, 0);
+  slack.posted.set(1, "1800.1");
+  await publisher.drainOnce();
+  assert.equal(slack.wakes.length, 1);
+  assert.equal(slack.wakes[0]!.channelId, "C_NEW");
+  assert.equal(slack.wakes[0]!.threadTs, "1800.1");
+  assert.equal(store.row("eff_wake").status, "sent");
 });

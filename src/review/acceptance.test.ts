@@ -32,7 +32,7 @@ import type {
   ReviewState,
 } from "./contract.js";
 import { validateReview, validateReviewState } from "./contract.js";
-import { issueCommentRecord, type GitHubChangedFile, type GitHubPort, type GitHubPullRequest, type GitHubRecord } from "./github/port.js";
+import { issueCommentRecord, type GitHubChangedFile, type GitHubPort, type GitHubPullRequest, type GitHubRecord, type GitHubReaction } from "./github/port.js";
 import { ReconcileScheduler, reconcile } from "./github/reconcile.js";
 import { handleWebhook } from "./github/webhook.js";
 import { ReviewPublisher, type ReviewGitHubPort, type SystemWakePort } from "./publisher.js";
@@ -273,6 +273,7 @@ class FakeGitHubPort implements GitHubPort {
   pr: GitHubPullRequest;
   pulls = 0;
   issueComments: GitHubRecord[] = [];
+  prReactions: GitHubReaction[] = [];
   files: GitHubChangedFile[] = [{ path: "src/x.py", sha: "1".repeat(40), status: "modified" }];
   /** Canonical template blobs by path (§6.C6 verbatim_copy). */
   blobs = new Map<string, string>();
@@ -286,6 +287,7 @@ class FakeGitHubPort implements GitHubPort {
   async listReviews(): Promise<GitHubRecord[]> { return []; }
   async listReviewComments(): Promise<GitHubRecord[]> { return []; }
   async listIssueComments(): Promise<GitHubRecord[]> { return [...this.issueComments]; }
+  async listIssueReactions(): Promise<GitHubReaction[]> { return this.prReactions; }
   async listFiles(): Promise<GitHubChangedFile[]> { return [...this.files]; }
   async getBlobSha(_r: number, _ref: string, path: string): Promise<string | null> { return this.blobs.get(path) ?? null; }
   async listFailedDeliveries(): Promise<Array<{ id: number; guid: string }>> { return []; }
@@ -999,5 +1001,28 @@ test("adopting a new Slack channel starts a new thread and later publications us
   assert.equal(core.slack.lines.at(-1)?.threadTs, "1700.3");
   assert.equal(core.store.projections.slackBoardOutboxId(core.review().id, "C0123ABCD"), 1);
   assert.equal(core.store.projections.slackBoardOutboxId(core.review().id, "C_NEW"), 3);
+  core.close();
+});
+
+test("Codex clean completion reaches readiness when the PR approval arrives after the summary edit", async () => {
+  const core = new Core();
+  const port = new FakeGitHubPort(H1);
+  const summary = issueCommentRecord({ id: 999, user: { login: CODEX_LOGIN }, updated_at: T0,
+    body: `<!-- codex-pull-request-review-summary -->\n\n| 📝 **Code Review** | ✅ **Completed** | \`${H1.slice(0,7)}\` | Manual request |` });
+  port.issueComments = [summary];
+  const deps = { store: core.store, github: port, clock: core.clock };
+  await reconcile(deps, KEY, "before-approval");
+  assert.equal(core.state().readiness.ready, false);
+  port.prReactions = [{ id: 99, content: "+1", authorLogin: CODEX_LOGIN, createdAt: T0 }];
+  await reconcile(deps, KEY, "after-approval");
+  assert.equal(core.state().readiness.ready, true);
+  assert.equal(core.review().answers.length, 1);
+  await core.publisher.drainOnce();
+  assert.equal(core.github!.checks.at(-1)?.conclusion, "success");
+  await reconcile(deps, KEY, "again");
+  assert.equal(core.review().answers.length, 1, "the unchanged summary version is admitted once");
+  port.pr.headSha = H2;
+  await reconcile(deps, KEY, "new-head-old-approval");
+  assert.equal(core.state().readiness.ready, false, "the prior head's summary/reaction cannot satisfy a new subject");
   core.close();
 });

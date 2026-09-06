@@ -53,7 +53,7 @@ interface Expectation {
   reason?: "quota" | "connector";
 }
 
-const baseContext: ClassifyContext = { headSha: HIVE_66_HEAD, heads: [HIVE_66_HEAD], repository: "Skrates/hive", members: [] };
+const baseContext: ClassifyContext = { headSha: HIVE_66_HEAD, heads: [HIVE_66_HEAD], repository: "Skrates/hive", members: [], reviews: [], reviewComments: [], prReactions: [] };
 
 /**
  * The expected table, authored by reading every fixture (not by running the classifier).
@@ -236,4 +236,23 @@ test("verdict prose: the opening sentence is the claim, a withheld verdict is no
   assert.equal(at("## Review Result — `initial` generation 2\n\nno findings.").classification, "unknown", "a terse clean verdict with no head binds nothing");
   assert.equal(at("## Verdict\n\nNo blocking findings.").classification, "unknown", "a bare heading is not a verdict heading");
   assert.equal(at("## Review verdict\n\n**No major issues found at exact head `" + "a".repeat(40) + "`.**").external?.reviewed_head, "a".repeat(40));
+});
+
+test("current clean producer: completed summary plus Codex PR approval, without a contradicting review", () => {
+  const sha = "a".repeat(40);
+  const summary = issueCommentRecord({ id: 99, user: { login: CODEX }, updated_at: "2026-09-06T19:00:00Z",
+    body: `<!-- codex-pull-request-review-summary -->\n\n| 📝 **Code Review** | ✅ **Completed** <relative-time datetime="2026-09-06T19:00:00Z">now</relative-time> | \`${sha.slice(0,7)}\` | Manual request |` });
+  const context: ClassifyContext = { ...baseContext, headSha: sha, heads: [sha], prReactions: [{ id: 8, content: "+1", authorLogin: CODEX, createdAt: "2026-09-06T19:00:00Z" }] };
+  const clean = classifyCodexRecord(summary, context);
+  assert.equal(clean.classification, "clean");
+  assert.equal(clean.external?.reviewed_head, sha);
+  assert.equal(validateExternalResult(clean.external).ok, true);
+  assert.equal(classifyCodexRecord(summary, { ...context, prReactions: [] }).classification, "status");
+  assert.equal(classifyCodexRecord(summary, { ...context, prReactions: [{ ...context.prReactions[0]!, authorLogin: "someone-else" }] }).classification, "status");
+  assert.equal(classifyCodexRecord({ ...summary, authorLogin: "someone-else" }, context).classification, "status");
+  assert.equal(classifyCodexRecord({ ...summary, body: summary.body.replace("✅ **Completed**", "🔄 **Running**") }, context).classification, "status");
+  assert.equal(classifyCodexRecord(summary, { ...context, headSha: "b".repeat(40), heads: [sha, "b".repeat(40)] }).classification, "status", "an old thumbs-up cannot bless the new head");
+  const findings = reviewRecord({ id: 7, commit_id: sha, user: { login: CODEX }, submitted_at: "2026-09-06T18:59:00Z", body: "findings" });
+  assert.equal(classifyCodexRecord(summary, { ...context, reviews: [findings] }).classification, "status", "the review envelope owns its findings");
+  assert.equal(classifyCodexRecord(summary, { ...context, reviewComments: [{ ...findings, kind: "review_comment" }] }).classification, "status");
 });
