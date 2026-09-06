@@ -2,7 +2,7 @@
 
 source_repo: weave-doctrine
 source_sha: 6dd88bae0d2a8af8c685d14c30e5f6f72e08845a
-source_branch: gnomon/r1-reducer
+source_branch: gnomon/bundle-1
 authority: skills/code-review/scripts/src/weave_reviewkit/contract.py
 
 # The exact command that produced schemas/review-contract.schema.json, run in
