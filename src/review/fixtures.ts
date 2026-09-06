@@ -103,6 +103,8 @@ export function request(overrides: Partial<Request> = {}): Request {
     supersedes: null,
     transport: [],
     retransports: [],
+    transport_exhausted: false,
+    cancellation: null,
     answered_by: null,
     ...overrides,
   };
@@ -115,7 +117,7 @@ export function finding(overrides: Partial<AdmittedFinding> = {}): AdmittedFindi
     subject_key: `${SHA_A}:main`,
     raised_by: "codex",
     answer_id: null,
-    source: { record_kind: "review_comment", comment_id: 9001 },
+    source: { container_kind: "review_comment", comment_id: 9001, locator: 0 },
     priority: "P1",
     reviewer_disposition: null,
     title: "Off-by-one in pagination",

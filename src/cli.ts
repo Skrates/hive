@@ -8,7 +8,7 @@ import { z } from "zod";
 import { AdmissionPolicySchema } from "./addressing.js";
 import { BrokerHttpServer } from "./broker/http.js";
 import { SlackLinkProbe } from "./broker/probe.js";
-import { BrokerService } from "./broker/service.js";
+import { BrokerService, housekeepingTick } from "./broker/service.js";
 import { SlackCanaryPoster, SlackSocketIngress, SlackWebTransport } from "./broker/slack.js";
 import { BrokerStore } from "./broker/store.js";
 import { SlackDeafnessWatchdog } from "./broker/watchdog.js";
@@ -77,22 +77,15 @@ program.command("broker")
     // The claim loop also sweeps and drains, but only while an edge is
     // polling. This interval keeps loss visible (R-3) and the outbox flowing
     // (R-6) even when every edge is dark. The review publisher rides the same
-    // tick (§8.1): its Slack deliveries land in this outbox, so the two drains
-    // run in order — effects first, then the outbox rows they minted.
+    // tick (§8.1) but not the same queue: publication and the outbox drain run
+    // independently, so a GitHub port that is slow or hung delays no Hive wake.
     const housekeeping = setInterval(() => {
-      try {
-        store.requeueExpiredLeases();
-      } catch (error) {
-        console.error("hive broker sweep failed", error instanceof Error ? error.message : String(error));
-      }
-      void review.publisher.drainOnce()
-        .catch((error: unknown) => {
-          console.error("hive review publish failed", error instanceof Error ? error.message : String(error));
-        })
-        .then(() => broker.drainOutbox())
-        .catch((error: unknown) => {
-          console.error("hive broker outbox drain failed", error instanceof Error ? error.message : String(error));
-        });
+      void housekeepingTick({
+        sweep: () => store.requeueExpiredLeases(),
+        publish: () => review.publisher.drainOnce(),
+        drainOutbox: () => broker.drainOutbox(),
+        log: (what, error) => console.error(what, error instanceof Error ? error.message : String(error)),
+      });
     }, 5_000);
     // Deafness watchdog: a Socket Mode link that stays "connected" but stops
     // carrying events (half-open socket, or a second consumer stealing the

@@ -43,7 +43,7 @@ import type {
   ReviewState,
   Testimony,
 } from "./contract.js";
-import { transportState } from "./effects.js";
+import { BOARD_SINKS, transportState } from "./effects.js";
 
 // ---------------------------------------------------------------------------------------------
 // Context and identity
@@ -114,7 +114,7 @@ export type SeatRule =
   | "follow_up_disposition" // ResolveFinding follow_up only when the raiser's disposition was follow-up
   | "own_hold"; // Release: its own holds
 
-export type SystemRule = boolean | "subject_change_or_unanswerable";
+export type SystemRule = boolean | "subject_change_or_transport_exhausted";
 export type AdapterRule = boolean | "codex_login";
 
 export interface AuthorizationRow {
@@ -145,8 +145,8 @@ export const AUTHORIZATION_TABLE: readonly AuthorizationRow[] = [
   { verb: "ClassifyFinding", variants: null, seat: "raiser", operator: true, adapter: false, system: false },
   { verb: "Hold", variants: ["human_gate", "stack"], seat: "any", operator: true, adapter: false, system: false },
   { verb: "Hold", variants: ["operator"], seat: false, operator: true, adapter: false, system: false },
-  { verb: "Hold", variants: ["exhaustion", "unanswerable", "owner_decision"], seat: false, operator: false, adapter: false, system: true },
-  { verb: "Release", variants: null, seat: "own_hold", operator: true, adapter: false, system: "subject_change_or_unanswerable" },
+  { verb: "Hold", variants: ["exhaustion", "transport_exhausted", "owner_decision"], seat: false, operator: false, adapter: false, system: true },
+  { verb: "Release", variants: null, seat: "own_hold", operator: true, adapter: false, system: "subject_change_or_transport_exhausted" },
   { verb: "GrantRounds", variants: null, seat: false, operator: true, adapter: false, system: false },
   { verb: "AdoptPolicy", variants: null, seat: false, operator: true, adapter: false, system: false },
 ];
@@ -210,11 +210,11 @@ export function authorize(state: Review | null, action: Action, principal: Princ
       return null;
     case "system":
       if (row.system === false) return denied;
-      if (row.system === "subject_change_or_unanswerable") {
+      if (row.system === "subject_change_or_transport_exhausted") {
         if (action.kind !== "Release" || state === null) return denied;
         const hold = state.holds.find((h) => h.id === action.hold_id);
         if (hold === undefined) return refuse("no_such_target", `hold ${action.hold_id} does not exist`);
-        return hold.release_on === "subject_change" || hold.kind === "unanswerable" ? null : denied;
+        return hold.release_on === "subject_change" || hold.kind === "transport_exhausted" ? null : denied;
       }
       return null;
     case "seat":
@@ -296,16 +296,55 @@ function activeHolds(review: Review): Hold[] {
   return review.holds.filter((h) => h.released === null);
 }
 
-function summonsBlocked(review: Review): boolean {
-  return activeHolds(review).some((h) => h.blocks.summons);
-}
-
 function openEpisode(review: Review): ExhaustionEpisode | undefined {
   return review.episodes.find((e) => e.closed === null);
 }
 
 function pendingReviewRequestsAt(review: Review, subjectKey: string): Request[] {
-  return review.requests.filter((r) => r.status === "pending" && r.kind === "review" && r.subject_key === subjectKey);
+  return review.requests.filter((r) => isOutstanding(r) && r.kind === "review" && r.subject_key === subjectKey);
+}
+
+/**
+ * §3.4 / §6.D9 — the one outstanding-obligation predicate.
+ *
+ * A request carries its obligation until a named authoritative act discharges it: an `Answer`
+ * (§E1, `answered`) or an explicit cancellation (§D9, `cancelled`) — an exemption (§C6)
+ * discharges the *subject's* requirement, never a request. Transport is not part of this. A
+ * request whose transport bound is spent (`transport_exhausted`, §D6), whose transport is
+ * withheld by a hold (§G3), by a conflict (§D8) or by a closed PR (§C3), or whose assignee
+ * became unavailable (§D3), is still outstanding: the work was never done.
+ *
+ * Every consumer asks this and nothing else — readiness (§6.H, `read`), recovery (§D6
+ * housekeeping, `admitExternal` and `Answer` matching) and restoration (§D9,
+ * {@link restoreObligations}).
+ */
+function isOutstanding(request: Request): boolean {
+  return request.status === "pending";
+}
+
+/** §6.H: the outstanding *required* obligations at `subjectKey` — what readiness waits on. */
+function outstandingRequiredAt(review: Review, subjectKey: string): Request[] {
+  return review.requests.filter((r) => isOutstanding(r) && r.required && r.subject_key === subjectKey);
+}
+
+/**
+ * §D9 cancellation evidence: an operator's `CancelRequest` on a required review request at the
+ * *current* subject is the operator's decision that this subject needs no review. It stands
+ * until the subject changes (a new subject is new work, and its own requests were cancelled
+ * `subject_changed` by the system, not by anyone's decision). The system's own cancellations —
+ * `subject_changed`, `reviewer_unavailable` followed by a reassignment — are bookkeeping and
+ * never suppress restoration.
+ */
+function operatorCancelledAt(review: Review, subjectKey: string): boolean {
+  return review.requests.some(
+    (r) =>
+      r.status === "cancelled" &&
+      r.required &&
+      r.kind === "review" &&
+      r.subject_key === subjectKey &&
+      r.cancellation !== null &&
+      r.cancellation.by.kind === "operator",
+  );
 }
 
 function isNormalized(n: NormalizedResult | Testimony): n is NormalizedResult {
@@ -420,9 +459,13 @@ function applyConsequence(review: Review, c: Consequence): void {
     case "request_opened":
       review.requests.push(c.request);
       return;
-    case "request_cancelled":
-      must(review.requests.find((r) => r.id === c.request_id), `request ${c.request_id}`).status = "cancelled";
+    case "request_cancelled": {
+      // §D9: the cancelling act is retained — it is the evidence `restoreObligations` reads.
+      const request = must(review.requests.find((r) => r.id === c.request_id), `request ${c.request_id}`);
+      request.status = "cancelled";
+      request.cancellation = { by: c.by, at: c.at, reason: c.reason };
       return;
+    }
     case "request_answered": {
       const request = must(review.requests.find((r) => r.id === c.request_id), `request ${c.request_id}`);
       request.status = "answered";
@@ -432,9 +475,19 @@ function applyConsequence(review: Review, c: Consequence): void {
     case "request_retransported":
       must(review.requests.find((r) => r.id === c.request_id), `request ${c.request_id}`).retransports.push(c.at);
       return;
-    case "request_unanswerable":
-      must(review.requests.find((r) => r.id === c.request_id), `request ${c.request_id}`).status = "unanswerable";
+    case "request_transport_exhausted":
+      // §D6: the bound is spent. The obligation is untouched — the request stays pending.
+      must(review.requests.find((r) => r.id === c.request_id), `request ${c.request_id}`).transport_exhausted = true;
       return;
+    case "request_requirement_raised": {
+      // §D4: the superseded obligation folded into the substitute's existing pending request.
+      const request = must(review.requests.find((r) => r.id === c.request_id), `request ${c.request_id}`);
+      request.required = c.required;
+      request.names = c.names;
+      request.mode = c.mode;
+      request.supersedes = c.supersedes;
+      return;
+    }
     case "answer_admitted":
       review.answers.push(c.answer);
       return;
@@ -611,18 +664,28 @@ export function decide(state: Review | null, action: Action, ctx: DecideContext)
   const verb = applyVerb(tx, action);
   if (verb !== null) return verb;
 
-  // §8.1: a finding with a comment source whose status changed refreshes its thread.
+  // §8.1: a finding whose status changed refreshes its container's thread — but only a
+  // `review_comment` container has a GitHub review thread. An `issue_comment` container (the
+  // shape that carries several inline findings) has none, so it is never a `thread:` target.
+  // The target is the container, not the finding: `tx.effect` dedupes, so a container whose
+  // several findings all changed is refreshed once, and `threadState` re-reads all of them.
   for (const finding of tx.review.findings) {
-    if (!("comment_id" in finding.source) || finding.source.record_kind !== "review_comment") continue;
+    if (!("comment_id" in finding.source)) continue;
+    if (finding.source.container_kind !== "review_comment") continue;
     const prior = tx.before?.findings.find((f) => f.id === finding.id);
     if (prior === undefined) continue;
     if (JSON.stringify(prior.status) !== JSON.stringify(finding.status)) {
       tx.effect("refresh", `thread:${finding.source.comment_id}`, null);
     }
   }
-  // Observations with unchanged facts are audit batches, not new publication work.
+  // Module map §2: every batch that changed something refreshes the board and the check at the
+  // current head. A batch with no consequences is an audit batch — its facts are unchanged, so
+  // it has no new publication work and emits nothing.
+  // §8.1: the board has one row per sink, always both — the reducer is pure and cannot know
+  // which sinks this broker has, so the publisher marks an unconfigured sink's row obsolete
+  // (the GitHub comment in M0) exactly as it already does for a check without a GitHub port.
   if (tx.consequences.length > 0) {
-    tx.effect("refresh", `board:${tx.review.id}`, null);
+    for (const sink of BOARD_SINKS) tx.effect("refresh", `board:${sink}:${tx.review.id}`, null);
     tx.effect("refresh", `check:${repoOf(tx.review.display)}:${tx.review.subject.head_sha}`, null);
   }
   return tx.batch(action);
@@ -761,8 +824,13 @@ function routeInitial(tx: Transaction): { assignee: string; reason: string } {
   return { assignee: first, reason: "routing_by_round.first" };
 }
 
+/** §D1's key: the one pending request per `(assignee, subject_key, kind)`, if there is one. */
+function pendingFor(review: Review, assignee: string, subjectKey: string, kind: Request["kind"]): Request | undefined {
+  return review.requests.find((r) => isOutstanding(r) && r.assignee === assignee && r.subject_key === subjectKey && r.kind === kind);
+}
+
 function hasPending(review: Review, assignee: string, subjectKey: string, kind: Request["kind"]): boolean {
-  return review.requests.some((r) => r.status === "pending" && r.assignee === assignee && r.subject_key === subjectKey && r.kind === kind);
+  return pendingFor(review, assignee, subjectKey, kind) !== undefined;
 }
 
 interface OpenSpec {
@@ -784,9 +852,7 @@ interface OpenSpec {
  * `duplicate_request` before reaching this point (§D1); the system openers are silent about it.
  */
 function open(tx: Transaction, spec: OpenSpec): Request {
-  const existing = tx.review.requests.find(
-    (r) => r.status === "pending" && r.assignee === spec.assignee && r.subject_key === spec.subjectKey && r.kind === spec.kind,
-  );
+  const existing = pendingFor(tx.review, spec.assignee, spec.subjectKey, spec.kind);
   if (existing !== undefined) return existing;
   const request: Request = {
     id: tx.mint("req"),
@@ -803,6 +869,8 @@ function open(tx: Transaction, spec: OpenSpec): Request {
     supersedes: spec.supersedes,
     transport: [],
     retransports: [],
+    transport_exhausted: false,
+    cancellation: null,
     answered_by: null,
   };
   tx.record({ kind: "request_opened", request });
@@ -810,12 +878,35 @@ function open(tx: Transaction, spec: OpenSpec): Request {
   return request;
 }
 
-/** §C2 / §C4: the system opens the initial required request per policy and routing. */
-function openInitialIfDue(tx: Transaction, why: string): void {
+/**
+ * §C2 / §C4 / §D9 — restore the required work the current subject must have.
+ *
+ * Creating an obligation and being permitted to transport it are different things. A hold
+ * withholds *transport* — that is `effects.transportState` (§G3, §D8, §C3) — and never
+ * prevents the obligation from existing, so this function asks nothing about holds. (Before
+ * this, an exhaustion hold suppressed the initial request at a head pushed under it, and the
+ * `GrantRounds` that released the hold queued nothing, on the assumption that a withheld
+ * transport row already existed: the new head was never reviewed.)
+ *
+ * It is the reducer's one invariant-restoration point, and so is called from every act that can
+ * change the invariant's inputs: `observe` (subject change, draft flip, lifecycle), `release`,
+ * `grantRounds`, `cancelRequest`, `setAvailability` and `adoptPolicy`. It is idempotent — it
+ * opens nothing when an outstanding obligation already stands at the current subject
+ * ({@link outstandingRequiredAt}) — so a release, a grant or a reopen queues no second
+ * transport: the withheld row resumes at dispatch (§8.1).
+ *
+ * It never resurrects what the operator explicitly ended: {@link operatorCancelledAt} is the
+ * evidence, and it stands until the subject changes.
+ */
+function restoreObligations(tx: Transaction, why: string): void {
   const review = tx.review;
-  if (review.draft || review.lifecycle !== "open" || summonsBlocked(review)) return;
+  if (review.draft || review.lifecycle !== "open") return;
+  // §6.H: the same two ways the subject's requirement is already met — an exemption, or a
+  // standing complete answer. Neither leaves work to restore.
   if (review.exemption !== null && review.exemption.subject_key === review.subject.key) return;
-  if (pendingReviewRequestsAt(review, review.subject.key).some((r) => r.mode === "initial")) return;
+  if (satisfyingAnswers(review, review.subject.key).length > 0) return;
+  if (outstandingRequiredAt(review, review.subject.key).length > 0) return;
+  if (operatorCancelledAt(review, review.subject.key)) return;
   const route = routeInitial(tx);
   open(tx, {
     kind: "review",
@@ -830,9 +921,28 @@ function openInitialIfDue(tx: Transaction, why: string): void {
   });
 }
 
-/** §D4: cancel the pending request and open one to the substitute with `supersedes` — once. */
+/**
+ * §D4: cancel the pending request and carry its obligation to the substitute with `supersedes`
+ * — once, and never by silently adopting whatever the substitute happened to have pending.
+ *
+ * §D1 permits one pending request per `(assignee, subject_key, kind)`, so when the substitute
+ * already holds one a second request is not available: the existing request takes the
+ * superseded obligation on, as a recorded `request_requirement_raised` consequence — `required`
+ * becomes true, the named findings are the union, the mode is the more demanding of the two,
+ * and `supersedes` names what it absorbed. Nothing about the obligation is dropped.
+ */
 function reassign(tx: Transaction, request: Request, substitute: string, reason: string): void {
-  tx.record({ kind: "request_cancelled", request_id: request.id, reason });
+  const why = `${reason}: ${request.assignee} → ${substitute}`;
+  tx.record({ kind: "request_cancelled", request_id: request.id, reason, by: tx.system, at: tx.ctx.now });
+  const existing = pendingFor(tx.review, substitute, request.subject_key, request.kind);
+  if (existing !== undefined) {
+    const names = [...existing.names, ...request.names.filter((id) => !existing.names.includes(id))];
+    // §3.4: a review request that must answer named findings is a closure/appeal, not an
+    // initial — the mode follows the names it now carries.
+    const mode = names.length > existing.names.length ? request.mode : existing.mode;
+    tx.record({ kind: "request_requirement_raised", request_id: existing.id, required: true, names, mode, supersedes: request.id, reason: why });
+    return;
+  }
   open(tx, {
     kind: request.kind,
     mode: request.mode,
@@ -840,7 +950,7 @@ function reassign(tx: Transaction, request: Request, substitute: string, reason:
     subjectKey: request.subject_key,
     required: request.required,
     names: request.names,
-    reason: `${reason}: ${request.assignee} → ${substitute}`,
+    reason: why,
     supersedes: request.id,
     openedBy: tx.system,
   });
@@ -874,7 +984,7 @@ function observe(tx: Transaction, action: ObservePRAction): Refusal | null {
     // §C2: pending requests at the old subject are cancelled …
     for (const request of tx.review.requests) {
       if (request.status === "pending" && request.subject_key !== action.subject.key) {
-        tx.record({ kind: "request_cancelled", request_id: request.id, reason: "subject_changed" });
+        tx.record({ kind: "request_cancelled", request_id: request.id, reason: "subject_changed", by: tx.system, at: tx.ctx.now });
       }
     }
     // … holds released on subject change release …
@@ -904,13 +1014,11 @@ function observe(tx: Transaction, action: ObservePRAction): Refusal | null {
     tx.record({ kind: "mergeable_observed", mergeable: action.observed.mergeable });
   }
 
-  // §C2 / §C4: the initial request opens on a subject change or on the draft flip at an unchanged subject.
-  if (subjectChanged) openInitialIfDue(tx, "subject_changed");
-  else if (before !== null && before.draft && !action.draft) openInitialIfDue(tx, "ready_for_review");
-  else if (before?.lifecycle === "closed" && action.lifecycle === "open" &&
-    !tx.review.requests.some(r => r.kind === "review" && r.subject_key === tx.review.subject.key)) {
-    openInitialIfDue(tx, "reopened");
-  }
+  // §C2 / §C4 / §D9: the observation may have changed the subject, the draft flag or the
+  // lifecycle — each an input of the invariant the restoration establishes.
+  if (subjectChanged) restoreObligations(tx, "subject_changed");
+  else if (before !== null && before.draft && !action.draft) restoreObligations(tx, "ready_for_review");
+  else if (before !== null && before.lifecycle !== action.lifecycle) restoreObligations(tx, "lifecycle_changed");
 
   // §C3: → merged announces. A reopen queues nothing: the paused transport rows resume at dispatch (§8.1).
   if (before !== null && before.lifecycle !== "merged" && action.lifecycle === "merged") {
@@ -946,8 +1054,10 @@ function observe(tx: Transaction, action: ObservePRAction): Refusal | null {
 /**
  * §D6: after the policy's stall window with no answer, one more transport effect is queued —
  * a summon for Codex, a redelivery for a seat — bounded by `transport_bound`; when the bound is
- * spent the request becomes `unanswerable` and the system places `Hold(unanswerable, blocks
- * summons)`. The window is measured from the last transport the reducer queued (`opened_at`
+ * spent the request is marked `transport_exhausted` and the system places
+ * `Hold(transport_exhausted, blocks summons)`. That is a fact about reachability, not a
+ * discharge: the request stays pending, keeps blocking readiness (§6.H) and is still what a
+ * late answer discharges. The window is measured from the last transport the reducer queued (`opened_at`
  * or the last re-transport), and never runs while transport is paused (§C3 closed, §D8
  * conflicting, §G3 summons-blocking hold): a request nobody could reach has not stalled.
  * `Release` is the operator's, or the system's when an answer arrives anyway (`admitAnswer`).
@@ -959,7 +1069,9 @@ function housekeepStalls(tx: Transaction): void {
   const bound = policy.transport_bound ?? DEFAULT_TRANSPORT_BOUND;
   const now = Date.parse(tx.ctx.now);
   for (const request of [...review.requests]) {
-    if (request.status !== "pending") continue;
+    if (!isOutstanding(request)) continue;
+    // §D6: the bound is spent once; housekeeping is idempotent over an exhausted transport.
+    if (request.transport_exhausted) continue;
     if (transportState(review, request) !== "applicable") continue;
     const lastTransportAt = request.retransports[request.retransports.length - 1] ?? request.opened_at;
     if (now - Date.parse(lastTransportAt) < windowMs) continue;
@@ -969,7 +1081,7 @@ function housekeepStalls(tx: Transaction): void {
       continue;
     }
     tx.record({
-      kind: "request_unanswerable",
+      kind: "request_transport_exhausted",
       request_id: request.id,
       reason: `no answer from ${request.assignee} after ${bound} re-transport(s), each ${policy.stall_window_s ?? DEFAULT_STALL_WINDOW_S}s apart`,
     });
@@ -977,10 +1089,10 @@ function housekeepStalls(tx: Transaction): void {
       kind: "hold_placed",
       hold: {
         id: tx.mint("hold"),
-        kind: "unanswerable",
+        kind: "transport_exhausted",
         by: tx.system,
         at: tx.ctx.now,
-        reason: `unanswerable:${request.id}`,
+        reason: `transport_exhausted:${request.id}`,
         release_on: "explicit",
         blocks: { readiness: true, summons: true },
         released: null,
@@ -1035,17 +1147,21 @@ function admitExternal(tx: Transaction, action: Extract<Action, { kind: "AdmitEx
   // The head must be one the Review has seen; the newest subject at that head is its key.
   const subject = [...review.subjects].reverse().find((s) => s.head_sha === result.reviewed_head);
   if (subject === undefined) return refuse("unknown_subject", `head ${result.reviewed_head} was never observed on ${review.display}`);
-  const ids = result.findings.map((f) => f.source_comment_id);
-  if (new Set(ids).size !== ids.length) return refuse("malformed", "external findings must carry distinct source comment ids");
+  // §2.3/§3.5: the container is not the identity — one issue comment routinely carries several
+  // inline findings — so it is (container kind, container id, locator) that must be distinct.
+  const locators = result.findings.map((f) => `${f.container_kind}:${f.container_id}#${f.locator}`);
+  if (new Set(locators).size !== locators.length) {
+    return refuse("malformed", "external findings must carry distinct source locators within their container");
+  }
 
   // §D3: an admitted signal from Codex clears its recorded unavailability.
   clearAvailabilityOnSignal(tx, "codex");
 
-  // §E4: only a Codex request pending at that subject *now* is answered; otherwise unsolicited
-  // evidence. §D6: a request the system gave up on (`unanswerable`) is still the obligation the
-  // late answer discharges, and its hold is released with it.
+  // §E4: only a Codex request outstanding at that subject *now* is answered; otherwise
+  // unsolicited evidence. §D6: a request whose transport the system gave up on is outstanding
+  // like any other — the late answer discharges it, and its hold is released with it.
   const pending = review.requests.find(
-    (r) => (r.status === "pending" || r.status === "unanswerable") && r.kind === "review" && r.assignee === "codex" && r.subject_key === subject.key,
+    (r) => isOutstanding(r) && r.kind === "review" && r.assignee === "codex" && r.subject_key === subject.key,
   );
   const answerId = pending === undefined ? null : tx.mint("ans");
   const findings = result.findings.map((f) =>
@@ -1053,7 +1169,7 @@ function admitExternal(tx: Transaction, action: Extract<Action, { kind: "AdmitEx
       subject_key: subject.key,
       raised_by: "codex",
       answer_id: answerId,
-      source: { comment_id: f.source_comment_id, record_kind: result.source_record.kind === "issue_comment" ? "issue_comment" : "review_comment" },
+      source: { container_kind: f.container_kind, comment_id: f.container_id, locator: f.locator },
       priority: f.priority,
       reviewer_disposition: null,
       title: f.title,
@@ -1105,9 +1221,9 @@ function admitAnswer(tx: Transaction, request: Request, answerId: string, normal
   if (!complete) return admitted;
 
   tx.record({ kind: "request_answered", request_id: request.id, answer_id: answerId });
-  // §D6: an answer arriving anyway releases the unanswerable hold the system placed for it.
+  // §D6: an answer arriving anyway releases the transport-exhaustion hold placed for it.
   for (const hold of activeHolds(tx.review)) {
-    if (hold.kind === "unanswerable" && hold.reason === `unanswerable:${request.id}`) {
+    if (hold.kind === "transport_exhausted" && hold.reason === `transport_exhausted:${request.id}`) {
       tx.record({ kind: "hold_released", hold_id: hold.id, release: { by: tx.system, at: tx.ctx.now, reason: "answered" } });
     }
   }
@@ -1342,9 +1458,7 @@ function answer(tx: Transaction, action: AnswerAction): Refusal | null {
   const review = tx.review;
   const request = review.requests.find((r) => r.id === action.request_id);
   if (request === undefined) return refuse("no_such_target", `request ${action.request_id} does not exist`);
-  if (request.status !== "pending" && request.status !== "unanswerable") {
-    return refuse("no_such_target", `request ${request.id} is ${request.status}`);
-  }
+  if (!isOutstanding(request)) return refuse("no_such_target", `request ${request.id} is ${request.status}`);
   // §E1: the subject binds the request, the action and the report.
   if (action.subject_key !== request.subject_key) {
     return refuse("unknown_subject", `answer names ${action.subject_key}; request ${request.id} is at ${request.subject_key}`);
@@ -1467,10 +1581,11 @@ function openRequest(tx: Transaction, action: Extract<Action, { kind: "OpenReque
 function cancelRequest(tx: Transaction, action: Extract<Action, { kind: "CancelRequest" }>): Refusal | null {
   const request = tx.review.requests.find((r) => r.id === action.request_id);
   if (request === undefined) return refuse("no_such_target", `request ${action.request_id} does not exist`);
-  if (request.status !== "pending" && request.status !== "unanswerable") {
-    return refuse("no_such_target", `request ${request.id} is ${request.status}`);
-  }
-  tx.record({ kind: "request_cancelled", request_id: request.id, reason: action.reason });
+  if (!isOutstanding(request)) return refuse("no_such_target", `request ${request.id} is ${request.status}`);
+  tx.record({ kind: "request_cancelled", request_id: request.id, reason: action.reason, by: tx.ctx.principal, at: tx.ctx.now });
+  // §D9: cancelling is an input of the invariant. An operator's cancellation at the current
+  // subject is their decision and stands; anyone else's leaves the subject needing its review.
+  restoreObligations(tx, "request_cancelled");
   return null;
 }
 
@@ -1491,9 +1606,12 @@ function setAvailability(tx: Transaction, action: Extract<Action, { kind: "SetRe
   tx.record({ kind: "availability_set", reviewer: action.reviewer, availability });
   const substitute = substituteFor(tx.ctx.policy, action.reviewer);
   if (substitute === null) return null;
-  for (const request of tx.review.requests.filter((r) => r.status === "pending" && r.assignee === action.reviewer)) {
+  for (const request of tx.review.requests.filter((r) => isOutstanding(r) && r.assignee === action.reviewer)) {
     reassign(tx, request, substitute, `reviewer_unavailable (${action.reason})`);
   }
+  // §D9: routing is an input of the invariant; a reassignment that could not be made leaves the
+  // subject without its required work, and this is where that is noticed.
+  restoreObligations(tx, "reviewer_unavailable");
   return null;
 }
 
@@ -1512,6 +1630,8 @@ function adoptPolicy(tx: Transaction, action: Extract<Action, { kind: "AdoptPoli
     const route = routeInitial(tx);
     if (route.assignee !== request.assignee) reassign(tx, request, route.assignee, `policy_adopted (${route.reason})`);
   }
+  // §D9: routing is policy-dependent, so adopting a policy is an input of the invariant.
+  restoreObligations(tx, "policy_adopted");
   return null;
 }
 
@@ -1611,6 +1731,9 @@ function release(tx: Transaction, action: Extract<Action, { kind: "Release" }>):
   if (episode !== undefined) {
     tx.record({ kind: "episode_closed", episode_id: episode.id, close: { at: tx.ctx.now, by: tx.ctx.principal } });
   }
+  // §D9: the hold withheld transport, never creation — but a subject observed while it was
+  // active may still be missing the work the operator's release now expects to see move.
+  restoreObligations(tx, "hold_released");
   return null;
 }
 
@@ -1624,6 +1747,8 @@ function grantRounds(tx: Transaction, action: Extract<Action, { kind: "GrantRoun
   if (hold !== undefined && hold.released === null) {
     tx.record({ kind: "hold_released", hold_id: hold.id, release: { by: tx.ctx.principal, at: tx.ctx.now, reason: `rounds_granted: ${action.reason}` } });
   }
+  // §D9: the grant is what makes the head pushed under the episode reviewable again.
+  restoreObligations(tx, "rounds_granted");
   return null;
 }
 
@@ -1634,9 +1759,8 @@ function grantRounds(tx: Transaction, action: Extract<Action, { kind: "GrantRoun
 /** §3.6 / §6.H: requirement, blocking set, rounds, active holds, readiness with precedence-ordered reasons. */
 export function read(state: Review, ctx: { now: string; policy: Policy }): ReviewState {
   const subjectKey = state.subject.key;
-  const pendingRequired = state.requests
-    .filter((r) => r.status === "pending" && r.required && r.subject_key === subjectKey)
-    .map((r) => r.id);
+  // §6.H: readiness waits on the outstanding obligations, not on their transport (§D9).
+  const pendingRequired = outstandingRequiredAt(state, subjectKey).map((r) => r.id);
   const satisfying = satisfyingAnswers(state, subjectKey);
   const requirement: ReviewState["requirement"] =
     state.exemption !== null && state.exemption.subject_key === subjectKey

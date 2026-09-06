@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { validateEffect } from "./contract.js";
-import { applicability, deliveryPayload, formatTarget, noticePayload, parseTarget, targetKind, type EffectTarget } from "./effects.js";
+import { applicability, deliveryPayload, formatTarget, noticePayload, parseTarget, sinkOf, targetKind, type EffectTarget } from "./effects.js";
 import { hold, request, review, SHA_A, SHA_B } from "./fixtures.js";
 
 const TARGETS: Array<[string, EffectTarget]> = [
   [`check:skrates/hive:${SHA_A}`, { kind: "check", repo: "skrates/hive", headSha: SHA_A }],
-  ["board:rev_obs:run_1", { kind: "board", reviewId: "rev_obs:run_1" }],
+  ["board:github:rev_obs:run_1", { kind: "board", sink: "github", reviewId: "rev_obs:run_1" }],
+  ["board:slack:rev_obs:run_1", { kind: "board", sink: "slack", reviewId: "rev_obs:run_1" }],
   ["thread:9001", { kind: "thread", commentId: 9001 }],
   ["delivery:talos:req_obs:run_1_1", { kind: "delivery", actor: "talos", requestId: "req_obs:run_1_1" }],
   ["summon:req_obs:run_1_1", { kind: "summon", requestId: "req_obs:run_1_1" }],
@@ -26,7 +27,7 @@ test("target grammar parses and formats every §8.1 kind, colons in ids included
 });
 
 test("target grammar refuses what the contract refuses", () => {
-  for (const bad of ["check:skrates/hive:abc", "thread:0", "thread:x", "delivery:Talos:req_1", "gate:rev_1", "board:", "notice:Talos:x", "notice:talos"]) {
+  for (const bad of ["check:skrates/hive:abc", "thread:0", "thread:x", "delivery:Talos:req_1", "gate:rev_1", "board:", "board:rev_1", "board:email:rev_1", "notice:Talos:x", "notice:talos"]) {
     assert.throws(() => parseTarget(bad), /grammar/, bad);
     assert.equal(validateEffect({ effect_id: "e", kind: "refresh", target: bad, payload: null }).ok, false, bad);
   }
@@ -34,7 +35,8 @@ test("target grammar refuses what the contract refuses", () => {
 
 test("refresh vs actionable follows the target kind (§8.1)", () => {
   assert.equal(targetKind({ kind: "check", repo: "a/b", headSha: SHA_A }), "refresh");
-  assert.equal(targetKind({ kind: "board", reviewId: "r" }), "refresh");
+  assert.equal(targetKind({ kind: "board", sink: "github", reviewId: "r" }), "refresh");
+  assert.equal(targetKind({ kind: "board", sink: "slack", reviewId: "r" }), "refresh");
   assert.equal(targetKind({ kind: "thread", commentId: 1 }), "refresh");
   assert.equal(targetKind({ kind: "delivery", actor: "a", requestId: "r" }), "actionable");
   assert.equal(targetKind({ kind: "summon", requestId: "r" }), "actionable");
@@ -116,7 +118,7 @@ test("applicability: announce needs a merged Review; refreshes always apply", ()
   assert.equal(applicability(announce, review({ lifecycle: "merged" })), "applicable");
   const conflicting = review();
   conflicting.observed = { ...conflicting.observed, mergeable: false };
-  assert.equal(applicability({ kind: "board", reviewId: "r" }, conflicting), "applicable");
+  assert.equal(applicability({ kind: "board", sink: "slack", reviewId: "r" }, conflicting), "applicable");
   assert.equal(applicability({ kind: "check", repo: "a/b", headSha: SHA_A }, conflicting), "applicable");
   assert.equal(applicability({ kind: "thread", commentId: 1 }, conflicting), "applicable");
 });
@@ -134,4 +136,19 @@ test("payload readers return null for anything but the documented shape", () => 
     noticePayload({ actor: "talos", text: "conflicting", dedupe_key: "conflicting:rev_1:sha:main" }),
     { actor: "talos", text: "conflicting", dedupe_key: "conflicting:rev_1:sha:main" },
   );
+});
+
+// §8.1: every target names one sink, so the publisher can order a pass by it and one sink's
+// row can never be the reason another sink's row waits.
+test("every target names the port it dispatches through", () => {
+  assert.deepEqual(TARGETS.map(([, target]) => sinkOf(target)), [
+    "github", // check
+    "github", // board:github
+    "slack",  // board:slack
+    "github", // thread
+    "slack",  // delivery
+    "github", // summon
+    "slack",  // announce
+    "slack",  // notice
+  ]);
 });

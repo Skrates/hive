@@ -558,7 +558,10 @@
                 "$ref": "#/$defs/RequestRetransported"
               },
               {
-                "$ref": "#/$defs/RequestUnanswerable"
+                "$ref": "#/$defs/RequestTransportExhausted"
+              },
+              {
+                "$ref": "#/$defs/RequestRequirementRaised"
               },
               {
                 "$ref": "#/$defs/AnswerAdmitted"
@@ -951,22 +954,28 @@
     },
     "CommentFindingSource": {
       "additionalProperties": false,
+      "description": "\u00a73.5 \u2014 the source *container* the finding was read out of, plus its source-local locator.\n\nOne GitHub record can carry several findings, so a comment id alone does not identify one.\n``container_kind`` and ``comment_id`` name the record; ``locator`` is the finding's\nzero-based ordinal block within that record's body at the ``SourceRef.version`` it was read\nat \u2014 the one locator a re-read of the same version reproduces without consulting Hive state.\nOnly a ``review_comment`` container can carry a GitHub review thread, so only it is a\n``thread:<comment_id>`` target (\u00a78.1).",
       "properties": {
         "comment_id": {
           "minimum": 1,
           "type": "integer"
         },
-        "record_kind": {
+        "container_kind": {
           "enum": [
             "review_comment",
             "issue_comment"
           ],
           "type": "string"
+        },
+        "locator": {
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "required": [
-        "record_kind",
-        "comment_id"
+        "container_kind",
+        "comment_id",
+        "locator"
       ],
       "title": "CommentFindingSource",
       "type": "object"
@@ -1018,7 +1027,10 @@
           "$ref": "#/$defs/RequestRetransported"
         },
         {
-          "$ref": "#/$defs/RequestUnanswerable"
+          "$ref": "#/$defs/RequestTransportExhausted"
+        },
+        {
+          "$ref": "#/$defs/RequestRequirementRaised"
         },
         {
           "$ref": "#/$defs/AnswerAdmitted"
@@ -1314,7 +1326,7 @@
           ]
         },
         "target": {
-          "pattern": "^(check:\\S+:[0-9a-f]{40}|board:\\S+|thread:[1-9][0-9]*|delivery:[a-z0-9-]+:\\S+|summon:\\S+|announce:\\S+|notice:[a-z0-9-]+:\\S+)$",
+          "pattern": "^(check:\\S+:[0-9a-f]{40}|board:(github|slack):\\S+|thread:[1-9][0-9]*|delivery:[a-z0-9-]+:\\S+|summon:\\S+|announce:\\S+|notice:[a-z0-9-]+:\\S+)$",
           "type": "string"
         }
       },
@@ -1578,7 +1590,7 @@
     },
     "ExplicitHold": {
       "additionalProperties": false,
-      "description": "\u00a76.G3: exhaustion, owner_decision, unanswerable and operator release only explicitly.",
+      "description": "\u00a76.G3: exhaustion, owner_decision, transport_exhausted and operator release only\nexplicitly.",
       "properties": {
         "at": {
           "pattern": "^(?:[0-9]{4}-(?:(?:01|03|05|07|08|10|12)-(?:0[1-9]|[12][0-9]|3[01])|(?:04|06|09|11)-(?:0[1-9]|[12][0-9]|30)|02-(?:0[1-9]|1[0-9]|2[0-8]))|(?:[0-9]{2}(?:0[48]|[2468][048]|[13579][26])|(?:[02468][048]|[13579][26])00)-02-29)T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,9})?Z$",
@@ -1612,7 +1624,7 @@
           "enum": [
             "exhaustion",
             "owner_decision",
-            "unanswerable",
+            "transport_exhausted",
             "operator"
           ],
           "type": "string"
@@ -1658,7 +1670,7 @@
           "enum": [
             "exhaustion",
             "owner_decision",
-            "unanswerable",
+            "transport_exhausted",
             "operator"
           ],
           "type": "string"
@@ -1682,9 +1694,20 @@
     },
     "ExternalFinding": {
       "additionalProperties": false,
-      "description": "No fingerprint, falsifier or evidence is invented for Codex; provenance is the comment.",
+      "description": "No fingerprint, falsifier or evidence is invented for Codex; provenance is the container.\n\n``container_kind``/``container_id`` name the GitHub record the finding was read out of and\n``locator`` is its zero-based ordinal block within that record's body. A container is not\nunique across a result \u2014 one issue comment routinely carries several inline findings \u2014 so it\nis ``(container_kind, container_id, locator)`` that the reducer requires to be distinct, and\neach finding still gets its own Hive id (\u00a72.3, \u00a76.F).",
       "properties": {
         "body": {
+          "type": "string"
+        },
+        "container_id": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "container_kind": {
+          "enum": [
+            "review_comment",
+            "issue_comment"
+          ],
           "type": "string"
         },
         "line": {
@@ -1698,22 +1721,24 @@
             }
           ]
         },
+        "locator": {
+          "minimum": 0,
+          "type": "integer"
+        },
         "path": {
           "type": "string"
         },
         "priority": {
           "$ref": "#/$defs/FindingPriority"
         },
-        "source_comment_id": {
-          "minimum": 1,
-          "type": "integer"
-        },
         "title": {
           "type": "string"
         }
       },
       "required": [
-        "source_comment_id",
+        "container_kind",
+        "container_id",
+        "locator",
         "path",
         "line",
         "priority",
@@ -2480,7 +2505,7 @@
             "stack",
             "exhaustion",
             "owner_decision",
-            "unanswerable",
+            "transport_exhausted",
             "operator"
           ],
           "type": "string"
@@ -3562,7 +3587,7 @@
     },
     "Request": {
       "additionalProperties": false,
-      "description": "\u00a73.4 \u2014 an obligation. ``names`` is non-empty only for closure/appeal (reducer-checked).\n\n``transport`` holds the references the publisher records after a dispatch (\u00a76.D5);\n``retransports`` holds the instants at which \u00a76.D6 housekeeping queued one more transport\neffect \u2014 its length is the count the policy's ``transport_bound`` bounds.",
+      "description": "\u00a73.4 \u2014 an obligation. ``names`` is non-empty only for closure/appeal (reducer-checked).\n\n``status`` is the obligation's; ``transport``, ``retransports`` and ``transport_exhausted``\nare its transport's, and never discharge it. ``transport`` holds the references the\npublisher records after a dispatch (\u00a76.D5); ``retransports`` holds the instants at which\n\u00a76.D6 housekeeping queued one more transport effect \u2014 its length is the count the policy's\n``transport_bound`` bounds; ``transport_exhausted`` records that the bound is spent, which\nwithholds further transport (and holds) but leaves the obligation outstanding.",
       "properties": {
         "answered_by": {
           "anyOf": [
@@ -3579,6 +3604,16 @@
         "assignee": {
           "pattern": "^[a-z0-9-]+$",
           "type": "string"
+        },
+        "cancellation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RequestCancellation"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "id": {
           "minLength": 1,
@@ -3670,6 +3705,9 @@
             ]
           },
           "type": "array"
+        },
+        "transport_exhausted": {
+          "type": "boolean"
         }
       },
       "required": [
@@ -3687,6 +3725,8 @@
         "supersedes",
         "transport",
         "retransports",
+        "transport_exhausted",
+        "cancellation",
         "answered_by"
       ],
       "title": "Request",
@@ -3718,14 +3758,73 @@
       "title": "RequestAnswered",
       "type": "object"
     },
+    "RequestCancellation": {
+      "additionalProperties": false,
+      "description": "\u00a76.D \u2014 the named act that discharged an obligation without an answer.\n\nRetained on the request because it is the evidence the reducer's obligation restoration\nconsults: an operator's cancellation at a subject stands until that subject changes.",
+      "properties": {
+        "at": {
+          "pattern": "^(?:[0-9]{4}-(?:(?:01|03|05|07|08|10|12)-(?:0[1-9]|[12][0-9]|3[01])|(?:04|06|09|11)-(?:0[1-9]|[12][0-9]|30)|02-(?:0[1-9]|1[0-9]|2[0-8]))|(?:[0-9]{2}(?:0[48]|[2468][048]|[13579][26])|(?:[02468][048]|[13579][26])00)-02-29)T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,9})?Z$",
+          "type": "string"
+        },
+        "by": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/SeatPrincipal"
+            },
+            {
+              "$ref": "#/$defs/OperatorPrincipal"
+            },
+            {
+              "$ref": "#/$defs/AdapterPrincipal"
+            },
+            {
+              "$ref": "#/$defs/SystemPrincipal"
+            }
+          ]
+        },
+        "reason": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "by",
+        "at",
+        "reason"
+      ],
+      "title": "RequestCancellation",
+      "type": "object"
+    },
     "RequestCancelled": {
       "additionalProperties": false,
+      "description": "\u00a76.D \u2014 the only discharge of a required obligation short of an answer or an exemption.\n\n``by`` and ``at`` are materialized onto ``Request.cancellation`` so the reducer can tell an\noperator's decision from the system's bookkeeping (\u00a76.D9).",
       "properties": {
+        "at": {
+          "pattern": "^(?:[0-9]{4}-(?:(?:01|03|05|07|08|10|12)-(?:0[1-9]|[12][0-9]|3[01])|(?:04|06|09|11)-(?:0[1-9]|[12][0-9]|30)|02-(?:0[1-9]|1[0-9]|2[0-8]))|(?:[0-9]{2}(?:0[48]|[2468][048]|[13579][26])|(?:[02468][048]|[13579][26])00)-02-29)T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,9})?Z$",
+          "type": "string"
+        },
+        "by": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/SeatPrincipal"
+            },
+            {
+              "$ref": "#/$defs/OperatorPrincipal"
+            },
+            {
+              "$ref": "#/$defs/AdapterPrincipal"
+            },
+            {
+              "$ref": "#/$defs/SystemPrincipal"
+            }
+          ]
+        },
         "kind": {
           "const": "request_cancelled",
           "type": "string"
         },
         "reason": {
+          "minLength": 1,
           "type": "string"
         },
         "request_id": {
@@ -3737,7 +3836,9 @@
       "required": [
         "kind",
         "request_id",
-        "reason"
+        "reason",
+        "by",
+        "at"
       ],
       "title": "RequestCancelled",
       "type": "object"
@@ -3766,6 +3867,63 @@
         "request"
       ],
       "title": "RequestOpened",
+      "type": "object"
+    },
+    "RequestRequirementRaised": {
+      "additionalProperties": false,
+      "description": "\u00a76.D4 \u2014 a reassignment folded its obligation into an existing pending request.\n\n\u00a76.D1 permits one pending request per ``(assignee, subject_key, kind)``, so the substitute's\nexisting request takes on the superseded one's requiredness and named findings rather than a\nsecond request being opened or the obligation being dropped.",
+      "properties": {
+        "kind": {
+          "const": "request_requirement_raised",
+          "type": "string"
+        },
+        "mode": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReviewMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "names": {
+          "items": {
+            "minLength": 1,
+            "pattern": "^[!-~]+$(?![\\s\\S])",
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "reason": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "request_id": {
+          "minLength": 1,
+          "pattern": "^[!-~]+$(?![\\s\\S])",
+          "type": "string"
+        },
+        "required": {
+          "const": true,
+          "type": "boolean"
+        },
+        "supersedes": {
+          "minLength": 1,
+          "pattern": "^[!-~]+$(?![\\s\\S])",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "request_id",
+        "required",
+        "names",
+        "mode",
+        "supersedes",
+        "reason"
+      ],
+      "title": "RequestRequirementRaised",
       "type": "object"
     },
     "RequestRetransported": {
@@ -3800,23 +3958,25 @@
       "type": "object"
     },
     "RequestStatus": {
+      "description": "\u00a73.4 / \u00a76.D \u2014 the *obligation's* status, never its transport's.\n\nA required request stays ``pending`` until an authoritative act discharges it: an answer\n(``answered``) or an explicit cancellation (``cancelled``). A spent transport bound is\n``Request.transport_exhausted``, a fact about reachability, and discharges nothing.",
       "enum": [
         "pending",
         "answered",
-        "cancelled",
-        "unanswerable"
+        "cancelled"
       ],
       "title": "RequestStatus",
       "type": "string"
     },
-    "RequestUnanswerable": {
+    "RequestTransportExhausted": {
       "additionalProperties": false,
+      "description": "\u00a76.D6 \u2014 the transport bound is spent. A fact about reachability, not a discharge:\nthe request stays ``pending`` and keeps blocking readiness (\u00a76.H).",
       "properties": {
         "kind": {
-          "const": "request_unanswerable",
+          "const": "request_transport_exhausted",
           "type": "string"
         },
         "reason": {
+          "minLength": 1,
           "type": "string"
         },
         "request_id": {
@@ -3830,7 +3990,7 @@
         "request_id",
         "reason"
       ],
-      "title": "RequestUnanswerable",
+      "title": "RequestTransportExhausted",
       "type": "object"
     },
     "RequiredRequestPendingReason": {

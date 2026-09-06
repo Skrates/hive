@@ -168,6 +168,18 @@ for (const [name, expected] of Object.entries(EXPECTED)) {
         assert.ok(first !== undefined);
         assert.equal(first.path, expected.first?.path);
         assert.equal(first.line, expected.first?.line);
+        // §3.5: the container is the record a finding was read out of — the member comment for
+        // an envelope, the record itself otherwise — and the locator separates findings that
+        // share one. `(container, locator)` is distinct even where the container is not.
+        const containers = new Set(result.external.findings.map((f) => `${f.container_kind}:${f.container_id}`));
+        const located = result.external.findings.map((f) => `${f.container_kind}:${f.container_id}#${f.locator}`);
+        assert.equal(new Set(located).size, located.length, `distinct source locators: ${located.join(" ")}`);
+        if (record(name).kind === "review") {
+          assert.deepEqual([...containers], (expected.context?.members ?? []).map((m) => `review_comment:${m.id}`));
+          assert.deepEqual(result.external.findings.map((f) => f.locator), result.external.findings.map(() => 0), "one finding per member comment");
+        } else {
+          assert.deepEqual([...containers], [`${record(name).kind}:${record(name).id}`], "the record itself is the container");
+        }
         for (const finding of result.external.findings) {
           assert.ok(finding.title.length > 0 && !finding.title.includes("<sub>") && !finding.title.includes("Badge"), `title is prose: ${finding.title}`);
           assert.ok(!finding.body.includes("Useful? React"), "the connector's reaction footer is not finding body");

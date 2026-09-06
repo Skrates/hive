@@ -72,6 +72,7 @@
         "request": {
           "answered_by": null,
           "assignee": "codex",
+          "cancellation": null,
           "id": "req_obs:run_01J_1",
           "kind": "review",
           "mode": "initial",
@@ -87,7 +88,8 @@
           "status": "pending",
           "subject_key": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:main",
           "supersedes": null,
-          "transport": []
+          "transport": [],
+          "transport_exhausted": false
         }
       }
     ],
@@ -110,7 +112,13 @@
         "payload": {
           "note": "opened"
         },
-        "target": "board:rev_01J"
+        "target": "board:github:rev_01J"
+      },
+      {
+        "effect_id": "eff_obs:run_01J_4",
+        "kind": "refresh",
+        "payload": null,
+        "target": "board:slack:rev_01J"
       }
     ],
     "policy_version": 1,

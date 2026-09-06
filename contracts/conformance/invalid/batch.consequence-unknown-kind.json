@@ -71,7 +71,7 @@
         "payload": {
           "note": "opened"
         },
-        "target": "board:rev_01J"
+        "target": "board:slack:rev_01J"
       }
     ],
     "policy_version": 1,

@@ -108,7 +108,7 @@ function fakeReducer(): ReviewStoreDeps & { calls: { decide: DecideContext[]; re
         ...base,
         consequences: changed ? [{ kind: "subject_changed", previous_key: state?.subject.key ?? null, subject: action.subject }] : [],
         effects: [
-          { effect_id: `eff_${ctx.actId}_1`, kind: "refresh", target: `board:${reviewId}`, payload: null },
+          { effect_id: `eff_${ctx.actId}_1`, kind: "refresh", target: `board:slack:${reviewId}`, payload: null },
           { effect_id: `eff_${ctx.actId}_2`, kind: "refresh", target: `check:${ctx.identity?.display.split("#")[0]}:${action.subject.head_sha}`, payload: null },
           ...(changed
             ? [{ effect_id: `eff_${ctx.actId}_3`, kind: "actionable" as const, target: `summon:req_${ctx.actId}_1`, payload: { text: "@codex review" } }]
@@ -120,7 +120,7 @@ function fakeReducer(): ReviewStoreDeps & { calls: { decide: DecideContext[]; re
       return {
         ...base,
         consequences: [{ kind: "rounds_granted", n: action.n, reason: action.reason }],
-        effects: [{ effect_id: `eff_${ctx.actId}_1`, kind: "refresh", target: `board:${reviewId}`, payload: null }],
+        effects: [{ effect_id: `eff_${ctx.actId}_1`, kind: "refresh", target: `board:slack:${reviewId}`, payload: null }],
       };
     }
     return { refused: true, code: "unauthorized", detail: `fake reducer does not model ${action.kind}` };
@@ -465,7 +465,7 @@ test("effects: pendingByTarget never returns two rows for one target; claim is e
   const pending = store.effects.pendingByTarget(now);
   const targets = pending.map((effect) => effect.target);
   assert.equal(new Set(targets).size, targets.length, "one row per target");
-  const board = pending.find((effect) => effect.target === "board:rev_obs:run_1");
+  const board = pending.find((effect) => effect.target === "board:slack:rev_obs:run_1");
   assert.equal(board?.effect_id, "eff_01J_G2_1", "the newest pending refresh for the board");
   assert.equal(board?.revision, 3);
   const summon = pending.find((effect) => effect.target === "summon:req_obs:run_1_1");
@@ -480,7 +480,7 @@ test("effects: pendingByTarget never returns two rows for one target; claim is e
   assert.equal(store.effects.claim("eff_nope"), null);
   assert.ok(!store.effects.pendingByTarget(now).some((effect) => effect.effect_id === "eff_01J_G2_1"));
   // With the newest claimed, the older board refreshes are still pending and the next-newest surfaces.
-  assert.equal(store.effects.pendingByTarget(now).find((effect) => effect.target === "board:rev_obs:run_1")?.effect_id, "eff_01J_G1_1");
+  assert.equal(store.effects.pendingByTarget(now).find((effect) => effect.target === "board:slack:rev_obs:run_1")?.effect_id, "eff_01J_G1_1");
 });
 
 test("effects: markSent / markObsolete / markFailed with backoff and a terminal bound", () => {
@@ -521,14 +521,14 @@ test("effects: coalesceRefresh keeps only the newest pending refresh per target"
   store.apply(KEY, { actId: "01J_G1", principal: OPERATOR, expectedRevision: 1, action: grant(1) });
   store.apply(KEY, { actId: "01J_G2", principal: OPERATOR, expectedRevision: 2, action: grant(1) });
   store.effects.claim("eff_01J_G1_1");
-  assert.equal(store.effects.coalesceRefresh("board:rev_obs:run_1"), 1, "only pending rows are coalesced");
-  const rows = db.prepare("SELECT effect_id, status FROM review_effects WHERE target = ? ORDER BY rowid").all("board:rev_obs:run_1") as Array<{ effect_id: string; status: string }>;
+  assert.equal(store.effects.coalesceRefresh("board:slack:rev_obs:run_1"), 1, "only pending rows are coalesced");
+  const rows = db.prepare("SELECT effect_id, status FROM review_effects WHERE target = ? ORDER BY rowid").all("board:slack:rev_obs:run_1") as Array<{ effect_id: string; status: string }>;
   assert.deepEqual(rows, [
     { effect_id: "eff_obs:run_1_1", status: "obsolete" },
     { effect_id: "eff_01J_G1_1", status: "claimed" },
     { effect_id: "eff_01J_G2_1", status: "pending" },
   ]);
-  assert.equal(store.effects.coalesceRefresh("board:rev_obs:run_1"), 0);
+  assert.equal(store.effects.coalesceRefresh("board:slack:rev_obs:run_1"), 0);
   assert.equal(store.effects.coalesceRefresh("summon:req_obs:run_1_1"), 0, "actionable rows never coalesce");
   assert.equal(db.prepare("SELECT status FROM review_effects WHERE effect_id = ?").pluck().get("eff_obs:run_1_3"), "pending");
 });
@@ -613,7 +613,7 @@ test("active(since) lists Reviews with a pending request or recent activity", ()
   state.requests.push({
     id: "req_1", kind: "review", mode: "initial", assignee: "codex", subject_key: state.subject.key, required: true, names: [],
     status: "pending", opened_by: { kind: "system", caused_by: "obs:run_1" }, opened_at: "2026-09-06T12:00:00.000Z", reason: "routing_by_round.first",
-    supersedes: null, transport: [], retransports: [], answered_by: null,
+    supersedes: null, transport: [], retransports: [], transport_exhausted: false, cancellation: null, answered_by: null,
   });
   db.prepare("UPDATE reviews SET state_json = ? WHERE review_id = ?").run(JSON.stringify(state), state.id);
   assert.deepEqual(store.active("2026-09-06T12:00:30.000Z"), [quiet, KEY]);

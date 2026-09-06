@@ -35,6 +35,7 @@ import type {
   TransportRef,
 } from "./contract.js";
 import { validateAction } from "./contract.js";
+import { BOARD_SINKS } from "./effects.js";
 import type { DecideContext, ReviewIdentity, decide as reducerDecide, fold as reducerFold, read as reducerRead } from "./reducer.js";
 
 interface Row { [key: string]: unknown }
@@ -812,9 +813,13 @@ export class ReviewStore {
         this.updateSourceRecord(recordKey, version, "UPDATE source_records SET classification = ? WHERE record_key = ? AND version = ?", classification);
         if (classification === "unknown" || row.classification === "unknown") {
           const reviewId = String(row.review_id);
-          this.db.prepare(`INSERT OR IGNORE INTO review_effects(effect_id, review_id, revision, kind, target, payload_json, status)
-            SELECT ?, review_id, revision, 'refresh', ?, NULL, 'pending' FROM reviews WHERE review_id = ?`)
-            .run(`source:${recordKey}:${version}:${classification}`, `board:${reviewId}`, reviewId);
+          // §8.1: the board is one row per sink, so a classification change refreshes each of
+          // them on its own row — the same shape the reducer emits, and for the same reason.
+          const queue = this.db.prepare(`INSERT OR IGNORE INTO review_effects(effect_id, review_id, revision, kind, target, payload_json, status)
+            SELECT ?, review_id, revision, 'refresh', ?, NULL, 'pending' FROM reviews WHERE review_id = ?`);
+          for (const sink of BOARD_SINKS) {
+            queue.run(`source:${recordKey}:${version}:${classification}:${sink}`, `board:${sink}:${reviewId}`, reviewId);
+          }
         }
       })();
     },

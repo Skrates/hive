@@ -24,7 +24,9 @@ import {
   applicability,
   deliveryPayload,
   parseTarget,
+  sinkOf,
   summonPayload,
+  type EffectSink,
   type EffectTarget,
 } from "./effects.js";
 import { boardComment, checkRun, slackBoardLine, threadState } from "./render.js";
@@ -105,14 +107,56 @@ export interface ReviewPublisherPorts {
 /** Thrown by a dispatch that cannot proceed; the row is marked failed and retried behind backoff. */
 class DispatchError extends Error {}
 
+/**
+ * How long one GitHub port call may take before the row is failed instead of awaited (§8.1).
+ * A pass is sequential and single-flight, so a call that never resolves — a socket the peer
+ * forgot, an App-token fetch behind a black hole — would otherwise wedge review publication
+ * for the life of the process, not just its own row. Thirty seconds is far beyond any healthy
+ * GitHub response and six housekeeping ticks, so a timeout is always a fault, never load; the
+ * row then retries under the ordinary attempt-bounded backoff, visibly.
+ */
+export const REVIEW_GITHUB_DISPATCH_TIMEOUT_MS = 30_000;
+
+/** Await `work`, or reject once `ms` has passed with nothing to show for it. */
+async function timebox<T>(work: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new DispatchError(`GitHub ${what} did not answer within ${ms}ms`)), ms);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+/** The same port, with every call time-boxed by {@link REVIEW_GITHUB_DISPATCH_TIMEOUT_MS}. */
+function timeboxedGitHub(port: ReviewGitHubPort, ms: number): ReviewGitHubPort {
+  return {
+    createOrUpdateCheckRun: (input) => timebox(port.createOrUpdateCheckRun(input), ms, "createOrUpdateCheckRun"),
+    createOrUpdateBoardComment: (input) => timebox(port.createOrUpdateBoardComment(input), ms, "createOrUpdateBoardComment"),
+    resolveThread: (input) => timebox(port.resolveThread(input), ms, "resolveThread"),
+    unresolveThread: (input) => timebox(port.unresolveThread(input), ms, "unresolveThread"),
+    postComment: (input) => timebox(port.postComment(input), ms, "postComment"),
+  };
+}
+
 export class ReviewPublisher {
   private inFlight: Promise<number> | null = null;
+  private readonly ports: ReviewPublisherPorts;
 
   constructor(
     private readonly store: PublisherStore,
-    private readonly ports: ReviewPublisherPorts,
+    ports: ReviewPublisherPorts,
     private readonly clock: Clock,
-  ) {}
+    githubTimeoutMs: number = REVIEW_GITHUB_DISPATCH_TIMEOUT_MS,
+  ) {
+    this.ports = ports.github === null
+      ? ports
+      : { ...ports, github: timeboxedGitHub(ports.github, githubTimeoutMs) };
+  }
 
   /**
    * One pass over the pending effects, one row per target. Single-flight: a call while a
@@ -137,13 +181,48 @@ export class ReviewPublisher {
   }
 
   private async pass(): Promise<number> {
-    const rows = this.store.effects.pendingByTarget(iso(this.clock));
-    rows.sort((a, b) => Number(b.target.startsWith("board:")) - Number(a.target.startsWith("board:")));
+    const rows = this.slackFirst(this.store.effects.pendingByTarget(iso(this.clock)));
     let handled = 0;
     for (const row of rows) {
       if (await this.handle(row)) handled += 1;
     }
     return handled;
+  }
+
+  /**
+   * §8.1: within a pass the Slack-sink rows dispatch before the GitHub-sink ones. The loop
+   * has to stay sequential — per-target serialization is what keeps a delayed worker from
+   * publishing an older verdict — so a slow GitHub call delays whatever follows it; ordering
+   * by sink makes what follows only other GitHub work. Sink independence itself comes from
+   * the targets being distinct rows; this is about a hung await, which no marking can undo.
+   *
+   * `board:slack` leads its own sink's rows because it is the row that opens the Review's
+   * Slack thread, and every other Slack row waits unclaimed until that thread exists. The
+   * opener still only reaches the outbox in this pass, so the wait is one tick either way;
+   * leading keeps that tick from becoming two.
+   *
+   * A target that does not parse sorts last: `handle` fails it without touching a port.
+   */
+  private slackFirst(rows: PublishableEffect[]): PublishableEffect[] {
+    const slackBoard: PublishableEffect[] = [];
+    const slack: PublishableEffect[] = [];
+    const github: PublishableEffect[] = [];
+    const unparsed: PublishableEffect[] = [];
+    for (const row of rows) {
+      let target: EffectTarget | null;
+      try {
+        target = parseTarget(row.target);
+      } catch {
+        target = null;
+      }
+      const sink: EffectSink | null = target === null ? null : sinkOf(target);
+      if (sink === "slack") {
+        if (target !== null && target.kind === "board") slackBoard.push(row);
+        else slack.push(row);
+      } else if (sink === "github") github.push(row);
+      else unparsed.push(row);
+    }
+    return [...slackBoard, ...slack, ...github, ...unparsed];
   }
 
   private async handle(row: PublishableEffect): Promise<boolean> {
@@ -170,8 +249,12 @@ export class ReviewPublisher {
       if (applicability(target, review) === "withheld") return false;
       // M0 has no GitHub port; a summon must neither be lost nor marked, so it waits.
       if (target.kind === "summon" && this.ports.github === null) return false;
-      // Slack actionables wait unclaimed for the channel's board opener to drain.
-      // The broker drains its outbox after this pass; waiting here must never block it.
+      // Slack actionables wait unclaimed for the channel's board opener to drain: the thread
+      // ts only exists once the outbox has posted the board line, so this row cannot name a
+      // thread yet. The wait is always at least one tick — `board:slack` sorts ahead of these
+      // rows in this same pass (§8.1, `slackFirst`) but only queues the opener into the
+      // outbox. `housekeepingTick` drains that outbox independently of this pass on the same
+      // tick, so the ts is recorded before the next pass looks at these rows again.
       if (applicability(target, review) === "applicable" &&
         (target.kind === "delivery" || target.kind === "notice" || target.kind === "announce") &&
         this.slackPolicy(review) !== null && this.slackThread(review) === null) return false;
@@ -244,8 +327,14 @@ export class ReviewPublisher {
     const github = this.ports.github;
     switch (target.kind) {
       case "board": {
+        // §8.1: one sink per row. The two board sinks are independent targets, so a GitHub
+        // comment that fails or hangs marks only its own row failed — the Slack line, which
+        // opens the Review's thread, is queued by its own row on the same pass.
         const unknown = this.store.sourceRecords.unknown(state.id);
-        if (github !== null) {
+        if (target.sink === "github") {
+          // No GitHub port is a configuration, not a failure (M0, §1 F-2): the sink does not
+          // exist, so its row is retired rather than retried, as a check's row already is.
+          if (github === null) return "obsolete";
           const existingId = state.projection_handles.board_comment_id;
           const { commentId } = await github.createOrUpdateBoardComment({
             repositoryId: state.key.repository_id,
@@ -255,16 +344,17 @@ export class ReviewPublisher {
           });
           // §8.1: one comment per Review, created once. The id is recorded the moment it exists.
           if (existingId === null) this.store.projections.recordBoardComment(state.id, this.positiveId(commentId, "board comment"));
+          return "sent";
         }
+        // A policy that names no Slack channel is a defect, not a configuration: the row fails
+        // visibly behind backoff rather than retiring the Review's one Slack projection.
         const slack = this.slackPolicy(state);
-        if (slack === null && github === null) throw new DispatchError("board has no configured publication destination");
-        if (slack !== null) {
-          const threadTs = this.slackThread(state);
-          const { outboxId } = this.ports.slack.postBoardLine({ channelId: slack.channel_id, threadTs, text: slackBoardLine(state, unknown) });
-          // The first line opens the Review's thread; its ts is learned once the outbox drains it.
-          if (threadTs === null && this.store.projections.slackBoardOutboxId(state.id, slack.channel_id) === null) {
-            this.store.projections.recordSlackBoardOutbox(state.id, slack.channel_id, outboxId);
-          }
+        if (slack === null) throw new DispatchError("board has no configured Slack channel");
+        const threadTs = this.slackThread(state);
+        const { outboxId } = this.ports.slack.postBoardLine({ channelId: slack.channel_id, threadTs, text: slackBoardLine(state, unknown) });
+        // The first line opens the Review's thread; its ts is learned once the outbox drains it.
+        if (threadTs === null && this.store.projections.slackBoardOutboxId(state.id, slack.channel_id) === null) {
+          this.store.projections.recordSlackBoardOutbox(state.id, slack.channel_id, outboxId);
         }
         return "sent";
       }
