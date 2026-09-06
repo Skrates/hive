@@ -1,0 +1,19 @@
+{
+  "expect": {
+    "code": "malformed",
+    "why": "only human_gate and stack may release on subject change (\u00a7G3) \u2014 a structural invariant the schema carries"
+  },
+  "instance": {
+    "hold": {
+      "blocks": {
+        "readiness": true,
+        "summons": true
+      },
+      "kind": "operator",
+      "reason": "freeze",
+      "release_on": "subject_change"
+    },
+    "kind": "Hold"
+  },
+  "model": "action"
+}

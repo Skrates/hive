@@ -197,7 +197,7 @@ export class BrokerService {
     let sent = 0;
     for (const entry of entries) {
       try {
-        await this.slack.reply(entry.channelId, entry.threadTs, entry.text, entry.deliveryId === null
+        const messageTs = await this.slack.reply(entry.channelId, entry.threadTs, entry.text, entry.deliveryId === null
           ? {}
           : { delivery_id: String(entry.deliveryId) });
         // Reactions are glanceable annotation, not part of the two-events
@@ -212,7 +212,7 @@ export class BrokerService {
             });
           }
         }
-        this.store.markOutboxSent(entry.outboxId);
+        this.store.markOutboxSent(entry.outboxId, messageTs);
         sent += 1;
       } catch {
         this.store.markOutboxAttempt(entry.outboxId);

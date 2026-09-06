@@ -415,7 +415,9 @@ test("outbox rows drain once, back off after failure, and survive to retry", () 
   assert.equal(store.listUnsentOutbox().length, 0);
   clock.advance(retryBackoffMs(1) + 1);
   assert.equal(store.listUnsentOutbox().length, 1);
-  store.markOutboxSent(unsent[0]!.outboxId);
+  assert.equal(store.outboxMessageTs(unsent[0]!.outboxId), null, "no ts before the post");
+  store.markOutboxSent(unsent[0]!.outboxId, "100.9");
+  assert.equal(store.outboxMessageTs(unsent[0]!.outboxId), "100.9", "the posted ts is kept for threading");
   clock.advance(retryBackoffMs(2) + 1);
   assert.equal(store.listUnsentOutbox().length, 0);
   store.close();
@@ -1181,6 +1183,118 @@ test("subscription actors are stored under the same canonical key wake targets u
     threadTs: null,
   });
   assert.equal(receipt.actor, "theoros");
+  store.close();
+});
+
+// ---------------------------------------------------------------------------------------
+// Review design §8.1 (Slack): system-origin deliveries and the board line.
+
+test("a system wake is a system-origin delivery on the ordinary ledger and outbox (review §8.1)", () => {
+  const { store } = fixture();
+  store.ingestEvent(event()); // teaches the broker the workspace of channel C1
+
+  const receipt = store.mintSystemWake({
+    actor: "ariadne",
+    channelId: "C1",
+    threadTs: "200.1",
+    text: "burn the findings on skrates/hive#7",
+    dedupeKey: "eff_act_1",
+  });
+
+  const minted = store.getDelivery(receipt.deliveryId);
+  assert.equal(minted.actor, "ariadne");
+  assert.equal(minted.status, "pending");
+  assert.equal(minted.eventId, "review:eff_act_1");
+  assert.equal(minted.event.senderKind, "app");
+  assert.equal(minted.event.senderId, "hive-review");
+  assert.equal(minted.event.workspaceId, "T1");
+  assert.equal(minted.event.channelId, "C1");
+  assert.equal(minted.event.threadTs, "200.1");
+  assert.equal(minted.event.text, "burn the findings on skrates/hive#7");
+  // No Slack message exists yet: the pseudo-ts is never a reaction target.
+  assert.equal(minted.event.messageTs.startsWith("review:"), true);
+  assert.deepEqual(minted.reasons, []);
+
+  // The commons render rides the ordinary outbox — `hive_*`-stamped on the way out — with no
+  // reaction (there is no wake message to stamp).
+  const render = store.listUnsentOutbox().find((entry) => entry.deliveryId === receipt.deliveryId)!;
+  assert.match(render.text, /review wake hive-review → ariadne \(delivery \d+\)/);
+  assert.match(render.text, /burn the findings on skrates\/hive#7/);
+  assert.equal(render.channelId, "C1");
+  assert.equal(render.threadTs, "200.1");
+  assert.equal(render.reaction, null);
+
+  // The instruction frames its sender as the review machine, not as a seat or a human.
+  const framed = frameWakeInstruction(minted, null, "edge");
+  assert.match(framed, /^Message from hive-review in Slack thread C1\/200\.1/);
+  store.close();
+});
+
+test("a system wake is idempotent over its dedupe key: a replay names the original delivery and posts nothing new", () => {
+  const { store } = fixture();
+  const input = { actor: "ariadne", channelId: "C1", threadTs: null, text: "clean wake", dedupeKey: "eff_act_2" };
+  const first = store.mintSystemWake(input);
+  const before = store.listUnsentOutbox().length;
+  const again = store.mintSystemWake({ ...input, text: "a different text under the same key is the same wake" });
+  assert.equal(again.deliveryId, first.deliveryId);
+  assert.equal(store.listUnsentOutbox().length, before);
+  assert.equal(store.listDeliveries().length, 1);
+  // A different key is a different wake in the same thread — it coalesces into the pending
+  // delivery exactly as a second Slack message would (ordinary ingestEvent semantics).
+  const other = store.mintSystemWake({ ...input, dedupeKey: "eff_act_3" });
+  assert.equal(other.deliveryId, first.deliveryId);
+  assert.ok(store.getDelivery(first.deliveryId).coalescedEventIds.includes("review:eff_act_3"));
+  store.close();
+});
+
+test("a system wake to an unroutable actor throws and leaves no trace (R-3)", () => {
+  const { store } = fixture();
+  assert.throws(
+    () => store.mintSystemWake({ actor: "nobody", channelId: "C1", threadTs: null, text: "x", dedupeKey: "eff_act_4" }),
+    (error: unknown) => error instanceof SeatWakeRefusedError && error.code === "unroutable_actor",
+  );
+  assert.deepEqual(store.listDeliveries(), []);
+  assert.deepEqual(store.listUnsentOutbox(), []);
+  assert.throws(
+    () => store.mintSystemWake({ actor: "everyone", channelId: "C1", threadTs: null, text: "x", dedupeKey: "eff_act_5" }),
+    (error: unknown) => error instanceof SeatWakeRefusedError && error.code === "broadcast_forbidden",
+  );
+  assert.throws(
+    () => store.mintSystemWake({ actor: "ariadne", channelId: "C1", threadTs: "not-a-ts", text: "x", dedupeKey: "eff_act_6" }),
+    (error: unknown) => error instanceof SeatWakeRefusedError && error.code === "invalid_thread",
+  );
+  store.close();
+});
+
+test("a system wake follows the ordinary delivery lifecycle: claim, dispatch, outcome (R-6)", () => {
+  const { store } = fixture();
+  const { deliveryId } = store.mintSystemWake({ actor: "ariadne", channelId: "C1", threadTs: "100.1", text: "burn", dedupeKey: "eff_act_7" });
+  const claimed = store.claimNext("mac", 0)!;
+  assert.equal(claimed.id, deliveryId);
+  const generation = claimed.leaseGeneration!;
+  store.transition(deliveryId, "mac", generation, "claimed", "accepted_local");
+  store.transition(deliveryId, "mac", generation, "accepted_local", "dispatching");
+  store.markDispatched(deliveryId, "mac", generation);
+  store.recordOutcome(deliveryId, "burned two findings");
+  assert.equal(store.getDelivery(deliveryId).status, "processed");
+  const outcome = store.listUnsentOutbox().find((entry) => /burned two findings/.test(entry.text))!;
+  assert.match(outcome.text, /\[delivery \d+ · dedupe review:[0-9a-f]{16}:\d+ · ariadne\]/);
+  store.close();
+});
+
+test("the board line is a plain thread notice on the outbox; null thread posts at the channel top level", () => {
+  const { store } = fixture();
+  const top = store.postBoardLine({ channelId: "C9", threadTs: null, text: "skrates/hive#7 @ aaaaaaa · ready" });
+  const threaded = store.postBoardLine({ channelId: "C9", threadTs: "2000.1", text: "skrates/hive#7 @ bbbbbbb · not ready" });
+  const rows = store.listUnsentOutbox();
+  const first = rows.find((row) => row.outboxId === top.outboxId)!;
+  const second = rows.find((row) => row.outboxId === threaded.outboxId)!;
+  assert.equal(first.deliveryId, null);
+  assert.equal(first.channelId, "C9");
+  assert.equal(first.threadTs, "");
+  assert.equal(first.reaction, null);
+  assert.equal(second.threadTs, "2000.1");
+  assert.match(second.text, /not ready/);
   store.close();
 });
 

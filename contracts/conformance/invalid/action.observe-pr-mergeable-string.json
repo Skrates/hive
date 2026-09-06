@@ -1,0 +1,37 @@
+{
+  "expect": {
+    "code": "malformed",
+    "why": "mergeable is GitHub's tri-state true | false | null (\u00a76.D8)"
+  },
+  "instance": {
+    "draft": false,
+    "exemption": null,
+    "kind": "ObservePR",
+    "lifecycle": "open",
+    "observed": {
+      "author_login": "talos-weave",
+      "base_sha_now": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "head_ref": "feature",
+      "mergeable": "yes",
+      "seen_at": "2026-09-06T12:00:00.000Z",
+      "title": "Fix x"
+    },
+    "subject": {
+      "author": {
+        "actor": "talos",
+        "kind": "seat"
+      },
+      "base_ref": "main",
+      "base_sha_at_first_sight": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "changed_paths": [
+        "src/x.py"
+      ],
+      "diff_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "first_seen_at": "2026-09-06T12:00:00.000Z",
+      "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "key": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:main",
+      "merge_base_sha": "cccccccccccccccccccccccccccccccccccccccc"
+    }
+  },
+  "model": "action"
+}

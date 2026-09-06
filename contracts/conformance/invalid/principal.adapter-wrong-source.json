@@ -1,0 +1,13 @@
+{
+  "expect": {
+    "code": "malformed",
+    "why": "the only adapter is github (\u00a73.2)"
+  },
+  "instance": {
+    "event_login": "x",
+    "kind": "adapter",
+    "reconcile_run": "r",
+    "source": "gitlab"
+  },
+  "model": "principal"
+}

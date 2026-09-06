@@ -1,0 +1,12 @@
+{
+  "instance": {
+    "finding_id": "fnd_04",
+    "kind": "ResolveFinding",
+    "resolution": {
+      "evidence": "ruled 2026-09-06",
+      "kind": "owner_decision",
+      "resolution_text": "keep the early return; document it"
+    }
+  },
+  "model": "action"
+}

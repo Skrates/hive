@@ -243,6 +243,29 @@ function asSlackMessageEvent(value: unknown): SlackMessageEvent | null {
 /** Upper bound on one reaction stamp: past this the annotation is abandoned as failed. */
 export const REACTION_TIMEOUT_MS = 10_000;
 
+/**
+ * The `chat.postMessage` call behind one outbox row. An empty `thread_ts` is the outbox's
+ * "no thread" coordinate (review design §8.1 M0: the board line posts at the channel's top
+ * level — `BrokerStore.postBoardLine` stores `""` in the NOT NULL column); the field is
+ * omitted then, because Slack rejects an empty timestamp rather than treating it as none.
+ */
+export function replyArguments(
+  channelId: string,
+  threadTs: string,
+  text: string,
+  metadata: Record<string, string>,
+): { channel: string; thread_ts?: string; text: string; metadata: { event_type: string; event_payload: Record<string, string> } } {
+  return {
+    channel: channelId,
+    ...(threadTs === "" ? {} : { thread_ts: threadTs }),
+    text,
+    metadata: {
+      event_type: "hive_delivery_reply",
+      event_payload: metadata,
+    },
+  };
+}
+
 export class SlackWebTransport implements SlackTransport {
   private readonly web: WebClient;
 
@@ -279,15 +302,7 @@ export class SlackWebTransport implements SlackTransport {
     text: string,
     metadata: Record<string, string> = {},
   ): Promise<string> {
-    const result = await this.web.chat.postMessage({
-      channel: channelId,
-      thread_ts: threadTs,
-      text,
-      metadata: {
-        event_type: "hive_delivery_reply",
-        event_payload: metadata,
-      },
-    });
+    const result = await this.web.chat.postMessage(replyArguments(channelId, threadTs, text, metadata));
     if (!result.ts) throw new Error("Slack reply returned no timestamp");
     return result.ts;
   }

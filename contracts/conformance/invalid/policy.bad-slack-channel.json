@@ -1,0 +1,35 @@
+{
+  "expect": {
+    "code": "malformed",
+    "why": "a Slack channel id, not a name"
+  },
+  "instance": {
+    "author_aliases": {
+      "talos-weave": "talos"
+    },
+    "burn_actor": "talos",
+    "closure_by_seat": true,
+    "codex_meter": null,
+    "exempt_roots": [
+      "skills/"
+    ],
+    "retrospective_actor": "theoros",
+    "reviewer_set": [
+      "ariadne",
+      "theoros"
+    ],
+    "rounds_max": 7,
+    "routing_by_round": {
+      "first": "codex",
+      "later": "ariadne"
+    },
+    "slack": {
+      "channel_id": "general"
+    },
+    "stall_window_s": 1200,
+    "substitute_actor": "ariadne",
+    "transport_bound": 2,
+    "version": 1
+  },
+  "model": "policy"
+}

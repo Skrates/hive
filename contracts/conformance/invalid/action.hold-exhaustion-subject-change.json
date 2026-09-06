@@ -1,0 +1,19 @@
+{
+  "expect": {
+    "code": "malformed",
+    "why": "exhaustion releases only explicitly (\u00a7G3)"
+  },
+  "instance": {
+    "hold": {
+      "blocks": {
+        "readiness": true,
+        "summons": true
+      },
+      "kind": "exhaustion",
+      "reason": "spent",
+      "release_on": "subject_change"
+    },
+    "kind": "Hold"
+  },
+  "model": "action"
+}

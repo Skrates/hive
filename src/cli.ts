@@ -32,6 +32,9 @@ import {
 } from "./codex/binding.js";
 import type { BindingStatus } from "./codex/live.js";
 import { installCodexSkill } from "./codex/skill-install.js";
+import { registerReviewCommands } from "./review/cli.js";
+import { bootReviewRuntime } from "./review/runtime.js";
+import { systemClock } from "./time.js";
 
 const program = new Command().name("hive").description("Hive broker/edge wake router");
 
@@ -44,10 +47,22 @@ program.command("broker")
     const policy = AdmissionPolicySchema.parse(JSON.parse(config.HIVE_ADMISSION_POLICY));
     const store = new BrokerStore(config.HIVE_BROKER_DB);
     const broker = new BrokerService(store, new SlackWebTransport(config.HIVE_SLACK_BOT_TOKEN));
+    // The review state machine lives in the broker's own database (module map §8): the
+    // store, the publisher, and — once the App's owner-only secret files exist — the
+    // webhook ingress and the reconcile scheduler.
+    const review = bootReviewRuntime({
+      broker: store,
+      clock: systemClock,
+      adminToken: config.HIVE_ADMIN_TOKEN,
+      env: config,
+      failureChannelId: policy.channelIds.values().next().value,
+      log: (line) => console.error(line),
+    });
     const http = new BrokerHttpServer(broker, {
       host: config.HIVE_BROKER_HOST,
       port: config.HIVE_BROKER_PORT,
       adminToken: config.HIVE_ADMIN_TOKEN,
+      review: review.http,
     });
     const slack = new SlackSocketIngress(
       config.HIVE_SLACK_APP_TOKEN,
@@ -58,18 +73,26 @@ program.command("broker")
     );
     await http.start();
     await slack.start();
+    review.start();
     // The claim loop also sweeps and drains, but only while an edge is
     // polling. This interval keeps loss visible (R-3) and the outbox flowing
-    // (R-6) even when every edge is dark.
+    // (R-6) even when every edge is dark. The review publisher rides the same
+    // tick (§8.1): its Slack deliveries land in this outbox, so the two drains
+    // run in order — effects first, then the outbox rows they minted.
     const housekeeping = setInterval(() => {
       try {
         store.requeueExpiredLeases();
       } catch (error) {
         console.error("hive broker sweep failed", error instanceof Error ? error.message : String(error));
       }
-      void broker.drainOutbox().catch((error: unknown) => {
-        console.error("hive broker outbox drain failed", error instanceof Error ? error.message : String(error));
-      });
+      void review.publisher.drainOnce()
+        .catch((error: unknown) => {
+          console.error("hive review publish failed", error instanceof Error ? error.message : String(error));
+        })
+        .then(() => broker.drainOutbox())
+        .catch((error: unknown) => {
+          console.error("hive broker outbox drain failed", error instanceof Error ? error.message : String(error));
+        });
     }, 5_000);
     // Deafness watchdog: a Socket Mode link that stays "connected" but stops
     // carrying events (half-open socket, or a second consumer stealing the
@@ -118,6 +141,7 @@ program.command("broker")
       // cleanup returns so a stuck socket handle cannot keep the loop alive.
       await withTimeout(slack.stop(), 5_000, "slack.stop");
       await withTimeout(http.stop(), 5_000, "http.stop");
+      await withTimeout(review.stop(), 5_000, "review.stop");
       store.close();
       process.exit(0);
     });
@@ -309,6 +333,8 @@ program.command("delete-subscription")
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
   });
 
+registerReviewCommands(program);
+
 const BrokerConfig = z.object({
   HIVE_BROKER_DB: z.string().min(1).default("hive-broker.sqlite"),
   HIVE_BROKER_HOST: z.string().min(1).default("127.0.0.1"),
@@ -326,6 +352,12 @@ const BrokerConfig = z.object({
   // admission drops them, and each is deleted once observed). Defaults to the
   // first admitted channel — the commons.
   HIVE_WATCHDOG_PROBE_CHANNEL: z.string().min(1).optional(),
+  // The GitHub App (design §7): secrets are owner-only files, never bare values. All
+  // three or none; a named file that is absent or readable beyond its owner refuses to boot.
+  HIVE_GITHUB_WEBHOOK_SECRET_FILE: z.string().min(1).optional(),
+  HIVE_GITHUB_APP_ID: z.string().min(1).optional(),
+  HIVE_GITHUB_APP_KEY_FILE: z.string().min(1).optional(),
+  HIVE_GITHUB_SUMMON_TOKEN_FILE: z.string().min(1).optional(),
 });
 
 const EdgeConfig = z.object({

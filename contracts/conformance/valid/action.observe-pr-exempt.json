@@ -1,0 +1,37 @@
+{
+  "instance": {
+    "draft": false,
+    "exemption": {
+      "evidence": "every changed blob equals the canonical template blob: src/x.py@1111111111111111111111111111111111111111",
+      "reason": "verbatim_copy",
+      "subject_key": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:main"
+    },
+    "kind": "ObservePR",
+    "lifecycle": "open",
+    "observed": {
+      "author_login": "talos-weave",
+      "base_sha_now": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "head_ref": "feature",
+      "mergeable": true,
+      "seen_at": "2026-09-06T12:00:00.000Z",
+      "title": "Fix x"
+    },
+    "subject": {
+      "author": {
+        "actor": "talos",
+        "kind": "seat"
+      },
+      "base_ref": "main",
+      "base_sha_at_first_sight": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "changed_paths": [
+        "src/x.py"
+      ],
+      "diff_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "first_seen_at": "2026-09-06T12:00:00.000Z",
+      "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "key": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:main",
+      "merge_base_sha": "cccccccccccccccccccccccccccccccccccccccc"
+    }
+  },
+  "model": "action"
+}

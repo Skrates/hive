@@ -1,0 +1,31 @@
+{
+  "expect": {
+    "code": "malformed",
+    "why": "routing_by_round is required (\u00a7D2)"
+  },
+  "instance": {
+    "author_aliases": {
+      "talos-weave": "talos"
+    },
+    "burn_actor": "talos",
+    "closure_by_seat": true,
+    "codex_meter": null,
+    "exempt_roots": [
+      "skills/"
+    ],
+    "retrospective_actor": "theoros",
+    "reviewer_set": [
+      "ariadne",
+      "theoros"
+    ],
+    "rounds_max": 7,
+    "slack": {
+      "channel_id": "C0123ABCD"
+    },
+    "stall_window_s": 1200,
+    "substitute_actor": "ariadne",
+    "transport_bound": 2,
+    "version": 1
+  },
+  "model": "policy"
+}

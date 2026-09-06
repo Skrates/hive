@@ -1,0 +1,8 @@
+{
+  "instance": {
+    "finding_id": "fnd_05",
+    "kind": "ClassifyFinding",
+    "priority": "P3"
+  },
+  "model": "action"
+}

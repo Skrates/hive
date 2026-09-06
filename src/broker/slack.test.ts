@@ -10,6 +10,7 @@ import { PROBE_EVENT_TYPE } from "./canary.js";
 import {
   handleSlackEnvelope,
   MISSING_SLACK_EVENT_ID_DIAGNOSTIC,
+  replyArguments,
   safeErrorName,
   type SlackEnvelopeHandlerInput,
 } from "./slack.js";
@@ -805,4 +806,14 @@ test("a watchdog link canary is dropped at admission — a probe can never mint 
   }));
   assert.equal(store.listDeliveries().length, 1, "only the seed wake exists");
   store.close();
+});
+
+test("an empty outbox thread coordinate posts at the channel's top level: thread_ts is omitted, never sent empty (review §8.1 M0 board line)", () => {
+  const topLevel = replyArguments("C1", "", "board line", {});
+  assert.equal("thread_ts" in topLevel, false);
+  assert.equal(topLevel.channel, "C1");
+  assert.equal(topLevel.text, "board line");
+  const threaded = replyArguments("C1", "1725624000.000100", "reply", { delivery_id: "7" });
+  assert.equal(threaded.thread_ts, "1725624000.000100");
+  assert.deepEqual(threaded.metadata, { event_type: "hive_delivery_reply", event_payload: { delivery_id: "7" } });
 });

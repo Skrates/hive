@@ -1,0 +1,12 @@
+{
+  "instance": {
+    "finding_id": "fnd_03",
+    "kind": "ResolveFinding",
+    "resolution": {
+      "evidence": "same seam, same line",
+      "kind": "same_as",
+      "other": "fnd_01"
+    }
+  },
+  "model": "action"
+}

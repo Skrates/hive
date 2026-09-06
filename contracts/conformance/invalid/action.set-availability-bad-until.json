@@ -1,0 +1,15 @@
+{
+  "expect": {
+    "code": "malformed",
+    "why": "until is an ISO-8601 UTC timestamp"
+  },
+  "instance": {
+    "available": false,
+    "evidence": "comment 9002: usage limit reached",
+    "kind": "SetReviewerAvailability",
+    "reason": "quota",
+    "reviewer": "codex",
+    "until": "tomorrow"
+  },
+  "model": "action"
+}

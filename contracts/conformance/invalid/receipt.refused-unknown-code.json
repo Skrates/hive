@@ -1,0 +1,18 @@
+{
+  "expect": {
+    "code": "malformed",
+    "why": "refusal codes are closed (\u00a74)"
+  },
+  "instance": {
+    "act_id": "01J",
+    "outcome": {
+      "code": "nope",
+      "current_revision": 3,
+      "detail": "x",
+      "refused": true,
+      "state": null
+    },
+    "review_id": "rev_1"
+  },
+  "model": "receipt"
+}

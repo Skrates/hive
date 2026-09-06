@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { URL } from "node:url";
 import { canonicalActor, DeliveryResultInputSchema, ReasonSchema, SeatWakeMintSchema, SubscriptionInputSchema, BusySlotFormatError, parseBusySlots, type BusySlot } from "../domain.js";
+import { routeReview, type ReviewHttpDeps } from "../review/http.js";
 import { BrokerService } from "./service.js";
 import { InvalidTransitionError, SeatWakeRefusedError, StaleLeaseError, TurnSlotReductionError } from "./store.js";
 
@@ -8,6 +9,11 @@ export interface BrokerHttpConfig {
   host: string;
   port: number;
   adminToken: string;
+  /**
+   * The review surface (design §5, §9; `src/review/http.ts`). Null mounts none of
+   * it — the state a broker is in before the integrator wires a `ReviewStore`.
+   */
+  review: ReviewHttpDeps | null;
 }
 
 export class BrokerHttpServer {
@@ -58,6 +64,10 @@ export class BrokerHttpServer {
     if (request.method === "GET" && url.pathname === "/health") {
       return json(response, 200, { ok: true });
     }
+
+    // The review surface authenticates its own callers (edge, operator, admin,
+    // or the webhook's HMAC), so it is consulted before the edge gate below.
+    if (this.config.review && await routeReview(request, response, url, this.config.review)) return;
 
     if (url.pathname.startsWith("/v1/admin/")) {
       this.requireAdmin(request);

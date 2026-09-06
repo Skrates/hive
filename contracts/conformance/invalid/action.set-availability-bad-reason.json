@@ -1,0 +1,15 @@
+{
+  "expect": {
+    "code": "malformed",
+    "why": "availability reasons are quota | connector | meter (\u00a7D3)"
+  },
+  "instance": {
+    "available": false,
+    "evidence": "comment 9002: usage limit reached",
+    "kind": "SetReviewerAvailability",
+    "reason": "tired",
+    "reviewer": "codex",
+    "until": "2026-09-07T00:00:00Z"
+  },
+  "model": "action"
+}

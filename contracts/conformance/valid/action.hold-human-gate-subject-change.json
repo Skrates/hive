@@ -1,0 +1,15 @@
+{
+  "instance": {
+    "hold": {
+      "blocks": {
+        "readiness": true,
+        "summons": false
+      },
+      "kind": "human_gate",
+      "reason": "wait for H\u00e1kon",
+      "release_on": "subject_change"
+    },
+    "kind": "Hold"
+  },
+  "model": "action"
+}

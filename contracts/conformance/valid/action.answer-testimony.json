@@ -1,0 +1,20 @@
+{
+  "instance": {
+    "kind": "Answer",
+    "request_id": "req_09",
+    "subject_key": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:main",
+    "submission": {
+      "arm": "testimony",
+      "testimony": {
+        "cause": "the loop re-fixed the same seam four times",
+        "deliverable": {
+          "comment_id": 9100
+        },
+        "scars": [
+          "burn without a falsifier"
+        ]
+      }
+    }
+  },
+  "model": "action"
+}
