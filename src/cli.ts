@@ -352,7 +352,7 @@ const BrokerConfig = z.object({
   // first admitted channel — the commons.
   HIVE_WATCHDOG_PROBE_CHANNEL: z.string().min(1).optional(),
   // The GitHub App (design §7): secrets are owner-only files, never bare values. All
-  // three or none; absent files boot the broker with the adapter disabled.
+  // three or none; a named file that is absent or readable beyond its owner refuses to boot.
   HIVE_GITHUB_WEBHOOK_SECRET_FILE: z.string().min(1).optional(),
   HIVE_GITHUB_APP_ID: z.string().min(1).optional(),
   HIVE_GITHUB_APP_KEY_FILE: z.string().min(1).optional(),

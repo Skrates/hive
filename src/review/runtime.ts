@@ -8,10 +8,13 @@
  * `HIVE_GITHUB_WEBHOOK_SECRET_FILE` and `HIVE_GITHUB_APP_KEY_FILE` (§7: tier-2 secrets on
  * the dev box), never bare environment variables; `HIVE_GITHUB_APP_ID` is the App's id.
  *
- * Configuration is all-or-nothing: with none of the three names set, or with the files not
- * yet present (the App does not exist yet — §1 F-2), the broker boots with the GitHub
- * adapter disabled and says so once; M0's Slack board line still publishes. A partial
- * configuration is a boot failure, not a silent half-adapter.
+ * Configuration is all-or-nothing: with none of the three names set, the broker boots with
+ * the GitHub adapter disabled and says so once (M0, the App does not exist yet — §1 F-2);
+ * M0's Slack board line still publishes. Anything else that is not a complete, readable
+ * configuration is a boot failure: a partial set, a file readable beyond its owner, or a
+ * named file that is absent. A path typo must never boot a broker that acknowledges nothing
+ * from GitHub while the operator believes the adapter is live ("a missing profile is a hard
+ * pre-dispatch failure, never a fallback").
  */
 import type { BrokerStore } from "../broker/store.js";
 import type { Clock } from "../time.js";
@@ -22,7 +25,7 @@ import { handleWebhook } from "./github/webhook.js";
 import type { ReviewHttpDeps } from "./http.js";
 import { ReviewPublisher } from "./publisher.js";
 import { decide, fold, read } from "./reducer.js";
-import { readOwnerOnlyFileIfPresent } from "./secret-file.js";
+import { readOwnerOnlyFile } from "./secret-file.js";
 import { ReviewStore } from "./store.js";
 
 export interface ReviewRuntimeEnv {
@@ -59,7 +62,11 @@ const GITHUB_ENV = ["HIVE_GITHUB_WEBHOOK_SECRET_FILE", "HIVE_GITHUB_APP_ID", "HI
 
 interface GitHubConfig { appId: string; webhookSecret: string; privateKeyPem: string }
 
-/** All three present ⇒ config; none named or a named file absent ⇒ null with the reason; partial ⇒ throws. */
+/**
+ * All three present ⇒ config; none named ⇒ null with the reason (the only disabled state);
+ * partial ⇒ throws. A named file that cannot be read — absent, empty, or readable beyond its
+ * owner — throws {@link ReviewRuntimeConfigError} (absent) or `SecretFileError` (the rest).
+ */
 function githubConfig(env: ReviewRuntimeEnv): { config: GitHubConfig } | { config: null; reason: string } {
   const named = GITHUB_ENV.filter((name) => env[name] !== undefined && env[name] !== "");
   if (named.length === 0) return { config: null, reason: `${GITHUB_ENV.join(", ")} are not set` };
@@ -69,18 +76,21 @@ function githubConfig(env: ReviewRuntimeEnv): { config: GitHubConfig } | { confi
       `GitHub adapter is partially configured: ${named.join(", ")} set but ${missing.join(", ")} not; set all three or none`,
     );
   }
-  const secretPath = env.HIVE_GITHUB_WEBHOOK_SECRET_FILE as string;
-  const keyPath = env.HIVE_GITHUB_APP_KEY_FILE as string;
   const appId = env.HIVE_GITHUB_APP_ID as string;
-  const webhookSecret = readOwnerOnlyFileIfPresent(secretPath);
-  const privateKeyPem = readOwnerOnlyFileIfPresent(keyPath);
-  const absent = [webhookSecret === null ? secretPath : null, privateKeyPem === null ? keyPath : null].filter(
-    (path): path is string => path !== null,
-  );
-  if (webhookSecret === null || privateKeyPem === null) {
-    return { config: null, reason: `secret file(s) absent: ${absent.join(", ")}` };
-  }
+  const webhookSecret = readSecret("HIVE_GITHUB_WEBHOOK_SECRET_FILE", env.HIVE_GITHUB_WEBHOOK_SECRET_FILE as string);
+  const privateKeyPem = readSecret("HIVE_GITHUB_APP_KEY_FILE", env.HIVE_GITHUB_APP_KEY_FILE as string);
   return { config: { appId, webhookSecret, privateKeyPem } };
+}
+
+function readSecret(name: string, path: string): string {
+  try {
+    return readOwnerOnlyFile(path);
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      throw new ReviewRuntimeConfigError(`${name} names ${path}, which does not exist; the GitHub adapter refuses to boot without it (unset all three names to run without the adapter)`);
+    }
+    throw error;
+  }
 }
 
 export function bootReviewRuntime(input: ReviewRuntimeInput): ReviewRuntime {

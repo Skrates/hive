@@ -21,13 +21,3 @@ export function readOwnerOnlyFile(path: string): string {
   if (body.length === 0) throw new SecretFileError(`${path} is empty`);
   return body;
 }
-
-/** Like {@link readOwnerOnlyFile}, but a missing file is `null`; every other failure still throws. */
-export function readOwnerOnlyFileIfPresent(path: string): string | null {
-  try {
-    return readOwnerOnlyFile(path);
-  } catch (error) {
-    if (error instanceof Error && "code" in error && error.code === "ENOENT") return null;
-    throw error;
-  }
-}

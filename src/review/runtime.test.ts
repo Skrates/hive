@@ -63,21 +63,27 @@ test("without GitHub configuration the runtime boots the store and publisher, di
   broker.close();
 });
 
-test("names set but files absent ⇒ adapter disabled with the absent paths named, once", () => {
+// §7 tier-2 secrets / AGENTS.md: a named file that is absent is a hard boot failure, never a
+// silent downgrade to "adapter disabled" — a path typo must not boot a deaf broker.
+test("names set but a file absent ⇒ boot refused naming the variable and the path; never a disabled adapter", () => {
   const dir = scratch();
   try {
-    const { runtime, lines, broker } = boot({
+    const env: ReviewRuntimeEnv = {
       HIVE_GITHUB_WEBHOOK_SECRET_FILE: join(dir, "webhook.secret"),
       HIVE_GITHUB_APP_ID: "12345",
-      HIVE_GITHUB_APP_KEY_FILE: join(dir, "app.pem"),
+      HIVE_GITHUB_APP_KEY_FILE: secretFile(dir, "app.pem", FAKE_PEM),
+    };
+    assert.throws(() => boot(env), (error: unknown) => {
+      assert.ok(error instanceof ReviewRuntimeConfigError);
+      assert.match(error.message, /HIVE_GITHUB_WEBHOOK_SECRET_FILE/u);
+      assert.match(error.message, /webhook\.secret/u);
+      assert.match(error.message, /does not exist/u);
+      return true;
     });
-    assert.equal(runtime.github, null);
-    assert.equal(runtime.http.webhook, null);
-    assert.equal(lines.length, 1);
-    assert.match(lines[0] ?? "", /disabled/u);
-    assert.match(lines[0] ?? "", /webhook\.secret/u);
-    assert.match(lines[0] ?? "", /app\.pem/u);
-    broker.close();
+    assert.throws(
+      () => boot({ ...env, HIVE_GITHUB_WEBHOOK_SECRET_FILE: secretFile(dir, "webhook.secret", FAKE_SECRET), HIVE_GITHUB_APP_KEY_FILE: join(dir, "missing.pem") }),
+      /HIVE_GITHUB_APP_KEY_FILE[^\n]*missing\.pem/u,
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
