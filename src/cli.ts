@@ -32,6 +32,7 @@ import {
 } from "./codex/binding.js";
 import type { BindingStatus } from "./codex/live.js";
 import { installCodexSkill } from "./codex/skill-install.js";
+import { registerReviewCommands } from "./review/cli.js";
 
 const program = new Command().name("hive").description("Hive broker/edge wake router");
 
@@ -48,6 +49,8 @@ program.command("broker")
       host: config.HIVE_BROKER_HOST,
       port: config.HIVE_BROKER_PORT,
       adminToken: config.HIVE_ADMIN_TOKEN,
+      // Wired by the integrator once BrokerService owns a ReviewStore (module map §8).
+      review: null,
     });
     const slack = new SlackSocketIngress(
       config.HIVE_SLACK_APP_TOKEN,
@@ -308,6 +311,8 @@ program.command("delete-subscription")
     const result = await client.deleteSubscription(requiredEnv("HIVE_ADMIN_TOKEN"), actor);
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
   });
+
+registerReviewCommands(program);
 
 const BrokerConfig = z.object({
   HIVE_BROKER_DB: z.string().min(1).default("hive-broker.sqlite"),

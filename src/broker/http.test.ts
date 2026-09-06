@@ -17,7 +17,7 @@ test("stop() force-closes an in-flight long-poll instead of hanging on it", { ti
   t.after(() => store.close());
   const edgeToken = store.createEdge("edge-1");
   const broker = new BrokerService(store, slack);
-  const server = new BrokerHttpServer(broker, { host: "127.0.0.1", port: 0, adminToken: "x".repeat(32) });
+  const server = new BrokerHttpServer(broker, { host: "127.0.0.1", port: 0, adminToken: "x".repeat(32), review: null });
   const { port } = await server.start();
 
   // A real edge long-poll: with no delivery pending, the broker holds this GET
@@ -78,7 +78,7 @@ test("POST /v1/wakes mints a seat wake, and refuses one that cannot be delivered
   t.after(() => store.close());
   const edgeToken = store.createEdge("dev");
   const broker = new BrokerService(store, slack);
-  const server = new BrokerHttpServer(broker, { host: "127.0.0.1", port: 0, adminToken: "x".repeat(32) });
+  const server = new BrokerHttpServer(broker, { host: "127.0.0.1", port: 0, adminToken: "x".repeat(32), review: null });
   const { port } = await server.start();
   t.after(() => server.stop());
 
