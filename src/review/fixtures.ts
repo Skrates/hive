@@ -103,6 +103,8 @@ export function request(overrides: Partial<Request> = {}): Request {
     supersedes: null,
     transport: [],
     retransports: [],
+    transport_exhausted: false,
+    cancellation: null,
     answered_by: null,
     ...overrides,
   };

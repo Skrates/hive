@@ -222,7 +222,9 @@ interface Request {
   subject_key: string;
   required: boolean;                              // counts toward readiness (§6.H)
   names: string[];                                // finding ids this request must answer (closure/appeal)
-  status: "pending" | "answered" | "cancelled" | "unanswerable";
+  status: "pending" | "answered" | "cancelled";  // the OBLIGATION's status (§6.D9), never its transport's
+  transport_exhausted: boolean;                   // §6.D6: the bound is spent — a fact about reach
+  cancellation: null | { by: Principal; at: string; reason: string };   // §6.D9 evidence
   opened_by: Principal; opened_at: string; reason: string;
   supersedes: string | null;                      // reassignment (§6.D4)
   transport: TransportRef[];                      // references only: {delivery_id} | {summon_comment_id}; Hive owns attempts
@@ -264,7 +266,7 @@ interface Resolution {
   confirmed_by: string | null;                    // answer id of the closure that confirmed a fix, if any
 }
 interface Hold {
-  id: string; kind: "human_gate" | "owner_decision" | "exhaustion" | "unanswerable" | "operator" | "stack";
+  id: string; kind: "human_gate" | "owner_decision" | "exhaustion" | "transport_exhausted" | "operator" | "stack";
   by: Principal; at: string; reason: string;
   release_on: "explicit" | "subject_change";      // subject_change only where the change invalidates the reason
   blocks: { readiness: true; summons: boolean };
@@ -337,8 +339,8 @@ Thirteen verbs, closed. **Authorization is this table and nothing else** — no 
 | `ClassifyFinding` | ✓ (raiser) | ✓ | – | – |
 | `Hold` human_gate / stack | ✓ | ✓ | – | – |
 | `Hold` operator | – | ✓ | – | – |
-| `Hold` exhaustion / unanswerable / owner_decision | – | – | – | ✓ |
-| `Release` | ✓ (its own holds) | ✓ | – | ✓ (subject_change, unanswerable answered) |
+| `Hold` exhaustion / transport_exhausted / owner_decision | – | – | – | ✓ |
+| `Release` | ✓ (its own holds) | ✓ | – | ✓ (subject_change, transport_exhausted answered) |
 | `GrantRounds`, `AdoptPolicy` | – | ✓ | – | – |
 
 **Receipt:**
@@ -431,16 +433,22 @@ type RefusalCode = "stale_revision" | "unauthorized" | "lifecycle" | "unknown_su
   decision, recorded as a system consequence), or an operator `SetReviewerAvailability(true)`.
 - **D4** Unavailability while a request to that reviewer is pending **reassigns explicitly**: the pending
   request is cancelled (`reviewer_unavailable`) and a new request to the substitute is opened with
-  `supersedes` set — one consequence, recorded, once.
+  `supersedes` set — one consequence, recorded, once. **The obligation is preserved, never
+  substituted.** Where the substitute already holds a pending request at that `(subject_key, kind)` —
+  D1 leaves room for only one — the reassignment does not silently adopt it: it records
+  `request_requirement_raised`, which sets `required` true, unions the named findings and names what
+  it superseded. A reassignment can raise a requirement and never lower one.
 - **D5** Transport is Hive's: opening a request queues one effect — a Hive delivery to a seat assignee
   (the broker mints a `system`-origin event; the delivery ledger owns attempts, redelivery and failure) or a
   summon comment for `codex`. The request stores **references** (`delivery_id` / `summon_comment_id`),
   never its own retry ledger.
 - **D6** Stall handling is housekeeping over pending requests: after the policy's stall window with no
   answer, one more transport effect is queued (a summon for Codex, a redelivery for a seat), bounded by
-  policy; when the bound is spent the request becomes `unanswerable` and the system places
-  `Hold(unanswerable, blocks summons)`. `Release` is the operator's, or the system's when an answer
-  arrives anyway.
+  policy; when the bound is spent the request is marked `transport_exhausted` and the system places
+  `Hold(transport_exhausted, blocks summons)`. **Both are facts about transport; neither discharges the
+  obligation** — the request stays `pending`, keeps blocking readiness (§H), and is still what a late
+  answer discharges. `Release` is the operator's, or the system's when an answer arrives anyway;
+  releasing that hold lifts the readiness block the hold itself imposed and nothing more.
 - **D7** A summon effect checks applicability at dispatch: the request must still be pending at the
   current subject, else the effect is marked `obsolete` and not sent.
 - **D8** (ruled 2026-09-06: F-12 → (a)) Conflict-aware summons. `ObservePR` carries GitHub's `mergeable`
@@ -450,6 +458,24 @@ type RefusalCode = "stale_revision" | "unauthorized" | "lifecycle" | "unknown_su
   emitted whether or not a request is pending; `null` (not yet computed) never withholds. When `mergeable`
   flips to `true` transport resumes. No round is charged for a head nobody reviewed. This is KRA-1362's
   fork 1(a) plus fork 2(b) — the cheap detection the ticket verified, sited where the summons are.
+- **D9** (ruled 2026-09-06, bundle-1 #4/#5) **An obligation is separate from its assignment and its
+  transport.** One predicate names the outstanding ones: a request is outstanding while its `status` is
+  `pending` — that is, until an `Answer` (§E1) or an explicit `CancelRequest` discharges it. Exhausted
+  transport, a withholding hold, a conflict, a closed PR and an unavailable assignee are all transport
+  or assignment facts and change nothing about it. Readiness (§H), stall housekeeping, `Answer` and
+  `AdmitExternalResult` matching, and the restoration below all ask this one predicate.
+- **D10** (ruled 2026-09-06, bundle-1 #5) **Holds withhold transport, never creation.** The reducer has
+  one invariant-restoration function: *the current subject has the required work it must have* — the
+  §C2/§C4 initial request per policy and routing when the subject is open, non-draft, non-exempt,
+  unsatisfied by a standing complete answer, and carrying no outstanding obligation. It runs from every
+  act that can change those inputs: `ObservePR` (subject change, draft flip, lifecycle), `Release`,
+  `GrantRounds`, `CancelRequest`, `SetReviewerAvailability` and `AdoptPolicy`. It is idempotent, so a
+  release, a grant or a reopen queues no second transport — the withheld row resumes at dispatch (§8.1).
+  It never resurrects what the operator ended: a `cancelled` required review request at the **current**
+  subject whose `cancellation.by` is the operator is that decision, and it stands until the subject
+  changes (`CancelRequest` is the operator's alone, §4, so no other principal's cancellation can be
+  mistaken for it; the system's own `subject_changed` and `reviewer_unavailable` cancellations are
+  bookkeeping, and the latter carries the obligation on by D4).
 
 ### E. Answers — explicit completion
 
@@ -510,8 +536,9 @@ type RefusalCode = "stale_revision" | "unauthorized" | "lifecycle" | "unknown_su
   behaviour preserved.
 - **G3** Holds: closed kinds (§3.5). Any active hold ⇒ not ready. `blocks.summons` pauses transport for
   requests. `release_on: subject_change` is permitted only for `human_gate` and `stack`, whose reason a
-  new subject can invalidate; `exhaustion`, `owner_decision`, `unanswerable` and `operator` release only
-  explicitly (F-8 ruled).
+  new subject can invalidate; `exhaustion`, `owner_decision`, `transport_exhausted` and `operator` release only
+  explicitly (F-8 ruled). A hold pauses transport; it never suppresses the creation of required work
+  (§D10).
 - **G4** Exhaustion is an **episode**: when, after admitting an answer, `blocking_findings ≠ ∅ ∧
   rounds_consumed ≥ rounds_max + granted` and no episode is open, the reducer opens one — one
   `Hold(exhaustion)`, one gate projection, one delivery to the author seat, one retrospective request to
@@ -527,11 +554,15 @@ type RefusalCode = "stale_revision" | "unauthorized" | "lifecycle" | "unknown_su
 ready ⇔ lifecycle = open ∧ ¬draft
       ∧ ∄ active hold
       ∧ requirement(current subject) ∈ { satisfied, exempt }
-      ∧ ∄ request with required = true ∧ status = pending at the current subject
+      ∧ ∄ *outstanding* required request at the current subject (§D9: `status = pending`,
+        whatever its transport says)
       ∧ ∄ blocking finding
 ```
 `requirement.satisfied` ⇔ ∃ standing, complete `Answer` to a review request (`initial` or `closure`) at
 the current subject. Unsolicited evidence satisfies nothing. Readiness speaks for the review limb only.
+An obligation that was never answered keeps `required_request_pending` in the reasons even after every
+hold over it is released: releasing a hold is not a discharge (§D9, and the explicit-discharge doctrine
+this design opens with).
 
 ### I. Policy versions
 
@@ -626,7 +657,7 @@ The broker gains a Logfire token (tier-2, dev box) and exports spans through the
 (`sokrates`, service `review`): `review.ingress` (accepted / hmac_rejected / malformed), `review.reconcile`
 (records imported, admissions, duration, GitHub rate state), `review.admit` (code, refusal reason),
 `review.publish` (target, outcome, GitHub status), `review.housekeeping` (stalls, reassignments,
-unanswerable), `review.outbox` (stuck rows, retries). Dashboards and the baseline's SQL rewrite are
+transport exhaustion), `review.outbox` (stuck rows, retries). Dashboards and the baseline's SQL rewrite are
 deferred; visibility of the machinery is not.
 
 ---

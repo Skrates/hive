@@ -1,0 +1,8 @@
+{
+  "instance": {
+    "kind": "request_transport_exhausted",
+    "reason": "no answer from codex after 2 re-transport(s), each 1200s apart",
+    "request_id": "req_obs:run_01J_1"
+  },
+  "model": "consequence"
+}

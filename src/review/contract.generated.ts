@@ -1,7 +1,7 @@
 /* eslint-disable */
 /**
  * GENERATED — do not edit. Source: contracts/schemas/review-contract.schema.json,
- * vendored from weave-doctrine@0a887ada7ea8caa8b976d3472f6cd7dd1b6208ad (see contracts/SOURCE).
+ * vendored from weave-doctrine@4bd10dfb2c38f5753eaffe44659542c7c751cbf3 (see contracts/SOURCE).
  * Regenerate with `bun run check:contracts`.
  */
 
@@ -136,10 +136,16 @@ export type AnswerSubmission = ReviewkitSubmission | TestimonySubmission;
  */
 export type Availability = Available | Unavailable;
 /**
+ * §3.4 / §6.D — the *obligation's* status, never its transport's.
+ *
+ * A required request stays ``pending`` until an authoritative act discharges it: an answer
+ * (``answered``) or an explicit cancellation (``cancelled``). A spent transport bound is
+ * ``Request.transport_exhausted``, a fact about reachability, and discharges nothing.
+ *
  * This interface was referenced by `ReviewContract`'s JSON-Schema
  * via the `definition` "RequestStatus".
  */
-export type RequestStatus = "pending" | "answered" | "cancelled" | "unanswerable";
+export type RequestStatus = "pending" | "answered" | "cancelled";
 /**
  * §2.3 ``FindingAnswer.answer`` — the closure reviewer's word on a named finding.
  *
@@ -191,7 +197,8 @@ export type Consequence =
   | RequestCancelled
   | RequestAnswered
   | RequestRetransported
-  | RequestUnanswerable
+  | RequestTransportExhausted
+  | RequestRequirementRaised
   | AnswerAdmitted
   | AnswerRetracted
   | FindingAdmitted
@@ -862,7 +869,7 @@ export interface HoldBlocks {
  */
 export interface ExplicitHoldSpec {
   blocks: HoldBlocks;
-  kind: "exhaustion" | "owner_decision" | "unanswerable" | "operator";
+  kind: "exhaustion" | "owner_decision" | "transport_exhausted" | "operator";
   reason: string;
   release_on: "explicit";
 }
@@ -936,7 +943,8 @@ export interface Batch {
     | RequestCancelled
     | RequestAnswered
     | RequestRetransported
-    | RequestUnanswerable
+    | RequestTransportExhausted
+    | RequestRequirementRaised
     | AnswerAdmitted
     | AnswerRetracted
     | FindingAdmitted
@@ -1085,9 +1093,12 @@ export interface RequestOpened {
 /**
  * §3.4 — an obligation. ``names`` is non-empty only for closure/appeal (reducer-checked).
  *
- * ``transport`` holds the references the publisher records after a dispatch (§6.D5);
- * ``retransports`` holds the instants at which §6.D6 housekeeping queued one more transport
- * effect — its length is the count the policy's ``transport_bound`` bounds.
+ * ``status`` is the obligation's; ``transport``, ``retransports`` and ``transport_exhausted``
+ * are its transport's, and never discharge it. ``transport`` holds the references the
+ * publisher records after a dispatch (§6.D5); ``retransports`` holds the instants at which
+ * §6.D6 housekeeping queued one more transport effect — its length is the count the policy's
+ * ``transport_bound`` bounds; ``transport_exhausted`` records that the bound is spent, which
+ * withholds further transport (and holds) but leaves the obligation outstanding.
  *
  * This interface was referenced by `ReviewContract`'s JSON-Schema
  * via the `definition` "Request".
@@ -1095,6 +1106,7 @@ export interface RequestOpened {
 export interface Request {
   answered_by: string | null;
   assignee: string;
+  cancellation: RequestCancellation | null;
   id: string;
   kind: RequestKind;
   mode: ReviewMode | null;
@@ -1108,6 +1120,21 @@ export interface Request {
   subject_key: string;
   supersedes: string | null;
   transport: (DeliveryRef | SummonRef)[];
+  transport_exhausted: boolean;
+}
+/**
+ * §6.D — the named act that discharged an obligation without an answer.
+ *
+ * Retained on the request because it is the evidence the reducer's obligation restoration
+ * consults: an operator's cancellation at a subject stands until that subject changes.
+ *
+ * This interface was referenced by `ReviewContract`'s JSON-Schema
+ * via the `definition` "RequestCancellation".
+ */
+export interface RequestCancellation {
+  at: string;
+  by: SeatPrincipal | OperatorPrincipal | AdapterPrincipal | SystemPrincipal;
+  reason: string;
 }
 /**
  * This interface was referenced by `ReviewContract`'s JSON-Schema
@@ -1124,10 +1151,17 @@ export interface SummonRef {
   summon_comment_id: number;
 }
 /**
+ * §6.D — the only discharge of a required obligation short of an answer or an exemption.
+ *
+ * ``by`` and ``at`` are materialized onto ``Request.cancellation`` so the reducer can tell an
+ * operator's decision from the system's bookkeeping (§6.D9).
+ *
  * This interface was referenced by `ReviewContract`'s JSON-Schema
  * via the `definition` "RequestCancelled".
  */
 export interface RequestCancelled {
+  at: string;
+  by: SeatPrincipal | OperatorPrincipal | AdapterPrincipal | SystemPrincipal;
   kind: "request_cancelled";
   reason: string;
   request_id: string;
@@ -1154,13 +1188,35 @@ export interface RequestRetransported {
   request_id: string;
 }
 /**
+ * §6.D6 — the transport bound is spent. A fact about reachability, not a discharge:
+ * the request stays ``pending`` and keeps blocking readiness (§6.H).
+ *
  * This interface was referenced by `ReviewContract`'s JSON-Schema
- * via the `definition` "RequestUnanswerable".
+ * via the `definition` "RequestTransportExhausted".
  */
-export interface RequestUnanswerable {
-  kind: "request_unanswerable";
+export interface RequestTransportExhausted {
+  kind: "request_transport_exhausted";
   reason: string;
   request_id: string;
+}
+/**
+ * §6.D4 — a reassignment folded its obligation into an existing pending request.
+ *
+ * §6.D1 permits one pending request per ``(assignee, subject_key, kind)``, so the substitute's
+ * existing request takes on the superseded one's requiredness and named findings rather than a
+ * second request being opened or the obligation being dropped.
+ *
+ * This interface was referenced by `ReviewContract`'s JSON-Schema
+ * via the `definition` "RequestRequirementRaised".
+ */
+export interface RequestRequirementRaised {
+  kind: "request_requirement_raised";
+  mode: ReviewMode | null;
+  names: string[];
+  reason: string;
+  request_id: string;
+  required: true;
+  supersedes: string;
 }
 /**
  * This interface was referenced by `ReviewContract`'s JSON-Schema
@@ -1411,7 +1467,7 @@ export interface HoldRelease {
   reason: string;
 }
 /**
- * §6.G3: exhaustion, owner_decision, unanswerable and operator release only explicitly.
+ * §6.G3: exhaustion, owner_decision, transport_exhausted and operator release only explicitly.
  *
  * This interface was referenced by `ReviewContract`'s JSON-Schema
  * via the `definition` "ExplicitHold".
@@ -1421,7 +1477,7 @@ export interface ExplicitHold {
   blocks: HoldBlocks;
   by: SeatPrincipal | OperatorPrincipal | AdapterPrincipal | SystemPrincipal;
   id: string;
-  kind: "exhaustion" | "owner_decision" | "unanswerable" | "operator";
+  kind: "exhaustion" | "owner_decision" | "transport_exhausted" | "operator";
   reason: string;
   release_on: "explicit";
   released: HoldRelease | null;
@@ -1633,7 +1689,8 @@ export interface NotReady {
  * via the `definition` "HoldReason".
  */
 export interface HoldReason {
-  hold: "human_gate" | "stack" | "exhaustion" | "owner_decision" | "unanswerable" | "operator";
+  hold:
+    "human_gate" | "stack" | "exhaustion" | "owner_decision" | "transport_exhausted" | "operator";
 }
 /**
  * This interface was referenced by `ReviewContract`'s JSON-Schema

@@ -1,0 +1,16 @@
+{
+  "expect": {
+    "code": "malformed",
+    "why": "a reassignment only ever raises a requirement; `required` is Literal[True] so an obligation cannot be lowered away (\u00a76.D4)"
+  },
+  "instance": {
+    "kind": "request_requirement_raised",
+    "mode": null,
+    "names": [],
+    "reason": "drop it",
+    "request_id": "req_1",
+    "required": false,
+    "supersedes": "req_0"
+  },
+  "model": "consequence"
+}

@@ -530,7 +530,10 @@
                 "$ref": "#/$defs/RequestRetransported"
               },
               {
-                "$ref": "#/$defs/RequestUnanswerable"
+                "$ref": "#/$defs/RequestTransportExhausted"
+              },
+              {
+                "$ref": "#/$defs/RequestRequirementRaised"
               },
               {
                 "$ref": "#/$defs/AnswerAdmitted"
@@ -934,7 +937,10 @@
           "$ref": "#/$defs/RequestRetransported"
         },
         {
-          "$ref": "#/$defs/RequestUnanswerable"
+          "$ref": "#/$defs/RequestTransportExhausted"
+        },
+        {
+          "$ref": "#/$defs/RequestRequirementRaised"
         },
         {
           "$ref": "#/$defs/AnswerAdmitted"
@@ -1489,7 +1495,7 @@
     },
     "ExplicitHold": {
       "additionalProperties": false,
-      "description": "\u00a76.G3: exhaustion, owner_decision, unanswerable and operator release only explicitly.",
+      "description": "\u00a76.G3: exhaustion, owner_decision, transport_exhausted and operator release only explicitly.",
       "properties": {
         "at": {
           "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$",
@@ -1522,7 +1528,7 @@
           "enum": [
             "exhaustion",
             "owner_decision",
-            "unanswerable",
+            "transport_exhausted",
             "operator"
           ],
           "type": "string"
@@ -1568,7 +1574,7 @@
           "enum": [
             "exhaustion",
             "owner_decision",
-            "unanswerable",
+            "transport_exhausted",
             "operator"
           ],
           "type": "string"
@@ -2385,7 +2391,7 @@
             "stack",
             "exhaustion",
             "owner_decision",
-            "unanswerable",
+            "transport_exhausted",
             "operator"
           ],
           "type": "string"
@@ -3373,7 +3379,7 @@
     },
     "Request": {
       "additionalProperties": false,
-      "description": "\u00a73.4 \u2014 an obligation. ``names`` is non-empty only for closure/appeal (reducer-checked).\n\n``transport`` holds the references the publisher records after a dispatch (\u00a76.D5);\n``retransports`` holds the instants at which \u00a76.D6 housekeeping queued one more transport\neffect \u2014 its length is the count the policy's ``transport_bound`` bounds.",
+      "description": "\u00a73.4 \u2014 an obligation. ``names`` is non-empty only for closure/appeal (reducer-checked).\n\n``status`` is the obligation's; ``transport``, ``retransports`` and ``transport_exhausted``\nare its transport's, and never discharge it. ``transport`` holds the references the\npublisher records after a dispatch (\u00a76.D5); ``retransports`` holds the instants at which\n\u00a76.D6 housekeeping queued one more transport effect \u2014 its length is the count the policy's\n``transport_bound`` bounds; ``transport_exhausted`` records that the bound is spent, which\nwithholds further transport (and holds) but leaves the obligation outstanding.",
       "properties": {
         "answered_by": {
           "anyOf": [
@@ -3389,6 +3395,16 @@
         "assignee": {
           "pattern": "^[a-z0-9-]+$",
           "type": "string"
+        },
+        "cancellation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RequestCancellation"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "id": {
           "minLength": 1,
@@ -3477,6 +3493,9 @@
             ]
           },
           "type": "array"
+        },
+        "transport_exhausted": {
+          "type": "boolean"
         }
       },
       "required": [
@@ -3494,6 +3513,8 @@
         "supersedes",
         "transport",
         "retransports",
+        "transport_exhausted",
+        "cancellation",
         "answered_by"
       ],
       "title": "Request",
@@ -3523,14 +3544,73 @@
       "title": "RequestAnswered",
       "type": "object"
     },
+    "RequestCancellation": {
+      "additionalProperties": false,
+      "description": "\u00a76.D \u2014 the named act that discharged an obligation without an answer.\n\nRetained on the request because it is the evidence the reducer's obligation restoration\nconsults: an operator's cancellation at a subject stands until that subject changes.",
+      "properties": {
+        "at": {
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$",
+          "type": "string"
+        },
+        "by": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/SeatPrincipal"
+            },
+            {
+              "$ref": "#/$defs/OperatorPrincipal"
+            },
+            {
+              "$ref": "#/$defs/AdapterPrincipal"
+            },
+            {
+              "$ref": "#/$defs/SystemPrincipal"
+            }
+          ]
+        },
+        "reason": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "by",
+        "at",
+        "reason"
+      ],
+      "title": "RequestCancellation",
+      "type": "object"
+    },
     "RequestCancelled": {
       "additionalProperties": false,
+      "description": "\u00a76.D \u2014 the only discharge of a required obligation short of an answer or an exemption.\n\n``by`` and ``at`` are materialized onto ``Request.cancellation`` so the reducer can tell an\noperator's decision from the system's bookkeeping (\u00a76.D9).",
       "properties": {
+        "at": {
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$",
+          "type": "string"
+        },
+        "by": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/SeatPrincipal"
+            },
+            {
+              "$ref": "#/$defs/OperatorPrincipal"
+            },
+            {
+              "$ref": "#/$defs/AdapterPrincipal"
+            },
+            {
+              "$ref": "#/$defs/SystemPrincipal"
+            }
+          ]
+        },
         "kind": {
           "const": "request_cancelled",
           "type": "string"
         },
         "reason": {
+          "minLength": 1,
           "type": "string"
         },
         "request_id": {
@@ -3541,7 +3621,9 @@
       "required": [
         "kind",
         "request_id",
-        "reason"
+        "reason",
+        "by",
+        "at"
       ],
       "title": "RequestCancelled",
       "type": "object"
@@ -3570,6 +3652,60 @@
         "request"
       ],
       "title": "RequestOpened",
+      "type": "object"
+    },
+    "RequestRequirementRaised": {
+      "additionalProperties": false,
+      "description": "\u00a76.D4 \u2014 a reassignment folded its obligation into an existing pending request.\n\n\u00a76.D1 permits one pending request per ``(assignee, subject_key, kind)``, so the substitute's\nexisting request takes on the superseded one's requiredness and named findings rather than a\nsecond request being opened or the obligation being dropped.",
+      "properties": {
+        "kind": {
+          "const": "request_requirement_raised",
+          "type": "string"
+        },
+        "mode": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReviewMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "names": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "reason": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "request_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "required": {
+          "const": true,
+          "type": "boolean"
+        },
+        "supersedes": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "request_id",
+        "required",
+        "names",
+        "mode",
+        "supersedes",
+        "reason"
+      ],
+      "title": "RequestRequirementRaised",
       "type": "object"
     },
     "RequestRetransported": {
@@ -3603,23 +3739,25 @@
       "type": "object"
     },
     "RequestStatus": {
+      "description": "\u00a73.4 / \u00a76.D \u2014 the *obligation's* status, never its transport's.\n\nA required request stays ``pending`` until an authoritative act discharges it: an answer\n(``answered``) or an explicit cancellation (``cancelled``). A spent transport bound is\n``Request.transport_exhausted``, a fact about reachability, and discharges nothing.",
       "enum": [
         "pending",
         "answered",
-        "cancelled",
-        "unanswerable"
+        "cancelled"
       ],
       "title": "RequestStatus",
       "type": "string"
     },
-    "RequestUnanswerable": {
+    "RequestTransportExhausted": {
       "additionalProperties": false,
+      "description": "\u00a76.D6 \u2014 the transport bound is spent. A fact about reachability, not a discharge:\nthe request stays ``pending`` and keeps blocking readiness (\u00a76.H).",
       "properties": {
         "kind": {
-          "const": "request_unanswerable",
+          "const": "request_transport_exhausted",
           "type": "string"
         },
         "reason": {
+          "minLength": 1,
           "type": "string"
         },
         "request_id": {
@@ -3632,7 +3770,7 @@
         "request_id",
         "reason"
       ],
-      "title": "RequestUnanswerable",
+      "title": "RequestTransportExhausted",
       "type": "object"
     },
     "RequiredRequestPendingReason": {
