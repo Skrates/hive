@@ -8,6 +8,13 @@
  *
  * `review_batches` is the truth and `state_json` is a cache (§9.3): {@link ReviewStore.replay}
  * folds the stored batches and never calls `decide`, never re-emits effects (§5.B3).
+ *
+ * Projection facts — the handles the projections edit in place through (§8.1 board comment,
+ * check run, Slack thread; §3.3 `projection_handles`) and the transport references a request
+ * stores (§6.D5 `Request.transport`) — are what the publisher learned from a port, not
+ * judgments: no verb produces them (§4 is closed, §5.A4 forbids a separate system command), so
+ * they live in their own tables, are merged into every `get`/`read`, and are never replayed.
+ * `state_json` stays the pure fold, so the §11 #7 comparison holds byte for byte.
  */
 import type Database from "better-sqlite3";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
@@ -24,6 +31,7 @@ import type {
   Review,
   ReviewKey,
   ReviewState,
+  TransportRef,
 } from "./contract.js";
 import { validateAction } from "./contract.js";
 import type { DecideContext, ReviewIdentity, decide as reducerDecide, fold as reducerFold, read as reducerRead } from "./reducer.js";
@@ -97,6 +105,19 @@ export interface SourceRecordRow extends SourceRecordInput {
 }
 
 /**
+ * §7 step 3: a Codex record the classifier could not read, "recorded on the source record and
+ * surfaced on the board, never promoted". What the board needs to point a human at it.
+ */
+export interface UnknownSourceRecord {
+  recordKey: string;
+  version: string;
+  authorLogin: string;
+  htmlUrl: string | null;
+  /** The record body's first line, so the board says what it is without a click. */
+  excerpt: string;
+}
+
+/**
  * An effect row that keeps failing is retried behind the caller's backoff and finally
  * terminalized as `failed` — the same bound the Slack outbox uses (`OUTBOX_MAX_ATTEMPTS`),
  * restated here so the review module does not load the broker store to read one number.
@@ -146,6 +167,19 @@ function inboxFromRow(row: Row): InboxDelivery {
   };
 }
 
+function unknownRecordFromRow(row: Row): UnknownSourceRecord {
+  const body = JSON.parse(String(row.body_json)) as unknown;
+  const raw = typeof body === "object" && body !== null ? (body as Record<string, unknown>) : {};
+  const text = typeof raw.body === "string" ? raw.body : "";
+  return {
+    recordKey: String(row.record_key),
+    version: String(row.version),
+    authorLogin: String(row.author_login),
+    htmlUrl: typeof raw.html_url === "string" ? raw.html_url : null,
+    excerpt: text.split("\n").find((line) => line.trim().length > 0)?.trim().slice(0, 120) ?? "",
+  };
+}
+
 function sourceRecordFromRow(row: Row): SourceRecordRow {
   return {
     recordKey: String(row.record_key),
@@ -191,6 +225,12 @@ export class ReviewStore {
       CREATE TABLE IF NOT EXISTS review_policies (repository_id INTEGER NOT NULL, version INTEGER NOT NULL, policy_json TEXT NOT NULL,
         created_at TEXT NOT NULL, PRIMARY KEY(repository_id, version));
       CREATE TABLE IF NOT EXISTS operators (operator_id TEXT PRIMARY KEY, token_hash TEXT NOT NULL, created_at TEXT NOT NULL);
+
+      CREATE TABLE IF NOT EXISTS review_projection_handles (review_id TEXT NOT NULL, handle TEXT NOT NULL, key TEXT NOT NULL,
+        value TEXT NOT NULL, recorded_at TEXT NOT NULL, PRIMARY KEY(review_id, handle, key));
+      CREATE TABLE IF NOT EXISTS review_transport (effect_id TEXT PRIMARY KEY, review_id TEXT NOT NULL, request_id TEXT NOT NULL,
+        ref_json TEXT NOT NULL, recorded_at TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS review_transport_review_idx ON review_transport(review_id);
 
       CREATE INDEX IF NOT EXISTS reviews_display_idx ON reviews(display);
       CREATE INDEX IF NOT EXISTS review_effects_status_idx ON review_effects(status, next_attempt_at);
@@ -373,7 +413,9 @@ export class ReviewStore {
     this.db.prepare(`
       INSERT INTO review_attempts(review_id, act_id, command_json, refusal_json, at) VALUES (?, ?, ?, ?, ?)
     `).run(reviewId, input.actId, JSON.stringify(command), JSON.stringify(refusal), now);
-    const current = state !== null && policy !== null ? this.deps.read(state, { now, policy }) : null;
+    const current = state !== null && policy !== null && reviewId !== null
+      ? this.deps.read(this.withProjectionFacts(reviewId, state), { now, policy })
+      : null;
     return {
       review_id: reviewId,
       act_id: input.actId,
@@ -397,9 +439,36 @@ export class ReviewStore {
     return this.deps.read(state, { now: iso(this.deps.clock), policy });
   }
 
+  /** The folded Review plus the projection facts recorded for it (`projection_handles`, `Request.transport`). */
   get(key: ReviewKey): Review | null {
     const row = this.reviewRow(key);
-    return row === undefined ? null : (JSON.parse(String(row.state_json)) as Review);
+    return row === undefined ? null : this.withProjectionFacts(String(row.review_id), JSON.parse(String(row.state_json)) as Review);
+  }
+
+  /**
+   * Merges the projection facts into a folded Review. `state_json` and `replay()` never carry
+   * them: a handle is what a port answered, not a consequence of an admitted act.
+   */
+  private withProjectionFacts(reviewId: string, state: Review): Review {
+    const handles = this.db.prepare(
+      "SELECT handle, key, value FROM review_projection_handles WHERE review_id = ?",
+    ).all(reviewId) as Row[];
+    for (const row of handles) {
+      const handle = String(row.handle);
+      const value = String(row.value);
+      if (handle === "board_comment_id") state.projection_handles.board_comment_id = Number(value);
+      else if (handle === "check_run_id") state.projection_handles.check_run_ids[String(row.key)] = Number(value);
+      else if (handle === "slack_thread_ts") state.projection_handles.slack_thread_ts = value;
+    }
+    const transport = this.db.prepare(
+      "SELECT request_id, ref_json FROM review_transport WHERE review_id = ? ORDER BY rowid",
+    ).all(reviewId) as Row[];
+    for (const row of transport) {
+      const request = state.requests.find((candidate) => candidate.id === String(row.request_id));
+      if (request === undefined) throw new ReviewStoreError(`transport recorded for unknown request ${String(row.request_id)} on ${reviewId}`);
+      request.transport.push(JSON.parse(String(row.ref_json)) as TransportRef);
+    }
+    return state;
   }
 
   /** `read` by Review id: an effect row (§8.1) names its Review by id, not by key. */
@@ -413,7 +482,11 @@ export class ReviewStore {
     return row === undefined ? null : { repository_id: Number(row.repository_id), pr_number: Number(row.pr_number) };
   }
 
-  /** §5.B3 truth: fold over `review_batches` in revision order; never calls `decide`, never emits. */
+  /**
+   * §5.B3 truth: fold over `review_batches` in revision order; never calls `decide`, never emits.
+   * Projection facts are not part of the fold (see the module comment): the result equals
+   * `state_json`, not `get()`.
+   */
   replay(key: ReviewKey): Review {
     const row = this.reviewRow(key);
     const batches = this.batches(key);
@@ -587,6 +660,48 @@ export class ReviewStore {
     },
   };
 
+  // ---------------------------------------------------------------------------------------
+  // projection facts (§8.1 handles, §6.D5 transport references) — recorded by the publisher
+
+  readonly projections = {
+    /** §8.1: the one board comment, created once; later refreshes PATCH it. */
+    recordBoardComment: (reviewId: string, commentId: number): void => {
+      this.recordHandle(reviewId, "board_comment_id", "", String(commentId));
+    },
+    /** §8.1: the check run for one head, edited in place while that head is current. */
+    recordCheckRun: (reviewId: string, headSha: string, checkRunId: number): void => {
+      this.recordHandle(reviewId, "check_run_id", headSha, String(checkRunId));
+    },
+    /** The Review's Slack thread: the first board line's message ts; later lines and deliveries thread under it. */
+    recordSlackThread: (reviewId: string, threadTs: string): void => {
+      this.recordHandle(reviewId, "slack_thread_ts", "", threadTs);
+    },
+    /** The outbox row of the first board line, kept until its message ts is known. */
+    recordSlackBoardOutbox: (reviewId: string, outboxId: number): void => {
+      this.recordHandle(reviewId, "slack_board_outbox_id", "", String(outboxId));
+    },
+    slackBoardOutboxId: (reviewId: string): number | null => {
+      const row = this.db.prepare(
+        "SELECT value FROM review_projection_handles WHERE review_id = ? AND handle = 'slack_board_outbox_id' AND key = ''",
+      ).get(reviewId) as Row | undefined;
+      return row === undefined ? null : Number(row.value);
+    },
+    /** §6.D5: the reference a dispatched transport effect obtained; keyed by effect so a re-dispatch updates, never doubles. */
+    recordTransport: (reviewId: string, effectId: string, requestId: string, ref: TransportRef): void => {
+      this.db.prepare(`
+        INSERT INTO review_transport(effect_id, review_id, request_id, ref_json, recorded_at) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(effect_id) DO UPDATE SET ref_json = excluded.ref_json, recorded_at = excluded.recorded_at
+      `).run(effectId, reviewId, requestId, JSON.stringify(ref), iso(this.deps.clock));
+    },
+  };
+
+  private recordHandle(reviewId: string, handle: string, key: string, value: string): void {
+    this.db.prepare(`
+      INSERT INTO review_projection_handles(review_id, handle, key, value, recorded_at) VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(review_id, handle, key) DO UPDATE SET value = excluded.value, recorded_at = excluded.recorded_at
+    `).run(reviewId, handle, key, value, iso(this.deps.clock));
+  }
+
   private updateEffect(effectId: string, sql: string, ...params: unknown[]): void {
     const changed = this.db.prepare(sql).run(...params, effectId).changes;
     if (changed !== 1) throw new ReviewStoreError(`no effect ${effectId}`);
@@ -657,6 +772,14 @@ export class ReviewStore {
         "SELECT * FROM source_records WHERE review_id = ? AND admitted_act_id IS NULL ORDER BY rowid",
       ).all(reviewId) as Row[];
       return rows.map(sourceRecordFromRow);
+    },
+
+    /** §7 step 3: the live records classified `unknown` — the board surfaces them, nothing promotes them. */
+    unknown: (reviewId: string): UnknownSourceRecord[] => {
+      const rows = this.db.prepare(
+        "SELECT * FROM source_records WHERE review_id = ? AND classification = 'unknown' AND admitted_act_id IS NULL ORDER BY rowid",
+      ).all(reviewId) as Row[];
+      return rows.map(unknownRecordFromRow);
     },
 
     markAdmitted: (recordKey: string, version: string, actId: string): void => {

@@ -1,7 +1,7 @@
 # Vendored review contract (design §2.1)
 
 source_repo: weave-doctrine
-source_sha: 84af72b31f0a9c98a2b3798a7345360cc4a29ca6
+source_sha: e957857e38c24b529e39404286fc0e71012be979
 source_branch: gnomon/review-contract
 authority: skills/code-review/scripts/src/weave_reviewkit/contract.py
 

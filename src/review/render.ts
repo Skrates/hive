@@ -14,6 +14,7 @@ import type {
   ReviewState,
   Unavailable,
 } from "./contract.js";
+import type { UnknownSourceRecord } from "./store.js";
 
 export const CHECK_RUN_NAME = "weave/review";
 
@@ -146,7 +147,18 @@ function requestLine(request: Request): string {
       .join(", ");
   const names = request.names.length === 0 ? "" : ` naming ${request.names.join(", ")}`;
   const supersedes = request.supersedes === null ? "" : ` (supersedes ${request.supersedes})`;
-  return `\`${request.id}\` ${mode} → ${request.assignee} — ${request.status}, ${required}${names}${supersedes} — ${transport}`;
+  // §D6: how many times housekeeping re-transported, and the last time it did.
+  const stalls = request.retransports.length === 0
+    ? ""
+    : `; re-transported ${request.retransports.length}× (last ${request.retransports[request.retransports.length - 1]})`;
+  return `\`${request.id}\` ${mode} → ${request.assignee} — ${request.status}, ${required}${names}${supersedes} — ${transport}${stalls}`;
+}
+
+/** §7 step 3: an unreadable Codex record, named so a human can look at it. */
+function unknownRecordLine(record: UnknownSourceRecord): string {
+  const where = record.htmlUrl === null ? `\`${record.recordKey}\`` : `[${record.recordKey}](${record.htmlUrl})`;
+  const excerpt = record.excerpt.length === 0 ? "" : ` — "${record.excerpt}"`;
+  return `${where} by ${record.authorLogin} @ ${record.version}${excerpt}`;
 }
 
 function holdLine(hold: Hold): string {
@@ -221,9 +233,11 @@ export function checkRun(state: ReviewState): CheckRunRender {
  * §8.1: the one comment the belt writes, edited in place. Open and resolved findings with
  * their resolutions, requests with transport references, holds, charges, the exhaustion
  * gate text, and unknown-severity findings prominently — before everything else, because a
- * badge-less finding is the one a reader is most likely to under-weight (V-4).
+ * badge-less finding is the one a reader is most likely to under-weight (V-4). `unknown` are
+ * the Codex records the classifier could not read (§7 step 3): surfaced here, never promoted,
+ * ahead of the findings for the same reason.
  */
-export function boardComment(state: ReviewState): string {
+export function boardComment(state: ReviewState, unknownRecords: readonly UnknownSourceRecord[] = []): string {
   const lines: string[] = [];
   lines.push(`## Review ${state.display}`);
   lines.push("");
@@ -248,6 +262,13 @@ export function boardComment(state: ReviewState): string {
       + "This PR does not merge until an operator grants rounds (`hive review grant-rounds`) and the hold is released; "
       + "a retrospective has been requested.",
     );
+  }
+
+  if (unknownRecords.length > 0) {
+    lines.push("");
+    lines.push("### ⚠️ Codex records the classifier could not read — a human must look");
+    lines.push("");
+    for (const record of unknownRecords) lines.push(`- ${unknownRecordLine(record)}`);
   }
 
   const unknown = state.findings.filter((finding) => finding.priority === "unknown" && finding.status.open);
@@ -326,8 +347,8 @@ export function boardComment(state: ReviewState): string {
 // ---------------------------------------------------------------------------------------
 // Slack board line (M0's one visible projection)
 
-/** One line for the commons: who, where, ready or why not, rounds, what is pending. */
-export function slackBoardLine(state: ReviewState): string {
+/** One line for the commons: who, where, ready or why not, rounds, what is pending, what nobody could read. */
+export function slackBoardLine(state: ReviewState, unknownRecords: readonly UnknownSourceRecord[] = []): string {
   const pending = state.requests.filter((request) => request.status === "pending");
   const parts = [
     `${state.display} @ ${shortSha(state.subject.head_sha)}`,
@@ -337,6 +358,7 @@ export function slackBoardLine(state: ReviewState): string {
   ];
   const unknown = state.findings.filter((finding) => finding.priority === "unknown" && finding.status.open).length;
   if (unknown > 0) parts.push(`unknown-severity ${unknown}`);
+  if (unknownRecords.length > 0) parts.push(`unreadable codex records ${unknownRecords.length} (${unknownRecords.map((r) => r.recordKey).join(" ")})`);
   if (pending.length > 0) parts.push(`pending ${pending.map((r) => `${r.id}→${r.assignee}`).join(" ")}`);
   if (state.active_holds.length > 0) parts.push(`holds ${state.active_holds.map((h) => h.kind).join(" ")}`);
   return parts.join(" · ");

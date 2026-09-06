@@ -1,11 +1,10 @@
 {
   "expect": {
     "code": "malformed",
-    "why": "additionalProperties is false on every object"
+    "why": "ObservePR carries the reconcile run's §6.C6 exemption evidence (null when none); the reducer never recomputes it"
   },
   "instance": {
     "draft": false,
-    "exemption": null,
     "kind": "ObservePR",
     "lifecycle": "open",
     "observed": {
@@ -16,7 +15,6 @@
       "seen_at": "2026-09-06T12:00:00.000Z",
       "title": "Fix x"
     },
-    "rounds": 3,
     "subject": {
       "author": {
         "actor": "talos",

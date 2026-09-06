@@ -102,6 +102,7 @@ export function request(overrides: Partial<Request> = {}): Request {
     reason: "round one goes to codex",
     supersedes: null,
     transport: [],
+    retransports: [],
     answered_by: null,
     ...overrides,
   };

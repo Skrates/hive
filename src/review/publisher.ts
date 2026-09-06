@@ -7,11 +7,17 @@
  * through the ports, and marks the row. Publication is serialized
  * per target: the store hands out one row per target and passes never overlap, so a delayed
  * worker can never publish an older verdict — it never carried one.
+ *
+ * What a port answers is recorded as a projection fact (§8.1 "edited in place through
+ * `projection_handles`"; §6.D5 "the request stores references"): the board comment id, the
+ * check-run id per head, the Slack thread, and the delivery id / summon comment id on the
+ * request. Recording happens before the row is marked sent, so a lost mark re-dispatches
+ * against the handle rather than creating a second comment.
  */
 import { retryBackoffMs } from "../domain.js";
 import type { Clock } from "../time.js";
 import { iso } from "../time.js";
-import type { Effect, Policy, ReviewState } from "./contract.js";
+import type { Effect, Policy, ReviewState, TransportRef } from "./contract.js";
 import {
   announcePayload,
   applicability,
@@ -21,6 +27,7 @@ import {
   type EffectTarget,
 } from "./effects.js";
 import { boardComment, checkRun, slackBoardLine, threadState } from "./render.js";
+import type { UnknownSourceRecord } from "./store.js";
 
 /** GitHub-side projections (M1). `null` in M0: the Slack board line is the one projection. */
 export interface ReviewGitHubPort {
@@ -49,6 +56,8 @@ export interface ReviewGitHubPort {
 export interface SystemWakePort {
   mintSystemWake(input: { actor: string; channelId: string; threadTs: string | null; text: string; dedupeKey: string }): { deliveryId: number };
   postBoardLine(input: { channelId: string; threadTs: string | null; text: string }): { outboxId: number };
+  /** The Slack message ts an outbox row was posted as; null until the outbox has drained it. */
+  outboxMessageTs(outboxId: number): string | null;
 }
 
 /** An effect row as the publisher sees it: the contract's `Effect` plus its ledger columns. */
@@ -64,6 +73,19 @@ export interface PublishableEffect extends Effect {
 export interface PublisherStore {
   readById(reviewId: string): ReviewState | null;
   policy(repositoryId: number, version: number | "latest"): Policy | null;
+  /** §8.1 / §6.D5: the facts a dispatch establishes, recorded on the Review outside the fold. */
+  readonly projections: {
+    recordBoardComment(reviewId: string, commentId: number): void;
+    recordCheckRun(reviewId: string, headSha: string, checkRunId: number): void;
+    recordSlackThread(reviewId: string, threadTs: string): void;
+    recordSlackBoardOutbox(reviewId: string, outboxId: number): void;
+    slackBoardOutboxId(reviewId: string): number | null;
+    recordTransport(reviewId: string, effectId: string, requestId: string, ref: TransportRef): void;
+  };
+  /** §7 step 3: Codex records classified `unknown`, surfaced on the board and never promoted. */
+  readonly sourceRecords: {
+    unknown(reviewId: string): UnknownSourceRecord[];
+  };
   readonly effects: {
     pendingByTarget(now: string, limit?: number): PublishableEffect[];
     claim(effectId: string): PublishableEffect | null;
@@ -210,21 +232,26 @@ export class ReviewPublisher {
     const github = this.ports.github;
     switch (target.kind) {
       case "board": {
+        const unknown = this.store.sourceRecords.unknown(state.id);
         if (github !== null) {
-          await github.createOrUpdateBoardComment({
+          const existingId = state.projection_handles.board_comment_id;
+          const { commentId } = await github.createOrUpdateBoardComment({
             repositoryId: state.key.repository_id,
             prNumber: state.key.pr_number,
-            existingId: state.projection_handles.board_comment_id,
-            body: boardComment(state),
+            existingId,
+            body: boardComment(state, unknown),
           });
+          // §8.1: one comment per Review, created once. The id is recorded the moment it exists.
+          if (existingId === null) this.store.projections.recordBoardComment(state.id, this.positiveId(commentId, "board comment"));
         }
         const slack = this.slackPolicy(state);
         if (slack !== null) {
-          this.ports.slack.postBoardLine({
-            channelId: slack.channel_id,
-            threadTs: state.projection_handles.slack_thread_ts,
-            text: slackBoardLine(state),
-          });
+          const threadTs = this.slackThread(state);
+          const { outboxId } = this.ports.slack.postBoardLine({ channelId: slack.channel_id, threadTs, text: slackBoardLine(state, unknown) });
+          // The first line opens the Review's thread; its ts is learned once the outbox drains it.
+          if (threadTs === null && this.store.projections.slackBoardOutboxId(state.id) === null) {
+            this.store.projections.recordSlackBoardOutbox(state.id, outboxId);
+          }
         }
         return "sent";
       }
@@ -233,12 +260,14 @@ export class ReviewPublisher {
         // for a head nobody is at (§8.1 "at the current head").
         if (github === null || target.headSha !== state.subject.head_sha) return "obsolete";
         const render = checkRun(state);
-        await github.createOrUpdateCheckRun({
+        const existingId = state.projection_handles.check_run_ids[target.headSha] ?? null;
+        const { checkRunId } = await github.createOrUpdateCheckRun({
           repositoryId: state.key.repository_id,
           headSha: target.headSha,
-          existingId: state.projection_handles.check_run_ids[target.headSha] ?? null,
+          existingId,
           ...render,
         });
+        if (existingId === null) this.store.projections.recordCheckRun(state.id, target.headSha, this.positiveId(checkRunId, "check run"));
         return "sent";
       }
       case "thread": {
@@ -275,13 +304,15 @@ export class ReviewPublisher {
         }
         // §D5 / R-3: the ledger owns attempts; an unroutable actor throws out of the port
         // and this row retries behind backoff, visibly.
-        this.ports.slack.mintSystemWake({
+        const { deliveryId } = this.ports.slack.mintSystemWake({
           actor: payload.actor,
           channelId: slack.channel_id,
-          threadTs: state.projection_handles.slack_thread_ts,
+          threadTs: this.slackThread(state),
           text: payload.text,
           dedupeKey: payload.dedupe_key,
         });
+        // §D5: the request stores the reference; the delivery ledger owns the attempts.
+        this.store.projections.recordTransport(state.id, row.effect_id, target.requestId, { delivery_id: this.positiveId(deliveryId, "delivery") });
         return "sent";
       }
       case "summon": {
@@ -289,11 +320,12 @@ export class ReviewPublisher {
         if (payload === null) throw new DispatchError(`summon effect ${row.effect_id} carries no summon payload`);
         const github = this.ports.github;
         if (github === null) throw new DispatchError("summon dispatched without a GitHub port");
-        await github.postComment({
+        const { commentId } = await github.postComment({
           repositoryId: state.key.repository_id,
           prNumber: state.key.pr_number,
           body: payload.text,
         });
+        this.store.projections.recordTransport(state.id, row.effect_id, target.requestId, { summon_comment_id: this.positiveId(commentId, "summon comment") });
         return "sent";
       }
       case "announce": {
@@ -301,11 +333,7 @@ export class ReviewPublisher {
         if (payload === null) throw new DispatchError(`announce effect ${row.effect_id} carries no announce payload`);
         const slack = this.slackPolicy(state);
         if (slack !== null) {
-          this.ports.slack.postBoardLine({
-            channelId: slack.channel_id,
-            threadTs: state.projection_handles.slack_thread_ts,
-            text: payload.text,
-          });
+          this.ports.slack.postBoardLine({ channelId: slack.channel_id, threadTs: this.slackThread(state), text: payload.text });
         }
         return "sent";
       }
@@ -314,6 +342,29 @@ export class ReviewPublisher {
       case "thread":
         throw new DispatchError(`${target.kind} is not an actionable target`);
     }
+  }
+
+  /**
+   * The Review's Slack thread: the recorded ts, or — the first board line having been queued
+   * but its ts not yet recorded — the ts the outbox posted it as, recorded now. Null while the
+   * first line is still unsent (that post then lands at the channel top level, visibly, rather
+   * than waiting on the outbox).
+   */
+  private slackThread(state: ReviewState): string | null {
+    const recorded = state.projection_handles.slack_thread_ts;
+    if (recorded !== null) return recorded;
+    const outboxId = this.store.projections.slackBoardOutboxId(state.id);
+    if (outboxId === null) return null;
+    const ts = this.ports.slack.outboxMessageTs(outboxId);
+    if (ts === null) return null;
+    this.store.projections.recordSlackThread(state.id, ts);
+    return ts;
+  }
+
+  /** A port answered without an id: the dispatch happened, but there is nothing to edit in place through. */
+  private positiveId(id: number, what: string): number {
+    if (Number.isInteger(id) && id >= 1) return id;
+    throw new DispatchError(`${what} dispatched but the port returned no id (${id}); nothing to record`);
   }
 
   /** §6.I: the Review's own policy version, never the repo's latest. */

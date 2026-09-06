@@ -6,6 +6,7 @@
       "act_id": "obs:run_01J",
       "action": {
         "draft": false,
+        "exemption": null,
         "kind": "ObservePR",
         "lifecycle": "open",
         "observed": {
@@ -82,6 +83,7 @@
           },
           "reason": "routing_by_round.first",
           "required": true,
+          "retransports": [],
           "status": "pending",
           "subject_key": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:main",
           "supersedes": null,

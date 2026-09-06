@@ -1,6 +1,7 @@
 {
   "instance": {
     "draft": true,
+    "exemption": null,
     "kind": "ObservePR",
     "lifecycle": "closed",
     "observed": {

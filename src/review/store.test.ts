@@ -65,6 +65,7 @@ function observe(headSha: string, at = "2026-09-06T12:00:00.000Z"): ObservePRAct
     kind: "ObservePR",
     lifecycle: "open",
     draft: false,
+    exemption: null,
     observed: { title: "Fix x", author_login: "talos-weave", head_ref: "feature", base_sha_now: SHA_B, mergeable: true, seen_at: at },
     subject: {
       key: `${headSha}:main`,
@@ -217,14 +218,14 @@ test("migrate creates the §9.3 tables and indexes idempotently", () => {
   new ReviewStore(db, reducer);
   const tables = (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all() as Array<{ name: string }>)
     .map((row) => row.name);
-  for (const name of ["reviews", "review_batches", "review_attempts", "review_effects", "github_inbox", "source_records", "review_policies", "operators"]) {
+  for (const name of ["reviews", "review_batches", "review_attempts", "review_effects", "github_inbox", "source_records", "review_policies", "operators", "review_projection_handles", "review_transport"]) {
     assert.ok(tables.includes(name), `table ${name}`);
   }
   assert.ok(tables.includes("deliveries"), "an existing broker table is untouched");
   const indexes = (db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE '%_idx'").all() as Array<{ name: string }>)
     .map((row) => row.name).sort();
   assert.deepEqual(indexes, [
-    "github_inbox_unreconciled_idx", "review_effects_status_idx", "review_effects_target_idx", "reviews_display_idx", "source_records_review_idx",
+    "github_inbox_unreconciled_idx", "review_effects_status_idx", "review_effects_target_idx", "review_transport_review_idx", "reviews_display_idx", "source_records_review_idx",
   ]);
 });
 
@@ -612,7 +613,7 @@ test("active(since) lists Reviews with a pending request or recent activity", ()
   state.requests.push({
     id: "req_1", kind: "review", mode: "initial", assignee: "codex", subject_key: state.subject.key, required: true, names: [],
     status: "pending", opened_by: { kind: "system", caused_by: "obs:run_1" }, opened_at: "2026-09-06T12:00:00.000Z", reason: "routing_by_round.first",
-    supersedes: null, transport: [], answered_by: null,
+    supersedes: null, transport: [], retransports: [], answered_by: null,
   });
   db.prepare("UPDATE reviews SET state_json = ? WHERE review_id = ?").run(JSON.stringify(state), state.id);
   assert.deepEqual(store.active("2026-09-06T12:00:30.000Z"), [quiet, KEY]);
@@ -623,4 +624,71 @@ test("ApplyInput.meter reaches decide as ctx.meter", () => {
   const input: ApplyInput = { actId: "obs:run_1", principal: ADAPTER, expectedRevision: null, action: observe(SHA_A), display: DISPLAY, meter: { reading: 3, threshold: 5 } };
   store.apply(KEY, input);
   assert.deepEqual(reducer.calls.decide[0]?.meter, { reading: 3, threshold: 5 });
+});
+
+// §8.1 / §3.3 / §6.D5: what a port answered is a projection fact — recorded beside the fold, merged
+// into every read, never replayed (state_json stays the pure fold the §11 #7 comparison needs).
+test("projection facts: handles are recorded outside the fold, merged into get/read/readById, absent from replay and state_json", () => {
+  const { db, store } = setup();
+  const reviewId = String(applied(open(store)).batch_id).replace(/^bat_/, "rev_");
+  assert.deepEqual(store.get(KEY)?.projection_handles, { board_comment_id: null, check_run_ids: {}, slack_thread_ts: null });
+
+  store.projections.recordBoardComment(reviewId, 500);
+  store.projections.recordCheckRun(reviewId, SHA_A, 9);
+  store.projections.recordSlackThread(reviewId, "1700.5");
+  const expected = { board_comment_id: 500, check_run_ids: { [SHA_A]: 9 }, slack_thread_ts: "1700.5" };
+  assert.deepEqual(store.get(KEY)?.projection_handles, expected, "get merges the handles");
+  assert.deepEqual(store.read(KEY)?.projection_handles, expected, "read merges the handles");
+  assert.deepEqual(store.readById(reviewId)?.projection_handles, expected, "readById merges the handles");
+  assert.deepEqual(store.replay(KEY).projection_handles, { board_comment_id: null, check_run_ids: {}, slack_thread_ts: null }, "replay is the pure fold");
+  const cached = JSON.parse(String((db.prepare("SELECT state_json FROM reviews WHERE review_id = ?").get(reviewId) as { state_json: string }).state_json)) as Review;
+  assert.deepEqual(cached.projection_handles, { board_comment_id: null, check_run_ids: {}, slack_thread_ts: null }, "state_json never carries a handle");
+
+  // Re-recording replaces: the newest answer from the port wins; a second head gets its own check run.
+  store.projections.recordBoardComment(reviewId, 501);
+  store.projections.recordCheckRun(reviewId, SHA_B, 10);
+  assert.deepEqual(store.get(KEY)?.projection_handles, { board_comment_id: 501, check_run_ids: { [SHA_A]: 9, [SHA_B]: 10 }, slack_thread_ts: "1700.5" });
+
+  // The first board line's outbox row is kept until its ts is known; it is not a contract handle.
+  assert.equal(store.projections.slackBoardOutboxId(reviewId), null);
+  store.projections.recordSlackBoardOutbox(reviewId, 77);
+  assert.equal(store.projections.slackBoardOutboxId(reviewId), 77);
+  assert.equal(count(db, "SELECT count(*) AS n FROM review_projection_handles WHERE review_id = ?", reviewId), 5);
+
+  // A transport reference must name a request the Review has; otherwise the fact is a defect, refused loudly on read.
+  store.projections.recordTransport(reviewId, "eff_x", "req_missing", { delivery_id: 3 });
+  assert.throws(() => store.get(KEY), ReviewStoreError);
+});
+
+// §7 step 3: `unknown` is recorded on the source record and surfaced on the board, never promoted.
+test("source records: unknown(reviewId) lists the live records classified unknown with url and excerpt; admission removes them", () => {
+  const { store } = setup();
+  open(store);
+  const reviewId = "rev_obs:run_1";
+  const record = (id: number, version: string) => ({
+    recordKey: `issue_comment:${id}`,
+    version,
+    reviewId,
+    authorLogin: "chatgpt-codex-connector[bot]",
+    body: { id, html_url: `https://github.com/Owner/repo/pull/7#issuecomment-${id}`, body: "\n### Summary\nA work report, not a review.\n" },
+  });
+  store.sourceRecords.upsert(record(55, "v1"));
+  store.sourceRecords.upsert(record(56, "v1"));
+  assert.deepEqual(store.sourceRecords.unknown(reviewId), [], "nothing classified yet");
+  store.sourceRecords.setClassification("issue_comment:55", "v1", "unknown");
+  store.sourceRecords.setClassification("issue_comment:56", "v1", "clean");
+  assert.deepEqual(store.sourceRecords.unknown(reviewId), [{
+    recordKey: "issue_comment:55",
+    version: "v1",
+    authorLogin: "chatgpt-codex-connector[bot]",
+    htmlUrl: "https://github.com/Owner/repo/pull/7#issuecomment-55",
+    excerpt: "### Summary",
+  }]);
+  // An edited record supersedes its old version; a version later admitted is no longer unknown.
+  store.sourceRecords.setClassification("issue_comment:55", "v1", "superseded");
+  store.sourceRecords.upsert(record(55, "v2"));
+  store.sourceRecords.setClassification("issue_comment:55", "v2", "unknown");
+  assert.deepEqual(store.sourceRecords.unknown(reviewId).map((r) => r.version), ["v2"]);
+  store.sourceRecords.markAdmitted("issue_comment:55", "v2", "src:issue_comment:55:v2");
+  assert.deepEqual(store.sourceRecords.unknown(reviewId), []);
 });

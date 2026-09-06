@@ -101,8 +101,15 @@ export function isRefusal(result: Batch | Refusal): result is Refusal;
 
 Rules the reducer must implement and test, by name (each is one `node:test` case at minimum):
 §4 authorization table (every row, both allowed and refused principal), B1 `stale_revision`,
-C1–C6, D1, D2 routing (`policy.routing_by_round`, availability, meter), D3 clearing on admitted
-signal / `until` passed at decision time, D4 reassignment with `supersedes`, D8 `mergeable_observed`
+C1–C6 (C6: the exemption is `ObservePRAction.exemption`, computed by the reconcile run, recorded on a
+subject change, never recomputed by the reducer), D1 (enforced inside the one `open()` every opener
+uses, so the auto-request, a reassignment and the exhaustion episode honour it too), D2 routing
+(`policy.routing_by_round`, availability, meter), D3 clearing on admitted signal / `until` passed at
+decision time, D4 reassignment with `supersedes`, D6 stall housekeeping (runs inside every `ObservePR`
+— the §7 sweep is the cadence, §A4 forbids a separate command — measuring `stall_window_s` from the last
+transport the reducer queued, recording `request_retransported` up to `transport_bound`, then
+`request_unanswerable` + `Hold(unanswerable, blocks summons)`; paused transport never stalls; an answer
+arriving anyway releases the hold as the system), D8 `mergeable_observed`
 + transport withheld (effects not emitted while `mergeable === false`; emitted on flip to `true`),
 E1–E7, F1–F5, G1–G5, H readiness, I `AdoptPolicy`. Cross-item and process rules listed in the
 contract module's docstring (`weave_reviewkit/contract.py`) are refused `malformed` here — the store
@@ -199,6 +206,21 @@ export class ReviewStore {
     unadmitted(reviewId: string): SourceRecordRow[];
     markAdmitted(recordKey: string, version: string, actId: string): void;
     setClassification(recordKey: string, version: string, classification: string): void;
+    unknown(reviewId: string): UnknownSourceRecord[];             // §7 step 3: live records classified `unknown`, for the board
+  };
+
+  /**
+   * Projection facts (§8.1 handles, §6.D5 transport references): what a port answered, recorded by
+   * the publisher outside the fold — no verb produces them (§4 closed, §A4). Merged into get/read/
+   * readById; never in state_json or replay() (§11 #7 compares the pure fold).
+   */
+  readonly projections: {
+    recordBoardComment(reviewId: string, commentId: number): void;
+    recordCheckRun(reviewId: string, headSha: string, checkRunId: number): void;
+    recordSlackThread(reviewId: string, threadTs: string): void;
+    recordSlackBoardOutbox(reviewId: string, outboxId: number): void;   // the first board line's outbox row, until its ts is known
+    slackBoardOutboxId(reviewId: string): number | null;
+    recordTransport(reviewId: string, effectId: string, requestId: string, ref: TransportRef): void;
   };
 
   readonly operators: {
@@ -221,7 +243,9 @@ two rows for one target; `coalesceRefresh` (§11 #5, store half); `inbox.put` du
 DDL: §9.3 verbatim, plus `CREATE INDEX IF NOT EXISTS reviews_display_idx ON reviews(display)`,
 `review_effects_status_idx ON review_effects(status, next_attempt_at)`,
 `github_inbox_unreconciled_idx ON github_inbox(reconciled_run) WHERE reconciled_run IS NULL`,
-`source_records_review_idx ON source_records(review_id, admitted_act_id)`.
+`source_records_review_idx ON source_records(review_id, admitted_act_id)`, and the two projection-fact
+tables `review_projection_handles(review_id, handle, key, value, recorded_at)` and
+`review_transport(effect_id PK, review_id, request_id, ref_json, recorded_at)`.
 
 ## 4. `src/review/effects.ts`, `render.ts`, `publisher.ts` — owner: **effects builder**
 
@@ -246,8 +270,8 @@ export interface AnnouncePayload { review_id: string; text: string }
 
 // render.ts — pure
 export function checkRun(state: ReviewState): { name: "weave/review"; conclusion: "success" | "failure"; title: string; summary: string };
-export function boardComment(state: ReviewState): string;
-export function slackBoardLine(state: ReviewState): string;
+export function boardComment(state: ReviewState, unknownRecords?: readonly UnknownSourceRecord[]): string;   // §7 step 3: unreadable Codex records, ahead of the findings
+export function slackBoardLine(state: ReviewState, unknownRecords?: readonly UnknownSourceRecord[]): string;
 export function threadOps(before: Review | null, after: Review): Array<{ comment_id: number; op: "resolve" | "unresolve" }>;
 
 // publisher.ts
@@ -263,9 +287,10 @@ export interface ReviewGitHubPort {
 export interface SystemWakePort {
   mintSystemWake(input: { actor: string; channelId: string; threadTs: string | null; text: string; dedupeKey: string }): { deliveryId: number };
   postBoardLine(input: { channelId: string; threadTs: string | null; text: string }): { outboxId: number };
+  outboxMessageTs(outboxId: number): string | null;   // the ts the outbox posted a row as (BrokerStore.outbox.message_ts); the Review's thread
 }
 
-/** The slice of ReviewStore the publisher uses (readById, policy, effects.*); ReviewStore satisfies it structurally. */
+/** The slice of ReviewStore the publisher uses (readById, policy, effects.*, projections.*, sourceRecords.unknown); ReviewStore satisfies it structurally. */
 export interface PublisherStore { … }
 
 export class ReviewPublisher {
@@ -284,7 +309,11 @@ contested/re-opened ⇒ unresolve, only for comment-sourced findings; refresh co
 applicability — a summon whose request is no longer pending at the current subject is marked
 `obsolete`; a delivery uses `dedupeKey` so at-least-once is self-identifying; `mergeable === false`
 keeps summons/deliveries pending (not obsolete). M0 ships with `github: null` and the Slack board
-line only.
+line only. What a port answers is recorded through `store.projections` before the row is marked sent:
+the board comment id on its first create (later refreshes PATCH it — §8.1 "one per Review"), the check
+run id per head, the Slack thread (the first board line's outbox row, resolved to its `message_ts`
+once drained; later lines and deliveries thread under it), and `{delivery_id}` / `{summon_comment_id}`
+on the request (§6.D5). A port answering without an id fails the row visibly.
 
 `SystemWakePort` on `BrokerStore`: a `system`-origin `ingestEvent` (`senderKind: "app"`,
 `senderId: "hive-review"`, `eventId: "review:" + dedupeKey`) that reuses the ordinary ledger/outbox
@@ -421,9 +450,10 @@ drain (its Slack deliveries land in that outbox); `review.start()` arms the sche
 `review.stop()` joins the shutdown.
 
 Env (broker): `HIVE_GITHUB_WEBHOOK_SECRET_FILE`, `HIVE_GITHUB_APP_ID`, `HIVE_GITHUB_APP_KEY_FILE` — secrets are
-owner-only (0600) files read by `src/review/secret-file.ts`, never bare values; all three or none. With none set,
-or with the named files absent, the broker boots with the adapter disabled and logs it once (webhook 404,
-reconcile 503, Slack board line only — M0); a partial set or a file readable beyond its owner is a boot failure.
+owner-only (0600) files read by `src/review/secret-file.ts`, never bare values; all three or none. With none set
+the broker boots with the adapter disabled and logs it once (webhook 404, reconcile 503, Slack board line only —
+M0); a partial set, a named file that does not exist, or a file readable beyond its owner is a boot failure (§7
+tier-2 secrets; AGENTS.md "a missing profile is a hard pre-dispatch failure, never a fallback").
 CLI (operator only): `HIVE_OPERATOR_TOKEN_FILE`, same reader.
 
 The acceptance runner for §11 is `src/review/acceptance.test.ts`: the real `BrokerStore` database, the real store

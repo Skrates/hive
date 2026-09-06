@@ -5,7 +5,7 @@
  * both sides agree on what a `target` string means and what an actionable `payload`
  * carries. It is pure: no I/O, no clock.
  */
-import type { Effect, Review } from "./contract.js";
+import type { Effect, Request, Review } from "./contract.js";
 import { contractSchema } from "./contract.js";
 
 /** §8.1 — the six targets. `refresh` for check/board/thread, `actionable` for the rest. */
@@ -175,19 +175,29 @@ export function applicability(target: EffectTarget, review: Review): Applicabili
       return review.lifecycle === "merged" ? "applicable" : "obsolete";
     case "delivery":
     case "summon": {
-      // §D7: the request must still be pending at the current subject.
       const request = review.requests.find((candidate) => candidate.id === target.requestId);
       if (request === undefined) return "obsolete";
-      if (request.status !== "pending") return "obsolete";
-      if (request.subject_key !== review.subject.key) return "obsolete";
-      // §C3: merged is terminal for new work; closed pauses.
-      if (review.lifecycle === "merged") return "obsolete";
-      if (review.lifecycle === "closed") return "withheld";
-      // §D8: `false` withholds; `null` (not yet computed) never does.
-      if (review.observed.mergeable === false) return "withheld";
-      // §G3: `blocks.summons` pauses transport for review requests while the hold is active.
-      if (request.kind === "review" && review.holds.some((hold) => hold.released === null && hold.blocks.summons)) return "withheld";
-      return "applicable";
+      return transportState(review, request);
     }
   }
+}
+
+/**
+ * The transport half of {@link applicability}, on the request itself: what a delivery or a
+ * summon for `request` would learn at dispatch. Shared with the reducer's §D6 housekeeping,
+ * which must not count a stall while transport is paused — a request nobody could reach has
+ * not stalled.
+ */
+export function transportState(review: Review, request: Request): Applicability {
+  // §D7: the request must still be pending at the current subject.
+  if (request.status !== "pending") return "obsolete";
+  if (request.subject_key !== review.subject.key) return "obsolete";
+  // §C3: merged is terminal for new work; closed pauses.
+  if (review.lifecycle === "merged") return "obsolete";
+  if (review.lifecycle === "closed") return "withheld";
+  // §D8: `false` withholds; `null` (not yet computed) never does.
+  if (review.observed.mergeable === false) return "withheld";
+  // §G3: `blocks.summons` pauses transport for review requests while the hold is active.
+  if (request.kind === "review" && review.holds.some((hold) => hold.released === null && hold.blocks.summons)) return "withheld";
+  return "applicable";
 }

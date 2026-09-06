@@ -41,9 +41,9 @@ import type {
   ReviewKey,
   ReviewReport,
   ReviewState,
-  Subject,
   Testimony,
 } from "./contract.js";
+import { transportState } from "./effects.js";
 
 // ---------------------------------------------------------------------------------------------
 // Context and identity
@@ -80,8 +80,9 @@ export const DEFAULT_ROUNDS_MAX = 7;
 const SHA_RE = /^[0-9a-f]{40}$/;
 /** §3.2 A3 / §4: the connector's bot logins — the only adapter provenance that may admit an external result. */
 export const CODEX_LOGINS: ReadonlySet<string> = new Set(["chatgpt-codex-connector[bot]"]);
-/** §C6: the skill root whose exclusive changes make a subject `skill_only`. */
-const SKILL_ROOT = "skills/";
+/** §9.2 defaults when the policy leaves the §D6 knobs unset. */
+export const DEFAULT_STALL_WINDOW_S = 1200;
+export const DEFAULT_TRANSPORT_BOUND = 2;
 
 // ---------------------------------------------------------------------------------------------
 // Refusals
@@ -429,6 +430,9 @@ function applyConsequence(review: Review, c: Consequence): void {
       request.answered_by = c.answer_id;
       return;
     }
+    case "request_retransported":
+      must(review.requests.find((r) => r.id === c.request_id), `request ${c.request_id}`).retransports.push(c.at);
+      return;
     case "request_unanswerable":
       must(review.requests.find((r) => r.id === c.request_id), `request ${c.request_id}`).status = "unanswerable";
       return;
@@ -772,7 +776,17 @@ interface OpenSpec {
   openedBy: Principal;
 }
 
+/**
+ * §D1 by construction: every opener — the verb, the auto-request (§C2/§C4), a reassignment
+ * (§D4), the exhaustion episode (§G5) — passes through here, and a pending request to the same
+ * `(assignee, subject_key, kind)` is returned instead of doubled. The verb refuses
+ * `duplicate_request` before reaching this point (§D1); the system openers are silent about it.
+ */
 function open(tx: Transaction, spec: OpenSpec): Request {
+  const existing = tx.review.requests.find(
+    (r) => r.status === "pending" && r.assignee === spec.assignee && r.subject_key === spec.subjectKey && r.kind === spec.kind,
+  );
+  if (existing !== undefined) return existing;
   const request: Request = {
     id: tx.mint("req"),
     kind: spec.kind,
@@ -787,6 +801,7 @@ function open(tx: Transaction, spec: OpenSpec): Request {
     reason: spec.reason,
     supersedes: spec.supersedes,
     transport: [],
+    retransports: [],
     answered_by: null,
   };
   tx.record({ kind: "request_opened", request });
@@ -817,7 +832,6 @@ function openInitialIfDue(tx: Transaction, why: string): void {
 /** §D4: cancel the pending request and open one to the substitute with `supersedes` — once. */
 function reassign(tx: Transaction, request: Request, substitute: string, reason: string): void {
   tx.record({ kind: "request_cancelled", request_id: request.id, reason });
-  if (hasPending(tx.review, substitute, request.subject_key, request.kind)) return;
   open(tx, {
     kind: request.kind,
     mode: request.mode,
@@ -841,25 +855,14 @@ function substituteFor(policy: Policy, reviewer: string): string | null {
 // ObservePR (§C1–§C6, §D8)
 // ---------------------------------------------------------------------------------------------
 
-/** §C6: all changed paths under the skill root ⇒ `skill_only`; under declared roots ⇒ `exempt_paths`. */
-function computeExemption(policy: Policy, subject: Subject): Review["exemption"] {
-  if (subject.changed_paths.length === 0) return null;
-  const evidence = subject.changed_paths.join(", ");
-  if (subject.changed_paths.every((p) => p.startsWith(SKILL_ROOT))) {
-    return { reason: "skill_only", evidence, subject_key: subject.key };
-  }
-  const roots = policy.exempt_roots;
-  if (roots.length > 0 && subject.changed_paths.every((p) => roots.some((root) => p.startsWith(root)))) {
-    return { reason: "exempt_paths", evidence, subject_key: subject.key };
-  }
-  return null;
-}
-
 /** §C1: a whole-state observation; every consequence is derived independently. */
 function observe(tx: Transaction, action: ObservePRAction): Refusal | null {
   const before = tx.before;
   if (action.subject.key !== subjectKeyOf(action.subject.head_sha, action.subject.base_ref)) {
     return refuse("malformed", "Subject.key must be `<head_sha>:<base_ref>`");
+  }
+  if (action.exemption !== null && action.exemption.subject_key !== action.subject.key) {
+    return refuse("malformed", `exemption evidence names ${action.exemption.subject_key}, not the observed subject ${action.subject.key}`);
   }
   // §C5: the same (head, base_ref) is the same subject however the base tip moved.
   const subjectChanged = before === null || before.subject.key !== action.subject.key;
@@ -879,10 +882,10 @@ function observe(tx: Transaction, action: ObservePRAction): Refusal | null {
         tx.record({ kind: "hold_released", hold_id: hold.id, release: { by: tx.system, at: tx.ctx.now, reason: "subject_changed" } });
       }
     }
-    // … and the exemption is recomputed (§C6).
-    const exemption = computeExemption(tx.ctx.policy, action.subject);
-    if (JSON.stringify(exemption) !== JSON.stringify(tx.review.exemption)) {
-      tx.record({ kind: "exemption_set", exemption });
+    // … and the exemption is the evidence the reconcile run computed for this subject (§C6:
+    // "the reconcile run computes it; the Review records the evidence") — never recomputed here.
+    if (JSON.stringify(action.exemption) !== JSON.stringify(tx.review.exemption)) {
+      tx.record({ kind: "exemption_set", exemption: action.exemption });
     }
   }
 
@@ -924,7 +927,58 @@ function observe(tx: Transaction, action: ObservePRAction): Refusal | null {
       });
     }
   }
+
+  // §D6: housekeeping over pending requests rides the observation (§A4: a system act is a
+  // consequence inside an admitted command's batch; the §7 sweep observes every Review with a
+  // pending request, which is the housekeeping cadence).
+  housekeepStalls(tx);
   return null;
+}
+
+/**
+ * §D6: after the policy's stall window with no answer, one more transport effect is queued —
+ * a summon for Codex, a redelivery for a seat — bounded by `transport_bound`; when the bound is
+ * spent the request becomes `unanswerable` and the system places `Hold(unanswerable, blocks
+ * summons)`. The window is measured from the last transport the reducer queued (`opened_at`
+ * or the last re-transport), and never runs while transport is paused (§C3 closed, §D8
+ * conflicting, §G3 summons-blocking hold): a request nobody could reach has not stalled.
+ * `Release` is the operator's, or the system's when an answer arrives anyway (`admitAnswer`).
+ */
+function housekeepStalls(tx: Transaction): void {
+  const review = tx.review;
+  const policy = tx.ctx.policy;
+  const windowMs = (policy.stall_window_s ?? DEFAULT_STALL_WINDOW_S) * 1000;
+  const bound = policy.transport_bound ?? DEFAULT_TRANSPORT_BOUND;
+  const now = Date.parse(tx.ctx.now);
+  for (const request of [...review.requests]) {
+    if (request.status !== "pending") continue;
+    if (transportState(review, request) !== "applicable") continue;
+    const lastTransportAt = request.retransports[request.retransports.length - 1] ?? request.opened_at;
+    if (now - Date.parse(lastTransportAt) < windowMs) continue;
+    if (request.retransports.length < bound) {
+      tx.record({ kind: "request_retransported", request_id: request.id, at: tx.ctx.now, attempt: request.retransports.length + 1 });
+      emitTransport(tx, request);
+      continue;
+    }
+    tx.record({
+      kind: "request_unanswerable",
+      request_id: request.id,
+      reason: `no answer from ${request.assignee} after ${bound} re-transport(s), each ${policy.stall_window_s ?? DEFAULT_STALL_WINDOW_S}s apart`,
+    });
+    tx.record({
+      kind: "hold_placed",
+      hold: {
+        id: tx.mint("hold"),
+        kind: "unanswerable",
+        by: tx.system,
+        at: tx.ctx.now,
+        reason: `unanswerable:${request.id}`,
+        release_on: "explicit",
+        blocks: { readiness: true, summons: true },
+        released: null,
+      },
+    });
+  }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -979,9 +1033,11 @@ function admitExternal(tx: Transaction, action: Extract<Action, { kind: "AdmitEx
   // §D3: an admitted signal from Codex clears its recorded unavailability.
   clearAvailabilityOnSignal(tx, "codex");
 
-  // §E4: only a Codex request pending at that subject *now* is answered; otherwise unsolicited evidence.
+  // §E4: only a Codex request pending at that subject *now* is answered; otherwise unsolicited
+  // evidence. §D6: a request the system gave up on (`unanswerable`) is still the obligation the
+  // late answer discharges, and its hold is released with it.
   const pending = review.requests.find(
-    (r) => r.status === "pending" && r.kind === "review" && r.assignee === "codex" && r.subject_key === subject.key,
+    (r) => (r.status === "pending" || r.status === "unanswerable") && r.kind === "review" && r.assignee === "codex" && r.subject_key === subject.key,
   );
   const answerId = pending === undefined ? null : tx.mint("ans");
   const findings = result.findings.map((f) =>
@@ -1081,20 +1137,17 @@ function checkExhaustion(tx: Transaction): void {
 
   // §G5: the retrospective is an obligation with `required: false`; its transport goes out under the
   // exhaustion hold (the publisher withholds only review requests under a summons-blocking hold, §G3).
-  const retrospectiveActor = tx.ctx.policy.retrospective_actor;
-  const retrospective =
-    review.requests.find((r) => r.status === "pending" && r.kind === "retrospective" && r.assignee === retrospectiveActor && r.subject_key === review.subject.key)
-    ?? open(tx, {
-      kind: "retrospective",
-      mode: null,
-      assignee: retrospectiveActor,
-      subjectKey: review.subject.key,
-      required: false,
-      names: [],
-      reason: `exhaustion:${episode.id}`,
-      supersedes: null,
-      openedBy: tx.system,
-    });
+  const retrospective = open(tx, {
+    kind: "retrospective",
+    mode: null,
+    assignee: tx.ctx.policy.retrospective_actor,
+    subjectKey: review.subject.key,
+    required: false,
+    names: [],
+    reason: `exhaustion:${episode.id}`,
+    supersedes: null,
+    openedBy: tx.system,
+  });
   const author = review.subject.author;
   if (author.kind === "seat") {
     // The gate delivery names the retrospective request: pending until the episode's work is done, so the

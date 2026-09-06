@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { Policy, ReviewState } from "./contract.js";
+import type { Policy, ReviewState, TransportRef } from "./contract.js";
 import type { Clock } from "../time.js";
 import { AT, finding, fixedClaim, hold, policy, request, SHA_A, SHA_B, state } from "./fixtures.js";
 import {
@@ -10,6 +10,7 @@ import {
   type ReviewGitHubPort,
   type SystemWakePort,
 } from "./publisher.js";
+import type { UnknownSourceRecord } from "./store.js";
 
 class FakeClock implements Clock {
   constructor(private current = new Date(AT)) {}
@@ -33,12 +34,45 @@ class FakeReviewStore implements PublisherStore {
   states = new Map<string, ReviewState>();
   policies = new Map<string, Policy>();
   reads = 0;
+  /** What the publisher recorded, and — as the real store does — merged into the next read. */
+  handles: Array<{ reviewId: string; handle: string; key: string; value: string | number }> = [];
+  transport: Array<{ reviewId: string; effectId: string; requestId: string; ref: TransportRef }> = [];
+  unknownRecords = new Map<string, UnknownSourceRecord[]>();
 
   put(reviewState: ReviewState): void { this.states.set(reviewState.id, reviewState); }
   readById(reviewId: string): ReviewState | null {
     this.reads += 1;
-    return this.states.get(reviewId) ?? null;
+    const stored = this.states.get(reviewId);
+    if (stored === undefined) return null;
+    const merged = structuredClone(stored);
+    for (const h of this.handles.filter((candidate) => candidate.reviewId === reviewId)) {
+      if (h.handle === "board_comment_id") merged.projection_handles.board_comment_id = Number(h.value);
+      else if (h.handle === "check_run_id") merged.projection_handles.check_run_ids[h.key] = Number(h.value);
+      else if (h.handle === "slack_thread_ts") merged.projection_handles.slack_thread_ts = String(h.value);
+    }
+    for (const t of this.transport.filter((candidate) => candidate.reviewId === reviewId)) {
+      merged.requests.find((r) => r.id === t.requestId)?.transport.push(t.ref);
+    }
+    return merged;
   }
+  readonly projections = {
+    recordBoardComment: (reviewId: string, commentId: number): void => { this.handles.push({ reviewId, handle: "board_comment_id", key: "", value: commentId }); },
+    recordCheckRun: (reviewId: string, headSha: string, checkRunId: number): void => { this.handles.push({ reviewId, handle: "check_run_id", key: headSha, value: checkRunId }); },
+    recordSlackThread: (reviewId: string, threadTs: string): void => { this.handles.push({ reviewId, handle: "slack_thread_ts", key: "", value: threadTs }); },
+    recordSlackBoardOutbox: (reviewId: string, outboxId: number): void => { this.handles.push({ reviewId, handle: "slack_board_outbox_id", key: "", value: outboxId }); },
+    slackBoardOutboxId: (reviewId: string): number | null => {
+      const found = this.handles.find((h) => h.reviewId === reviewId && h.handle === "slack_board_outbox_id");
+      return found === undefined ? null : Number(found.value);
+    },
+    recordTransport: (reviewId: string, effectId: string, requestId: string, ref: TransportRef): void => {
+      const existing = this.transport.findIndex((t) => t.effectId === effectId);
+      if (existing >= 0) this.transport[existing] = { reviewId, effectId, requestId, ref };
+      else this.transport.push({ reviewId, effectId, requestId, ref });
+    },
+  };
+  readonly sourceRecords = {
+    unknown: (reviewId: string): UnknownSourceRecord[] => this.unknownRecords.get(reviewId) ?? [],
+  };
   policy(repositoryId: number, version: number | "latest"): Policy | null {
     return this.policies.get(`${repositoryId}:${version}`) ?? null;
   }
@@ -113,6 +147,9 @@ class FakeSlack implements SystemWakePort {
     this.lines.push(input);
     return { outboxId: this.lines.length };
   }
+  /** Outbox rows the test has "drained": outbox id → posted ts. */
+  posted = new Map<number, string>();
+  outboxMessageTs(outboxId: number): string | null { return this.posted.get(outboxId) ?? null; }
 }
 
 class FakeGitHub implements ReviewGitHubPort {
@@ -122,14 +159,16 @@ class FakeGitHub implements ReviewGitHubPort {
   comments: string[] = [];
   /** A gate the test releases to hold one publish mid-flight. */
   gate: Promise<void> | null = null;
+  /** A port whose responses carry no id (the App port's `?? 0` fallback). */
+  noIds = false;
   async createOrUpdateCheckRun(input: { headSha: string; existingId: number | null; conclusion: "success" | "failure"; title: string }): Promise<{ checkRunId: number }> {
     if (this.gate !== null) await this.gate;
     this.checks.push({ headSha: input.headSha, conclusion: input.conclusion, title: input.title, existingId: input.existingId });
-    return { checkRunId: this.checks.length };
+    return { checkRunId: this.noIds ? 0 : input.existingId ?? this.checks.length };
   }
   async createOrUpdateBoardComment(input: { existingId: number | null; body: string }): Promise<{ commentId: number }> {
     this.boards.push({ body: input.body, existingId: input.existingId });
-    return { commentId: 500 };
+    return { commentId: this.noIds ? 0 : input.existingId ?? 500 };
   }
   async resolveThread(input: { commentId: number }): Promise<void> { this.threads.push({ commentId: input.commentId, op: "resolve" }); }
   async unresolveThread(input: { commentId: number }): Promise<void> { this.threads.push({ commentId: input.commentId, op: "unresolve" }); }
@@ -404,4 +443,107 @@ test("a row already claimed elsewhere is skipped, and a row whose Review is gone
   assert.equal(await publisher.drainOnce(), 1);
   assert.equal(store.row("eff_1").status, "claimed");
   assert.equal(store.row("eff_2").status, "obsolete");
+});
+
+// §8.1 "one per Review, created once, edited in place through projection_handles": the id the
+// port answers is recorded, and the next refresh carries it as existingId (POST once, PATCH after).
+test("the board comment is created once: the first refresh POSTs, records the id, and the next refresh PATCHes with it", async () => {
+  const { store, github, publisher } = fixture({ github: true });
+  store.add({ effect_id: "eff_1", kind: "refresh", target: "board:rev_obs:run_1" });
+  assert.equal(await publisher.drainOnce(), 1);
+  assert.deepEqual(github!.boards.map((b) => b.existingId), [null]);
+  assert.deepEqual(store.handles.filter((h) => h.handle === "board_comment_id"), [{ reviewId: "rev_obs:run_1", handle: "board_comment_id", key: "", value: 500 }]);
+  store.add({ effect_id: "eff_2", kind: "refresh", target: "board:rev_obs:run_1" });
+  assert.equal(await publisher.drainOnce(), 1);
+  assert.deepEqual(github!.boards.map((b) => b.existingId), [null, 500]);
+  assert.equal(store.handles.filter((h) => h.handle === "board_comment_id").length, 1, "recorded once, not per refresh");
+});
+
+test("check-run ids are recorded per head: POST once, PATCH after, and a new head POSTs its own", async () => {
+  const { store, github, publisher } = fixture({ github: true });
+  store.add({ effect_id: "eff_1", kind: "refresh", target: CHECK });
+  await publisher.drainOnce();
+  store.add({ effect_id: "eff_2", kind: "refresh", target: CHECK });
+  await publisher.drainOnce();
+  assert.deepEqual(github!.checks.map((c) => [c.headSha, c.existingId]), [[SHA_A, null], [SHA_A, 1]]);
+  const moved = state();
+  moved.subject = { ...moved.subject, key: `${SHA_B}:main`, head_sha: SHA_B };
+  store.put(moved);
+  store.add({ effect_id: "eff_3", kind: "refresh", target: `check:skrates/hive:${SHA_B}` });
+  await publisher.drainOnce();
+  assert.deepEqual(github!.checks.at(-1), { headSha: SHA_B, conclusion: "success", title: `ready at ${SHA_B.slice(0, 7)}`, existingId: null });
+  assert.deepEqual(store.handles.filter((h) => h.handle === "check_run_id").map((h) => [h.key, h.value]), [[SHA_A, 1], [SHA_B, 3]]);
+});
+
+test("the Slack thread: the first board line opens it; once the outbox has posted it, later lines and deliveries thread under it", async () => {
+  const { store, slack, publisher } = fixture();
+  store.put(state({ requests: [request({ id: "req_2", assignee: "talos" })] }));
+  store.add({ effect_id: "eff_1", kind: "refresh", target: "board:rev_obs:run_1" });
+  await publisher.drainOnce();
+  assert.equal(slack.lines[0]!.threadTs, null, "the first line is the thread's top-level post");
+  assert.equal(store.projections.slackBoardOutboxId("rev_obs:run_1"), 1);
+  // The outbox has not drained yet: the next line still posts at the top level rather than waiting or vanishing.
+  store.add({ effect_id: "eff_2", kind: "refresh", target: "board:rev_obs:run_1" });
+  await publisher.drainOnce();
+  assert.equal(slack.lines[1]!.threadTs, null);
+  assert.equal(store.projections.slackBoardOutboxId("rev_obs:run_1"), 1, "the first row stays the thread opener");
+  // Drained: the ts is learned, recorded once, and everything after threads under it.
+  slack.posted.set(1, "1700.1");
+  store.add({ effect_id: "eff_3", kind: "refresh", target: "board:rev_obs:run_1" });
+  store.add({ effect_id: "eff_4", kind: "actionable", target: "delivery:talos:req_2", payload: { actor: "talos", request_id: "req_2", text: "please burn", dedupe_key: "eff_4" } });
+  assert.equal(await publisher.drainOnce(), 2);
+  assert.equal(slack.lines[2]!.threadTs, "1700.1");
+  assert.equal(slack.wakes[0]!.threadTs, "1700.1");
+  assert.deepEqual(store.handles.filter((h) => h.handle === "slack_thread_ts"), [{ reviewId: "rev_obs:run_1", handle: "slack_thread_ts", key: "", value: "1700.1" }]);
+  assert.equal(store.readById("rev_obs:run_1")?.projection_handles.slack_thread_ts, "1700.1");
+});
+
+// §6.D5: "The request stores references (delivery_id / summon_comment_id)".
+test("a dispatched delivery records {delivery_id} and a summon records {summon_comment_id} on the request; a re-dispatch updates, never doubles", async () => {
+  const { store, github, publisher } = fixture({ github: true });
+  store.put(state({ requests: [request({ id: "req_1" }), request({ id: "req_2", assignee: "talos" })] }));
+  store.add({ effect_id: "eff_1", kind: "actionable", target: "summon:req_1", payload: { request_id: "req_1", subject_key: `${SHA_A}:main`, text: "@codex review" } });
+  store.add({ effect_id: "eff_2", kind: "actionable", target: "delivery:talos:req_2", payload: { actor: "talos", request_id: "req_2", text: "please burn", dedupe_key: "eff_2" } });
+  assert.equal(await publisher.drainOnce(), 2);
+  assert.deepEqual(github!.comments, ["@codex review"]);
+  const read = store.readById("rev_obs:run_1");
+  assert.deepEqual(read?.requests.find((r) => r.id === "req_1")?.transport, [{ summon_comment_id: 701 }]);
+  assert.deepEqual(read?.requests.find((r) => r.id === "req_2")?.transport, [{ delivery_id: 1 }]);
+  // At-least-once: the same effect re-queued reaches the port again and the reference stays one.
+  store.row("eff_2").status = "pending";
+  await publisher.drainOnce();
+  assert.deepEqual(store.readById("rev_obs:run_1")?.requests.find((r) => r.id === "req_2")?.transport, [{ delivery_id: 1 }]);
+  assert.equal(store.transport.length, 2);
+});
+
+test("a port that answers without an id fails the row visibly instead of recording nothing", async () => {
+  const { store, github, publisher } = fixture({ github: true });
+  github!.noIds = true;
+  store.add({ effect_id: "eff_1", kind: "refresh", target: "board:rev_obs:run_1" });
+  const quiet = console.error;
+  console.error = () => {};
+  try {
+    assert.equal(await publisher.drainOnce(), 0);
+  } finally {
+    console.error = quiet;
+  }
+  assert.equal(store.row("eff_1").status, "pending");
+  assert.equal(store.row("eff_1").attempts, 1);
+  assert.deepEqual(store.handles, []);
+});
+
+// §7 step 3: an `unknown` Codex record is surfaced on the board and the Slack line, never promoted.
+test("Codex records the classifier could not read reach the board comment and the Slack board line", async () => {
+  const { store, slack, github, publisher } = fixture({ github: true });
+  store.unknownRecords.set("rev_obs:run_1", [{
+    recordKey: "issue_comment:5550157393",
+    version: "2026-09-06T16:00:00Z",
+    authorLogin: "chatgpt-codex-connector[bot]",
+    htmlUrl: "https://github.com/skrates/hive/pull/7#issuecomment-5550157393",
+    excerpt: "### Summary",
+  }]);
+  store.add({ effect_id: "eff_1", kind: "refresh", target: "board:rev_obs:run_1" });
+  await publisher.drainOnce();
+  assert.match(github!.boards[0]!.body, /could not read[\s\S]*\[issue_comment:5550157393\]\(https:\/\/github\.com\/skrates\/hive\/pull\/7#issuecomment-5550157393\) by chatgpt-codex-connector\[bot\][^\n]*### Summary/u);
+  assert.match(slack.lines[0]!.text, /unreadable codex records 1 \(issue_comment:5550157393\)/u);
 });

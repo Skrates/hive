@@ -1,10 +1,11 @@
 {
   "expect": {
     "code": "malformed",
-    "why": "lifecycle is open | closed | merged (\u00a76.C3)"
+    "why": "lifecycle is open | closed | merged (§6.C3)"
   },
   "instance": {
     "draft": false,
+    "exemption": null,
     "kind": "ObservePR",
     "lifecycle": "paused",
     "observed": {

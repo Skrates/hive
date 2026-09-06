@@ -165,6 +165,8 @@ class FakePort implements GitHubPort {
   pullRequestCalls: Array<string | undefined> = [];
   notModified = false;
   gate: Promise<void> | null = null;
+  /** When set, the PR fetch rejects with it (a GitHub 5xx, a rate limit). */
+  fail: Error | null = null;
 
   constructor(headSha: string) {
     this.pr = {
@@ -175,6 +177,7 @@ class FakePort implements GitHubPort {
   async getPullRequest(_r: number, _n: number, etag?: string): Promise<GitHubPullRequest | "not_modified"> {
     this.pullRequestCalls.push(etag);
     if (this.gate !== null) await this.gate;
+    if (this.fail !== null) throw this.fail;
     return this.notModified && etag !== undefined ? "not_modified" : this.pr;
   }
   async listReviews(): Promise<GitHubRecord[]> { return this.reviews; }
@@ -397,6 +400,10 @@ test("§6.C6: exemption evidence is computed when the subject changes, from skil
   github.blobs.set(".github/scripts/review_loop.py", "7".repeat(40));
   const first = await reconcile({ ...deps, templates: { repositoryId: 999, ref: "84af72b31f0a9c98a2b3798a7345360cc4a29ca6" } }, KEY, "run-1");
   assert.equal(first.exemption?.reason, "verbatim_copy");
+  // §6.C6 "the reconcile run computes it; the Review records the evidence": the observation carries it.
+  const opening = observations(store)[0]?.input.action;
+  assert.ok(opening !== undefined && opening.kind === "ObservePR");
+  assert.deepEqual(opening.exemption, { ...first.exemption, subject_key: `${H1}:main` });
   const unchanged = await reconcile({ ...deps, templates: { repositoryId: 999, ref: "x" } }, KEY, "run-2");
   assert.equal(unchanged.exemption, null, "not recomputed while the subject is unchanged");
   github.pr = { ...github.pr, headSha: H2 };
@@ -404,6 +411,9 @@ test("§6.C6: exemption evidence is computed when the subject changes, from skil
   const changed = await reconcile(deps, KEY, "run-3");
   assert.equal(changed.exemption?.reason, "skill_only");
   assert.equal(store.review?.subject.head_sha, H2);
+  const moved = observations(store)[2]?.input.action;
+  assert.ok(moved !== undefined && moved.kind === "ObservePR");
+  assert.deepEqual(moved.exemption, { ...changed.exemption, subject_key: `${H2}:main` });
 });
 
 test("conditional GET: the etag cache is offered on the next run and a 304 reuses the cached facts", async () => {
@@ -422,11 +432,11 @@ test("conditional GET: the etag cache is offered on the next run and a 304 reuse
 test("buildObservePR: merged and closed lifecycles, draft, and the human author fallback", () => {
   const pr = new FakePort(H2).pr;
   const now = "2026-09-06T18:00:00.000Z";
-  const merged = buildObservePR({ ...pr, merged: true, state: "closed", authorLogin: "someone" }, [], null, POLICY, now);
+  const merged = buildObservePR({ ...pr, merged: true, state: "closed", authorLogin: "someone" }, [], null, POLICY, now, null);
   assert.ok(merged.kind === "ObservePR");
   assert.equal(merged.lifecycle, "merged");
   assert.deepEqual(merged.subject.author, { kind: "human", login: "someone" });
-  const closed = buildObservePR({ ...pr, state: "closed", draft: true }, [], null, POLICY, now);
+  const closed = buildObservePR({ ...pr, state: "closed", draft: true }, [], null, POLICY, now, null);
   assert.ok(closed.kind === "ObservePR");
   assert.equal(closed.lifecycle, "closed");
   assert.equal(closed.draft, true);
@@ -485,4 +495,30 @@ test("scheduler: start asks for failed deliveries in the last 24 h and redeliver
   await scheduler.stop();
   assert.deepEqual(github.redelivered, [41, 42]);
   assert.equal(observations(store).length, 1, "the start-up sweep reconciled the active Review");
+});
+
+// §7 "Gaps": a failed run has not covered its deliveries. They stay unreconciled so the next drain
+// re-drives them; only a run that completed stamps them.
+test("scheduler: a run that throws leaves its inbox deliveries unreconciled; the next drain re-drives them and a successful run marks them", async () => {
+  const { store, github, deps } = setup(H2);
+  store.deliveries.push({ deliveryId: "d1", event: "pull_request", repositoryId: 1054, prNumber: 66, payload: {}, receivedAt: "t" });
+  github.fail = new Error("GitHub 503");
+  const logs: string[] = [];
+  const scheduler = new ReconcileScheduler({ ...deps, log: (line) => logs.push(line) });
+  scheduler.drainInbox();
+  await scheduler.idle();
+  assert.equal(logs.length, 1);
+  assert.match(logs[0] ?? "", /failed: GitHub 503/u);
+  assert.equal(store.reconciled.length, 0, "a failed run stamps nothing");
+  assert.deepEqual(store.inbox.unreconciled().map((d) => d.deliveryId), ["d1"], "the delivery is still owed a run");
+  assert.equal(observations(store).length, 0, "nothing was observed (no Review exists to be swept later)");
+
+  github.fail = null;
+  scheduler.drainInbox();
+  await scheduler.idle();
+  assert.equal(store.reconciled.length, 1);
+  assert.deepEqual(store.reconciled[0]?.ids, ["d1"]);
+  assert.equal(observations(store)[0]?.input.actId, `obs:${store.reconciled[0]?.runId}`);
+  assert.deepEqual(store.inbox.unreconciled(), []);
+  await scheduler.stop();
 });

@@ -1,7 +1,7 @@
 {
   "expect": {
     "code": "malformed",
-    "why": "effect targets follow the \u00a78.1 grammar"
+    "why": "effect targets follow the §8.1 grammar"
   },
   "instance": {
     "admitted_at": "2026-09-06T12:00:00.000Z",
@@ -10,6 +10,7 @@
       "act_id": "obs:run_01J",
       "action": {
         "draft": false,
+        "exemption": null,
         "kind": "ObservePR",
         "lifecycle": "open",
         "observed": {
@@ -86,6 +87,7 @@
           },
           "reason": "routing_by_round.first",
           "required": true,
+          "retransports": [],
           "status": "pending",
           "subject_key": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:main",
           "supersedes": null,

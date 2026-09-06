@@ -1,11 +1,11 @@
 {
-  "expect": {
-    "code": "malformed",
-    "why": "additionalProperties is false on every object"
-  },
   "instance": {
     "draft": false,
-    "exemption": null,
+    "exemption": {
+      "evidence": "every changed blob equals the canonical template blob: src/x.py@1111111111111111111111111111111111111111",
+      "reason": "verbatim_copy",
+      "subject_key": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:main"
+    },
     "kind": "ObservePR",
     "lifecycle": "open",
     "observed": {
@@ -16,7 +16,6 @@
       "seen_at": "2026-09-06T12:00:00.000Z",
       "title": "Fix x"
     },
-    "rounds": 3,
     "subject": {
       "author": {
         "actor": "talos",

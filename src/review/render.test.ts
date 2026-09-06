@@ -200,3 +200,27 @@ test("thread ops: resolve on close, unresolve on contest or re-open, nothing for
   assert.equal(threadState(review({ findings: [contested] }), 9001), "unresolve");
   assert.equal(threadState(review({ findings: [kitClosed] }), 9001), null);
 });
+
+// §7 step 3: `unknown` is surfaced on the board, never promoted — ahead of the findings, with a link.
+test("board and Slack line surface Codex records the classifier could not read, ahead of the findings", () => {
+  const records = [
+    { recordKey: "issue_comment:5550157393", version: "2026-09-06T16:00:00Z", authorLogin: "chatgpt-codex-connector[bot]", htmlUrl: "https://github.com/skrates/hive/pull/7#issuecomment-5550157393", excerpt: "### Summary" },
+    { recordKey: "review:5125461304", version: "2026-09-05T10:00:00Z", authorLogin: "chatgpt-codex-connector[bot]", htmlUrl: null, excerpt: "" },
+  ];
+  const board = boardComment(state({ findings: [finding()] }), records);
+  const unknownAt = board.indexOf("Codex records the classifier could not read");
+  const blockingAt = board.indexOf("### Blocking findings");
+  assert.ok(unknownAt >= 0 && unknownAt < blockingAt, "the unreadable-records section precedes the findings");
+  assert.match(board, /\[issue_comment:5550157393\]\(https:\/\/github\.com\/skrates\/hive\/pull\/7#issuecomment-5550157393\) by chatgpt-codex-connector\[bot\] @ 2026-09-06T16:00:00Z — "### Summary"/u);
+  assert.match(board, /`review:5125461304` by chatgpt-codex-connector\[bot\] @ 2026-09-05T10:00:00Z\n/u);
+  assert.doesNotMatch(boardComment(state()), /could not read/u);
+  assert.match(slackBoardLine(state(), records), /unreadable codex records 2 \(issue_comment:5550157393 review:5125461304\)/u);
+  assert.doesNotMatch(slackBoardLine(state()), /unreadable/u);
+});
+
+// §6.D6: the board says how often housekeeping re-transported and when.
+test("board shows a request's re-transports", () => {
+  const board = boardComment(state({ requests: [request({ id: "req_1", retransports: [AT, "2026-09-06T12:20:00.000Z"] })] }));
+  assert.match(board, /req_1[^\n]*no transport yet; re-transported 2× \(last 2026-09-06T12:20:00.000Z\)/u);
+  assert.doesNotMatch(boardComment(state({ requests: [request({ id: "req_1" })] })), /re-transported/u);
+});

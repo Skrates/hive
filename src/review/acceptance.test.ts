@@ -101,6 +101,7 @@ interface ObserveOverrides {
   lifecycle?: ObservePRAction["lifecycle"];
   draft?: boolean;
   mergeable?: boolean | null;
+  exemption?: ObservePRAction["exemption"];
 }
 
 function observe(o: ObserveOverrides = {}): ObservePRAction {
@@ -109,6 +110,7 @@ function observe(o: ObserveOverrides = {}): ObservePRAction {
     kind: "ObservePR",
     lifecycle: o.lifecycle ?? "open",
     draft: o.draft ?? false,
+    exemption: o.exemption ?? null,
     observed: {
       title: "Fix x",
       author_login: "talos-weave",
@@ -226,20 +228,28 @@ class FakeSlack implements SystemWakePort {
     this.lines.push(input);
     return { outboxId: this.lines.length };
   }
+  /** The outbox drains between publisher passes: every queued line has been posted as `1700.<outboxId>`. */
+  outboxMessageTs(outboxId: number): string | null {
+    return outboxId >= 1 && outboxId <= this.lines.length ? `1700.${outboxId}` : null;
+  }
 }
 
 /** The projection sink. `boardGate`, when set, holds the worker inside the board render (§11.5's delayed worker). */
 class FakeGitHub implements ReviewGitHubPort {
   checks: Array<{ headSha: string; conclusion: "success" | "failure"; title: string }> = [];
   boards: string[] = [];
+  /** What each call was asked to edit (`existingId`): null is a create. Same order as `checks` / `boards`. */
+  checkEdits: Array<number | null> = [];
+  boardEdits: Array<number | null> = [];
   threads: Array<{ commentId: number; op: "resolve" | "unresolve" }> = [];
   comments: string[] = [];
   boardGate: { reached: () => void; proceed: Promise<void> } | null = null;
-  async createOrUpdateCheckRun(input: { headSha: string; conclusion: "success" | "failure"; title: string }): Promise<{ checkRunId: number }> {
+  async createOrUpdateCheckRun(input: { headSha: string; existingId: number | null; conclusion: "success" | "failure"; title: string }): Promise<{ checkRunId: number }> {
     this.checks.push({ headSha: input.headSha, conclusion: input.conclusion, title: input.title });
-    return { checkRunId: this.checks.length };
+    this.checkEdits.push(input.existingId);
+    return { checkRunId: input.existingId ?? this.checks.length };
   }
-  async createOrUpdateBoardComment(input: { body: string }): Promise<{ commentId: number }> {
+  async createOrUpdateBoardComment(input: { existingId: number | null; body: string }): Promise<{ commentId: number }> {
     const gate = this.boardGate;
     if (gate !== null) {
       this.boardGate = null;
@@ -247,7 +257,8 @@ class FakeGitHub implements ReviewGitHubPort {
       await gate.proceed;
     }
     this.boards.push(input.body);
-    return { commentId: 500 };
+    this.boardEdits.push(input.existingId);
+    return { commentId: input.existingId ?? 500 };
   }
   async resolveThread(input: { commentId: number }): Promise<void> { this.threads.push({ commentId: input.commentId, op: "resolve" }); }
   async unresolveThread(input: { commentId: number }): Promise<void> { this.threads.push({ commentId: input.commentId, op: "unresolve" }); }
@@ -262,6 +273,9 @@ class FakeGitHubPort implements GitHubPort {
   pr: GitHubPullRequest;
   pulls = 0;
   issueComments: GitHubRecord[] = [];
+  files: GitHubChangedFile[] = [{ path: "src/x.py", sha: "1".repeat(40), status: "modified" }];
+  /** Canonical template blobs by path (§6.C6 verbatim_copy). */
+  blobs = new Map<string, string>();
   constructor(headSha: string) {
     this.pr = {
       repositoryId: KEY.repository_id, prNumber: KEY.pr_number, owner: "Owner", repo: "repo", title: "Fix x", authorLogin: "talos-weave",
@@ -272,7 +286,8 @@ class FakeGitHubPort implements GitHubPort {
   async listReviews(): Promise<GitHubRecord[]> { return []; }
   async listReviewComments(): Promise<GitHubRecord[]> { return []; }
   async listIssueComments(): Promise<GitHubRecord[]> { return [...this.issueComments]; }
-  async listFiles(): Promise<GitHubChangedFile[]> { return [{ path: "src/x.py", sha: "1".repeat(40), status: "modified" }]; }
+  async listFiles(): Promise<GitHubChangedFile[]> { return [...this.files]; }
+  async getBlobSha(_r: number, _ref: string, path: string): Promise<string | null> { return this.blobs.get(path) ?? null; }
   async listFailedDeliveries(): Promise<Array<{ id: number; guid: string }>> { return []; }
   async redeliver(): Promise<void> {}
 }
@@ -860,5 +875,86 @@ test("§11.10 Codex request pending → quota refusal → later Codex signal", a
   assert.deepEqual(core.effectRows().filter((r) => r.target.startsWith("summon:")).map((r) => r.status), ["obsolete"]);
   assert.deepEqual(core.github?.comments, []);
   assert.deepEqual(core.slack.wakes.map((w) => w.actor), ["ariadne"]);
+  core.close();
+});
+
+// ---------------------------------------------------------------------------------------
+// Burn of the 2026-09-06 verification findings, through the composed core
+// ---------------------------------------------------------------------------------------
+
+// §8.1 board comment "one per Review, created once, edited in place through projection_handles";
+// §6.D5 "the request stores references". The real store records what the real publisher learned.
+test("§8.1 one board comment and one check run per head, created once and edited in place; the request carries its summon reference", async () => {
+  const core = new Core();
+  const github = core.github;
+  assert.ok(github);
+  core.applied(observe(), ADAPTER);
+  await core.publisher.drainOnce();
+  assert.deepEqual(github.boardEdits, [null], "the first board refresh creates");
+  assert.deepEqual(github.checkEdits, [null]);
+  assert.deepEqual(github.comments, ["@codex review"]);
+  assert.deepEqual(core.review().projection_handles, { board_comment_id: 500, check_run_ids: { [H1]: 1 }, slack_thread_ts: null });
+  assert.deepEqual(core.pending("codex")[0]?.transport, [{ summon_comment_id: 701 }], "the summon comment id is the request's reference");
+  assert.equal(core.slack.lines.length, 1);
+  assert.equal(core.slack.lines[0]?.threadTs, null, "the first line opens the thread");
+
+  // Every later act refreshes the same comment and the same check run (PATCH by id), and threads the line.
+  core.applied({ kind: "GrantRounds", n: 1, reason: "r" }, OPERATOR);
+  await core.publisher.drainOnce();
+  assert.deepEqual(github.boardEdits, [null, 500], "the second board refresh edits in place");
+  assert.deepEqual(github.checkEdits, [null, 1]);
+  assert.equal(core.slack.lines.at(-1)?.threadTs, "1700.1", "later lines thread under the first, once the outbox posted it");
+  assert.equal(core.review().projection_handles.slack_thread_ts, "1700.1");
+  assert.equal(github.boards.length, 2, "one comment per refresh, never a second comment");
+
+  // A new head gets its own check run; the board comment stays the one comment.
+  core.applied(observe({ head: H2 }), ADAPTER);
+  await core.publisher.drainOnce();
+  assert.deepEqual(github.checkEdits.at(-1), null, "a check run names one head: the new head creates");
+  assert.deepEqual(github.boardEdits.at(-1), 500);
+  assert.deepEqual(core.review().projection_handles.check_run_ids, { [H1]: 1, [H2]: 3 });
+  // The seat's delivery id is the reference on a seat request; §11.7's replay is untouched by any of it.
+  core.applied({ kind: "OpenRequest", request_kind: "review", mode: "appeal", assignee: "ariadne", subject_key: `${H2}:main`, required: true, names: [], reason: "r" }, OPERATOR);
+  await core.publisher.drainOnce();
+  assert.deepEqual(core.pending("ariadne")[0]?.transport, [{ delivery_id: 1 }]);
+  assert.deepEqual(core.slack.wakes[0]?.threadTs, "1700.1", "deliveries land in the Review's thread");
+  const replayed = new ReviewStore(core.broker.db, { decide, fold, read, clock: core.clock }).replay(KEY);
+  assert.equal(JSON.stringify(replayed), core.stateJson(), "projection facts never enter the fold");
+  assert.deepEqual(replayed.projection_handles, { board_comment_id: null, check_run_ids: {}, slack_thread_ts: null });
+  core.close();
+});
+
+// §6.C6 "(the reconcile run computes it; the Review records the evidence)": verbatim_copy and the
+// three skill roots reach `read().requirement` through the real reconciler and the real reducer.
+test("§6.C6 through the reconciler: a verbatim template copy is exempt in the Review; a .claude/skills PR is exempt; a code push is not", async () => {
+  const core = new Core();
+  const port = new FakeGitHubPort(H1);
+  port.files = [{ path: ".github/scripts/review_loop.py", sha: "7".repeat(40), status: "modified" }];
+  port.blobs.set(".github/scripts/review_loop.py", "7".repeat(40));
+  const deps = { store: core.store, github: port, clock: core.clock, templates: { repositoryId: 999, ref: "canonical" } };
+
+  const verbatim = await reconcile(deps, KEY, "run-verbatim");
+  assert.equal(verbatim.exemption?.reason, "verbatim_copy");
+  assert.equal(core.review().exemption?.reason, "verbatim_copy");
+  assert.equal(core.review().exemption?.subject_key, `${H1}:main`);
+  assert.deepEqual(core.state().requirement, { subject_key: `${H1}:main`, status: "exempt" });
+  assert.equal(core.pending().length, 0, "an exempt subject opens no request");
+  assert.equal(core.state().readiness.ready, true);
+
+  port.pr.headSha = H2;
+  port.files = [{ path: ".claude/skills/x/SKILL.md", sha: "8".repeat(40), status: "added" }];
+  core.clock.advance(MINUTE);
+  await reconcile(deps, KEY, "run-skill");
+  assert.equal(core.review().exemption?.reason, "skill_only");
+  assert.deepEqual(core.state().requirement, { subject_key: `${H2}:main`, status: "exempt" });
+  assert.equal(core.pending().length, 0);
+
+  port.pr.headSha = H3;
+  port.files = [{ path: "src/x.py", sha: "9".repeat(40), status: "modified" }];
+  core.clock.advance(MINUTE);
+  await reconcile(deps, KEY, "run-code");
+  assert.equal(core.review().exemption, null);
+  assert.equal(core.pending("codex").length, 1, "a code subject gets its initial request");
+  assert.equal(core.state().requirement.status, "unsatisfied");
   core.close();
 });

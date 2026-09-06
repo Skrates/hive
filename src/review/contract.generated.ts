@@ -1,7 +1,7 @@
 /* eslint-disable */
 /**
  * GENERATED — do not edit. Source: contracts/schemas/review-contract.schema.json,
- * vendored from weave-doctrine@84af72b31f0a9c98a2b3798a7345360cc4a29ca6 (see contracts/SOURCE).
+ * vendored from weave-doctrine@e957857e38c24b529e39404286fc0e71012be979 (see contracts/SOURCE).
  * Regenerate with `bun run check:contracts`.
  */
 
@@ -23,6 +23,11 @@ export type Action =
   | ReleaseAction
   | GrantRoundsAction
   | AdoptPolicyAction;
+/**
+ * This interface was referenced by `ReviewContract`'s JSON-Schema
+ * via the `definition` "ExemptionReason".
+ */
+export type ExemptionReason = "skill_only" | "exempt_paths" | "verbatim_copy";
 /**
  * §6.C3: closed pauses, reopened resumes, merged is terminal.
  *
@@ -132,11 +137,6 @@ export type AnswerSubmission = ReviewkitSubmission | TestimonySubmission;
 export type Availability = Available | Unavailable;
 /**
  * This interface was referenced by `ReviewContract`'s JSON-Schema
- * via the `definition` "ExemptionReason".
- */
-export type ExemptionReason = "skill_only" | "exempt_paths" | "verbatim_copy";
-/**
- * This interface was referenced by `ReviewContract`'s JSON-Schema
  * via the `definition` "RequestStatus".
  */
 export type RequestStatus = "pending" | "answered" | "cancelled" | "unanswerable";
@@ -190,6 +190,7 @@ export type Consequence =
   | RequestOpened
   | RequestCancelled
   | RequestAnswered
+  | RequestRetransported
   | RequestUnanswerable
   | AnswerAdmitted
   | AnswerRetracted
@@ -344,15 +345,30 @@ export interface ReviewContract {
 /**
  * §6.C1 — a whole-state observation; the reducer derives each consequence independently.
  *
+ * ``exemption`` is the §6.C6 evidence the reconcile run computed for ``subject`` (``null``
+ * when no rule applies); the reducer records it on a subject change and never recomputes it.
+ *
  * This interface was referenced by `ReviewContract`'s JSON-Schema
  * via the `definition` "ObservePRAction".
  */
 export interface ObservePRAction {
   draft: boolean;
+  exemption: Exemption | null;
   kind: "ObservePR";
   lifecycle: Lifecycle;
   observed: Observed;
   subject: Subject;
+}
+/**
+ * §6.C6.
+ *
+ * This interface was referenced by `ReviewContract`'s JSON-Schema
+ * via the `definition` "Exemption".
+ */
+export interface Exemption {
+  evidence: string;
+  reason: ExemptionReason;
+  subject_key: string;
 }
 /**
  * §3.3 metadata refreshed by observation; ``mergeable`` is GitHub's tri-state (§6.D8).
@@ -911,6 +927,7 @@ export interface Batch {
     | RequestOpened
     | RequestCancelled
     | RequestAnswered
+    | RequestRetransported
     | RequestUnanswerable
     | AnswerAdmitted
     | AnswerRetracted
@@ -1050,17 +1067,6 @@ export interface ExemptionSet {
   kind: "exemption_set";
 }
 /**
- * §6.C6.
- *
- * This interface was referenced by `ReviewContract`'s JSON-Schema
- * via the `definition` "Exemption".
- */
-export interface Exemption {
-  evidence: string;
-  reason: ExemptionReason;
-  subject_key: string;
-}
-/**
  * This interface was referenced by `ReviewContract`'s JSON-Schema
  * via the `definition` "RequestOpened".
  */
@@ -1070,6 +1076,10 @@ export interface RequestOpened {
 }
 /**
  * §3.4 — an obligation. ``names`` is non-empty only for closure/appeal (reducer-checked).
+ *
+ * ``transport`` holds the references the publisher records after a dispatch (§6.D5);
+ * ``retransports`` holds the instants at which §6.D6 housekeeping queued one more transport
+ * effect — its length is the count the policy's ``transport_bound`` bounds.
  *
  * This interface was referenced by `ReviewContract`'s JSON-Schema
  * via the `definition` "Request".
@@ -1085,6 +1095,7 @@ export interface Request {
   opened_by: SeatPrincipal | OperatorPrincipal | AdapterPrincipal | SystemPrincipal;
   reason: string;
   required: boolean;
+  retransports: string[];
   status: RequestStatus;
   subject_key: string;
   supersedes: string | null;
@@ -1120,6 +1131,18 @@ export interface RequestCancelled {
 export interface RequestAnswered {
   answer_id: string;
   kind: "request_answered";
+  request_id: string;
+}
+/**
+ * §6.D6 — housekeeping queued one more transport effect for a stalled request.
+ *
+ * This interface was referenced by `ReviewContract`'s JSON-Schema
+ * via the `definition` "RequestRetransported".
+ */
+export interface RequestRetransported {
+  at: string;
+  attempt: number;
+  kind: "request_retransported";
   request_id: string;
 }
 /**

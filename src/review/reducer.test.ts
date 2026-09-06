@@ -5,6 +5,7 @@ import type {
   AdmittedFinding,
   Batch,
   Effect,
+  ExemptionReason,
   ExternalResult,
   Finding,
   ObservePRAction,
@@ -84,15 +85,24 @@ interface ObserveOverrides {
   author?: ObservePRAction["subject"]["author"];
   seenAt?: string;
   diff?: string;
+  /** §C6 evidence as the reconcile run would carry it; a reason alone names the observed subject. */
+  exemption?: ObservePRAction["exemption"] | ExemptionReason;
 }
 
 function observe(o: ObserveOverrides = {}): ObservePRAction {
   const head = o.head ?? H1;
   const baseRef = o.baseRef ?? "main";
+  const key = `${head}:${baseRef}`;
+  const exemption: ObservePRAction["exemption"] = o.exemption === undefined || o.exemption === null
+    ? null
+    : typeof o.exemption === "string"
+      ? { reason: o.exemption, evidence: (o.changedPaths ?? ["src/x.py"]).join(", "), subject_key: key }
+      : o.exemption;
   return {
     kind: "ObservePR",
     lifecycle: o.lifecycle ?? "open",
     draft: o.draft ?? false,
+    exemption,
     observed: {
       title: "Fix x",
       author_login: "talos-weave",
@@ -603,25 +613,36 @@ test("§C5 the base advancing under an unchanged (head, base_ref) is not a subje
   assert.equal(refusal(review, bad, ADAPTER).code, "malformed");
 });
 
-test("§C6 exemption satisfies the requirement, opens no request and never releases a hold", () => {
-  const skill = opened({ changedPaths: ["skills/code-review/SKILL.md", "skills/x/y.md"] });
+test("§C6 the Review records the exemption evidence the reconcile run carried: it satisfies the requirement, opens no request, never releases a hold, and is never recomputed here", () => {
+  const skill = opened({ changedPaths: ["skills/code-review/SKILL.md", "skills/x/y.md"], exemption: "skill_only" });
   assert.deepEqual(skill.exemption, { reason: "skill_only", evidence: "skills/code-review/SKILL.md, skills/x/y.md", subject_key: skill.subject.key });
   assert.equal(pending(skill).length, 0);
   assert.deepEqual(state(skill).requirement, { subject_key: skill.subject.key, status: "exempt" });
   assert.equal(state(skill).readiness.ready, true);
-  const docs = opened({ changedPaths: ["docs/a.md"] });
-  assert.equal(docs.exemption?.reason, "exempt_paths");
-  const mixed = opened({ changedPaths: ["docs/a.md", "src/x.py"] });
-  assert.equal(mixed.exemption, null);
+  // verbatim_copy is evidence only the reconcile run can compute (template blobs); the Review records it like any other reason.
+  const verbatim = opened({ changedPaths: [".github/scripts/review_loop.py"], exemption: "verbatim_copy" });
+  assert.equal(verbatim.exemption?.reason, "verbatim_copy");
+  assert.deepEqual(state(verbatim).requirement, { subject_key: verbatim.subject.key, status: "exempt" });
+  assert.equal(pending(verbatim).length, 0);
+  // The reducer holds no rule of its own: a skills/-only subject without evidence is not exempt.
+  const unproven = opened({ changedPaths: ["skills/x/SKILL.md"] });
+  assert.equal(unproven.exemption, null);
+  assert.equal(pending(unproven).length, 1);
+  // Evidence that names another subject is malformed.
+  assert.equal(refusal(null, observe({ exemption: { reason: "skill_only", evidence: "e", subject_key: `${H2}:main` } }), ADAPTER).code, "malformed");
   // A hold survives an exempt subject change.
+  const mixed = opened({ changedPaths: ["docs/a.md", "src/x.py"] });
   const held = apply(mixed, { kind: "Hold", hold: { kind: "operator", reason: "r", release_on: "explicit", blocks: { readiness: true, summons: false } } }, OPERATOR).state;
-  const exempt = apply(held, observe({ head: H2, changedPaths: ["docs/b.md"] }), ADAPTER).state;
+  const exempt = apply(held, observe({ head: H2, changedPaths: ["docs/b.md"], exemption: "exempt_paths" }), ADAPTER).state;
   assert.equal(exempt.exemption?.subject_key, `${H2}:main`);
   assert.equal(exempt.holds[0]?.released, null);
   assert.deepEqual(state(exempt).readiness, { ready: false, subject_key: exempt.subject.key, reasons: [{ hold: "operator" }] });
-  // Leaving the exempt roots recomputes the exemption away.
+  // A later subject with no evidence clears it; an unchanged subject preserves the recorded judgment (§C1).
   const back = apply(exempt, observe({ head: H3 }), ADAPTER).state;
   assert.equal(back.exemption, null);
+  const same = apply(back, observe({ head: H3, exemption: "skill_only" }), ADAPTER);
+  assert.ok(!kinds(same.batch).includes("exemption_set"), "exemption is a subject-change consequence only");
+  assert.equal(same.state.exemption, null);
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -639,6 +660,100 @@ test("§D1 at most one pending request per (assignee, subject_key, kind)", () =>
   assert.equal(refusal(review, { ...dup, subject_key: `${H3}:main` }, OPERATOR).code, "unknown_subject");
   assert.equal(refusal(review, { ...dup, mode: "initial", names: ["x"] }, OPERATOR).code, "malformed");
   assert.equal(refusal(review, { ...dup, mode: "closure", names: ["nope"] }, OPERATOR).code, "no_such_target");
+  // The system's own openers honour §D1 too: a draft flip after an operator-opened codex request
+  // opens no second pending codex review request at the subject.
+  const draft = opened({ draft: true });
+  const early = apply(draft, { ...dup, subject_key: draft.subject.key, reason: "early look" }, OPERATOR).state;
+  assert.equal(pending(early, "codex").length, 1);
+  const flipped = apply(early, observe({ draft: false }), ADAPTER);
+  assert.ok(!kinds(flipped.batch).includes("request_opened"), "no second opening");
+  assert.equal(pending(flipped.state, "codex").length, 1, "still one pending codex review request");
+  assert.equal(pending(flipped.state, "codex")[0]?.mode, "appeal", "the operator's request stands");
+});
+
+// ---------------------------------------------------------------------------------------------
+// §D6 — stall handling
+// ---------------------------------------------------------------------------------------------
+
+const MIN = 60_000;
+const at = (minutes: number): string => new Date(Date.parse(T0) + minutes * MIN).toISOString();
+
+test("§D6 stall handling: after the stall window one more transport, bounded by transport_bound; then unanswerable and Hold(unanswerable, blocks summons); an answer arriving anyway releases it", () => {
+  const review = opened();
+  const req = pending(review, "codex")[0];
+  assert.ok(req);
+  // Inside the window (policy: 1200 s): housekeeping records nothing.
+  const soon = apply(review, observe(), ADAPTER, { now: at(10) });
+  assert.deepEqual(kinds(soon.batch), []);
+  // Past the window: one re-transport, one more summon effect, recorded on the request.
+  const first = apply(soon.state, observe(), ADAPTER, { now: at(21), actId: "obs:s1" });
+  assert.deepEqual(kinds(first.batch), ["request_retransported"]);
+  assert.deepEqual(first.batch.consequences[0], { kind: "request_retransported", request_id: req.id, at: at(21), attempt: 1 });
+  assert.deepEqual(targets(first.batch).filter((t) => t.startsWith("summon:")), [`summon:${req.id}`]);
+  assert.deepEqual(first.state.requests[0]?.retransports, [at(21)]);
+  assert.equal(first.state.requests[0]?.status, "pending");
+  // The window is measured from the last transport, not from opened_at.
+  const notYet = apply(first.state, observe(), ADAPTER, { now: at(35) });
+  assert.deepEqual(kinds(notYet.batch), []);
+  const second = apply(notYet.state, observe(), ADAPTER, { now: at(42), actId: "obs:s2" });
+  assert.deepEqual(kinds(second.batch), ["request_retransported"]);
+  assert.equal(second.state.requests[0]?.retransports.length, 2, "transport_bound = 2 re-transports");
+  // The bound is spent: the request is unanswerable and the system holds, blocking readiness and summons.
+  const spent = apply(second.state, observe(), ADAPTER, { now: at(63), actId: "obs:s3" });
+  assert.deepEqual(kinds(spent.batch), ["request_unanswerable", "hold_placed"]);
+  assert.ok(!spent.batch.effects.some((e) => e.kind === "actionable"), "no further transport once the bound is spent");
+  assert.equal(spent.state.requests[0]?.status, "unanswerable");
+  const hold = spent.state.holds[0];
+  assert.ok(hold);
+  assert.equal(hold.kind, "unanswerable");
+  assert.equal(hold.reason, `unanswerable:${req.id}`);
+  assert.equal(hold.release_on, "explicit");
+  assert.deepEqual(hold.blocks, { readiness: true, summons: true });
+  assert.deepEqual(hold.by, { kind: "system", caused_by: "obs:s3" });
+  assert.deepEqual(state(spent.state, POLICY, at(63)).readiness, {
+    ready: false, subject_key: review.subject.key, reasons: [{ hold: "unanswerable" }, { requirement_unsatisfied: [review.subject.key] }],
+  });
+  assert.equal(applicability(parseTarget(`summon:${req.id}`), spent.state), "obsolete", "a pending summon for it is obsolete at dispatch");
+  // Housekeeping is idempotent over an unanswerable request.
+  assert.deepEqual(kinds(apply(spent.state, observe(), ADAPTER, { now: at(90) }).batch), []);
+  // §4 Release row: the system's release is "unanswerable answered" — the late answer discharges the request and releases the hold.
+  const late = apply(spent.state, external(), ADAPTER, { now: at(95), actId: "src:review:5001:v1" });
+  assert.deepEqual(kinds(late.batch), ["answer_admitted", "request_answered", "hold_released", "charge_recorded"]);
+  assert.equal(late.state.requests[0]?.status, "answered");
+  assert.deepEqual(late.state.holds[0]?.released, { by: { kind: "system", caused_by: "src:review:5001:v1" }, at: at(95), reason: "answered" });
+  assert.equal(state(late.state, POLICY, at(95)).readiness.ready, true);
+});
+
+test("§D6 the operator releases an unanswerable hold explicitly; a seat cannot; a paused transport never stalls; a seat request is re-delivered", () => {
+  // A seat assignee stalls into a redelivery with its own dedupe key.
+  const { review, request } = seatReviewed();
+  const stalled = apply(review, observe(), ADAPTER, { now: at(25), actId: "obs:seat", policy: SEAT_POLICY });
+  assert.deepEqual(kinds(stalled.batch), ["request_retransported"]);
+  const redelivery = stalled.batch.effects.find((e) => e.target === `delivery:ariadne:${request}`);
+  assert.ok(redelivery, "one more delivery to the seat");
+  assert.equal((redelivery.payload as { dedupe_key: string }).dedupe_key, `request:${request}:obs:seat`);
+
+  // Transport paused ⇒ no stall: closed (§C3), conflicting (§D8), summons-blocking hold (§G3).
+  assert.ok(!kinds(apply(review, observe({ lifecycle: "closed" }), ADAPTER, { now: at(25), policy: SEAT_POLICY }).batch).includes("request_retransported"), "closed");
+  assert.ok(!kinds(apply(review, observe({ mergeable: false }), ADAPTER, { now: at(25), policy: SEAT_POLICY }).batch).includes("request_retransported"), "conflicting");
+  const held = apply(review, { kind: "Hold", hold: { kind: "stack", reason: "r", release_on: "explicit", blocks: { readiness: true, summons: true } } }, seat("talos"), { policy: SEAT_POLICY }).state;
+  assert.ok(!kinds(apply(held, observe(), ADAPTER, { now: at(25), policy: SEAT_POLICY }).batch).includes("request_retransported"), "summons-blocking hold");
+
+  // Spend the bound (transport_bound 2) and check the explicit release path.
+  const twice = apply(stalled.state, observe(), ADAPTER, { now: at(50), policy: SEAT_POLICY }).state;
+  const spent = apply(twice, observe(), ADAPTER, { now: at(75), policy: SEAT_POLICY }).state;
+  const hold = spent.holds.find((h) => h.kind === "unanswerable");
+  assert.ok(hold);
+  assert.equal(refusal(spent, { kind: "Release", hold_id: hold.id, reason: "r" }, seat("ariadne"), { policy: SEAT_POLICY }).code, "unauthorized");
+  const released = apply(spent, { kind: "Release", hold_id: hold.id, reason: "reviewer is back" }, OPERATOR, { policy: SEAT_POLICY });
+  assert.deepEqual(kinds(released.batch), ["hold_released"]);
+  // The obligation stands (unanswerable, not cancelled): the seat's Answer still discharges it.
+  const answered = apply(released.state, answerAction(request, released.state.subject.key, report("ariadne")), seat("ariadne"), { policy: SEAT_POLICY });
+  assert.equal(answered.state.requests.find((r) => r.id === request)?.status, "answered");
+  assert.equal(state(answered.state, SEAT_POLICY).readiness.ready, true);
+  // The §D6 knobs come from the policy: a longer window stalls nothing at 25 minutes.
+  const patient = apply(review, observe(), ADAPTER, { now: at(25), policy: { ...SEAT_POLICY, stall_window_s: 3600 } });
+  assert.deepEqual(kinds(patient.batch), []);
 });
 
 test("§D2 routing by round: codex first, the substitute after the first charge, unavailable or metered codex skipped", () => {

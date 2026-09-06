@@ -3,14 +3,16 @@
  *
  * A wake — an inbox row, the 5-minute sweep, or `hive review reconcile` — runs
  * `reconcile(key)`, which always observes the *live* PR and imports the *live* records:
- *   1. fetch the PR (conditional GET) → `ObservePR(current facts)` under act id `obs:<run>`;
+ *   1. fetch the PR (conditional GET) → `ObservePR(current facts)` under act id `obs:<run>`,
+ *      carrying the §6.C6 exemption evidence computed for a changed subject (step 4 of the
+ *      design, run first because the Review records what the observation carries);
  *   2. import reviews, review comments and issue comments into `source_records` keyed
  *      `(kind, id)` with `version = updated_at / submitted_at`, idempotently;
  *   3. for every Codex record not yet admitted at its version: classify once and admit
  *      `AdmitExternalResult` (clean / findings) or `SetReviewerAvailability` (quota refusal /
  *      connector error) under act id `src:<record_key>:<version>`; `status` and `unknown`
  *      are recorded on the source record and never promoted;
- *   4. compute exemption evidence (§6.C6) when the subject changed.
+ *   4. (folded into 1) exemption evidence when the subject changed.
  *
  * A delayed older webhook therefore observes the current PR and nothing regresses (F-14,
  * §11 #4). The three ids stay distinct: the delivery id never becomes an act id.
@@ -68,7 +70,7 @@ export interface ReconcileSummary {
   recordsImported: number;
   admitted: string[];
   refused: Array<{ actId: string; code: RefusalCode }>;
-  /** §7 step 4; computed when the subject changed, null otherwise or when no root covers every path. */
+  /** §6.C6; computed when the subject changed and carried on the observation, null otherwise or when no rule applies. */
   exemption: ExemptionEvidence | null;
   durationMs: number;
 }
@@ -116,11 +118,23 @@ export function buildSubject(pr: GitHubPullRequest, files: GitHubChangedFile[], 
   };
 }
 
-/** §4 `ObservePR`: the whole-state observation the reducer diffs (§6.C1). */
-export function buildObservePR(pr: GitHubPullRequest, files: GitHubChangedFile[], existing: Review | null, policy: Policy, now: string): Action {
+/**
+ * §4 `ObservePR`: the whole-state observation the reducer diffs (§6.C1). `exemption` is the
+ * §6.C6 evidence for the subject (null when no rule applies); the Review records it verbatim.
+ */
+export function buildObservePR(
+  pr: GitHubPullRequest,
+  files: GitHubChangedFile[],
+  existing: Review | null,
+  policy: Policy,
+  now: string,
+  exemption: ExemptionEvidence | null,
+): Action {
+  const subject = buildSubject(pr, files, existing, policy, now);
   return {
     kind: "ObservePR",
-    subject: buildSubject(pr, files, existing, policy, now),
+    subject,
+    exemption: exemption === null ? null : { ...exemption, subject_key: subject.key },
     lifecycle: pr.merged ? "merged" : pr.state === "closed" ? "closed" : "open",
     draft: pr.draft,
     observed: {
@@ -196,8 +210,20 @@ export async function reconcile(deps: ReconcileDeps, key: ReviewKey, runId: stri
   const files = await deps.github.listFiles(key.repository_id, key.pr_number);
   const meterReading = policy.codex_meter !== null && deps.meter !== undefined ? await deps.meter.read(policy.codex_meter) : null;
   const now = deps.clock.now().toISOString();
-  const observe = buildObservePR(pr, files, existing, policy, now);
-  const subjectChanged = existing === null || (observe.kind === "ObservePR" && existing.subject.key !== observe.subject.key);
+  // §6.C6 / §7 step 4: exemption evidence is computed for a changed subject and travels on the
+  // observation, so the Review records exactly what this run established.
+  const subjectChanged = existing === null || existing.subject.key !== `${pr.headSha}:${pr.baseRef}`;
+  if (subjectChanged) {
+    let templateBlobs: Map<string, string | null> | null = null;
+    if (deps.templates !== undefined && deps.github.getBlobSha !== undefined) {
+      templateBlobs = new Map();
+      for (const file of files) {
+        templateBlobs.set(file.path, await deps.github.getBlobSha(deps.templates.repositoryId, deps.templates.ref, file.path));
+      }
+    }
+    summary.exemption = exemptionEvidence(files, policy.exempt_roots, templateBlobs);
+  }
+  const observe = buildObservePR(pr, files, existing, policy, now, subjectChanged ? summary.exemption : existing?.exemption ?? null);
   const observation = deps.store.apply(key, {
     actId: `obs:${runId}`,
     principal: adapterPrincipal(runId, pr.authorLogin),
@@ -281,17 +307,6 @@ export async function reconcile(deps: ReconcileDeps, key: ReviewKey, runId: stri
     }
   }
 
-  // 4. exemption evidence when the subject changed (§6.C6)
-  if (subjectChanged) {
-    let templateBlobs: Map<string, string | null> | null = null;
-    if (deps.templates !== undefined && deps.github.getBlobSha !== undefined) {
-      templateBlobs = new Map();
-      for (const file of files) {
-        templateBlobs.set(file.path, await deps.github.getBlobSha(deps.templates.repositoryId, deps.templates.ref, file.path));
-      }
-    }
-    summary.exemption = exemptionEvidence(files, policy.exempt_roots, templateBlobs);
-  }
   return finish();
 }
 
@@ -354,10 +369,13 @@ export class ReconcileScheduler {
       try {
         const summary = await reconcile(this.deps, key, runId);
         if (summary.refused.length > 0) this.log(`reconcile ${runId} ${key.repository_id}:${key.pr_number} refused ${JSON.stringify(summary.refused)}`);
+        // §7 "Gaps": only a run that completed covered its wakes. A run that threw leaves its
+        // inbox deliveries unreconciled, so the next drain re-drives them — the adapter's one
+        // recovery responsibility is not discharged by a failure.
+        for (const callback of callbacks) callback(runId);
       } catch (error) {
         this.log(`reconcile ${runId} ${key.repository_id}:${key.pr_number} failed: ${error instanceof Error ? error.message : String(error)}`);
       }
-      for (const callback of callbacks) callback(runId);
     } while (lane.pending && !this.stopped);
   }
 
