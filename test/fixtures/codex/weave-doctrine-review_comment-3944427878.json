@@ -1,0 +1,69 @@
+{
+  "url": "https://api.github.com/repos/RationallyPrime/weave-doctrine/pulls/comments/3944427878",
+  "pull_request_review_id": 5125806227,
+  "id": 3944427878,
+  "node_id": "PRRC_kwDOTt6bd87rGzFm",
+  "diff_hunk": "@@ -4,8 +4,8 @@\n |---|---|---|---|\n | `timaeus-dev` (dev box, 192.168.1.238) | 100.75.184.37 | **Hive broker** (`:8790`, user unit `hive-broker`) + sokrates dev deploys | — (no seat; broker credentials never leave this box) |\n | `pop-os` (Hákon's laptop) | 100.84.215.88 | Fable's machine; interactive sessions + `hive-edge` user unit | `fable` |\n-| `mac` (MacBook) | 100.98.220.21 | Ariadne's machine (Codex app-server must be same-machine) | `ariadne` |\n-| `agent-cx53` (Hetzner, 62.238.51.63) | 100.75.219.73 | gnomon's + Theoros's box (one edge, two actors) + self-hosted GitHub Actions runner (separate `ci-runner` user) | `gnomon`, `theoros` |\n+| `mac` (MacBook) | 100.98.220.21 | **No edge since 2026-09-06.** Interactive Codex Desktop only — the app-server and Desktop IPC sockets must be same-machine, so mid-turn steering lives here and nowhere else; Hive dispatches nothing to this box | — (interactive `ariadne` body; no subscription names edge `mac`) |",
+  "path": "universe/20-machines.md",
+  "commit_id": "4624ddcf91a768907997c2435a5e6a228788099c",
+  "original_commit_id": "4624ddcf91a768907997c2435a5e6a228788099c",
+  "user": {
+    "login": "chatgpt-codex-connector[bot]",
+    "id": 199175422,
+    "node_id": "BOT_kgDOC98s_g",
+    "avatar_url": "https://avatars.githubusercontent.com/in/1144995?v=4",
+    "gravatar_id": "",
+    "url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D",
+    "html_url": "https://github.com/apps/chatgpt-codex-connector",
+    "followers_url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D/followers",
+    "following_url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D/following{/other_user}",
+    "gists_url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D/gists{/gist_id}",
+    "starred_url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D/starred{/owner}{/repo}",
+    "subscriptions_url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D/subscriptions",
+    "organizations_url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D/orgs",
+    "repos_url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D/repos",
+    "events_url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D/events{/privacy}",
+    "received_events_url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D/received_events",
+    "type": "Bot",
+    "user_view_type": "public",
+    "site_admin": false
+  },
+  "body": "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Qualify the every-machine edge invariant**\n\nFresh evidence after this row update is the law later in the same rendered fragment: `universe/20-machines.md` still says that every machine other than the broker is an edge. Every installed profile therefore receives both this new declaration that the Mac has no edge and the unchanged invariant that it must have one, which can direct an operator to preserve or restart the launchd edge this cutover retires. Restrict that invariant to registered seat hosts or explicitly exempt the interactive-only Mac.\n\nUseful? React with 👍 / 👎.",
+  "created_at": "2026-09-06T15:32:49Z",
+  "updated_at": "2026-09-06T15:32:49Z",
+  "html_url": "https://github.com/RationallyPrime/weave-doctrine/pull/218#discussion_r3944427878",
+  "pull_request_url": "https://api.github.com/repos/RationallyPrime/weave-doctrine/pulls/218",
+  "_links": {
+    "self": {
+      "href": "https://api.github.com/repos/RationallyPrime/weave-doctrine/pulls/comments/3944427878"
+    },
+    "html": {
+      "href": "https://github.com/RationallyPrime/weave-doctrine/pull/218#discussion_r3944427878"
+    },
+    "pull_request": {
+      "href": "https://api.github.com/repos/RationallyPrime/weave-doctrine/pulls/218"
+    }
+  },
+  "reactions": {
+    "url": "https://api.github.com/repos/RationallyPrime/weave-doctrine/pulls/comments/3944427878/reactions",
+    "total_count": 0,
+    "+1": 0,
+    "-1": 0,
+    "laugh": 0,
+    "hooray": 0,
+    "confused": 0,
+    "heart": 0,
+    "rocket": 0,
+    "eyes": 0
+  },
+  "start_line": null,
+  "original_start_line": null,
+  "start_side": null,
+  "line": 7,
+  "original_line": 7,
+  "side": "RIGHT",
+  "author_association": "NONE",
+  "original_position": 6,
+  "position": 6,
+  "subject_type": "line"
+}
