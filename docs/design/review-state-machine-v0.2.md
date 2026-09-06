@@ -439,7 +439,8 @@ type RefusalCode = "stale_revision" | "unauthorized" | "lifecycle" | "unknown_su
 - **D8** (ruled 2026-09-06: F-12 → (a)) Conflict-aware summons. `ObservePR` carries GitHub's `mergeable`
   (`true | false | null`). While it is `false`, request transport is withheld (the request stays pending,
   attempts paused, the board and check say `conflicting against <base tip>`), and the author seat gets
-  **one** delivery per subject saying so; `null` (not yet computed) never withholds. When `mergeable`
+  **one** notice per subject saying so — a `notice:` effect, dispatched while the summons stay withheld,
+  emitted whether or not a request is pending; `null` (not yet computed) never withholds. When `mergeable`
   flips to `true` transport resumes. No round is charged for a head nobody reviewed. This is KRA-1362's
   fork 1(a) plus fork 2(b) — the cheap detection the ticket verified, sited where the summons are.
 
@@ -569,8 +570,12 @@ reads the policy by the Review's version; the batch records it (§B3).
 ### 8.1 Effects and publication
 
 - Every effect row has its own `effect_id`, a `target` (`check:<repo>:<head>`, `board:<review>`,
-  `thread:<comment_id>`, `delivery:<actor>:<request>`, `summon:<request>`, `announce:<review>`) and a kind:
-  **refresh** (check, board, thread) or **actionable** (delivery, summon, announce).
+  `thread:<comment_id>`, `delivery:<actor>:<request>`, `summon:<request>`, `announce:<review>`,
+  `notice:<actor>:<subject_key>`) and a kind: **refresh** (check, board, thread) or **actionable**
+  (delivery, summon, announce, notice).
+- A `notice` is a standing message to an actor about a subject, named by the subject rather than by a
+  request. It is **not request transport**: the §D8 pause never withholds it (it is what explains the
+  pause), and it goes obsolete only when the Review has left the subject it names.
 - A refresh job means "re-render this target from `read()` now"; per-target publication is serialized and
   pending refreshes for the same target coalesce into the newest. A delayed worker can never publish an
   older verdict because it never carries one.

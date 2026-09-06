@@ -350,6 +350,49 @@ test("mergeable false keeps summons and deliveries pending, not obsolete", async
   assert.equal(slack.wakes.length, 1);
 });
 
+// §6.D8: the conflict notice explains the pause, so the pause must not hold it back.
+test("the conflict notice is dispatched while the summons and deliveries it explains stay withheld", async () => {
+  const { store, slack, github, publisher } = fixture({ github: true });
+  const conflicting = state({ requests: [request({ id: "req_1" }), request({ id: "req_2", assignee: "talos" })] });
+  conflicting.observed = { ...conflicting.observed, mergeable: false };
+  store.put(conflicting);
+  store.add({ effect_id: "eff_1", kind: "actionable", target: "summon:req_1", payload: { request_id: "req_1", subject_key: `${SHA_A}:main`, text: "@codex review" } });
+  store.add({ effect_id: "eff_2", kind: "actionable", target: "delivery:talos:req_2", payload: { actor: "talos", request_id: "req_2", text: "please burn", dedupe_key: "eff_2" } });
+  store.add({
+    effect_id: "eff_3",
+    kind: "actionable",
+    target: `notice:talos:${SHA_A}:main`,
+    payload: { actor: "talos", text: "conflicting against main tip abc", dedupe_key: `conflicting:${conflicting.id}:${SHA_A}:main` },
+  });
+
+  assert.equal(await publisher.drainOnce(), 1, "only the notice leaves");
+  assert.equal(store.row("eff_3").status, "sent");
+  assert.equal(store.row("eff_1").status, "pending");
+  assert.equal(store.row("eff_2").status, "pending");
+  assert.equal(store.row("eff_2").attempts, 0);
+  assert.deepEqual(github!.comments, []);
+  assert.deepEqual(slack.wakes, [{
+    actor: "talos",
+    channelId: "C0123ABCD",
+    threadTs: null,
+    text: "conflicting against main tip abc",
+    dedupeKey: `conflicting:${conflicting.id}:${SHA_A}:main`,
+  }]);
+  // It is not request transport: nothing is recorded on a request.
+  assert.deepEqual(store.transport, []);
+
+  // A notice for a subject the Review has left is moot, not withheld.
+  const moved = state({ requests: conflicting.requests });
+  moved.subject = { ...moved.subject, key: `${SHA_B}:main`, head_sha: SHA_B };
+  moved.observed = { ...moved.observed, mergeable: false };
+  store.put(moved);
+  store.row("eff_3").status = "pending";
+  // The stale request rows go obsolete with the subject (§D7); the stale notice goes with them.
+  assert.equal(await publisher.drainOnce(), 3);
+  assert.equal(store.row("eff_3").status, "obsolete");
+  assert.equal(slack.wakes.length, 1);
+});
+
 // §8.1 / R-3: a delivery is a system-origin Hive wake, self-identifying by its dedupe key;
 // a redelivery of the same effect is a replay at the port, never a second wake.
 test("a delivery mints a system wake with the payload's dedupe key, and re-dispatch is a replay", async () => {

@@ -912,16 +912,19 @@ function observe(tx: Transaction, action: ObservePRAction): Refusal | null {
     tx.effect("actionable", `announce:${tx.review.id}`, { review_id: tx.review.id, text: `${tx.review.display} merged` });
   }
 
-  // §D8: a flip into `false` tells the author once per subject; a flip out of it resumes the withheld rows at dispatch.
+  // §D8: `mergeable === false` at a subject tells the author once — on the flip into it, and
+  // again at a new subject that is born conflicting, since that is a different subject's
+  // notice. Whether a request is pending is not the notice's business: the conflict is a fact
+  // about the branch, and the author is told so the transport can resume. A flip out of `false`
+  // resumes the withheld transport rows at dispatch; the notice itself is never withheld
+  // (§8.1 `notice:` — it is not request transport), and `dedupe_key` is the one-per-subject bound.
   const wasConflicting = before !== null && before.observed.mergeable === false;
   const isConflicting = action.observed.mergeable === false;
-  if (!wasConflicting && isConflicting) {
+  if (isConflicting && (subjectChanged || !wasConflicting)) {
     const author = tx.review.subject.author;
-    const withheld = pendingReviewRequestsAt(tx.review, tx.review.subject.key)[0];
-    if (author.kind === "seat" && withheld !== undefined) {
-      tx.effect("actionable", `delivery:${author.actor}:${withheld.id}`, {
+    if (author.kind === "seat") {
+      tx.effect("actionable", `notice:${author.actor}:${tx.review.subject.key}`, {
         actor: author.actor,
-        request_id: withheld.id,
         text: `${tx.review.display} is conflicting against ${tx.review.subject.base_ref} tip ${action.observed.base_sha_now}; review transport is withheld until it is mergeable`,
         dedupe_key: `conflicting:${tx.review.id}:${tx.review.subject.key}`,
       });

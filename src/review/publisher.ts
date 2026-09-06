@@ -22,6 +22,7 @@ import {
   announcePayload,
   applicability,
   deliveryPayload,
+  noticePayload,
   parseTarget,
   summonPayload,
   type EffectTarget,
@@ -282,6 +283,7 @@ export class ReviewPublisher {
       case "delivery":
       case "summon":
       case "announce":
+      case "notice":
         throw new DispatchError(`${target.kind} is not a refresh target`);
     }
   }
@@ -326,6 +328,24 @@ export class ReviewPublisher {
           body: payload.text,
         });
         this.store.projections.recordTransport(state.id, row.effect_id, target.requestId, { summon_comment_id: this.positiveId(commentId, "summon comment") });
+        return "sent";
+      }
+      case "notice": {
+        // §D8: the author's conflict notice. It is not request transport — no request is named,
+        // nothing is recorded on one — so it leaves while the summons it explains are withheld.
+        const payload = noticePayload(row.payload);
+        if (payload === null) throw new DispatchError(`notice effect ${row.effect_id} carries no notice payload`);
+        const slack = this.slackPolicy(state);
+        if (slack === null) {
+          throw new DispatchError(`policy v${state.policy_version} for repository ${state.key.repository_id} names no Slack channel`);
+        }
+        this.ports.slack.mintSystemWake({
+          actor: payload.actor,
+          channelId: slack.channel_id,
+          threadTs: this.slackThread(state),
+          text: payload.text,
+          dedupeKey: payload.dedupe_key,
+        });
         return "sent";
       }
       case "announce": {

@@ -845,11 +845,15 @@ test("§D8 mergeable=false withholds transport at dispatch and tells the author 
   // §D5: the one summon is queued at open; §D8: the publisher withholds it while conflicting.
   assert.ok(targets(batch).includes("summon:req_obs:c_1"));
   assert.equal(applicability(parseTarget("summon:req_obs:c_1"), conflicting), "withheld");
-  const notice = batch.effects.find((e) => e.target === "delivery:talos:req_obs:c_1");
+  const notice = batch.effects.find((e) => e.target === `notice:talos:${H1}:main`);
   assert.ok(notice, "the author seat is told");
-  const payload = notice.payload as { dedupe_key: string; text: string };
+  const payload = notice.payload as { actor: string; dedupe_key: string; text: string };
+  assert.equal(payload.actor, "talos");
   assert.equal(payload.dedupe_key, `conflicting:${conflicting.id}:${H1}:main`);
   assert.match(payload.text, /conflicting against main/);
+  // The notice is not request transport: it names no request and the §D8 pause never holds it.
+  assert.equal("request_id" in (notice.payload as Record<string, unknown>), false);
+  assert.equal(applicability(parseTarget(notice.target), conflicting), "applicable");
   // Still conflicting: nothing new.
   const still = apply(conflicting, observe({ mergeable: false, seenAt: T1 }), ADAPTER);
   assert.ok(!still.batch.effects.some((e) => e.kind === "actionable"));
@@ -862,10 +866,33 @@ test("§D8 mergeable=false withholds transport at dispatch and tells the author 
   const unknown = apply(null, observe({ mergeable: null }), ADAPTER, { actId: "obs:n" });
   assert.ok(targets(unknown.batch).includes("summon:req_obs:n_1"));
   assert.equal(applicability(parseTarget("summon:req_obs:n_1"), unknown.state), "applicable");
-  // A human author gets no seat delivery; the summon is queued and withheld all the same.
+  // A human author gets no notice; the summon is queued and withheld all the same.
   const human = apply(null, observe({ mergeable: false, author: { kind: "human", login: "hakon" } }), ADAPTER);
-  assert.ok(!human.batch.effects.some((e) => e.target.startsWith("delivery:")));
+  assert.ok(!human.batch.effects.some((e) => e.target.startsWith("notice:")));
   assert.equal(human.batch.effects.filter((e) => e.kind === "actionable").length, 1);
+});
+
+test("§D8 the conflict notice is one per subject, emitted whether or not a request is pending, and reissued at a new subject", () => {
+  // A draft opens no request (§C4); the conflict is still a fact about the branch, and the
+  // author is still told — the notice is not the request's transport.
+  const first = apply(null, observe({ draft: true, mergeable: false }), ADAPTER, { actId: "obs:d" });
+  assert.equal(pending(first.state).length, 0, "no request is pending");
+  const noticeTargets = (b: Batch) => targets(b).filter((t) => t.startsWith("notice:"));
+  assert.deepEqual(noticeTargets(first.batch), [`notice:talos:${H1}:main`]);
+
+  // Repeated `false` at the same subject says nothing more.
+  const again = apply(first.state, observe({ draft: true, mergeable: false, seenAt: T1 }), ADAPTER);
+  assert.deepEqual(noticeTargets(again.batch), []);
+
+  // A new subject born conflicting is a different subject, and gets its own notice — the
+  // dedupe key moves with it, so the author is told once about each head.
+  const moved = apply(again.state, observe({ draft: true, mergeable: false, head: H2, seenAt: T2 }), ADAPTER, { actId: "obs:d2" });
+  assert.deepEqual(noticeTargets(moved.batch), [`notice:talos:${H2}:main`]);
+  const movedPayload = moved.batch.effects.find((e) => e.target === `notice:talos:${H2}:main`)?.payload as { dedupe_key: string };
+  assert.equal(movedPayload.dedupe_key, `conflicting:${moved.state.id}:${H2}:main`);
+  // The first subject's notice is moot once the Review has left it; the current one stands.
+  assert.equal(applicability(parseTarget(`notice:talos:${H1}:main`), moved.state), "obsolete");
+  assert.equal(applicability(parseTarget(`notice:talos:${H2}:main`), moved.state), "applicable");
 });
 
 // ---------------------------------------------------------------------------------------------
