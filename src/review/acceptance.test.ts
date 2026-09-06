@@ -1,12 +1,19 @@
 /**
- * §11 acceptance, run through the composed core (module map §8): the real `BrokerStore`
- * database, the real `ReviewStore` with the real `decide`/`fold`/`read`, the real
- * `ReviewPublisher` over fake GitHub and Slack ports, and `reconcile` over a fake
- * `GitHubPort`. Each builder proved its module in isolation; this file proves the seams
- * carry every sequence end to end: act → transition → durable state → read → projection.
+ * §11 acceptance — Hákon's ten sequences, run through the composed core (module map §8):
+ * the real `BrokerStore` database, the real `ReviewStore` with the real `decide`/`fold`/`read`,
+ * the real `ReviewPublisher` over fake GitHub and Slack ports, the real `handleWebhook`,
+ * `ReconcileScheduler` and `reconcile` over a fake `GitHubPort`, and the real Codex
+ * `classify` over captured producer fixtures (V-6). Each builder proved its module in
+ * isolation; this file proves the seams carry every sequence end to end: act → transition →
+ * durable state → read → projection. One test per §11 row, named `§11.<n> <sequence>`,
+ * asserting exactly that row's "Required result" column.
  */
 import assert from "node:assert/strict";
+import { createHmac } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import { BrokerStore } from "../broker/store.js";
 import type { Clock } from "../time.js";
 import type {
@@ -19,15 +26,15 @@ import type {
   Principal,
   Receipt,
   RefusedOutcome,
-  ReplayedOutcome,
   Review,
   ReviewKey,
   ReviewReport,
   ReviewState,
 } from "./contract.js";
 import { validateReview, validateReviewState } from "./contract.js";
-import type { GitHubChangedFile, GitHubPort, GitHubPullRequest, GitHubRecord } from "./github/port.js";
-import { reconcile } from "./github/reconcile.js";
+import { issueCommentRecord, type GitHubChangedFile, type GitHubPort, type GitHubPullRequest, type GitHubRecord } from "./github/port.js";
+import { ReconcileScheduler, reconcile } from "./github/reconcile.js";
+import { handleWebhook } from "./github/webhook.js";
 import { ReviewPublisher, type ReviewGitHubPort, type SystemWakePort } from "./publisher.js";
 import { decide, fold, read } from "./reducer.js";
 import { ReviewStore } from "./store.js";
@@ -39,14 +46,21 @@ import { ReviewStore } from "./store.js";
 const H1 = "a".repeat(40);
 const H2 = "b".repeat(40);
 const H3 = "c".repeat(40);
+/** The head the captured clean comment `hive-issue_comment-5560110170` binds by its footer. */
+const HIVE_66_HEAD = "4df54b1c368a31d3f617c2f4c0672479724ccdad";
 const BASE = "1".repeat(40);
 const MERGE_BASE = "2".repeat(40);
 const DIFF = "d".repeat(64);
 const FP = (n: number): string => `ifp-sha256:${n.toString(16).padStart(64, "0")}`;
 const T0 = "2026-09-06T12:00:00.000Z";
+const MINUTE = 60_000;
 
 const KEY: ReviewKey = { repository_id: 1, pr_number: 7 };
 const DISPLAY = "Owner/repo#7";
+const CODEX_LOGIN = "chatgpt-codex-connector[bot]";
+/** An obviously fake webhook secret (never a real one in a test). */
+const WEBHOOK_SECRET = "hive-acceptance-test-webhook-secret-not-real";
+const FIXTURES = resolve(dirname(fileURLToPath(import.meta.url)), "../../test/fixtures/codex");
 
 const POLICY: Policy = {
   version: 1,
@@ -68,7 +82,7 @@ const POLICY: Policy = {
 const SEAT_POLICY: Policy = { ...POLICY, routing_by_round: { first: "ariadne", later: "theoros" } };
 const TIGHT_POLICY: Policy = { ...SEAT_POLICY, rounds_max: 1 };
 
-const ADAPTER: Principal = { kind: "adapter", source: "github", reconcile_run: "run1", event_login: "chatgpt-codex-connector[bot]" };
+const ADAPTER: Principal = { kind: "adapter", source: "github", reconcile_run: "run1", event_login: CODEX_LOGIN };
 const OPERATOR: Principal = { kind: "operator", id: "hakon" };
 const seat = (actor: string): Principal => ({ kind: "seat", actor, custody: { delivery_id: 1 } });
 
@@ -76,6 +90,10 @@ class FakeClock implements Clock {
   constructor(private current: Date) {}
   now(): Date { return new Date(this.current); }
   advance(ms: number): void { this.current = new Date(this.current.getTime() + ms); }
+}
+
+function codexFixture(name: string): GitHubRecord {
+  return issueCommentRecord(JSON.parse(readFileSync(join(FIXTURES, `${name}.json`), "utf8")) as Record<string, unknown>);
 }
 
 interface ObserveOverrides {
@@ -210,16 +228,24 @@ class FakeSlack implements SystemWakePort {
   }
 }
 
+/** The projection sink. `boardGate`, when set, holds the worker inside the board render (§11.5's delayed worker). */
 class FakeGitHub implements ReviewGitHubPort {
   checks: Array<{ headSha: string; conclusion: "success" | "failure"; title: string }> = [];
   boards: string[] = [];
   threads: Array<{ commentId: number; op: "resolve" | "unresolve" }> = [];
   comments: string[] = [];
+  boardGate: { reached: () => void; proceed: Promise<void> } | null = null;
   async createOrUpdateCheckRun(input: { headSha: string; conclusion: "success" | "failure"; title: string }): Promise<{ checkRunId: number }> {
     this.checks.push({ headSha: input.headSha, conclusion: input.conclusion, title: input.title });
     return { checkRunId: this.checks.length };
   }
   async createOrUpdateBoardComment(input: { body: string }): Promise<{ commentId: number }> {
+    const gate = this.boardGate;
+    if (gate !== null) {
+      this.boardGate = null;
+      gate.reached();
+      await gate.proceed;
+    }
     this.boards.push(input.body);
     return { commentId: 500 };
   }
@@ -231,23 +257,38 @@ class FakeGitHub implements ReviewGitHubPort {
   }
 }
 
-/** The adapter's port for §11 #4: a live PR whose head the test moves. */
+/** The adapter's port: a live PR whose head the test moves, and the Codex records GitHub returns. */
 class FakeGitHubPort implements GitHubPort {
   pr: GitHubPullRequest;
   pulls = 0;
+  issueComments: GitHubRecord[] = [];
   constructor(headSha: string) {
     this.pr = {
       repositoryId: KEY.repository_id, prNumber: KEY.pr_number, owner: "Owner", repo: "repo", title: "Fix x", authorLogin: "talos-weave",
       draft: false, state: "open", merged: false, mergeable: true, headSha, headRef: "feature", baseRef: "main", baseSha: BASE, mergeBaseSha: MERGE_BASE, etag: null,
     };
   }
-  async getPullRequest(): Promise<GitHubPullRequest | "not_modified"> { this.pulls += 1; return this.pr; }
+  async getPullRequest(): Promise<GitHubPullRequest | "not_modified"> { this.pulls += 1; return { ...this.pr }; }
   async listReviews(): Promise<GitHubRecord[]> { return []; }
   async listReviewComments(): Promise<GitHubRecord[]> { return []; }
-  async listIssueComments(): Promise<GitHubRecord[]> { return []; }
+  async listIssueComments(): Promise<GitHubRecord[]> { return [...this.issueComments]; }
   async listFiles(): Promise<GitHubChangedFile[]> { return [{ path: "src/x.py", sha: "1".repeat(40), status: "modified" }]; }
   async listFailedDeliveries(): Promise<Array<{ id: number; guid: string }>> { return []; }
   async redeliver(): Promise<void> {}
+}
+
+/** §7 ingress: a signed `pull_request` delivery naming `head`, exactly as GitHub would send it. */
+function webhookDelivery(deliveryId: string, head: string): { headers: Record<string, string>; rawBody: Buffer } {
+  const rawBody = Buffer.from(JSON.stringify({
+    action: "synchronize",
+    repository: { id: KEY.repository_id, full_name: "Owner/repo" },
+    pull_request: { number: KEY.pr_number, head: { sha: head } },
+  }));
+  const signature = `sha256=${createHmac("sha256", WEBHOOK_SECRET).update(rawBody).digest("hex")}`;
+  return {
+    headers: { "x-hub-signature-256": signature, "x-github-delivery": deliveryId, "x-github-event": "pull_request" },
+    rawBody,
+  };
 }
 
 // ---------------------------------------------------------------------------------------
@@ -278,14 +319,18 @@ class Core {
     const expectedRevision = o.expect !== undefined ? o.expect : fenced ? current : null;
     const actId = o.actId ?? (principal.kind === "adapter" ? `obs:run${this.acts}` : `01J${String(this.acts).padStart(3, "0")}`);
     const receipt = this.store.apply(KEY, { actId, principal, expectedRevision, action, display: DISPLAY });
-    const review = this.store.get(KEY);
-    if (review !== null) {
-      const shape = validateReview(review);
-      assert.ok(shape.ok, `state_json violates the contract: ${shape.ok ? "" : shape.detail}`);
-      const derived = validateReviewState(this.state());
-      assert.ok(derived.ok, `ReviewState violates the contract: ${derived.ok ? "" : derived.detail}`);
-    }
+    this.assertContract();
     return receipt;
+  }
+
+  /** Every persisted Review and every derived ReviewState is contract-valid, whichever path wrote it. */
+  assertContract(): void {
+    const review = this.store.get(KEY);
+    if (review === null) return;
+    const shape = validateReview(review);
+    assert.ok(shape.ok, `state_json violates the contract: ${shape.ok ? "" : shape.detail}`);
+    const derived = validateReviewState(this.state());
+    assert.ok(derived.ok, `ReviewState violates the contract: ${derived.ok ? "" : derived.detail}`);
   }
 
   applied(action: Action, principal: Principal, o: { actId?: string; expect?: number | null } = {}): AppliedOutcome {
@@ -324,6 +369,23 @@ class Core {
     return (this.broker.db.prepare("SELECT count(*) AS n FROM review_attempts").get() as { n: number }).n;
   }
 
+  /** The `state_json` column verbatim — the bytes §11.7 compares. */
+  stateJson(): string {
+    const row = this.broker.db.prepare("SELECT state_json FROM reviews WHERE repository_id = ? AND pr_number = ?").get(KEY.repository_id, KEY.pr_number) as { state_json: string } | undefined;
+    assert.ok(row !== undefined);
+    return row.state_json;
+  }
+
+  inboxRows(): Array<{ delivery_id: string; reconciled_run: string | null }> {
+    return this.broker.db.prepare("SELECT delivery_id, reconciled_run FROM github_inbox ORDER BY rowid").all() as Array<{ delivery_id: string; reconciled_run: string | null }>;
+  }
+
+  sourceRecord(recordKey: string): { classification: string | null; admitted_act_id: string | null } {
+    const row = this.broker.db.prepare("SELECT classification, admitted_act_id FROM source_records WHERE record_key = ?").get(recordKey) as { classification: string | null; admitted_act_id: string | null } | undefined;
+    assert.ok(row !== undefined, `no source record ${recordKey}`);
+    return row;
+  }
+
   close(): void { this.broker.close(); }
 }
 
@@ -353,140 +415,220 @@ test("M0 slice: an adapter observation and a Codex clean answer reach the Slack 
   core.close();
 });
 
-test("§B1/§B2 through the store with the real reducer: a stale seat act is refused with the current state; a repeated act id replays", () => {
-  const core = new Core(SEAT_POLICY);
-  core.applied(observe(), ADAPTER);
-  const req = core.pending("ariadne")[0];
-  assert.ok(req);
-  const stale = core.refused(answer(req.id, `${H1}:main`, report("ariadne")), seat("ariadne"), { expect: 0 });
-  assert.equal(stale.code, "stale_revision");
-  assert.equal(stale.current_revision, 1);
-  assert.equal(stale.state?.revision, 1);
-  assert.equal(core.attempts(), 1, "the refusal is an attempt (§B4)");
-
-  const first = core.act(answer(req.id, `${H1}:main`, report("ariadne")), seat("ariadne"), { actId: "01JSAME" });
-  assert.ok("applied" in first.outcome);
-  const effectsBefore = core.effectRows().length;
-  const again = core.act(answer(req.id, `${H1}:main`, report("ariadne")), seat("ariadne"), { actId: "01JSAME", expect: 99 });
-  assert.ok("replayed" in again.outcome);
-  assert.equal((again.outcome as ReplayedOutcome).batch_id, first.outcome.batch_id);
-  assert.equal(core.effectRows().length, effectsBefore, "replay writes no effect");
-  assert.equal(core.review().revision, 2);
-  core.close();
-});
-
 // ---------------------------------------------------------------------------------------
 // §11
 // ---------------------------------------------------------------------------------------
 
-test("§11 #1 CLEAN answer → required re-review opened → malformed Answer → corrected Answer", () => {
+test("§11.1 CLEAN answer → required re-review opened → malformed Answer → corrected Answer", () => {
   const core = new Core();
   core.applied(observe(), ADAPTER);
   core.applied(external(), ADAPTER);
-  assert.equal(core.state().readiness.ready, true);
+  assert.equal(core.state().readiness.ready, true, "the Codex CLEAN satisfies the requirement at H1 (§H)");
   const key = `${H1}:main`;
-  core.applied({ kind: "OpenRequest", request_kind: "review", mode: "appeal", assignee: "ariadne", subject_key: key, required: true, names: [], reason: "second look" }, OPERATOR);
+
+  // §D2: every request after the first charge goes to the substitute; the operator opens it as required.
+  core.applied({ kind: "OpenRequest", request_kind: "review", mode: "initial", assignee: "ariadne", subject_key: key, required: true, names: [], reason: "required re-review by the substitute" }, OPERATOR);
   const req = core.pending("ariadne")[0];
   assert.ok(req);
-  assert.deepEqual(core.state().readiness, { ready: false, subject_key: key, reasons: [{ required_request_pending: [req.id] }] });
+  assert.equal(req.required, true);
+  const pendingReason = { ready: false, subject_key: key, reasons: [{ required_request_pending: [req.id] }] };
+  assert.deepEqual(core.state().readiness, pendingReason, "ready = false with required_request_pending (§H)");
+  assert.equal(core.state().requirement.status, "satisfied", "the old CLEAN still satisfies the requirement; the pending required request is what blocks");
 
-  const malformed = core.refused(answer(req.id, key, report("ariadne", { mode: "appeal", appeal_fingerprint: FP(1), generation: 0 })), seat("ariadne"));
+  // §E2: a malformed Answer is refused, the request stays pending, the attempt is logged.
+  const malformed = core.refused(answer(req.id, key, report("ariadne", { generation: 1 })), seat("ariadne"));
   assert.equal(malformed.code, "malformed");
-  assert.deepEqual(malformed.state?.readiness, { ready: false, subject_key: key, reasons: [{ required_request_pending: [req.id] }] }, "still pending (§E2)");
-  assert.equal(core.attempts(), 1);
+  assert.deepEqual(malformed.state?.readiness, pendingReason, "still pending after the malformed Answer");
+  assert.equal(core.review().requests.find((r) => r.id === req.id)?.status, "pending");
+  assert.equal(core.review().answers.length, 1, "no answer was admitted");
+  assert.equal(core.attempts(), 1, "the refusal is a visible attempt (§B4)");
+  assert.deepEqual(core.state().readiness, pendingReason, "ready = false until the corrected answer is admitted");
 
-  core.applied(answer(req.id, key, report("ariadne", { mode: "appeal", appeal_fingerprint: FP(1) })), seat("ariadne"));
-  assert.equal(core.state().readiness.ready, true);
+  // The corrected Answer is admitted; then ready = true.
+  core.applied(answer(req.id, key, report("ariadne")), seat("ariadne"));
+  assert.equal(core.review().requests.find((r) => r.id === req.id)?.status, "answered");
+  assert.deepEqual(core.state().readiness, { ready: true, subject_key: key });
   core.close();
 });
 
-test("§11 #2 finding F at H1 → unrelated push H2 → complete answer at H2 that does not mention F", () => {
+test("§11.2 Finding F raised at H1 → unrelated push H2 → complete answer at H2 that does not mention F", () => {
   const core = new Core();
   core.applied(observe(), ADAPTER);
   core.applied(external({ comments: [{ id: 1, title: "F" }] }), ADAPTER);
   const F = core.review().findings[0];
   assert.ok(F);
+  assert.equal(F.subject_key, `${H1}:main`, "F was raised at H1");
+  assert.deepEqual(core.state().readiness.ready, false);
+
   core.applied(observe({ head: H2 }), ADAPTER);
   const req = core.pending("ariadne")[0];
   assert.ok(req, "the later round goes to the substitute (§D2)");
+  assert.equal(req.subject_key, `${H2}:main`);
   core.applied(answer(req.id, `${H2}:main`, report("ariadne", { head: H2 })), seat("ariadne"));
-  assert.equal(core.review().findings[0]?.status.open, true);
+
+  const answered = core.review().answers.at(-1);
+  assert.ok(answered && "findings" in answered.normalized);
+  assert.deepEqual(answered.normalized.findings, [], "the H2 answer does not mention F");
+  assert.equal(core.state().requirement.status, "satisfied", "the H2 answer satisfies the requirement at H2");
+  const f = core.review().findings.find((x) => x.id === F.id);
+  assert.ok(f);
+  assert.deepEqual(f.status, { open: true }, "F is still open (§E5: a later clean withdraws nothing)");
+  assert.deepEqual(core.state().blocking_findings.map((x) => x.id), [F.id], "F is still blocking (§F4: no transfer by omission)");
   assert.deepEqual(core.state().readiness, { ready: false, subject_key: `${H2}:main`, reasons: [{ blocking_findings: [F.id] }] });
-  assert.equal(core.state().requirement.status, "satisfied");
   core.close();
 });
 
-test("§11 #3 draft → ready at unchanged head; open → closed → reopened", () => {
+test("§11.3 Draft → ready-for-review at unchanged head; open → closed → reopened", async () => {
   const core = new Core();
+  const github = core.github;
+  assert.ok(github !== null);
   core.applied(observe({ draft: true }), ADAPTER);
-  assert.equal(core.pending().length, 0);
+  assert.equal(core.pending().length, 0, "no auto-request while draft (§C4)");
+  assert.deepEqual(core.state().readiness, { ready: false, subject_key: `${H1}:main`, reasons: [{ requirement_unsatisfied: [`${H1}:main`] }, "draft"] });
+
   core.applied(observe({ draft: false }), ADAPTER);
-  assert.equal(core.pending().length, 1, "the draft flip opens the initial request (§C4)");
+  const initial = core.pending();
+  assert.equal(initial.length, 1, "the draft flip opens the initial request (§C4)");
+  assert.equal(initial[0]?.mode, "initial");
+  assert.equal(initial[0]?.subject_key, `${H1}:main`, "at the unchanged head");
+  assert.equal(core.review().subjects.length, 1, "the draft flip is not a subject change");
+  assert.deepEqual(core.effectRows().filter((r) => r.target === `summon:${initial[0]?.id}`).map((r) => r.status), ["pending"], "one summons queued at open (§D5)");
+
   core.applied(external({ comments: [{ id: 1 }] }), ADAPTER);
+  assert.equal(core.pending().length, 0, "Codex answered the initial request");
+  // A required re-review to a seat is pending across the close; its one delivery effect is queued at open (§D5).
+  core.applied({ kind: "OpenRequest", request_kind: "review", mode: "initial", assignee: "ariadne", subject_key: `${H1}:main`, required: true, names: [], reason: "re-review" }, OPERATOR);
   const before = core.review();
+  assert.equal(before.findings.length, 1);
+  const reReview = core.pending("ariadne")[0];
+  assert.ok(reReview);
+  const delivery = `delivery:ariadne:${reReview.id}`;
+
   core.applied(observe({ lifecycle: "closed" }), ADAPTER);
   const closed = core.state().readiness;
-  assert.ok(!closed.ready);
-  assert.equal(closed.reasons[0], "closed");
+  assert.equal(closed.ready, false, "readiness false while closed (§C3)");
+  assert.ok(!closed.ready && closed.reasons[0] === "closed");
+  assert.deepEqual(core.review().requests, before.requests, "requests intact while closed: the re-review stays pending");
+  assert.deepEqual(core.review().findings, before.findings, "findings intact while closed");
+  // §C3 transport paused: the publisher withholds the pending delivery while closed — not sent, not obsolete.
+  await core.publisher.drainOnce();
+  assert.equal(core.slack.wakes.length, 0, "no delivery while closed");
+  assert.deepEqual(core.effectRows().filter((r) => r.target === delivery).map((r) => r.status), ["pending"]);
+  assert.deepEqual(core.effectRows().filter((r) => r.target.startsWith("summon:")).map((r) => r.status), ["obsolete"], "the answered Codex request's summons is obsolete (§D7)");
+
   core.applied(observe({ lifecycle: "open" }), ADAPTER);
   const reopened = core.review();
-  assert.deepEqual(reopened.requests, before.requests);
-  assert.deepEqual(reopened.findings, before.findings);
+  assert.equal(reopened.lifecycle, "open");
+  assert.deepEqual(reopened.requests, before.requests, "requests intact across close/reopen");
+  assert.deepEqual(reopened.findings, before.findings, "findings intact across close/reopen");
   assert.deepEqual(reopened.answers, before.answers);
-  assert.equal(reopened.subjects.length, 1);
+  assert.equal(reopened.subjects.length, 1, "history intact: still one subject");
+  const after = core.state().readiness;
+  assert.ok(!after.ready && !after.reasons.includes("closed"), "closed no longer blocks; the pending re-review and the finding do");
+  // §C3 resumes: the withheld delivery goes out once; the reopen queued no second one.
+  assert.deepEqual(core.effectRows().filter((r) => r.target === delivery).map((r) => r.status), ["pending"], "still the one delivery row");
+  await core.publisher.drainOnce();
+  await core.publisher.drainOnce();
+  assert.deepEqual(core.slack.wakes.map((w) => w.actor), ["ariadne"], "delivered exactly once after the reopen");
+  assert.deepEqual(core.effectRows().filter((r) => r.target === delivery).map((r) => r.status), ["sent"]);
   core.close();
 });
 
-test("§11 #4 observe H2 → delayed webhook for H1 arrives: reconcile observes the live PR, subject stays H2, no duplicate request", async () => {
+test("§11.4 Observe H2 → delayed webhook for H1 arrives", async () => {
   const core = new Core();
-  const github = new FakeGitHubPort(H2);
-  const first = await reconcile({ store: core.store, github, clock: core.clock }, KEY, "run-1");
-  assert.equal(first.observed, true);
-  assert.equal(core.review().subject.head_sha, H2);
-  assert.equal(core.pending("codex").length, 1);
-  const requestsBefore = core.review().requests.map((r) => r.id);
+  const port = new FakeGitHubPort(H1);
+  const logs: string[] = [];
+  const scheduler = new ReconcileScheduler({ store: core.store, github: port, clock: core.clock, log: (line) => logs.push(line) });
+  const wake = async (deliveryId: string, head: string): Promise<void> => {
+    // §7 ingress: verify, persist to github_inbox, ack — and nothing else.
+    assert.deepEqual(handleWebhook(core.store, WEBHOOK_SECRET, webhookDelivery(deliveryId, head), core.clock), { status: 200, outcome: "accepted" });
+    assert.equal(core.store.inbox.unreconciled().at(-1)?.deliveryId, deliveryId, "persisted before the ack");
+    scheduler.drainInbox();
+    await scheduler.idle();
+    core.assertContract();
+  };
 
-  // A notification about H1 arrives late; it is a wake, not a command (§7).
-  assert.equal(core.store.inbox.put({ deliveryId: "late-h1", event: "pull_request", repositoryId: KEY.repository_id, prNumber: KEY.pr_number, payload: { pull_request: { head: { sha: H1 } } }, receivedAt: T0 }), true);
-  const second = await reconcile({ store: core.store, github, clock: core.clock }, KEY, "run-2");
-  core.store.inbox.markReconciled(["late-h1"], second.runId);
+  await wake("delivery-h1", H1);
+  assert.equal(core.review().subject.head_sha, H1);
+  const atH1 = core.pending("codex")[0];
+  assert.ok(atH1);
 
-  assert.equal(github.pulls, 2, "the live PR was fetched again");
-  assert.equal(core.review().subject.head_sha, H2, "no regression");
-  assert.equal(core.review().subjects.length, 1);
-  assert.deepEqual(core.review().requests.map((r) => r.id), requestsBefore, "no duplicate request (§D1)");
-  assert.equal(core.store.inbox.unreconciled().length, 0);
-  const batches = core.store.batches(KEY);
-  assert.deepEqual(batches.map((b) => b.command.act_id), ["obs:run-1", "obs:run-2"], "act ids are the runs, never the delivery id (§B2)");
+  port.pr.headSha = H2;
+  core.clock.advance(MINUTE);
+  await wake("delivery-h2", H2);
+  assert.equal(core.review().subject.head_sha, H2, "H2 observed");
+  assert.equal(core.review().requests.find((r) => r.id === atH1.id)?.status, "cancelled", "the H1 request was cancelled by the subject change (§C2)");
+  assert.equal(core.pending("codex").length, 1, "one initial request at H2");
+  const requestsAtH2 = structuredClone(core.review().requests);
+  const revisionAtH2 = core.review().revision;
+
+  // The delayed notification about H1 arrives after H2 was observed (F-14). It is a wake, not a command (§7).
+  core.clock.advance(MINUTE);
+  await wake("delivery-h1-delayed", H1);
+  assert.equal(port.pulls, 3, "reconcile fetched the live PR again rather than trusting the payload");
+  assert.equal(core.review().subject.head_sha, H2, "subject stays H2: no regression");
+  assert.equal(core.review().subjects.length, 2, "H1 was not re-entered as a new subject");
+  assert.deepEqual(core.review().requests, requestsAtH2, "no duplicate request (§D1), nothing re-cancelled, nothing re-opened");
+  assert.equal(core.review().revision, revisionAtH2 + 1, "the observation is recorded (metadata refresh, §C1) without regressing anything");
+  assert.deepEqual(logs, [], "no reconcile run failed or was refused");
+
+  // The three ids stay distinct (§7): every act is `obs:<run>`, never the delivery id; every delivery is stamped with its run.
+  const actIds = core.store.batches(KEY).map((b) => b.command.act_id);
+  assert.equal(actIds.length, 3);
+  assert.ok(actIds.every((id) => id.startsWith("obs:") && !id.includes("delivery-")), `act ids are runs: ${actIds.join(", ")}`);
+  const inbox = core.inboxRows();
+  assert.deepEqual(inbox.map((r) => r.delivery_id), ["delivery-h1", "delivery-h2", "delivery-h1-delayed"]);
+  assert.ok(inbox.every((r) => r.reconciled_run !== null && !r.reconciled_run.includes("delivery-")), "each delivery is stamped with the run that covered it");
+  assert.deepEqual(core.store.inbox.unreconciled(), []);
+
+  // GitHub redelivers the same notification (F-14 redelivery is an API act): recorded once, acknowledged, nothing re-run.
+  assert.deepEqual(handleWebhook(core.store, WEBHOOK_SECRET, webhookDelivery("delivery-h1-delayed", H1), core.clock), { status: 200, outcome: "duplicate" });
+  assert.equal(core.inboxRows().length, 3);
+  await scheduler.stop();
   core.close();
 });
 
-test("§11 #5 ready refresh queued → Hold → delayed worker: the check publishes failure(hold); the earlier job is coalesced", async () => {
+test("§11.5 Ready refresh queued → Hold → delayed worker runs the earlier job", async () => {
   const core = new Core();
+  const github = core.github;
+  assert.ok(github !== null);
   core.applied(observe(), ADAPTER);
   core.applied(external(), ADAPTER);
   assert.equal(core.state().readiness.ready, true, "a check refresh saying ready is queued");
-  core.applied({ kind: "Hold", hold: { kind: "operator", reason: "design ruling pending", release_on: "explicit", blocks: { readiness: true, summons: false } } }, OPERATOR);
-
   const target = `check:Owner/repo:${H1}`;
-  const queued = core.effectRows().filter((r) => r.target === target);
-  assert.equal(queued.length, 3, "three refreshes for one check target, all pending");
-  assert.ok(queued.every((r) => r.status === "pending"));
+  assert.deepEqual(core.effectRows().filter((r) => r.target === target).map((r) => r.status), ["pending", "pending"], "the ready refresh is queued, unsent");
 
+  // The worker picks up the queue now — the ready check job is in its listing — and is then delayed
+  // inside the board render (the target before the check) while the Hold lands.
+  let reached!: () => void;
+  let proceed!: () => void;
+  const reachedBoard = new Promise<void>((r) => { reached = r; });
+  github.boardGate = { reached, proceed: new Promise<void>((r) => { proceed = r; }) };
+  const delayedPass = core.publisher.drainOnce();
+  await reachedBoard;
+
+  core.applied({ kind: "Hold", hold: { kind: "operator", reason: "design ruling pending", release_on: "explicit", blocks: { readiness: true, summons: false } } }, OPERATOR);
+  assert.equal(core.state().readiness.ready, false);
+  assert.deepEqual(core.effectRows().filter((r) => r.target === target).map((r) => r.status), ["pending", "pending", "pending"], "the Hold queued a third check refresh");
+
+  proceed();
+  await delayedPass;
+  // The earlier job the worker carried coalesced into the newer refresh (§8.1); it never published "ready".
+  assert.deepEqual(github.checks, [], "the delayed worker published nothing for the earlier job");
+  assert.deepEqual(core.effectRows().filter((r) => r.target === target).map((r) => r.status), ["obsolete", "obsolete", "pending"], "the earlier job coalesced; the Hold's refresh is what remains");
+
+  // The next pass renders the remaining refresh from the current state: failure(hold), never the older verdict.
   await core.publisher.drainOnce();
-  const github = core.github;
-  assert.ok(github !== null);
-  assert.deepEqual(github.checks, [{ headSha: H1, conclusion: "failure", title: "hold: operator" }], "never the older verdict");
-  const after = core.effectRows().filter((r) => r.target === target);
-  assert.deepEqual(after.map((r) => r.status), ["obsolete", "obsolete", "sent"]);
-  assert.equal(github.boards.length, 1, "one board render for the coalesced board refreshes");
+  assert.deepEqual(github.checks, [{ headSha: H1, conclusion: "failure", title: "hold: operator" }], "the check publishes failure(hold)");
+  assert.deepEqual(core.effectRows().filter((r) => r.target === target).map((r) => r.status), ["obsolete", "obsolete", "sent"]);
+  assert.match(github.boards.at(-1) ?? "", /not ready — hold: operator/u, "the board is re-rendered from current state too");
   // The clean answer discharged the codex request before dispatch: the summons is obsolete, not sent (§D7).
   assert.deepEqual(github.comments, []);
   assert.deepEqual(core.effectRows().filter((r) => r.target.startsWith("summon:")).map((r) => r.status), ["obsolete"]);
   core.close();
 });
 
-test("§11 #6 exhaustion: one episode, one hold, one gate, one author delivery and one retrospective request, each with a distinct effect id", async () => {
+test("§11.6 Exhaustion predicate becomes true → another answer at the same subject", async () => {
   const core = new Core(TIGHT_POLICY);
   core.applied(observe(), ADAPTER);
   const req = core.pending("ariadne")[0];
@@ -494,46 +636,69 @@ test("§11 #6 exhaustion: one episode, one hold, one gate, one author delivery a
   const key = `${H1}:main`;
   const exhausted = core.applied(answer(req.id, key, report("ariadne", { findings: [rkFinding("F1")] })), seat("ariadne"));
   const review = core.review();
+  const F1 = review.findings[0];
+  assert.ok(F1);
+
+  // Exactly one episode, one hold, one retrospective request.
   assert.equal(review.episodes.length, 1);
+  assert.equal(review.episodes[0]?.closed, null);
   assert.equal(review.holds.length, 1);
   assert.equal(review.holds[0]?.kind, "exhaustion");
-  const retro = review.requests.find((r) => r.kind === "retrospective");
+  assert.equal(review.holds[0]?.id, review.episodes[0]?.hold_id);
+  const retrospectives = review.requests.filter((r) => r.kind === "retrospective");
+  assert.equal(retrospectives.length, 1);
+  const retro = retrospectives[0];
   assert.ok(retro);
-  assert.equal(new Set(exhausted.effects).size, exhausted.effects.length);
-  assert.deepEqual(core.state().readiness, { ready: false, subject_key: key, reasons: [{ hold: "exhaustion" }, "exhausted", { blocking_findings: [review.findings[0]?.id ?? ""] }] });
+  assert.equal(retro.assignee, "theoros", "to the policy's retrospective actor");
+  assert.equal(retro.required, false, "§G5: it never gates");
+  assert.deepEqual(core.state().readiness, { ready: false, subject_key: key, reasons: [{ hold: "exhaustion" }, "exhausted", { blocking_findings: [F1.id] }] });
 
-  // Another answer at the same subject while the episode is open emits nothing new.
-  core.applied({ kind: "OpenRequest", request_kind: "review", mode: "appeal", assignee: "ariadne", subject_key: key, required: false, names: [], reason: "r" }, OPERATOR);
+  // Each with a distinct effect id: one author delivery, one retrospective delivery, one gate projection.
+  assert.equal(new Set(exhausted.effects).size, exhausted.effects.length, "distinct effect ids");
+  const rows = core.effectRows().filter((r) => exhausted.effects.includes(r.effect_id));
+  const deliveries = rows.filter((r) => r.target.startsWith("delivery:"));
+  assert.deepEqual(deliveries.map((r) => r.target).sort(), [`delivery:talos:${retro.id}`, `delivery:theoros:${retro.id}`].sort(), "one author delivery, one retrospective request delivery");
+  assert.deepEqual(rows.filter((r) => r.kind === "refresh").map((r) => r.target), [`board:${review.id}`, `check:Owner/repo:${H1}`], "one gate projection (the board and check refresh from current state)");
+
+  // Another answer at the same subject while the episode is open: the predicate holds again and emits nothing new.
+  core.applied({ kind: "OpenRequest", request_kind: "review", mode: "appeal", assignee: "ariadne", subject_key: key, required: false, names: [], reason: "one more look" }, OPERATOR);
   const appeal = core.pending("ariadne")[0];
   assert.ok(appeal);
   const second = core.applied(answer(appeal.id, key, report("ariadne", { mode: "appeal", appeal_fingerprint: FP(2), findings: [rkFinding("F2", { fp: 2 })] })), seat("ariadne"));
-  assert.equal(core.review().episodes.length, 1);
-  assert.equal(core.review().holds.length, 1);
+  assert.equal(core.review().charges.length, 1, "same-subject re-answers charge nothing (§G1)");
+  assert.equal(core.review().episodes.length, 1, "exactly one episode");
+  assert.equal(core.review().holds.length, 1, "exactly one hold");
+  assert.equal(core.review().requests.filter((r) => r.kind === "retrospective").length, 1, "exactly one retrospective request");
   const secondRows = core.effectRows().filter((r) => second.effects.includes(r.effect_id));
   assert.ok(secondRows.every((r) => r.kind === "refresh"), "no second gate, delivery or retrospective");
 
-  // The publisher delivers the gate to the author and the retrospective to its actor, once each.
+  // The publisher delivers the gate to the author and the retrospective to its actor, once each, and renders the gate.
   await core.publisher.drainOnce();
-  const wakes = core.slack.wakes.map((w) => [w.actor, w.dedupeKey]);
+  const wakes = core.slack.wakes.map((w) => [w.actor, w.dedupeKey] as const);
   assert.equal(wakes.length, 2);
   assert.ok(wakes.some(([actor]) => actor === "talos"), "the author seat gets the gate");
   assert.ok(wakes.some(([actor]) => actor === "theoros"), "the retrospective actor gets its request");
-  assert.equal(new Set(wakes.map(([, key]) => key)).size, 2, "distinct dedupe keys");
+  assert.equal(new Set(wakes.map(([, dedupe]) => dedupe)).size, 2, "distinct dedupe keys");
+  const github = core.github;
+  assert.ok(github !== null);
+  assert.equal((github.boards.at(-1) ?? "").split("### 🛑 Review rounds exhausted").length, 2, "the board renders the exhaustion gate once");
+  assert.deepEqual(github.checks.map((c) => c.title), ["hold: exhaustion"]);
 
+  // §G4: GrantRounds closes the episode and releases the hold.
   core.applied({ kind: "GrantRounds", n: 2, reason: "one more go" }, OPERATOR);
   assert.equal(core.review().episodes[0]?.closed?.by.kind, "operator");
-  assert.equal(core.review().holds[0]?.released !== null, true);
+  assert.notEqual(core.review().holds[0]?.released, null);
   core.close();
 });
 
-test("§11 #7 replay all batches under a different clock and the current policy: identical state_json, zero effects emitted", () => {
+test("§11.7 Replay all batches under a different clock and the current policy", () => {
   const core = new Core(SEAT_POLICY);
   core.applied(observe(), ADAPTER);
   const req = core.pending("ariadne")[0];
   assert.ok(req);
   core.applied(answer(req.id, `${H1}:main`, report("ariadne", { findings: [rkFinding("F1")] })), seat("ariadne"));
   const F = core.review().findings[0]?.id ?? "";
-  core.clock.advance(3_600_000);
+  core.clock.advance(60 * MINUTE);
   core.applied({ kind: "ResolveFinding", finding_id: F, resolution: { kind: "fixed", evidence: "e", commits: [H2] } }, seat("talos"));
   core.applied(observe({ head: H2, mergeable: false }), ADAPTER);
   core.applied({ kind: "SetReviewerAvailability", reviewer: "theoros", available: false, reason: "connector", until: "2026-09-06T14:00:00.000Z", evidence: "500" }, ADAPTER);
@@ -544,78 +709,156 @@ test("§11 #7 replay all batches under a different clock and the current policy:
   core.applied({ kind: "AdoptPolicy", version: 2 }, OPERATOR);
   assert.equal(core.review().policy_version, 2, "the store decided AdoptPolicy under the adopted version (§6.I)");
 
-  const cached = core.review();
-  assert.equal(core.store.batches(KEY).length, 9);
-  const effectsBefore = core.effectRows().length;
+  const cachedJson = core.stateJson();
+  const batches = core.store.batches(KEY);
+  assert.equal(batches.length, 9, "every consequence kind this sequence touches is in the batch log");
+  const effectsBefore = core.effectRows();
+  const attemptsBefore = core.attempts();
+  // The repository's current policy moves on; a replay does not consult it (fold takes no policy, §B3).
+  core.store.putPolicy(KEY.repository_id, { ...SEAT_POLICY, version: 3, rounds_max: 1 });
 
-  // A second store over the same database, under another clock, replays the batches.
+  // A second store over the same database, under another clock, folds the stored batches: never `decide`, never an effect.
   const later = new ReviewStore(core.broker.db, { decide, fold, read, clock: new FakeClock(new Date("2027-01-01T00:00:00.000Z")) });
   const replayed = later.replay(KEY);
-  assert.deepEqual(replayed, cached);
-  assert.equal(JSON.stringify(replayed), JSON.stringify(cached), "state_json is identical");
-  assert.equal(core.effectRows().length, effectsBefore, "replay emits nothing");
+  assert.equal(JSON.stringify(replayed), cachedJson, "state_json is byte-identical");
+  assert.equal(replayed.revision, 9);
+  assert.equal(replayed.policy_version, 2);
+  assert.deepEqual(core.effectRows(), effectsBefore, "zero effects emitted by the replay");
+  assert.equal(core.store.batches(KEY).length, 9, "no batch written by the replay");
+  assert.equal(core.attempts(), attemptsBefore, "no attempt written by the replay");
+  assert.equal(core.stateJson(), cachedJson, "the cache is untouched");
   assert.equal(later.read(KEY)?.revision, 9);
   core.close();
 });
 
-test("§11 #8 unsolicited Codex re-sample at H → request opened later at H stays pending", () => {
+test("§11.8 Unsolicited Codex re-sample at H → request opened later at H", () => {
   const core = new Core();
   core.applied(observe(), ADAPTER);
-  core.applied(external(), ADAPTER);
-  core.applied(external({ comments: [{ id: 42 }], source_record: { kind: "review", id: 5002, version: "2026-09-06T13:00:00.000Z" } }), ADAPTER);
+  core.applied(external(), ADAPTER, { actId: "src:review:5001:v1" });
+  assert.equal(core.pending("codex").length, 0, "the initial Codex request is answered");
+
+  // A second Codex sample at H with no Codex request pending: unsolicited evidence (§E4).
+  const resample: Action = external({ comments: [{ id: 42 }], source_record: { kind: "review", id: 5002, version: "2026-09-06T13:00:00.000Z" } });
+  core.applied(resample, ADAPTER, { actId: "src:review:5002:v1" });
   const F = core.review().findings[0];
-  assert.ok(F);
+  assert.ok(F, "findings admitted");
+  assert.equal(F.raised_by, "codex");
   assert.equal(F.answer_id, null, "unsolicited evidence answers nothing (§E4)");
-  core.applied({ kind: "OpenRequest", request_kind: "review", mode: "appeal", assignee: "codex", subject_key: `${H1}:main`, required: true, names: [], reason: "again" }, OPERATOR);
+  assert.equal(core.review().answers.length, 1, "no second answer");
+  assert.deepEqual(core.state().blocking_findings.map((x) => x.id), [F.id], "the admitted finding blocks (§F5)");
+
+  // A Codex request opened later at the same subject is not answered by the earlier evidence.
+  core.applied({ kind: "OpenRequest", request_kind: "review", mode: "initial", assignee: "codex", subject_key: `${H1}:main`, required: true, names: [], reason: "again at H" }, OPERATOR);
   const later = core.pending("codex")[0];
-  assert.ok(later);
+  assert.ok(later, "the later request stays pending");
+  assert.equal(later.answered_by, null);
   assert.deepEqual(core.state().readiness, { ready: false, subject_key: `${H1}:main`, reasons: [{ required_request_pending: [later.id] }, { blocking_findings: [F.id] }] });
+
+  // The reconciler re-presenting the same record at the same version is a replay (§B2): it still answers nothing.
+  const again = core.act(resample, ADAPTER, { actId: "src:review:5002:v1" });
+  assert.ok("replayed" in again.outcome);
+  assert.equal(core.pending("codex")[0]?.id, later.id, "the later request stays pending");
+  assert.equal(core.review().findings.length, 1, "nothing re-admitted");
   core.close();
 });
 
-test("§11 #9 fixed claim on F → new subject → Codex raises F′ → same_as F: F contested and open, F′ linked, the board shows the prior claim", async () => {
+test("§11.9 `fixed` claim on F → new subject → Codex raises F′ → `same_as F`", async () => {
   const core = new Core(SEAT_POLICY);
   core.applied(observe(), ADAPTER);
   const req = core.pending("ariadne")[0];
   assert.ok(req);
-  core.applied(answer(req.id, `${H1}:main`, report("ariadne", { findings: [rkFinding("F1")] })), seat("ariadne"));
+  core.applied(answer(req.id, `${H1}:main`, report("ariadne", { findings: [rkFinding("F1", { title: "Off-by-one in pagination" })] })), seat("ariadne"));
   const F = core.review().findings[0]?.id ?? "";
+  assert.ok(F !== "");
+
+  // The burn seat claims the fix; the board says so, unconfirmed (§F3).
   core.applied({ kind: "ResolveFinding", finding_id: F, resolution: { kind: "fixed", evidence: "cured", commits: [H2] } }, seat("talos"));
+  assert.equal(core.review().findings[0]?.status.open, false);
+  assert.equal(core.state().readiness.ready, true, "a claimed fix closes the finding (§F3)");
+
+  // New subject; Codex re-samples unsolicited and raises F′ — the same title, a new observation (§F4).
   core.applied(observe({ head: H2 }), ADAPTER);
-  const next = core.pending("theoros")[0];
-  assert.ok(next);
-  core.applied(answer(next.id, `${H2}:main`, report("theoros", { head: H2, findings: [rkFinding("F1", { fp: 2, title: "Finding F1" })] })), seat("theoros"));
+  core.applied(external({ reviewed_head: H2, comments: [{ id: 91, title: "Off-by-one in pagination" }], source_record: { kind: "review", id: 5002, version: "2026-09-06T13:00:00.000Z" } }), ADAPTER, { actId: "src:review:5002:v1" });
   const fPrime = core.review().findings[1];
   assert.ok(fPrime);
+  assert.equal(fPrime.raised_by, "codex");
   assert.deepEqual(fPrime.correlation_hints, [F], "a hint, never authority (§F1/§F4)");
-  core.applied({ kind: "ResolveFinding", finding_id: fPrime.id, resolution: { kind: "same_as", evidence: "same bug", other: F } }, seat("theoros"));
+  assert.equal(core.review().findings[0]?.status.open, false, "F stays resolved until someone links (§F4)");
 
+  // The explicit link: F′ same_as F (§F2).
+  core.applied({ kind: "ResolveFinding", finding_id: fPrime.id, resolution: { kind: "same_as", evidence: "same bug, new head", other: F } }, seat("ariadne"));
   const f = core.review().findings.find((x) => x.id === F);
-  assert.ok(f && f.status.open && "contested" in f.status);
-  assert.equal(f.status.contested.prior.kind, "fixed");
-  assert.equal(core.review().findings[1]?.links[0]?.other, F);
-  assert.deepEqual(core.state().blocking_findings.map((x) => x.id), [F, fPrime.id]);
+  assert.ok(f && f.status.open && "contested" in f.status, "F contested and open");
+  assert.equal(f.status.contested.by, "ariadne");
+  assert.equal(f.status.contested.prior.kind, "fixed", "the prior claim is retained as history");
+  assert.deepEqual(core.review().findings[1]?.links.map((l) => l.other), [F], "F′ linked to F");
+  assert.deepEqual(f.links.map((l) => l.other), [fPrime.id], "F linked back to F′");
+  assert.deepEqual(core.state().blocking_findings.map((x) => x.id), [F, fPrime.id], "both open and blocking");
 
   await core.publisher.drainOnce();
   const board = core.github?.boards.at(-1) ?? "";
-  assert.match(board, /contested by theoros/u);
-  assert.match(board, /prior claim: fixed, claimed by talos @ bbbbbbb/u);
+  assert.match(board, /contested by ariadne/u);
+  assert.match(board, /prior claim: fixed, claimed by talos @ bbbbbbb, unconfirmed/u, "the board shows the prior claim");
+  assert.match(board, new RegExp(`same as ${F.replaceAll(":", "\\:")}`, "u"), "the board shows the link");
   core.close();
 });
 
-test("§11 #10 Codex request pending → quota refusal → later Codex signal: one reassignment with supersedes; availability clears", () => {
+test("§11.10 Codex request pending → quota refusal → later Codex signal", async () => {
   const core = new Core();
-  core.applied(observe(), ADAPTER);
+  const port = new FakeGitHubPort(HIVE_66_HEAD);
+  const deps = { store: core.store, github: port, clock: core.clock };
+
+  const first = await reconcile(deps, KEY, "run-1");
+  assert.equal(first.observed, true);
+  core.assertContract();
   const codexReq = core.pending("codex")[0];
-  assert.ok(codexReq);
-  core.applied({ kind: "SetReviewerAvailability", reviewer: "codex", available: false, reason: "quota", until: "2026-09-06T14:00:00.000Z", evidence: "quota exhausted" }, ADAPTER);
-  const sub = core.pending()[0];
-  assert.equal(sub?.assignee, "ariadne");
-  assert.equal(sub?.supersedes, codexReq.id);
-  assert.equal(core.review().requests.filter((r) => r.supersedes !== null).length, 1, "one reassignment (§D4)");
-  core.applied(external({ comments: [{ id: 5 }] }), ADAPTER);
-  assert.deepEqual(core.review().availability["codex"], { available: true }, "clears on the admitted signal (§D3)");
-  assert.equal(core.review().findings[0]?.answer_id, null, "the cancelled request is not answered by the late signal");
-  assert.equal(core.pending("ariadne").length, 1);
+  assert.ok(codexReq, "the initial request routes to codex (§D2)");
+
+  // GitHub now returns the connector's quota refusal (captured producer fixture, V-6).
+  const quota = codexFixture("sokrates-issue_comment-5350649768");
+  assert.equal(quota.authorLogin, CODEX_LOGIN);
+  port.issueComments = [quota];
+  core.clock.advance(MINUTE);
+  const second = await reconcile(deps, KEY, "run-2");
+  core.assertContract();
+  assert.deepEqual(second.refused, []);
+  assert.deepEqual(second.admitted, [`src:issue_comment:${quota.id}:${quota.version}`], "classified once and admitted under the record's own act id");
+  assert.equal(core.sourceRecord(`issue_comment:${quota.id}`).classification, "quota_refusal");
+  const unavailable = core.review().availability["codex"];
+  assert.ok(unavailable && !unavailable.available);
+  assert.equal(unavailable.reason, "quota");
+  assert.equal(unavailable.until, null, "no meter ⇒ no resets_at");
+  assert.match(unavailable.evidence, /^You have reached your Codex usage limits/u);
+
+  // §D4: one reassignment to the substitute with `supersedes`.
+  assert.equal(core.review().requests.find((r) => r.id === codexReq.id)?.status, "cancelled");
+  const reassigned = core.review().requests.filter((r) => r.supersedes !== null);
+  assert.equal(reassigned.length, 1, "one reassignment");
+  assert.equal(reassigned[0]?.assignee, "ariadne", "to the policy's substitute");
+  assert.equal(reassigned[0]?.supersedes, codexReq.id);
+  assert.equal(reassigned[0]?.status, "pending");
+  assert.deepEqual(core.pending().map((r) => r.assignee), ["ariadne"]);
+
+  // A later Codex signal — the connector's clean comment at this head (fixture) — clears availability (§D3)
+  // and, with no Codex request pending, answers nothing (§E4).
+  const clean = codexFixture("hive-issue_comment-5560110170");
+  port.issueComments = [quota, clean];
+  core.clock.advance(MINUTE);
+  const third = await reconcile(deps, KEY, "run-3");
+  core.assertContract();
+  assert.deepEqual(third.refused, []);
+  assert.deepEqual(third.admitted, [`src:issue_comment:${clean.id}:${clean.version}`]);
+  assert.equal(core.sourceRecord(`issue_comment:${clean.id}`).classification, "clean");
+  assert.deepEqual(core.review().availability["codex"], { available: true }, "availability clears on the later signal");
+  assert.equal(core.review().requests.filter((r) => r.supersedes !== null).length, 1, "still exactly one reassignment");
+  assert.deepEqual(core.review().answers, [], "the cancelled request is not answered by the late signal");
+  assert.equal(core.pending("ariadne").length, 1, "the substitute's request stays pending");
+  assert.equal(core.state().requirement.status, "unsatisfied");
+
+  // Transport: the summons for the cancelled Codex request is obsolete (§D7); the substitute got one delivery.
+  await core.publisher.drainOnce();
+  assert.deepEqual(core.effectRows().filter((r) => r.target.startsWith("summon:")).map((r) => r.status), ["obsolete"]);
+  assert.deepEqual(core.github?.comments, []);
+  assert.deepEqual(core.slack.wakes.map((w) => w.actor), ["ariadne"]);
   core.close();
 });
