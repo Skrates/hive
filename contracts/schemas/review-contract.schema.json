@@ -561,7 +561,10 @@
                 "$ref": "#/$defs/RequestTransportExhausted"
               },
               {
-                "$ref": "#/$defs/RequestRequirementRaised"
+                "$ref": "#/$defs/RequestObligationMerged"
+              },
+              {
+                "$ref": "#/$defs/RequestTransportRearmed"
               },
               {
                 "$ref": "#/$defs/AnswerAdmitted"
@@ -1030,7 +1033,10 @@
           "$ref": "#/$defs/RequestTransportExhausted"
         },
         {
-          "$ref": "#/$defs/RequestRequirementRaised"
+          "$ref": "#/$defs/RequestObligationMerged"
+        },
+        {
+          "$ref": "#/$defs/RequestTransportRearmed"
         },
         {
           "$ref": "#/$defs/AnswerAdmitted"
@@ -3851,30 +3857,12 @@
       "title": "RequestKind",
       "type": "string"
     },
-    "RequestOpened": {
+    "RequestObligationMerged": {
       "additionalProperties": false,
+      "description": "\u00a76.D4 \u2014 a reassignment folded its obligation into an existing pending request.\n\n\u00a76.D1 permits one pending request per ``(assignee, subject_key, kind)``, so the substitute's\nexisting request takes the superseded one's obligation on rather than a second request being\nopened or the obligation being dropped. The merged request carries the *union*: ``required``\nis the OR of the two (two optional obligations merge into an optional one \u2014 the merge records\nwhat happened, it does not invent a requirement), ``names`` is the union of the named\nfindings, and ``mode`` is one whose complete answer satisfies every obligation folded in\n(\u00a76.D4 precedence: appeal only when both were appeal; otherwise closure when the merged\nrequest names findings and initial when it names none).",
       "properties": {
         "kind": {
-          "const": "request_opened",
-          "type": "string"
-        },
-        "request": {
-          "$ref": "#/$defs/Request"
-        }
-      },
-      "required": [
-        "kind",
-        "request"
-      ],
-      "title": "RequestOpened",
-      "type": "object"
-    },
-    "RequestRequirementRaised": {
-      "additionalProperties": false,
-      "description": "\u00a76.D4 \u2014 a reassignment folded its obligation into an existing pending request.\n\n\u00a76.D1 permits one pending request per ``(assignee, subject_key, kind)``, so the substitute's\nexisting request takes on the superseded one's requiredness and named findings rather than a\nsecond request being opened or the obligation being dropped.",
-      "properties": {
-        "kind": {
-          "const": "request_requirement_raised",
+          "const": "request_obligation_merged",
           "type": "string"
         },
         "mode": {
@@ -3905,7 +3893,6 @@
           "type": "string"
         },
         "required": {
-          "const": true,
           "type": "boolean"
         },
         "supersedes": {
@@ -3923,7 +3910,25 @@
         "supersedes",
         "reason"
       ],
-      "title": "RequestRequirementRaised",
+      "title": "RequestObligationMerged",
+      "type": "object"
+    },
+    "RequestOpened": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "request_opened",
+          "type": "string"
+        },
+        "request": {
+          "$ref": "#/$defs/Request"
+        }
+      },
+      "required": [
+        "kind",
+        "request"
+      ],
+      "title": "RequestOpened",
       "type": "object"
     },
     "RequestRetransported": {
@@ -3991,6 +3996,32 @@
         "reason"
       ],
       "title": "RequestTransportExhausted",
+      "type": "object"
+    },
+    "RequestTransportRearmed": {
+      "additionalProperties": false,
+      "description": "\u00a76.D6 \u2014 a request whose transport bound was spent is reachable again.\n\nExhaustion is a fact about transport, and it is undone only by a named act: retracting the\nlate answer that discharged an exhausted request reopens an obligation nobody would ever\npush again (housekeeping skips an exhausted request), so the retraction re-arms it \u2014 the\nflag is cleared, the re-transport ledger is emptied, and one fresh transport is queued.",
+      "properties": {
+        "kind": {
+          "const": "request_transport_rearmed",
+          "type": "string"
+        },
+        "reason": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "request_id": {
+          "minLength": 1,
+          "pattern": "^[!-~]+$(?![\\s\\S])",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "request_id",
+        "reason"
+      ],
+      "title": "RequestTransportRearmed",
       "type": "object"
     },
     "RequiredRequestPendingReason": {

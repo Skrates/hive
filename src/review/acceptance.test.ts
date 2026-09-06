@@ -1087,12 +1087,13 @@ test("§8.1 a review envelope's member comments are thread containers: one refre
     return effects.map((id) => rows.get(id) ?? id);
   };
 
-  // Closing the first of the container's two findings refreshes its thread — the refresh is the
-  // container's, and the container is not yet resolvable.
+  // Closing the first of the container's two findings changes the *finding*, not the container:
+  // its sibling is still open, so the thread stays un-resolved and there is nothing to refresh.
+  // The container's aggregate state is the trigger, not any one finding's status.
   const first = byContainer(3944094503)[0];
   assert.ok(first !== undefined);
   const firstClose = close(first.id, "01JCLOSE1");
-  assert.deepEqual(targetsOf(firstClose.effects).filter((t) => t.startsWith("thread:")), ["thread:3944094503"], "one refresh, for the container");
+  assert.deepEqual(targetsOf(firstClose.effects).filter((t) => t.startsWith("thread:")), [], "the container's state did not change");
   assert.equal(threadState(core.review(), 3944094503), "unresolve", "one finding still open keeps the whole container un-resolved");
 
   const remaining = byContainer(3944094503).find((f) => f.status.open);
@@ -1108,6 +1109,43 @@ test("§8.1 a review envelope's member comments are thread containers: one refre
   assert.ok(other !== undefined);
   const otherClose = close(other.id, "01JCLOSE3");
   assert.deepEqual(targetsOf(otherClose.effects).filter((t) => t.startsWith("thread:")), ["thread:3944094508"]);
+  core.close();
+});
+
+test("§8.1 admitting a new open finding into a resolved container un-resolves its thread", () => {
+  const core = new Core();
+  core.applied(observe({ head: ENVELOPE_HEAD }), ADAPTER, { actId: "obs:readmit" });
+
+  const members = [codexRecord("hive-review_comment-3944094503")];
+  const envelope = classified("hive-review-5125461304", { repository: "Skrates/hive", head: ENVELOPE_HEAD, members });
+  core.applied({ kind: "AdmitExternalResult", result: envelope }, ADAPTER, { actId: "src:review:5125461304:v1" });
+
+  const targetsOf = (effects: string[]): string[] => {
+    const rows = new Map(core.effectRows().map((r) => [r.effect_id, r.target]));
+    return effects.map((id) => rows.get(id) ?? id);
+  };
+
+  const only = core.review().findings[0];
+  assert.ok(only !== undefined);
+  const closed = core.applied(
+    { kind: "ResolveFinding", finding_id: only.id, resolution: { kind: "fixed", evidence: "repaired", commits: [H2] } },
+    seat("talos"),
+    { actId: "01JREADMIT1" },
+  );
+  assert.deepEqual(targetsOf(closed.effects).filter((t) => t.startsWith("thread:")), ["thread:3944094503"]);
+  assert.equal(threadState(core.review(), 3944094503), "resolve", "the container's only finding is closed");
+
+  // A later run finds a second problem in the same review comment. Nothing about the existing
+  // finding changes, so a refresh keyed on a finding's status change emits nothing and the
+  // thread stays resolved over an open blocking finding. The container's aggregate flipped.
+  const again: FindingsExternalResult = {
+    ...envelope,
+    findings: [{ ...envelope.findings[0], locator: 1, title: "A second problem in the same review comment" }],
+    source_record: { ...envelope.source_record, version: "2026-09-06T14:00:00Z" },
+  };
+  const readmitted = core.applied({ kind: "AdmitExternalResult", result: again }, ADAPTER, { actId: "src:review:5125461304:v2" });
+  assert.deepEqual(targetsOf(readmitted.effects).filter((t) => t.startsWith("thread:")), ["thread:3944094503"], "the container is un-resolved");
+  assert.equal(threadState(core.review(), 3944094503), "unresolve", "an open finding in the container keeps its thread open");
   core.close();
 });
 

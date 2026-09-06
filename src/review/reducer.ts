@@ -44,6 +44,7 @@ import type {
   Testimony,
 } from "./contract.js";
 import { BOARD_SINKS, transportState } from "./effects.js";
+import { threadContainerIds, threadState } from "./render.js";
 
 // ---------------------------------------------------------------------------------------------
 // Context and identity
@@ -479,13 +480,22 @@ function applyConsequence(review: Review, c: Consequence): void {
       // §D6: the bound is spent. The obligation is untouched — the request stays pending.
       must(review.requests.find((r) => r.id === c.request_id), `request ${c.request_id}`).transport_exhausted = true;
       return;
-    case "request_requirement_raised": {
-      // §D4: the superseded obligation folded into the substitute's existing pending request.
+    case "request_obligation_merged": {
+      // §D4: the superseded obligation folded into the substitute's existing pending request —
+      // the union of the two, never a raise the merge invented.
       const request = must(review.requests.find((r) => r.id === c.request_id), `request ${c.request_id}`);
       request.required = c.required;
       request.names = c.names;
       request.mode = c.mode;
       request.supersedes = c.supersedes;
+      return;
+    }
+    case "request_transport_rearmed": {
+      // §D6: exhaustion undone by a named act — the request is reachable again and housekeeping
+      // measures its window from the transport this consequence's act queues.
+      const request = must(review.requests.find((r) => r.id === c.request_id), `request ${c.request_id}`);
+      request.transport_exhausted = false;
+      request.retransports = [];
       return;
     }
     case "answer_admitted":
@@ -664,19 +674,20 @@ export function decide(state: Review | null, action: Action, ctx: DecideContext)
   const verb = applyVerb(tx, action);
   if (verb !== null) return verb;
 
-  // §8.1: a finding whose status changed refreshes its container's thread — but only a
-  // `review_comment` container has a GitHub review thread. An `issue_comment` container (the
-  // shape that carries several inline findings) has none, so it is never a `thread:` target.
-  // The target is the container, not the finding: `tx.effect` dedupes, so a container whose
-  // several findings all changed is refreshed once, and `threadState` re-reads all of them.
-  for (const finding of tx.review.findings) {
-    if (!("comment_id" in finding.source)) continue;
-    if (finding.source.container_kind !== "review_comment") continue;
-    const prior = tx.before?.findings.find((f) => f.id === finding.id);
-    if (prior === undefined) continue;
-    if (JSON.stringify(prior.status) !== JSON.stringify(finding.status)) {
-      tx.effect("refresh", `thread:${finding.source.comment_id}`, null);
-    }
+  // §8.1: a `review_comment` container's thread is refreshed when the *container's* aggregate
+  // state changed across the batch — resolved once every finding in it is closed, un-resolved
+  // as soon as any is open or contested (`threadState`). Only a `review_comment` container has
+  // a GitHub review thread; an `issue_comment` container (the shape that carries several inline
+  // findings) has none, so it is never a `thread:` target.
+  //
+  // The aggregate, not the per-finding status change, is the trigger: admitting a new open
+  // finding into a container whose thread is already resolved changes no existing finding's
+  // status, and a loop over changed findings emitted nothing — the thread stayed resolved over
+  // an open blocking finding. The container is also the target, so a batch that changed several
+  // findings in one container refreshes it once.
+  for (const commentId of threadContainerIds(tx.review)) {
+    const then = tx.before === null ? null : threadState(tx.before, commentId);
+    if (threadState(tx.review, commentId) !== then) tx.effect("refresh", `thread:${commentId}`, null);
   }
   // Module map §2: every batch that changed something refreshes the board and the check at the
   // current head. A batch with no consequences is an audit batch — its facts are unchanged, so
@@ -766,10 +777,14 @@ function emitTransport(tx: Transaction, request: Request): void {
     return;
   }
   const mode = request.kind === "review" ? request.mode ?? "review" : "retrospective";
+  // The obligation the row is delivering, not only the one the request was opened with: a
+  // request whose obligation was merged (§D4) is re-dispatched, and what changed is its mode and
+  // the findings it now names, so both are in the text the assignee reads.
+  const names = request.names.length > 0 ? ` addressing ${request.names.join(", ")};` : "";
   tx.effect("actionable", `delivery:${request.assignee}:${request.id}`, {
     actor: request.assignee,
     request_id: request.id,
-    text: `${review.display}: ${mode} request ${request.id} at ${request.subject_key} — ${request.reason}`,
+    text: `${review.display}: ${mode} request ${request.id} at ${request.subject_key} —${names} ${request.reason}`,
     dedupe_key: `request:${request.id}:${tx.ctx.actId}`,
   });
 }
@@ -922,14 +937,46 @@ function restoreObligations(tx: Transaction, why: string): void {
 }
 
 /**
+ * §3.4 / §6.D4 — the mode a merged request must carry.
+ *
+ * A merge folds two obligations into one request, and the one request is discharged by one
+ * complete answer, so its mode must be one whose complete answer satisfies *every* obligation
+ * folded in. {@link satisfyingAnswers} counts only `initial` and `closure`, so an `appeal` mode
+ * on a request that absorbed an initial requirement would leave the subject permanently
+ * unsatisfied with nothing pending — the requirement discharged by an answer that cannot
+ * satisfy it. The precedence, in order:
+ *
+ * 1. Two retrospective requests have no mode at all (`null` on both sides).
+ * 2. `appeal` survives only when *both* obligations were appeals — an appeal is the only mode
+ *    that satisfies nothing on its own, so it can never absorb something that must be
+ *    satisfied.
+ * 3. Otherwise the merged request names findings ⇒ `closure` (a request carrying names is not
+ *    an initial, §6.D1), and names none ⇒ `initial`. Both satisfy the subject's requirement,
+ *    so an unsatisfied initial obligation survives the merge either way.
+ */
+function mergedMode(left: Request["mode"], right: Request["mode"], names: readonly string[]): Request["mode"] {
+  if (left === null && right === null) return null;
+  if (left === "appeal" && right === "appeal") return "appeal";
+  return names.length > 0 ? "closure" : "initial";
+}
+
+/**
  * §D4: cancel the pending request and carry its obligation to the substitute with `supersedes`
  * — once, and never by silently adopting whatever the substitute happened to have pending.
  *
  * §D1 permits one pending request per `(assignee, subject_key, kind)`, so when the substitute
  * already holds one a second request is not available: the existing request takes the
- * superseded obligation on, as a recorded `request_requirement_raised` consequence — `required`
- * becomes true, the named findings are the union, the mode is the more demanding of the two,
- * and `supersedes` names what it absorbed. Nothing about the obligation is dropped.
+ * superseded obligation on, as a recorded `request_obligation_merged` consequence carrying the
+ * *union* of the two — `required` is the OR (two optional obligations merge into an optional
+ * one; the merge records what happened and never invents a requirement), `names` is the union
+ * of the named findings, `mode` is {@link mergedMode}, and `supersedes` names what it absorbed.
+ * Nothing about the obligation is dropped.
+ *
+ * A merge that expanded the obligation queues one fresh transport (§D5): the payload already
+ * delivered describes the request as it was, so without this the substitute is never told that
+ * the request now carries a requirement, named findings or a mode it did not have. The delivery
+ * `dedupe_key` carries the act id, so the new row is a distinct row and not a duplicate of the
+ * one the opening queued.
  */
 function reassign(tx: Transaction, request: Request, substitute: string, reason: string): void {
   const why = `${reason}: ${request.assignee} → ${substitute}`;
@@ -937,10 +984,12 @@ function reassign(tx: Transaction, request: Request, substitute: string, reason:
   const existing = pendingFor(tx.review, substitute, request.subject_key, request.kind);
   if (existing !== undefined) {
     const names = [...existing.names, ...request.names.filter((id) => !existing.names.includes(id))];
-    // §3.4: a review request that must answer named findings is a closure/appeal, not an
-    // initial — the mode follows the names it now carries.
-    const mode = names.length > existing.names.length ? request.mode : existing.mode;
-    tx.record({ kind: "request_requirement_raised", request_id: existing.id, required: true, names, mode, supersedes: request.id, reason: why });
+    const required = existing.required || request.required;
+    const mode = mergedMode(existing.mode, request.mode, names);
+    const expanded = required !== existing.required || names.length > existing.names.length || mode !== existing.mode;
+    tx.record({ kind: "request_obligation_merged", request_id: existing.id, required, names, mode, supersedes: request.id, reason: why });
+    // The consequence is already folded into `tx.review`, so `existing` is the merged request.
+    if (expanded) emitTransport(tx, existing);
     return;
   }
   open(tx, {
@@ -1531,12 +1580,30 @@ function answer(tx: Transaction, action: AnswerAction): Refusal | null {
   return null;
 }
 
-/** §E7: re-opens the request, keeps the charge, leaves the findings admitted. */
+/**
+ * §E7: re-opens the request, keeps the charge, leaves the findings admitted.
+ *
+ * §D6: a request whose transport bound was spent can still be discharged by a late answer, and
+ * that answer released the `transport_exhausted` hold. Retracting it reopens an obligation
+ * housekeeping will never push again — it skips an exhausted request — so the retraction is the
+ * named act that re-arms transport: the flag is cleared, the re-transport ledger emptied, and
+ * one fresh transport queued. Exhaustion measured a reviewer who never answered; this one did.
+ */
 function retractAnswer(tx: Transaction, action: Extract<Action, { kind: "RetractAnswer" }>): Refusal | null {
   const found = tx.review.answers.find((a) => a.id === action.answer_id);
   if (found === undefined) return refuse("no_such_target", `answer ${action.answer_id} does not exist`);
   if (found.status !== "standing") return refuse("no_such_target", `answer ${found.id} is already retracted`);
+  const reopened = tx.review.requests.filter((r) => r.answered_by === found.id);
   tx.record({ kind: "answer_retracted", answer_id: found.id, reason: action.reason });
+  for (const request of reopened) {
+    if (!request.transport_exhausted) continue;
+    tx.record({
+      kind: "request_transport_rearmed",
+      request_id: request.id,
+      reason: `answer ${found.id} retracted; the obligation is outstanding again and unreachable while transport stays exhausted`,
+    });
+    emitTransport(tx, request);
+  }
   return null;
 }
 

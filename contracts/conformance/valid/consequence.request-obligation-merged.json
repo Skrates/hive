@@ -1,12 +1,12 @@
 {
   "instance": {
-    "kind": "request_requirement_raised",
+    "kind": "request_obligation_merged",
     "mode": "closure",
     "names": [
       "fnd_1",
       "fnd_2"
     ],
-    "reason": "reviewer_unavailable (quota): codex \u2192 talos",
+    "reason": "reviewer_unavailable (quota): codex → talos",
     "request_id": "req_obs:run_01K_1",
     "required": true,
     "supersedes": "req_obs:run_01J_1"

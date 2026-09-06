@@ -391,7 +391,7 @@ function containerState(findings: AdmittedFinding[]): "resolve" | "unresolve" | 
 }
 
 /** Every `review_comment` container the Review's findings name, in first-finding order. */
-function threadContainers(review: Review): number[] {
+export function threadContainerIds(review: Review): number[] {
   const seen: number[] = [];
   for (const finding of review.findings) {
     if (!("comment_id" in finding.source)) continue;
@@ -409,7 +409,7 @@ function threadContainers(review: Review): number[] {
  */
 export function threadOps(before: Review | null, after: Review): ThreadOp[] {
   const ops: ThreadOp[] = [];
-  for (const commentId of threadContainers(after)) {
+  for (const commentId of threadContainerIds(after)) {
     const now = containerState(containerFindings(after, commentId));
     const then = before === null ? null : containerState(containerFindings(before, commentId));
     if (now === null || now === then) continue;

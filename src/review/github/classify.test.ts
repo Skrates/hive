@@ -234,6 +234,26 @@ test("§6.F5: a badge-less finding is priority unknown — admitted, visible, bl
   assert.equal(result.external?.findings[0]?.body, "body");
 });
 
+test("§3.5 the connector's nested badge tags leave nothing on the title", () => {
+  // The producer writes `**<sub><sub>![P1 Badge](…)</sub></sub>  Title**`. A non-greedy
+  // `<sub>.*?</sub>` matches the inner pair and leaves the outer `</sub>` on the front of every
+  // title — every finding admitted from Skrates/hive#71 carried one. The exact fixture bytes:
+  const nested = record("sokrates-issue_comment-5420521329");
+  assert.ok(nested.body.includes("**<sub><sub>![P1 Badge]"), "the fixture carries the nested markup");
+  const result = classifyCodexRecord(nested, { ...baseContext, repository: "Skrates/sokrates", heads: [head("f8b5e0e")] });
+  assert.equal(result.classification, "findings");
+  assert.deepEqual(result.external?.findings.map((f) => f.title), [
+    "Expand the CRM URL before submitting the config",
+    "Transfer the Postmark spec with the source config",
+    "Relocate the Twenty SDL before deleting it",
+    "Retire the active Meridian runbooks with the deleted driver",
+    "Update the canonical inventory for the relocated fixtures",
+  ]);
+  // A single-`<sub>` wrapper and a bare title are unchanged by the same rule.
+  const single = { ...record("hive-review_comment-3944094503"), body: "**<sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub>  Add Codex to cx53's service PATH**\n\nbody" };
+  assert.equal(classifyCodexRecord(single, baseContext).external?.findings[0]?.title, "Add Codex to cx53's service PATH");
+});
+
 test("a reply inside a review thread is not a finding", () => {
   const reply = { ...record("hive-review_comment-3944094503"), raw: { ...(record("hive-review_comment-3944094503").raw as Raw), in_reply_to_id: 1 } };
   assert.equal(classifyCodexRecord(reply, baseContext).classification, "unknown");

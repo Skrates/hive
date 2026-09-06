@@ -191,10 +191,16 @@ export function findingPriority(text: string): FindingPriority {
   return `P${badge[1] ?? "3"}` as FindingPriority;
 }
 
+/**
+ * The connector wraps its badge in *nested* `<sub>` tags: `**<sub><sub>![P1 …](…)</sub></sub>
+ * Title**`. A non-greedy `<sub>.*?</sub>` matches the inner pair and leaves the outer `</sub>`
+ * on the front of every title it produced. Strip the image first, then every `<sub>`/`</sub>`
+ * tag on its own — nesting depth then stops mattering.
+ */
 function stripTitleMarkup(line: string): string {
   return line
-    .replace(/<sub>.*?<\/sub>/gsu, "")
     .replace(/!\[[^\]]*\]\([^)]*\)/gu, "")
+    .replace(/<\/?sub>/gu, "")
     .replace(/\[P[0-3]\]/u, "")
     .replace(/^\*+|\*+$/gu, "")
     .replace(/\s+/gu, " ")

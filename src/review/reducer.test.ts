@@ -821,9 +821,9 @@ test("§D4/§D9 reassignment carries the obligation into the substitute's existi
 
   // codex goes unavailable: the closure is cancelled and its obligation is folded into the appeal.
   const down = apply(withAppeal, { kind: "SetReviewerAvailability", reviewer: "codex", available: false, reason: "quota", until: null, evidence: "429" }, OPERATOR);
-  assert.deepEqual(kinds(down.batch), ["availability_set", "request_cancelled", "request_requirement_raised"]);
+  assert.deepEqual(kinds(down.batch), ["availability_set", "request_cancelled", "request_obligation_merged"]);
   assert.deepEqual(down.batch.consequences[2], {
-    kind: "request_requirement_raised",
+    kind: "request_obligation_merged",
     request_id: appeal.id,
     required: true,
     names: [F1.id],
@@ -834,7 +834,11 @@ test("§D4/§D9 reassignment carries the obligation into the substitute's existi
   const carried = down.state.requests.find((r) => r.id === appeal.id);
   assert.ok(carried);
   assert.deepEqual({ required: carried.required, names: carried.names, supersedes: carried.supersedes }, { required: true, names: [F1.id], supersedes: closure.id });
-  assert.ok(!down.batch.effects.some((e) => e.kind === "actionable"), "the substitute's transport row already exists; nothing is doubled");
+  // §D5: the payload already delivered described the optional appeal; the request now carries a
+  // requirement and a named finding, so one fresh transport says so.
+  const redelivery = down.batch.effects.filter((e) => e.kind === "actionable");
+  assert.equal(redelivery.length, 1, "an expanded obligation is re-dispatched, once");
+  assert.equal(redelivery[0]?.target, `delivery:ariadne:${appeal.id}`);
 
   // The obligation is outstanding at the subject and readiness waits for it.
   const s = state(down.state);
@@ -844,6 +848,97 @@ test("§D4/§D9 reassignment carries the obligation into the substitute's existi
   const closed = apply(down.state, answerAction(appeal.id, down.state.subject.key, report("ariadne", { mode: "closure", findings: [], coverage: [{ id: "A1", area: "the F1 seam", paths: ["src/x.py"], status: "reviewed-no-issue", finding_id: F1.id, reason: "fixed in the pushed commit", next_step: null }] })), seat("ariadne"));
   assert.equal(closed.state.requests.find((r) => r.id === appeal.id)?.status, "answered");
   assert.deepEqual(state(closed.state).requirement.status, "satisfied");
+});
+
+test("§D4 a merged obligation keeps a mode whose complete answer satisfies the requirement", () => {
+  // codex holds the subject's required *initial* request; ariadne already holds an optional
+  // appeal at the same subject. Both name no findings, so a merge that simply kept the
+  // substitute's mode would leave the requirement carried by an `appeal` — and an appeal
+  // satisfies nothing (§6.H), so the Review would stand unsatisfied with nothing pending.
+  const review = opened();
+  const initial = pending(review, "codex")[0];
+  assert.ok(initial);
+  assert.equal(initial.mode, "initial");
+  const withAppeal = apply(review, { kind: "OpenRequest", request_kind: "review", mode: "appeal", assignee: "ariadne", subject_key: review.subject.key, required: false, names: [], reason: "second opinion" }, OPERATOR).state;
+  const appeal = pending(withAppeal, "ariadne")[0];
+  assert.ok(appeal);
+
+  const down = apply(withAppeal, { kind: "SetReviewerAvailability", reviewer: "codex", available: false, reason: "quota", until: null, evidence: "429" }, OPERATOR);
+  const merged = down.state.requests.find((r) => r.id === appeal.id);
+  assert.ok(merged);
+  assert.deepEqual({ mode: merged.mode, required: merged.required, names: merged.names }, { mode: "initial", required: true, names: [] });
+  assert.equal(state(down.state).requirement.status, "unsatisfied");
+
+  // The merged request's complete answer satisfies the subject's requirement — the whole point.
+  const answered = apply(down.state, answerAction(appeal.id, down.state.subject.key, report("ariadne")), seat("ariadne"));
+  assert.equal(answered.state.requests.find((r) => r.id === appeal.id)?.status, "answered");
+  const after = state(answered.state);
+  assert.equal(after.requirement.status, "satisfied");
+  assert.equal(after.readiness.ready, true, "no obligation is left, and nothing is pending to carry one");
+});
+
+test("§D4 merging two optional obligations leaves an optional one, and readiness never moves", () => {
+  const review = opened();
+  const codexInitial = pending(review, "codex")[0];
+  assert.ok(codexInitial);
+  // Take the subject's required work out of the way: the operator cancels it, which stands
+  // (§D9), so the only obligations left are the two optional appeals this test merges.
+  const quiet = apply(review, { kind: "CancelRequest", request_id: codexInitial.id, reason: "reviewed out of band" }, OPERATOR).state;
+  const readyBefore = state(quiet).readiness.ready;
+
+  const toCodex = apply(quiet, { kind: "OpenRequest", request_kind: "review", mode: "appeal", assignee: "codex", subject_key: quiet.subject.key, required: false, names: [], reason: "a codex opinion" }, OPERATOR).state;
+  const codexAppeal = pending(toCodex, "codex")[0];
+  assert.ok(codexAppeal);
+  const both = apply(toCodex, { kind: "OpenRequest", request_kind: "review", mode: "appeal", assignee: "ariadne", subject_key: quiet.subject.key, required: false, names: [], reason: "an ariadne opinion" }, OPERATOR).state;
+  const ariadneAppeal = pending(both, "ariadne")[0];
+  assert.ok(ariadneAppeal);
+
+  const down = apply(both, { kind: "SetReviewerAvailability", reviewer: "codex", available: false, reason: "quota", until: null, evidence: "429" }, OPERATOR);
+  assert.deepEqual(kinds(down.batch), ["availability_set", "request_cancelled", "request_obligation_merged"]);
+  assert.equal(down.batch.consequences[2]?.kind === "request_obligation_merged" && down.batch.consequences[2].required, false, "two optional obligations merge into an optional one");
+  const merged = down.state.requests.find((r) => r.id === ariadneAppeal.id);
+  assert.ok(merged);
+  assert.deepEqual({ required: merged.required, mode: merged.mode, names: merged.names }, { required: false, mode: "appeal", names: [] });
+  assert.ok(!down.batch.effects.some((e) => e.kind === "actionable"), "nothing about the obligation expanded, so nothing is re-dispatched");
+  assert.equal(state(down.state).readiness.ready, readyBefore, "an optional merge moves readiness not at all");
+});
+
+test("§D6/§E7 retracting a late answer re-arms the exhausted transport it discharged", () => {
+  const { review, request } = seatReviewed();
+  const initial = review.requests.find((r) => r.id === request);
+  assert.ok(initial);
+
+  // Housekeeping rides observations: two re-transports, then the bound is spent.
+  const s1 = apply(review, observe(), ADAPTER, { policy: SEAT_POLICY, now: at(30) }).state;
+  const s2 = apply(s1, observe(), ADAPTER, { policy: SEAT_POLICY, now: at(60) }).state;
+  const spent = apply(s2, observe(), ADAPTER, { policy: SEAT_POLICY, now: at(90) });
+  assert.ok(kinds(spent.batch).includes("request_transport_exhausted"), "the bound is spent");
+  assert.equal(spent.state.requests.find((r) => r.id === request)?.transport_exhausted, true);
+  const exhaustionHold = spent.state.holds.find((h) => h.kind === "transport_exhausted" && h.released === null);
+  assert.ok(exhaustionHold);
+
+  // The reviewer answers anyway. That discharges the request and releases the hold.
+  const late = apply(spent.state, answerAction(request, spent.state.subject.key, report("ariadne")), seat("ariadne"), { policy: SEAT_POLICY, now: at(100) });
+  assert.equal(late.state.requests.find((r) => r.id === request)?.status, "answered");
+  assert.equal(late.state.holds.find((h) => h.id === exhaustionHold.id)?.released !== null, true, "the answer released the exhaustion hold");
+  const answer = late.state.answers[0];
+  assert.ok(answer);
+
+  // Retracting it reopens the obligation. Without a re-arm the request is pending, exhausted,
+  // and skipped by housekeeping for ever: required work nobody would ever be asked for again.
+  const retracted = apply(late.state, { kind: "RetractAnswer", answer_id: answer.id, reason: "the report was for the wrong seam" }, seat("ariadne"), { policy: SEAT_POLICY, now: at(110) });
+  assert.deepEqual(kinds(retracted.batch), ["answer_retracted", "request_transport_rearmed"]);
+  const reopened = retracted.state.requests.find((r) => r.id === request);
+  assert.ok(reopened);
+  assert.deepEqual({ status: reopened.status, exhausted: reopened.transport_exhausted, retransports: reopened.retransports }, { status: "pending", exhausted: false, retransports: [] });
+
+  const transport = `delivery:${reopened.assignee}:${reopened.id}`;
+  assert.deepEqual(targets(retracted.batch).filter((t) => t.startsWith("delivery:")), [transport], "exactly one fresh transport row");
+  assert.equal(applicability(parseTarget(transport), retracted.state), "applicable", "and it is dispatchable: no hold withholds it");
+
+  const derived = state(retracted.state, SEAT_POLICY, at(110));
+  assert.equal(derived.readiness.ready, false);
+  assert.ok((derived.readiness.ready ? [] : derived.readiness.reasons).some((r) => typeof r === "object" && "required_request_pending" in r && r.required_request_pending.includes(request)));
 });
 
 test("§D9 a head observed under an exhaustion hold gets its required request, and GrantRounds releases the one transport already queued", () => {

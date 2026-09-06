@@ -1,7 +1,7 @@
 /* eslint-disable */
 /**
  * GENERATED — do not edit. Source: contracts/schemas/review-contract.schema.json,
- * vendored from weave-doctrine@50fac42e44e4f2a30577738026649a7d472d557a (see contracts/SOURCE).
+ * vendored from weave-doctrine@6dd88bae0d2a8af8c685d14c30e5f6f72e08845a (see contracts/SOURCE).
  * Regenerate with `bun run check:contracts`.
  */
 
@@ -193,7 +193,8 @@ export type Consequence =
   | RequestAnswered
   | RequestRetransported
   | RequestTransportExhausted
-  | RequestRequirementRaised
+  | RequestObligationMerged
+  | RequestTransportRearmed
   | AnswerAdmitted
   | AnswerRetracted
   | FindingAdmitted
@@ -989,7 +990,8 @@ export interface Batch {
     | RequestAnswered
     | RequestRetransported
     | RequestTransportExhausted
-    | RequestRequirementRaised
+    | RequestObligationMerged
+    | RequestTransportRearmed
     | AnswerAdmitted
     | AnswerRetracted
     | FindingAdmitted
@@ -1249,20 +1251,41 @@ export interface RequestTransportExhausted {
  * §6.D4 — a reassignment folded its obligation into an existing pending request.
  *
  * §6.D1 permits one pending request per ``(assignee, subject_key, kind)``, so the substitute's
- * existing request takes on the superseded one's requiredness and named findings rather than a
- * second request being opened or the obligation being dropped.
+ * existing request takes the superseded one's obligation on rather than a second request being
+ * opened or the obligation being dropped. The merged request carries the *union*: ``required``
+ * is the OR of the two (two optional obligations merge into an optional one — the merge records
+ * what happened, it does not invent a requirement), ``names`` is the union of the named
+ * findings, and ``mode`` is one whose complete answer satisfies every obligation folded in
+ * (§6.D4 precedence: appeal only when both were appeal; otherwise closure when the merged
+ * request names findings and initial when it names none).
  *
  * This interface was referenced by `ReviewContract`'s JSON-Schema
- * via the `definition` "RequestRequirementRaised".
+ * via the `definition` "RequestObligationMerged".
  */
-export interface RequestRequirementRaised {
-  kind: "request_requirement_raised";
+export interface RequestObligationMerged {
+  kind: "request_obligation_merged";
   mode: ReviewMode | null;
   names: string[];
   reason: string;
   request_id: string;
-  required: true;
+  required: boolean;
   supersedes: string;
+}
+/**
+ * §6.D6 — a request whose transport bound was spent is reachable again.
+ *
+ * Exhaustion is a fact about transport, and it is undone only by a named act: retracting the
+ * late answer that discharged an exhausted request reopens an obligation nobody would ever
+ * push again (housekeeping skips an exhausted request), so the retraction re-arms it — the
+ * flag is cleared, the re-transport ledger is emptied, and one fresh transport is queued.
+ *
+ * This interface was referenced by `ReviewContract`'s JSON-Schema
+ * via the `definition` "RequestTransportRearmed".
+ */
+export interface RequestTransportRearmed {
+  kind: "request_transport_rearmed";
+  reason: string;
+  request_id: string;
 }
 /**
  * This interface was referenced by `ReviewContract`'s JSON-Schema

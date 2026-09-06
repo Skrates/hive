@@ -438,8 +438,16 @@ type RefusalCode = "stale_revision" | "unauthorized" | "lifecycle" | "unknown_su
   `supersedes` set — one consequence, recorded, once. **The obligation is preserved, never
   substituted.** Where the substitute already holds a pending request at that `(subject_key, kind)` —
   D1 leaves room for only one — the reassignment does not silently adopt it: it records
-  `request_requirement_raised`, which sets `required` true, unions the named findings and names what
-  it superseded. A reassignment can raise a requirement and never lower one.
+  `request_obligation_merged`, which carries the **union** of the two obligations and names what it
+  superseded. (ruled 2026-09-06, Codex 3945383525/3945383505/3945383529) The union is exact:
+  `required` is the OR of the two, so two optional obligations merge into an optional one and the
+  merge never invents a requirement neither side had; `names` is the union of the named findings; and
+  `mode` is one whose **complete answer satisfies every obligation folded in** — `appeal` survives only
+  when both sides were appeals (an appeal satisfies no requirement, §H, so it can never absorb one),
+  otherwise the merged request names findings ⇒ `closure` and names none ⇒ `initial`. A merge that
+  **expanded** the obligation (required raised, names added, mode changed) queues one fresh transport
+  (§D5): the payload already delivered describes the request as it was, and the assignee is otherwise
+  never told what the request now carries.
 - **D5** Transport is Hive's: opening a request queues one effect — a Hive delivery to a seat assignee
   (the broker mints a `system`-origin event; the delivery ledger owns attempts, redelivery and failure) or a
   summon comment for `codex`. The request stores **references** (`delivery_id` / `summon_comment_id`),
@@ -451,6 +459,12 @@ type RefusalCode = "stale_revision" | "unauthorized" | "lifecycle" | "unknown_su
   obligation** — the request stays `pending`, keeps blocking readiness (§H), and is still what a late
   answer discharges. `Release` is the operator's, or the system's when an answer arrives anyway;
   releasing that hold lifts the readiness block the hold itself imposed and nothing more.
+  (ruled 2026-09-06, Codex 3945383519) Exhaustion is undone only by a named act. Retracting the late
+  answer that discharged an exhausted request reopens an obligation housekeeping will never push
+  again — it skips an exhausted request — so `RetractAnswer` records
+  `request_transport_rearmed {request_id, reason}` for each request it reopens that is exhausted: the
+  flag is cleared, the re-transport ledger emptied, and one transport queued. Nothing else clears the
+  flag; releasing the `transport_exhausted` hold still does not (§D6 above).
 - **D7** A summon effect checks applicability at dispatch: the request must still be pending at the
   current subject, else the effect is marked `obsolete` and not sent.
 - **D8** (ruled 2026-09-06: F-12 → (a)) Conflict-aware summons. `ObservePR` carries GitHub's `mergeable`
@@ -636,6 +650,12 @@ reads the policy by the Review's version; the batch records it (§B3).
   review thread: a finding whose container is an `issue_comment` never queues a `thread:` effect. The
   thread renders from every finding in that container — resolved once all of them are closed,
   un-resolved as soon as any is open or contested — never from the first one found.
+  (ruled 2026-09-06, Codex 3945383536) The **container's** aggregate state across the batch is what
+  queues the refresh, not any one finding's status change: a batch is compared container-by-container,
+  before against after, **admissions included**. Admitting a new open finding into a container whose
+  thread is resolved changes no existing finding, and a per-finding trigger left that thread resolved
+  over an open blocking finding. Symmetrically, closing one of two open findings in a container changes
+  the container not at all and queues nothing.
 - A refresh job means "re-render this target from `read()` now"; per-target publication is serialized and
   pending refreshes for the same target coalesce into the newest. A delayed worker can never publish an
   older verdict because it never carries one.
