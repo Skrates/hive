@@ -10,18 +10,22 @@ const PRIVATE_KEY_PEM = privateKey.export({ type: "pkcs8", format: "pem" }).toSt
 const NOW = new Date("2026-09-06T12:00:00.000Z");
 const clock: Clock = { now: () => NOW };
 const APP_ID = "424242";
+/** A signal that is never aborted: the projection calls take one, the publisher's time-box owns it. */
+const LIVE = new AbortController().signal;
 const FAKE_SUMMON_TOKEN = "connected-user-token-fake";
 const FAKE_INSTALLATION_TOKEN = "installation-token-fake-not-real";
 
-interface Call { method: string; url: string; headers: Record<string, string>; body: unknown }
+interface Call { method: string; url: string; headers: Record<string, string>; body: unknown; signal: AbortSignal | null }
 
 type Route = (call: Call) => { status?: number; json?: unknown; headers?: Record<string, string> } | undefined;
 
 function fakeFetch(route: Route): { fetch: FetchLike; calls: Call[] } {
   const calls: Call[] = [];
   const fetch: FetchLike = async (url, init) => {
-    const call: Call = { method: init.method, url, headers: init.headers, body: init.body === undefined ? undefined : JSON.parse(init.body) };
+    const call: Call = { method: init.method, url, headers: init.headers, body: init.body === undefined ? undefined : JSON.parse(init.body), signal: init.signal };
     calls.push(call);
+    // A real fetch rejects an already-aborted request rather than sending it.
+    if (init.signal?.aborted === true) throw new Error("aborted");
     const reply = route(call) ?? { status: 404, json: { message: "no route" } };
     const headers = new Map(Object.entries(reply.headers ?? {}));
     return {
@@ -206,26 +210,62 @@ test("projections: check run create/update, board comment create/update, summons
     }
     return undefined;
   });
-  const created = await p.createOrUpdateCheckRun({ repositoryId: 1054, headSha: "a".repeat(40), existingId: null, name: "weave/review", conclusion: "failure", title: "hold", summary: "s" });
+  const created = await p.createOrUpdateCheckRun({ repositoryId: 1054, headSha: "a".repeat(40), existingId: null, name: "weave/review", conclusion: "failure", title: "hold", summary: "s" }, LIVE);
   assert.deepEqual(created, { checkRunId: 900 });
   const post = calls.find((c) => c.url.endsWith("/check-runs"));
   assert.deepEqual(post?.body, { name: "weave/review", head_sha: "a".repeat(40), status: "completed", conclusion: "failure", output: { title: "hold", summary: "s" } });
-  await p.createOrUpdateCheckRun({ repositoryId: 1054, headSha: "a".repeat(40), existingId: 900, name: "weave/review", conclusion: "success", title: "ok", summary: "s" });
+  await p.createOrUpdateCheckRun({ repositoryId: 1054, headSha: "a".repeat(40), existingId: 900, name: "weave/review", conclusion: "success", title: "ok", summary: "s" }, LIVE);
   assert.equal(calls.find((c) => c.url.endsWith("/check-runs/900"))?.method, "PATCH");
-  assert.deepEqual(await p.createOrUpdateBoardComment({ repositoryId: 1054, prNumber: 66, existingId: null, body: "board" }), { commentId: 7000 });
-  await p.createOrUpdateBoardComment({ repositoryId: 1054, prNumber: 66, existingId: 7000, body: "board 2" });
+  assert.deepEqual(await p.createOrUpdateBoardComment({ repositoryId: 1054, prNumber: 66, existingId: null, body: "board" }, LIVE), { commentId: 7000 });
+  await p.createOrUpdateBoardComment({ repositoryId: 1054, prNumber: 66, existingId: 7000, body: "board 2" }, LIVE);
   assert.deepEqual(calls.find((c) => c.url.endsWith("/issues/comments/7000"))?.body, { body: "board 2" });
-  assert.deepEqual(await p.postComment({ repositoryId: 1054, prNumber: 66, body: "@codex review" }), { commentId: 7000, summonLogin: "RationallyPrime" });
+  assert.deepEqual(await p.postComment({ repositoryId: 1054, prNumber: 66, body: "@codex review" }, LIVE), { commentId: 7000, summonLogin: "RationallyPrime" });
   const commentPosts = calls.filter(c => c.url.endsWith("/issues/66/comments") && c.method === "POST");
   assert.equal(commentPosts[0]?.headers.authorization, `Bearer ${FAKE_INSTALLATION_TOKEN}`, "the App owns the board");
   assert.equal(commentPosts[1]?.headers.authorization, `Bearer ${FAKE_SUMMON_TOKEN}`, "only summons use the connected user");
-  await p.resolveThread({ repositoryId: 1054, commentId: 3944094503 });
+  await p.resolveThread({ repositoryId: 1054, commentId: 3944094503 }, LIVE);
   const mutation = calls.filter((c) => c.url.endsWith("/graphql")).at(-1)?.body as { query: string; variables: { id: string } };
   assert.ok(mutation.query.includes("resolveReviewThread"));
   assert.equal(mutation.variables.id, "PRRT_9");
-  await p.unresolveThread({ repositoryId: 1054, commentId: 3944094503 });
+  await p.unresolveThread({ repositoryId: 1054, commentId: 3944094503 }, LIVE);
   const unresolve = calls.filter((c) => c.url.endsWith("/graphql")).at(-1)?.body as { query: string };
   assert.ok(unresolve.query.includes("unresolveReviewThread"));
+});
+
+// §8.1 / bundle-1 #9: the publisher's dispatch time-box aborts the call it has given up on, so
+// the signal must reach every request the call makes — App JWT listing and token mint included.
+test("a projection call carries its dispatch signal on every request it makes, token fetch included", async () => {
+  const { port: p, calls } = port((call) => {
+    if (call.url.endsWith("/pulls/comments/3944094503")) return { json: { pull_request_url: "https://api.github.com/repos/Skrates/hive/pulls/66" } };
+    if (call.url.endsWith("/graphql")) {
+      const body = call.body as { query: string; variables: Record<string, unknown> };
+      if (body.query.startsWith("query")) {
+        return { json: { data: { repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [{ id: "PRRT_9", comments: { nodes: [{ databaseId: 3944094503 }] } }] } } } } } };
+      }
+      return { json: { data: { resolveReviewThread: { thread: { id: body.variables.id } } } } };
+    }
+    return undefined;
+  });
+  const controller = new AbortController();
+  await p.resolveThread({ repositoryId: 1054, commentId: 3944094503 }, controller.signal);
+  assert.ok(calls.length >= 5, `the whole path: ${calls.map((c) => c.url).join(" ")}`);
+  assert.ok(calls.some((c) => c.url.endsWith("/access_tokens")), "the token mint is on the path");
+  assert.deepEqual(calls.filter((c) => c.signal !== controller.signal).map((c) => c.url), [], "every request carries the dispatch's signal");
+});
+
+test("aborting a dispatch aborts the request in flight instead of leaving it to land later", async () => {
+  const controller = new AbortController();
+  const started: string[] = [];
+  const hangingFetch: FetchLike = (url, init) => new Promise((_resolve, reject) => {
+    started.push(url);
+    init.signal?.addEventListener("abort", () => { reject(new Error(`aborted ${url}`)); });
+  });
+  const p = new AppGitHubPort({ appId: APP_ID, privateKeyPem: PRIVATE_KEY_PEM, summonToken: FAKE_SUMMON_TOKEN, clock, fetch: hangingFetch });
+  const dispatch = p.createOrUpdateBoardComment({ repositoryId: 1054, prNumber: 66, existingId: null, body: "board" }, controller.signal);
+  await Promise.resolve();
+  assert.equal(started.length, 1, "the call is on the wire");
+  controller.abort();
+  await assert.rejects(dispatch, /aborted/u);
 });
 
 test("a non-2xx answer is a GitHubApiError naming the status and the URL, never a silent null", async () => {
@@ -245,5 +285,5 @@ test("PR reactions are read under App authentication with author identity", asyn
 test("a check-run response without a positive id fails before recording a fake handle", async () => {
   const { port: p } = port(call => call.url.endsWith("/check-runs") ? { status: 201, json: {} } : undefined);
   await assert.rejects(p.createOrUpdateCheckRun({ repositoryId: 1054, headSha: "a".repeat(40), existingId: null,
-    name: "weave/review", conclusion: "failure", title: "Pending", summary: "Pending review" }), /positive id/);
+    name: "weave/review", conclusion: "failure", title: "Pending", summary: "Pending review" }, LIVE), /positive id/);
 });

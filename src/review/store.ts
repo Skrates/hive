@@ -35,7 +35,7 @@ import type {
   TransportRef,
 } from "./contract.js";
 import { validateAction } from "./contract.js";
-import { BOARD_SINKS } from "./effects.js";
+import { BOARD_SINKS, parseTarget, sinkOf, type EffectSink } from "./effects.js";
 import type { DecideContext, ReviewIdentity, decide as reducerDecide, fold as reducerFold, read as reducerRead } from "./reducer.js";
 
 interface Row { [key: string]: unknown }
@@ -157,6 +157,18 @@ function effectFromRow(row: Row): EffectRow {
     sentAt: row.sent_at === null ? null : String(row.sent_at),
     obsoleteAt: row.obsolete_at === null ? null : String(row.obsolete_at),
   };
+}
+
+/**
+ * Does this target dispatch through `sink`? A target that does not parse belongs to no sink and
+ * is offered to every pass, so the defect is failed visibly rather than listed by nobody.
+ */
+function inSink(target: string, sink: EffectSink): boolean {
+  try {
+    return sinkOf(parseTarget(target)) === sink;
+  } catch {
+    return true;
+  }
 }
 
 function inboxFromRow(row: Row): InboxDelivery {
@@ -606,11 +618,23 @@ export class ReviewStore {
 
   readonly effects = {
     /**
-     * One row per target: the newest pending refresh (a refresh re-renders from `read()`, so
-     * only the latest matters) or the oldest pending actionable (dispatched in order). A row
-     * whose `next_attempt_at` is in the future is not yet due.
+     * The due rows of one sink, one row per target: the newest pending refresh (a refresh
+     * re-renders from `read()`, so only the latest matters) or the oldest pending actionable
+     * (dispatched in order). A row whose `next_attempt_at` is in the future is not yet due.
+     *
+     * §8.1: each sink publishes on its own pass, so the selection is by sink. The row grammar is
+     * unchanged — a target already names its sink — and the filter runs in memory over the
+     * listing rather than in SQL, because the mapping from target to sink is `parseTarget` +
+     * `sinkOf` (`effects.ts`) and a LIKE-per-target-kind predicate would be a second copy of it,
+     * free to drift. The query already reads every due row before deduplicating by target, so
+     * filtering here costs nothing extra; `limit` is applied after it, which is what keeps one
+     * sink's backlog from crowding the other out of its own pass.
+     *
+     * A target that does not parse names no sink. Such a row is a defect that must stay visible,
+     * so it is returned to every sink; the publisher's exclusive claim decides which pass fails
+     * it, and it touches no port on the way.
      */
-    pendingByTarget: (now: string, limit = 100): EffectRow[] => {
+    pendingByTarget: (now: string, sink: EffectSink, limit = 100): EffectRow[] => {
       const rows = this.db.prepare(`
         SELECT * FROM review_effects
         WHERE status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
@@ -619,6 +643,7 @@ export class ReviewStore {
       const byTarget = new Map<string, EffectRow>();
       for (const row of rows) {
         const effect = effectFromRow(row);
+        if (!inSink(effect.target, sink)) continue;
         if (effect.kind === "refresh" || !byTarget.has(effect.target)) byTarget.set(effect.target, effect);
       }
       return [...byTarget.values()].slice(0, limit);
