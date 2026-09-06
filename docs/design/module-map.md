@@ -108,8 +108,13 @@ uses, so the auto-request, a reassignment and the exhaustion episode honour it t
 decision time, D4 reassignment with `supersedes`, D6 stall housekeeping (runs inside every `ObservePR`
 — the §7 sweep is the cadence, §A4 forbids a separate command — measuring `stall_window_s` from the last
 transport the reducer queued, recording `request_retransported` up to `transport_bound`, then
-`request_unanswerable` + `Hold(unanswerable, blocks summons)`; paused transport never stalls; an answer
-arriving anyway releases the hold as the system), D8 `mergeable_observed`
+`request_transport_exhausted` + `Hold(transport_exhausted, blocks summons)` — neither discharges the
+obligation, the request stays pending; paused transport never stalls; an answer arriving anyway releases
+the hold as the system), D9 the one outstanding-obligation predicate (`isOutstanding`, used by
+readiness, housekeeping, answer matching and restoration), D10 `restoreObligations` (the one
+invariant-restoration point, called from `observe`, `release`, `grantRounds`, `cancelRequest`,
+`setAvailability` and `adoptPolicy`; holds withhold transport, never creation; an operator's
+`cancellation` at the current subject is not resurrected), D8 `mergeable_observed`
 + transport withheld (effects not emitted while `mergeable === false`; emitted on flip to `true`),
 E1–E7, F1–F5, G1–G5, H readiness, I `AdoptPolicy`. Cross-item and process rules listed in the
 contract module's docstring (`weave_reviewkit/contract.py`) are refused `malformed` here — the store

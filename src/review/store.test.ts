@@ -613,7 +613,7 @@ test("active(since) lists Reviews with a pending request or recent activity", ()
   state.requests.push({
     id: "req_1", kind: "review", mode: "initial", assignee: "codex", subject_key: state.subject.key, required: true, names: [],
     status: "pending", opened_by: { kind: "system", caused_by: "obs:run_1" }, opened_at: "2026-09-06T12:00:00.000Z", reason: "routing_by_round.first",
-    supersedes: null, transport: [], retransports: [], answered_by: null,
+    supersedes: null, transport: [], retransports: [], transport_exhausted: false, cancellation: null, answered_by: null,
   });
   db.prepare("UPDATE reviews SET state_json = ? WHERE review_id = ?").run(JSON.stringify(state), state.id);
   assert.deepEqual(store.active("2026-09-06T12:00:30.000Z"), [quiet, KEY]);

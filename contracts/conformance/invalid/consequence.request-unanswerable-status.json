@@ -1,0 +1,12 @@
+{
+  "expect": {
+    "code": "malformed",
+    "why": "a spent transport bound does not discharge an obligation; the consequence is `request_transport_exhausted` and the request stays pending (\u00a76.D6)"
+  },
+  "instance": {
+    "kind": "request_unanswerable",
+    "reason": "gave up",
+    "request_id": "req_obs:run_01J_1"
+  },
+  "model": "consequence"
+}
