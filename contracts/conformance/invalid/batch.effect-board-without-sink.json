@@ -1,7 +1,7 @@
 {
   "expect": {
     "code": "malformed",
-    "why": "consequences are the closed set of materialized state changes (§5.B3)"
+    "why": "a board effect names its sink: board:github:<review> or board:slack:<review>, never board:<review> (§8.1)"
   },
   "instance": {
     "admitted_at": "2026-09-06T12:00:00.000Z",
@@ -48,30 +48,59 @@
     },
     "consequences": [
       {
-        "from": "H1",
-        "kind": "verdict_inherited"
+        "kind": "subject_changed",
+        "previous_key": null,
+        "subject": {
+          "author": {
+            "actor": "talos",
+            "kind": "seat"
+          },
+          "base_ref": "main",
+          "base_sha_at_first_sight": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "changed_paths": [
+            "src/x.py"
+          ],
+          "diff_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "first_seen_at": "2026-09-06T12:00:00.000Z",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "key": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:main",
+          "merge_base_sha": "cccccccccccccccccccccccccccccccccccccccc"
+        }
+      },
+      {
+        "kind": "mergeable_observed",
+        "mergeable": true
+      },
+      {
+        "kind": "request_opened",
+        "request": {
+          "answered_by": null,
+          "assignee": "codex",
+          "id": "req_obs:run_01J_1",
+          "kind": "review",
+          "mode": "initial",
+          "names": [],
+          "opened_at": "2026-09-06T12:00:00.000Z",
+          "opened_by": {
+            "caused_by": "obs:run_01J",
+            "kind": "system"
+          },
+          "reason": "routing_by_round.first",
+          "required": true,
+          "retransports": [],
+          "status": "pending",
+          "subject_key": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:main",
+          "supersedes": null,
+          "transport": []
+        }
       }
     ],
     "effects": [
       {
         "effect_id": "eff_obs:run_01J_1",
-        "kind": "actionable",
-        "payload": null,
-        "target": "summon:req_obs:run_01J_1"
-      },
-      {
-        "effect_id": "eff_obs:run_01J_2",
         "kind": "refresh",
         "payload": null,
-        "target": "check:Owner/repo:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-      },
-      {
-        "effect_id": "eff_obs:run_01J_3",
-        "kind": "refresh",
-        "payload": {
-          "note": "opened"
-        },
-        "target": "board:slack:rev_01J"
+        "target": "board:rev_01J"
       }
     ],
     "policy_version": 1,

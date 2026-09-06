@@ -1218,7 +1218,7 @@
           ]
         },
         "target": {
-          "pattern": "^(check:\\S+:[0-9a-f]{40}|board:\\S+|thread:[1-9][0-9]*|delivery:[a-z0-9-]+:\\S+|summon:\\S+|announce:\\S+|notice:[a-z0-9-]+:\\S+)$",
+          "pattern": "^(check:\\S+:[0-9a-f]{40}|board:(github|slack):\\S+|thread:[1-9][0-9]*|delivery:[a-z0-9-]+:\\S+|summon:\\S+|announce:\\S+|notice:[a-z0-9-]+:\\S+)$",
           "type": "string"
         }
       },

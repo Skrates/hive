@@ -14,7 +14,9 @@ import { readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { BrokerService, housekeepingTick, type SlackTransport } from "../broker/service.js";
 import { BrokerStore } from "../broker/store.js";
+import type { ReplaySnapshot, SubscriptionInput } from "../domain.js";
 import type { Clock } from "../time.js";
 import type {
   Action,
@@ -244,12 +246,24 @@ class FakeGitHub implements ReviewGitHubPort {
   threads: Array<{ commentId: number; op: "resolve" | "unresolve" }> = [];
   comments: string[] = [];
   boardGate: { reached: () => void; proceed: Promise<void> } | null = null;
+  /** A port that refuses every call (bundle-1 #9: GitHub down). */
+  down: Error | null = null;
+  /** A port that accepts every call and never answers (bundle-1 #9: GitHub hung). */
+  hang: Promise<never> | null = null;
   async createOrUpdateCheckRun(input: { headSha: string; existingId: number | null; conclusion: "success" | "failure"; title: string }): Promise<{ checkRunId: number }> {
+    await this.reachable();
     this.checks.push({ headSha: input.headSha, conclusion: input.conclusion, title: input.title });
     this.checkEdits.push(input.existingId);
     return { checkRunId: input.existingId ?? this.checks.length };
   }
+  /** Whatever this port is doing to the caller — throwing, hanging, or answering. */
+  private async reachable(): Promise<void> {
+    if (this.down !== null) throw this.down;
+    if (this.hang !== null) await this.hang;
+  }
+
   async createOrUpdateBoardComment(input: { existingId: number | null; body: string }): Promise<{ commentId: number }> {
+    await this.reachable();
     const gate = this.boardGate;
     if (gate !== null) {
       this.boardGate = null;
@@ -260,9 +274,10 @@ class FakeGitHub implements ReviewGitHubPort {
     this.boardEdits.push(input.existingId);
     return { commentId: input.existingId ?? 500 };
   }
-  async resolveThread(input: { commentId: number }): Promise<void> { this.threads.push({ commentId: input.commentId, op: "resolve" }); }
-  async unresolveThread(input: { commentId: number }): Promise<void> { this.threads.push({ commentId: input.commentId, op: "unresolve" }); }
+  async resolveThread(input: { commentId: number }): Promise<void> { await this.reachable(); this.threads.push({ commentId: input.commentId, op: "resolve" }); }
+  async unresolveThread(input: { commentId: number }): Promise<void> { await this.reachable(); this.threads.push({ commentId: input.commentId, op: "unresolve" }); }
   async postComment(input: { body: string }): Promise<{ commentId: number }> {
+    await this.reachable();
     this.comments.push(input.body);
     return { commentId: 700 + this.comments.length };
   }
@@ -426,7 +441,12 @@ test("M0 slice: an adapter observation and a Codex clean answer reach the Slack 
   // Without GitHub (M0) the check refresh has no sink and the summons waits; nothing is lost.
   const rows = core.effectRows();
   assert.ok(rows.some((r) => r.target.startsWith("check:") && r.status === "obsolete"));
-  assert.ok(rows.filter((r) => r.target.startsWith("board:")).every((r) => r.status === "sent" || r.status === "obsolete"));
+  // §8.1: the board's two sinks are two rows — the Slack line is sent, the GitHub comment
+  // has no port in M0 and is retired, neither waiting on the other.
+  const slackBoard = rows.filter((r) => r.target.startsWith("board:slack:"));
+  assert.ok(slackBoard.every((r) => r.status === "sent" || r.status === "obsolete"), "sent, or coalesced into the one that was");
+  assert.equal(slackBoard.filter((r) => r.status === "sent").length, 1);
+  assert.ok(rows.filter((r) => r.target.startsWith("board:github:")).every((r) => r.status === "obsolete"));
   core.close();
 });
 
@@ -673,7 +693,7 @@ test("§11.6 Exhaustion predicate becomes true → another answer at the same su
   const rows = core.effectRows().filter((r) => exhausted.effects.includes(r.effect_id));
   const deliveries = rows.filter((r) => r.target.startsWith("delivery:"));
   assert.deepEqual(deliveries.map((r) => r.target).sort(), [`delivery:talos:${retro.id}`, `delivery:theoros:${retro.id}`].sort(), "one author delivery, one retrospective request delivery");
-  assert.deepEqual(rows.filter((r) => r.kind === "refresh").map((r) => r.target), [`board:${review.id}`, `check:Owner/repo:${H1}`], "one gate projection (the board and check refresh from current state)");
+  assert.deepEqual(rows.filter((r) => r.kind === "refresh").map((r) => r.target), [`board:github:${review.id}`, `board:slack:${review.id}`, `check:Owner/repo:${H1}`], "one gate projection (the board sinks and the check refresh from current state)");
 
   // Another answer at the same subject while the episode is open: the predicate holds again and emits nothing new.
   core.applied({ kind: "OpenRequest", request_kind: "review", mode: "appeal", assignee: "ariadne", subject_key: key, required: false, names: [], reason: "one more look" }, OPERATOR);
@@ -957,4 +977,166 @@ test("§6.C6 through the reconciler: a verbatim template copy is exempt in the R
   assert.equal(core.pending("codex").length, 1, "a code subject gets its initial request");
   assert.equal(core.state().requirement.status, "unsatisfied");
   core.close();
+});
+
+// ---------------------------------------------------------------------------------------
+// Bundle-1 #9: GitHub availability is not a prerequisite for Hive delivery
+// ---------------------------------------------------------------------------------------
+
+/** A live subscription, so a system wake to this seat is routable (R-3). */
+function seatSubscription(actor: string): SubscriptionInput {
+  return {
+    actor, provider: "codex", providerSurface: "app-server", providerVersion: "0.144.0",
+    sessionId: null, homeEdge: "mac", workspace: "hive",
+    edgeWorkspaces: [{ edgeId: "mac", cwd: "/work/hive", worktree: null }],
+    wakePolicy: "spawn", permissionProfile: "read-only", accountProfile: "/home/user/.codex-hive",
+    leaseTtlMs: 1_000, deliveryTtlMs: 60_000, homeGraceMs: 2_000, spawnRateLimit: 1,
+    maxAttempts: 3, turnSlots: 1, expiresAt: null,
+  };
+}
+
+/**
+ * The composed sinks: the real broker database as the Slack sink (as `bootReviewRuntime` wires
+ * it), the real `BrokerService` outbox over a Slack transport the test drives, and a GitHub
+ * port the test can take down or hang.
+ */
+function sinks(options: { publisherTimeoutMs?: number } = {}) {
+  const clock = new FakeClock(new Date(T0));
+  const broker = new BrokerStore(":memory:", clock);
+  const store = new ReviewStore(broker.db, { decide, fold, read, clock });
+  store.putPolicy(KEY.repository_id, POLICY);
+  const github = new FakeGitHub();
+  const publisher = options.publisherTimeoutMs === undefined
+    ? new ReviewPublisher(store, { github, slack: broker }, clock)
+    : new ReviewPublisher(store, { github, slack: broker }, clock, options.publisherTimeoutMs);
+  const posts: Array<{ channelId: string; threadTs: string | null; text: string }> = [];
+  const slack: SlackTransport = {
+    async replay(): Promise<ReplaySnapshot> {
+      return { channelId: "C0123ABCD", threadTs: "1700.1", fetchedAt: T0, cursor: null, messages: [] };
+    },
+    async reply(channelId: string, threadTs: string, text: string): Promise<string> {
+      posts.push({ channelId, threadTs, text });
+      return `1700.${posts.length}`;
+    },
+    async react(): Promise<void> {},
+  };
+  const service = new BrokerService(broker, slack);
+  const acts = { n: 0 };
+  const act = (action: Action, principal: Principal): Receipt => {
+    acts.n += 1;
+    const fenced = principal.kind === "seat" || principal.kind === "operator";
+    return store.apply(KEY, {
+      actId: principal.kind === "adapter" ? `obs:run${acts.n}` : `01J${String(acts.n).padStart(3, "0")}`,
+      principal, expectedRevision: fenced ? store.get(KEY)?.revision ?? 0 : null, action, display: DISPLAY,
+    });
+  };
+  const rows = (): Array<{ target: string; status: string }> =>
+    broker.db.prepare("SELECT target, status FROM review_effects ORDER BY rowid").all() as Array<{ target: string; status: string }>;
+  /** Silence the publisher's own failure log for as long as the job under test runs. */
+  const quiet = async <T>(run: () => Promise<T>): Promise<T> => {
+    const original = console.error;
+    console.error = () => {};
+    try {
+      return await run();
+    } finally {
+      console.error = original;
+    }
+  };
+  return { clock, broker, store, github, publisher, service, posts, act, rows, quiet };
+}
+
+// A publication pass is single-flight, so a GitHub port that never answers used to hold the
+// whole tick — and the outbox drained only after it. Every Hive wake on the bus, review or not,
+// waited on GitHub.
+test("bundle-1 #9: a hung GitHub port delays no Hive wake and no Slack board line", async () => {
+  // A short dispatch timeout so the hung port's rows fail inside the test rather than at the
+  // production bound; the point under test is what happens while it is still hung.
+  const { broker, github, publisher, service, posts, act, rows, quiet } = sinks({ publisherTimeoutMs: 50 });
+  broker.enqueueThreadNotice("C9", "900.1", "an unrelated Hive wake");
+  github.hang = new Promise<never>(() => {});
+  act(observe(), ADAPTER);
+
+  const tick = quiet(() => housekeepingTick({
+    sweep: () => broker.requeueExpiredLeases(),
+    publish: () => publisher.drainOnce(),
+    drainOutbox: () => service.drainOutbox(),
+    log: () => {},
+  }));
+  // The publication pass is still inside the hung GitHub call …
+  await new Promise((resolve) => setImmediate(resolve));
+  // … and the unrelated wake, plus the Review's own Slack board line, have gone out.
+  assert.deepEqual(posts.map((p) => p.text), ["an unrelated Hive wake", posts[1]?.text ?? ""]);
+  assert.match(posts[1]?.text ?? "", /Owner\/repo#7/u);
+  const board = rows().filter((r) => r.target.startsWith("board:"));
+  assert.deepEqual(board.filter((r) => r.target.startsWith("board:slack:")).map((r) => r.status), ["sent"]);
+  assert.ok(board.filter((r) => r.target.startsWith("board:github:")).every((r) => r.status === "pending" || r.status === "claimed"),
+    "the GitHub sink has published nothing — its row waits on its own port, alone");
+  assert.equal(github.boards.length, 0);
+  await tick;
+  broker.close();
+});
+
+// The Slack board line is what opens the Review's thread, and every delivery threads under it.
+test("bundle-1 #9: with GitHub down the Slack thread still opens and a seat delivery threads under it", async () => {
+  const { broker, store, github, publisher, service, posts, act, rows, quiet } = sinks();
+  broker.createEdge("mac");
+  broker.upsertSubscription(seatSubscription("talos"));
+  github.down = new Error("github is down");
+  act(observe(), ADAPTER);
+
+  await quiet(() => publisher.drainOnce());
+  await service.drainOutbox();
+  assert.equal(posts.length, 1, "the board line left, GitHub notwithstanding");
+  assert.ok(!posts[0]?.threadTs, "§8.1: the first line is the thread's top-level post");
+  assert.deepEqual(rows().filter((r) => r.target.startsWith("board:github:")).map((r) => r.status), ["pending"], "failed and behind backoff, alone");
+
+  // A delivery queued after the outbox has posted that line threads under it.
+  act({ kind: "OpenRequest", request_kind: "review", mode: "appeal", assignee: "talos", subject_key: `${H1}:main`, required: false, names: [], reason: "burn" }, OPERATOR);
+  await quiet(() => publisher.drainOnce());
+  await service.drainOutbox();
+  assert.equal(store.read(KEY)?.projection_handles.slack_thread_ts, "1700.1", "the thread ts was learned from the outbox, not from GitHub");
+  const transport = store.get(KEY)?.requests.find((r) => r.assignee === "talos")?.transport ?? [];
+  const ref = transport.find((t) => "delivery_id" in t);
+  assert.ok(ref !== undefined && "delivery_id" in ref, "the delivery was minted");
+  assert.equal(broker.getDelivery(ref.delivery_id).event.threadTs, "1700.1", "threaded under the Slack board parent, never under GitHub");
+  broker.close();
+});
+
+// Refresh-from-current: the GitHub sink catches up from the state as it is now, coalesced into
+// one call, and the check row was never part of the board's trouble.
+test("bundle-1 #9: when GitHub recovers the board comment catches up from the current state", async () => {
+  const { clock, broker, github, publisher, act, rows, quiet } = sinks();
+  github.down = new Error("github is down");
+  act(observe(), ADAPTER);
+  await quiet(() => publisher.drainOnce());
+  assert.equal(github.boards.length, 0);
+  assert.equal(github.checks.length, 0, "the check row is a GitHub row too, and failed on its own");
+
+  // Two more acts while GitHub is down: two more board:github rows, one per batch.
+  act({ kind: "GrantRounds", n: 1, reason: "one more" }, OPERATOR);
+  act({ kind: "Hold", hold: { kind: "operator", reason: "wait", release_on: "explicit", blocks: { readiness: true, summons: false } } }, OPERATOR);
+  github.down = null;
+  clock.advance(10 * MINUTE);
+  await publisher.drainOnce();
+
+  assert.equal(github.boards.length, 1, "one comment, rendered from the state now — the earlier rows coalesced");
+  assert.match(github.boards[0] ?? "", /hold: operator/u);
+  assert.deepEqual(github.checks.map((c) => [c.conclusion, c.title]), [["failure", "hold: operator"]], "the check caught up on its own row");
+  const github_rows = rows().filter((r) => r.target.startsWith("board:github:"));
+  assert.equal(github_rows.filter((r) => r.status === "sent").length, 1);
+  assert.ok(github_rows.every((r) => r.status === "sent" || r.status === "obsolete" || r.status === "pending"));
+  broker.close();
+});
+
+// The publisher's own guard against a port that never answers: the pass is sequential and
+// single-flight, so an await that never returns would wedge publication for the process's life.
+test("bundle-1 #9: a GitHub call that never answers fails its row on the dispatch timeout", async () => {
+  const { broker, github, publisher, act, rows, quiet } = sinks({ publisherTimeoutMs: 20 });
+  github.hang = new Promise<never>(() => {});
+  act(observe(), ADAPTER);
+  await quiet(() => publisher.drainOnce());
+  assert.deepEqual(rows().filter((r) => r.target.startsWith("board:slack:")).map((r) => r.status), ["sent"], "the Slack sink never waited on the hung port");
+  const stuck = rows().filter((r) => r.target.startsWith("board:github:") || r.target.startsWith("check:") || r.target.startsWith("summon:"));
+  assert.ok(stuck.every((r) => r.status === "pending"), "timed out, attempts spent, behind backoff — not claimed forever");
+  broker.close();
 });

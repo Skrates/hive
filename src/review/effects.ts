@@ -8,10 +8,16 @@
 import type { Effect, Request, Review } from "./contract.js";
 import { contractSchema } from "./contract.js";
 
+/**
+ * §8.1: the sink a target publishes through. Every target names exactly one, so one sink's
+ * failure, backoff, or absence never gates another's row.
+ */
+export type EffectSink = "github" | "slack";
+
 /** §8.1 — the seven targets. `refresh` for check/board/thread, `actionable` for the rest. */
 export type EffectTarget =
   | { kind: "check"; repo: string; headSha: string }
-  | { kind: "board"; reviewId: string }
+  | { kind: "board"; sink: EffectSink; reviewId: string }
   | { kind: "thread"; commentId: number }
   | { kind: "delivery"; actor: string; requestId: string }
   | { kind: "summon"; requestId: string }
@@ -42,8 +48,14 @@ export function parseTarget(target: string): EffectTarget {
       const split = rest.lastIndexOf(":");
       return { kind: "check", repo: rest.slice(0, split), headSha: rest.slice(split + 1) };
     }
-    case "board":
-      return { kind: "board", reviewId: rest };
+    case "board": {
+      // `board:<sink>:<review>` — the sink is a fixed token with no colon, so the first colon
+      // separates it from a review id that may itself carry colons (`rev_obs:<run>`).
+      const split = rest.indexOf(":");
+      const sink = rest.slice(0, split);
+      if (sink !== "github" && sink !== "slack") throw new Error(`board effect target names no sink: ${JSON.stringify(target)}`);
+      return { kind: "board", sink, reviewId: rest.slice(split + 1) };
+    }
     case "thread":
       return { kind: "thread", commentId: Number(rest) };
     case "delivery": {
@@ -73,7 +85,7 @@ export function formatTarget(target: EffectTarget): string {
     case "check":
       return `check:${target.repo}:${target.headSha}`;
     case "board":
-      return `board:${target.reviewId}`;
+      return `board:${target.sink}:${target.reviewId}`;
     case "thread":
       return `thread:${target.commentId}`;
     case "delivery":
@@ -84,6 +96,30 @@ export function formatTarget(target: EffectTarget): string {
       return `announce:${target.reviewId}`;
     case "notice":
       return `notice:${target.actor}:${target.subjectKey}`;
+  }
+}
+
+/** §8.1: the board's sinks, in the order the reducer emits a refresh for each. */
+export const BOARD_SINKS: readonly EffectSink[] = ["github", "slack"];
+
+/**
+ * §8.1: which port a target dispatches through. The publisher orders a pass by this — the
+ * Slack sink never queues behind a GitHub call that is slow or hung — and the two sinks'
+ * rows are independent everywhere else (claim, backoff, coalescing) because they are
+ * different targets.
+ */
+export function sinkOf(target: EffectTarget): EffectSink {
+  switch (target.kind) {
+    case "board":
+      return target.sink;
+    case "check":
+    case "thread":
+    case "summon":
+      return "github";
+    case "delivery":
+    case "announce":
+    case "notice":
+      return "slack";
   }
 }
 

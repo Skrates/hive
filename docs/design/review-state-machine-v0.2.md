@@ -569,10 +569,22 @@ reads the policy by the Review's version; the batch records it (§B3).
 
 ### 8.1 Effects and publication
 
-- Every effect row has its own `effect_id`, a `target` (`check:<repo>:<head>`, `board:<review>`,
-  `thread:<comment_id>`, `delivery:<actor>:<request>`, `summon:<request>`, `announce:<review>`,
-  `notice:<actor>:<subject_key>`) and a kind: **refresh** (check, board, thread) or **actionable**
-  (delivery, summon, announce, notice).
+- Every effect row has its own `effect_id`, a `target` (`check:<repo>:<head>`,
+  `board:<sink>:<review>`, `thread:<comment_id>`, `delivery:<actor>:<request>`, `summon:<request>`,
+  `announce:<review>`, `notice:<actor>:<subject_key>`) and a kind: **refresh** (check, board, thread)
+  or **actionable** (delivery, summon, announce, notice).
+- **A target names exactly one sink.** The board projection has two — the GitHub comment and the
+  Slack line — so it has two targets (`board:github:<review>`, `board:slack:<review>`), and one
+  sink's failure, backoff, or absence never gates the other. Every other target already named one
+  sink: check, thread and summon are GitHub; delivery, notice and announce are Slack. Every applied
+  batch emits both board rows; the publisher retires the row of a sink this broker does not have
+  (the GitHub comment in M0), and fails the row of a sink the policy should have named but did not.
+  Within a pass the Slack rows dispatch before the GitHub rows, and a GitHub call that has not
+  answered within the dispatch timeout fails its row rather than holding the pass.
+- **Publication is not broker housekeeping.** The broker's periodic tick runs the outbox drain and
+  a publication pass independently, neither awaiting the other, each single-flight: a GitHub port
+  that is slow, hung, or down delays no Hive delivery. The publisher's Slack rows land in that same
+  outbox and go out on the tick that finds them.
 - A `notice` is a standing message to an actor about a subject, named by the subject rather than by a
   request. It is **not request transport**: the §D8 pause never withholds it (it is what explains the
   pause), and it goes obsolete only when the Review has left the subject it names.

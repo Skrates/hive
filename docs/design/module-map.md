@@ -47,9 +47,10 @@ export type Validated<T> = { ok: true; value: T } | { ok: false; code: "malforme
   `ep_`, `eff_`; `batch_id = "bat_" + actId`; `review_id = "rev_" + actId` of the opening act. Ids may
   contain colons (adapter act ids are `obs:<run>` / `src:<record_key>:<version>`); the §8.1 target
   grammar tolerates that.
-- **Effect target grammar (§8.1)** — `check:<owner/repo>:<head_sha>` · `board:<review_id>` ·
-  `thread:<comment_id>` · `delivery:<actor>:<request_id>` · `summon:<request_id>` ·
-  `announce:<review_id>`. `kind` is `refresh` for check/board/thread and `actionable` for
+- **Effect target grammar (§8.1)** — `check:<owner/repo>:<head_sha>` ·
+  `board:<github|slack>:<review_id>` · `thread:<comment_id>` · `delivery:<actor>:<request_id>` ·
+  `summon:<request_id>` · `announce:<review_id>`. A target names one publication sink; the board's
+  two sinks are two targets. `kind` is `refresh` for check/board/thread and `actionable` for
   delivery/summon/announce. `payload` is `null` for refreshes (a refresh re-renders from `read()`);
   actionable payloads are §4 of this map.
 - **Refusal** (what `decide` returns; the store wraps it into a `Receipt`):
@@ -116,8 +117,8 @@ contract module's docstring (`weave_reviewkit/contract.py`) are refused `malform
 already ran Ajv, so `decide` may assume shape. `decide` on `state === null` admits only
 `ObservePR` from an adapter/system principal; everything else is `no_such_target`.
 
-Effects `decide` emits (ids `eff_<actId>_<n>`): on every applied batch one `refresh` for
-`board:<review_id>` and one for `check:<display-repo>:<head_sha>`; `thread:<comment_id>` refresh
+Effects `decide` emits (ids `eff_<actId>_<n>`): on every applied batch one `refresh` per board sink
+(`board:github:<review_id>`, `board:slack:<review_id>`) and one for `check:<display-repo>:<head_sha>`; `thread:<comment_id>` refresh
 when a finding with a comment source changes status; `delivery:<assignee>:<request_id>` on
 `request_opened` to a seat; `summon:<request_id>` on `request_opened` to `codex`;
 `announce:<review_id>` on `lifecycle_changed → merged`. G4's episode emits exactly one
@@ -445,9 +446,11 @@ builder's `deviations` output and the integrator amends this map; do not work ar
 `new ReviewStore(broker.db, { decide, fold, read, clock })`, the `ReviewPublisher` over `{ github, slack: broker }`
 (`BrokerStore` is the `SystemWakePort`), and, when the GitHub App is configured, the `AppGitHubPort`, the webhook
 handler bound to the secret, and the `ReconcileScheduler`; it returns the `ReviewHttpDeps` the `broker` command
-hands to `BrokerHttpServer`. The publisher drains on the broker's 5-second housekeeping tick ahead of the outbox
-drain (its Slack deliveries land in that outbox); `review.start()` arms the scheduler after Slack is up and
-`review.stop()` joins the shutdown.
+hands to `BrokerHttpServer`. The broker's 5-second housekeeping tick is `housekeepingTick` in
+`src/broker/service.ts`: it runs the sweep, one publication pass, and the outbox drain independently — no job
+waits on another, so GitHub availability is never a prerequisite for Hive delivery (§8.1). The publisher's Slack
+deliveries land in that outbox and go out on the tick that finds them. `review.start()` arms the scheduler after
+Slack is up and `review.stop()` joins the shutdown.
 
 Env (broker): `HIVE_GITHUB_WEBHOOK_SECRET_FILE`, `HIVE_GITHUB_APP_ID`, `HIVE_GITHUB_APP_KEY_FILE` — secrets are
 owner-only (0600) files read by `src/review/secret-file.ts`, never bare values; all three or none. With none set
