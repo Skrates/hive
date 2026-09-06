@@ -50,7 +50,7 @@ export interface ReviewGitHubPort {
   resolveThread(input: { repositoryId: number; commentId: number }): Promise<void>;
   unresolveThread(input: { repositoryId: number; commentId: number }): Promise<void>;
   /** Summons ("@codex review"). */
-  postComment(input: { repositoryId: number; prNumber: number; body: string }): Promise<{ commentId: number }>;
+  postComment(input: { repositoryId: number; prNumber: number; body: string }): Promise<{ commentId: number; summonLogin: string }>;
 }
 
 /** Implemented on `BrokerStore`: system-origin Hive deliveries and the board line (§8.1 Slack). */
@@ -337,12 +337,12 @@ export class ReviewPublisher {
         if (payload === null) throw new DispatchError(`summon effect ${row.effect_id} carries no summon payload`);
         const github = this.ports.github;
         if (github === null) throw new DispatchError("summon dispatched without a GitHub port");
-        const { commentId } = await github.postComment({
+        const { commentId, summonLogin } = await github.postComment({
           repositoryId: state.key.repository_id,
           prNumber: state.key.pr_number,
           body: `${payload.text}\n\nHive request ${target.requestId}; effect ${row.effect_id}; attempt ${row.attempts + 1}. Repeated delivery of this request is a retry of the same review obligation.`,
         });
-        this.store.projections.recordTransport(state.id, row.effect_id, target.requestId, { summon_comment_id: this.positiveId(commentId, "summon comment") });
+        this.store.projections.recordTransport(state.id, row.effect_id, target.requestId, { summon_comment_id: this.positiveId(commentId, "summon comment"), summon_login: summonLogin });
         return "sent";
       }
       case "announce": {

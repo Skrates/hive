@@ -143,7 +143,7 @@ function requestLine(request: Request): string {
   const transport = request.transport.length === 0
     ? "no transport yet"
     : request.transport
-      .map((ref) => ("delivery_id" in ref ? `delivery ${ref.delivery_id}` : `summon comment ${ref.summon_comment_id}`))
+      .map((ref) => ("delivery_id" in ref ? `delivery ${ref.delivery_id}` : `summon comment ${ref.summon_comment_id} by ${ref.summon_login}`))
       .join(", ");
   const names = request.names.length === 0 ? "" : ` naming ${request.names.join(", ")}`;
   const supersedes = request.supersedes === null ? "" : ` (supersedes ${request.supersedes})`;
@@ -377,7 +377,7 @@ export interface ThreadOp { comment_id: number; op: "resolve" | "unresolve" }
 export function threadOps(before: Review | null, after: Review): ThreadOp[] {
   const ops: ThreadOp[] = [];
   for (const finding of after.findings) {
-    if (!("comment_id" in finding.source)) continue;
+    if (!("comment_id" in finding.source) || finding.source.record_kind !== "review_comment") continue;
     const prior = before?.findings.find((candidate) => candidate.id === finding.id) ?? null;
     const wasClosed = prior !== null && !prior.status.open;
     const isClosed = !finding.status.open;
@@ -394,7 +394,7 @@ export function threadOps(before: Review | null, after: Review): ThreadOp[] {
  */
 export function threadState(review: Review, commentId: number): "resolve" | "unresolve" | null {
   const finding = review.findings.find(
-    (candidate) => "comment_id" in candidate.source && candidate.source.comment_id === commentId,
+    (candidate) => "comment_id" in candidate.source && candidate.source.record_kind === "review_comment" && candidate.source.comment_id === commentId,
   );
   if (finding === undefined) return null;
   return finding.status.open ? "unresolve" : "resolve";

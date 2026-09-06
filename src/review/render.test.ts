@@ -117,7 +117,7 @@ test("board renders requests with transport references, holds, charges and the g
   const withTransport = request({
     id: "req_1",
     assignee: "codex",
-    transport: [{ summon_comment_id: 5150 }],
+    transport: [{ summon_comment_id: 5150, summon_login: "RationallyPrime" }],
   });
   const seatRequest = request({
     id: "req_2",
@@ -199,6 +199,8 @@ test("thread ops: resolve on close, unresolve on contest or re-open, nothing for
   assert.equal(threadState(review({ findings: [closed] }), 9001), "resolve");
   assert.equal(threadState(review({ findings: [contested] }), 9001), "unresolve");
   assert.equal(threadState(review({ findings: [kitClosed] }), 9001), null);
+  const issue = finding({ source: { record_kind: "issue_comment", comment_id: 9001 } });
+  assert.equal(threadState(review({ findings: [issue, closed] }), 9001), "resolve", "issue and review comments have separate numeric id namespaces");
 });
 
 // §7 step 3: `unknown` is surfaced on the board, never promoted — ahead of the findings, with a link.

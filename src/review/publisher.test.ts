@@ -172,9 +172,9 @@ class FakeGitHub implements ReviewGitHubPort {
   }
   async resolveThread(input: { commentId: number }): Promise<void> { this.threads.push({ commentId: input.commentId, op: "resolve" }); }
   async unresolveThread(input: { commentId: number }): Promise<void> { this.threads.push({ commentId: input.commentId, op: "unresolve" }); }
-  async postComment(input: { body: string }): Promise<{ commentId: number }> {
+  async postComment(input: { body: string }): Promise<{ commentId: number; summonLogin: string }> {
     this.comments.push(input.body);
-    return { commentId: 700 + this.comments.length };
+    return { commentId: 700 + this.comments.length, summonLogin: "RationallyPrime" };
   }
 }
 
@@ -553,7 +553,7 @@ test("a dispatched delivery records {delivery_id} and a summon records {summon_c
   assert.equal(github!.comments.length, 1);
   assert.match(github!.comments[0]!, /^@codex review\n\nHive request req_1; effect eff_1; attempt 1\./u);
   const read = store.readById("rev_obs:run_1");
-  assert.deepEqual(read?.requests.find((r) => r.id === "req_1")?.transport, [{ summon_comment_id: 701 }]);
+  assert.deepEqual(read?.requests.find((r) => r.id === "req_1")?.transport, [{ summon_comment_id: 701, summon_login: "RationallyPrime" }]);
   assert.deepEqual(read?.requests.find((r) => r.id === "req_2")?.transport, [{ delivery_id: 1 }]);
   // At-least-once: the same effect re-queued reaches the port again and the reference stays one.
   store.row("eff_2").status = "pending";

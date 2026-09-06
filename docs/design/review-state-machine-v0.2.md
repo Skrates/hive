@@ -776,7 +776,7 @@ section. **Tickets, reconciled against Linear on 2026-09-06** (bodies read throu
 ### Verification items (facts to establish, not forks)
 
 - **V-0** live probe: can a fine-grained PAT create a check run today? (Decides nothing; records the truth.)
-- **V-1** does Codex honour `@codex review` from the App identity?
+- **V-1 — verified 2026-09-06: no.** App summon [5561560923](https://github.com/Skrates/hive/pull/68#issuecomment-5561560923) received the connector's connect-account refusal. Codex summons therefore use the connected user token from `HIVE_GITHUB_SUMMON_TOKEN_FILE`; the returned `summon_login` is recorded with the comment id. App credentials continue to own all projections.
 - **V-2** can the dev box tunnel reach the host-network broker (ingress → tailnet IP or a host `cloudflared`)?
 - **V-3** required check pinned to the App on weave-doctrine's ruleset, strict policy, proven with a real PR.
 - **V-4** what fraction of historical Codex findings are badge-less (the adapter keeps them as `unknown`).

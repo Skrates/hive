@@ -101,6 +101,7 @@ test("names set but a file absent ⇒ boot refused naming the variable and the p
       HIVE_GITHUB_WEBHOOK_SECRET_FILE: join(dir, "webhook.secret"),
       HIVE_GITHUB_APP_ID: "12345",
       HIVE_GITHUB_APP_KEY_FILE: secretFile(dir, "app.pem", FAKE_PEM),
+      HIVE_GITHUB_SUMMON_TOKEN_FILE: secretFile(dir, "summon.token", "fake-user-token"),
     };
     assert.throws(() => boot(env), (error: unknown) => {
       assert.ok(error instanceof ReviewRuntimeConfigError);
@@ -133,6 +134,7 @@ test("a secret file readable beyond its owner is refused at boot (never a bare e
       HIVE_GITHUB_WEBHOOK_SECRET_FILE: secretFile(dir, "webhook.secret", FAKE_SECRET, 0o644),
       HIVE_GITHUB_APP_ID: "12345",
       HIVE_GITHUB_APP_KEY_FILE: secretFile(dir, "app.pem", FAKE_PEM),
+      HIVE_GITHUB_SUMMON_TOKEN_FILE: secretFile(dir, "summon.token", "fake-user-token"),
     };
     assert.throws(() => boot(env), SecretFileError);
   } finally {
@@ -147,6 +149,7 @@ test("with owner-only secret files the adapter is enabled: HMAC ingress persists
       HIVE_GITHUB_WEBHOOK_SECRET_FILE: secretFile(dir, "webhook.secret", FAKE_SECRET),
       HIVE_GITHUB_APP_ID: "12345",
       HIVE_GITHUB_APP_KEY_FILE: secretFile(dir, "app.pem", FAKE_PEM),
+      HIVE_GITHUB_SUMMON_TOKEN_FILE: secretFile(dir, "summon.token", "fake-user-token"),
     });
     assert.deepEqual(runtime.github, { appId: "12345" });
     assert.ok(runtime.scheduler !== null);

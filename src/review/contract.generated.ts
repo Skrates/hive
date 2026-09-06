@@ -1,7 +1,7 @@
 /* eslint-disable */
 /**
  * GENERATED — do not edit. Source: contracts/schemas/review-contract.schema.json,
- * vendored from weave-doctrine@f5818affa272edae104dbb8d5aaff76f1cb804ab (see contracts/SOURCE).
+ * vendored from weave-doctrine@6ba1f3f712c1e2be9a772b7090e6c017013ce8a1 (see contracts/SOURCE).
  * Regenerate with `bun run check:contracts`.
  */
 
@@ -1159,6 +1159,7 @@ export interface DeliveryRef {
  */
 export interface SummonRef {
   summon_comment_id: number;
+  summon_login: string;
 }
 /**
  * This interface was referenced by `ReviewContract`'s JSON-Schema

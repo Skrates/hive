@@ -262,9 +262,9 @@ class FakeGitHub implements ReviewGitHubPort {
   }
   async resolveThread(input: { commentId: number }): Promise<void> { this.threads.push({ commentId: input.commentId, op: "resolve" }); }
   async unresolveThread(input: { commentId: number }): Promise<void> { this.threads.push({ commentId: input.commentId, op: "unresolve" }); }
-  async postComment(input: { body: string }): Promise<{ commentId: number }> {
+  async postComment(input: { body: string }): Promise<{ commentId: number; summonLogin: string }> {
     this.comments.push(input.body);
-    return { commentId: 700 + this.comments.length };
+    return { commentId: 700 + this.comments.length, summonLogin: "RationallyPrime" };
   }
 }
 
@@ -895,7 +895,7 @@ test("§8.1 one board comment and one check run per head, created once and edite
   assert.equal(github.comments.length, 1);
   assert.match(github.comments[0]!, /^@codex review\n\nHive request req_obs:run1_1; effect eff_obs:run1_1; attempt 1\./u);
   assert.deepEqual(core.review().projection_handles, { board_comment_id: 500, check_run_ids: { [H1]: 1 }, slack_thread_ts: null });
-  assert.deepEqual(core.pending("codex")[0]?.transport, [{ summon_comment_id: 701 }], "the summon comment id is the request's reference");
+  assert.deepEqual(core.pending("codex")[0]?.transport, [{ summon_comment_id: 701, summon_login: "RationallyPrime" }], "the summon comment id is the request's reference");
   assert.equal(core.slack.lines.length, 1);
   assert.equal(core.slack.lines[0]?.threadTs, null, "the first line opens the thread");
 

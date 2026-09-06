@@ -1,7 +1,7 @@
 {
   "expect": {
     "code": "malformed",
-    "why": "mergeable is GitHub's tri-state true | false | null (§6.D8)"
+    "why": "mergeable is GitHub's tri-state true | false | null (\u00a76.D8)"
   },
   "instance": {
     "draft": false,

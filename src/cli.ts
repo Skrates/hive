@@ -357,6 +357,7 @@ const BrokerConfig = z.object({
   HIVE_GITHUB_WEBHOOK_SECRET_FILE: z.string().min(1).optional(),
   HIVE_GITHUB_APP_ID: z.string().min(1).optional(),
   HIVE_GITHUB_APP_KEY_FILE: z.string().min(1).optional(),
+  HIVE_GITHUB_SUMMON_TOKEN_FILE: z.string().min(1).optional(),
 });
 
 const EdgeConfig = z.object({
