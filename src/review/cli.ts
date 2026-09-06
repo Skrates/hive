@@ -1,5 +1,5 @@
 import type { Command } from "commander";
-import { readFileSync, statSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { resolveEdgeSocketPath } from "../edge/providers.js";
 import { udsRequest, udsRequestJson } from "../local/uds.js";
 import {
@@ -12,6 +12,7 @@ import {
   type ReviewState,
 } from "./contract.js";
 import { parseReviewKey } from "./key.js";
+import { readOwnerOnlyFile, SecretFileError } from "./secret-file.js";
 import { ulid } from "./ulid.js";
 
 /**
@@ -76,14 +77,13 @@ export function resolveCustody(env: NodeJS.ProcessEnv, asOperator: boolean): Cus
     }
     const file = env.HIVE_OPERATOR_TOKEN_FILE;
     if (!file) throw new ReviewCliError("--as-operator needs HIVE_OPERATOR_TOKEN_FILE naming an owner-only (0600) token file");
-    const mode = statSync(file).mode & 0o777;
-    if ((mode & 0o077) !== 0) {
-      throw new ReviewCliError(
-        `refusing to read ${file}: mode ${mode.toString(8).padStart(4, "0")} is readable beyond its owner; chmod 0600 it`,
-      );
+    let token: string;
+    try {
+      token = readOwnerOnlyFile(file);
+    } catch (error) {
+      if (error instanceof SecretFileError) throw new ReviewCliError(error.message);
+      throw error;
     }
-    const token = readFileSync(file, "utf8").trim();
-    if (token.length === 0) throw new ReviewCliError(`${file} is empty`);
     return { kind: "operator", token };
   }
   if (env.HIVE_DELIVERY_TOKEN) return { kind: "delivery", token: env.HIVE_DELIVERY_TOKEN };

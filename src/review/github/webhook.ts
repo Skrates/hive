@@ -14,22 +14,12 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import type { Clock } from "../../time.js";
 import { iso, systemClock } from "../../time.js";
-
-/** §7 / §9.3 `github_inbox` row; the store owns the table, this module owns the row's shape. */
-export interface InboxDelivery {
-  deliveryId: string;
-  event: string;
-  repositoryId: number | null;
-  prNumber: number | null;
-  payload: unknown;
-  receivedAt: string;
-}
+import type { InboxDelivery } from "../store.js";
 
 /**
  * The slice of the store this handler touches: `inbox.put` returns `false` on a duplicate
- * `delivery_id` (§7 persist-before-ack). Declared here against the module map's
- * `ReviewStore.inbox` signature because `store.ts` is another builder's file; the real
- * store satisfies it structurally.
+ * `delivery_id` (§7 persist-before-ack). Structural so a test can hand in a fake; the
+ * real `ReviewStore` satisfies it.
  */
 export interface InboxStore {
   readonly inbox: {

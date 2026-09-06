@@ -4,7 +4,8 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { validateExternalResult } from "../contract.js";
-import { CODEX_LOGINS, classifyCodexRecord, findingPriority, type ClassifyContext, type CodexClassification } from "./classify.js";
+import { CODEX_LOGINS } from "../reducer.js";
+import { classifyCodexRecord, findingPriority, type ClassifyContext, type CodexClassification } from "./classify.js";
 import { issueCommentRecord, reviewCommentRecord, reviewRecord, type GitHubRecord } from "./port.js";
 
 /** V-6: raw producer output captured read-only with `gh api` on 2026-09-06 (see select.py in the PR body). */

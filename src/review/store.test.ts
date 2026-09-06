@@ -108,7 +108,7 @@ function fakeReducer(): ReviewStoreDeps & { calls: { decide: DecideContext[]; re
         consequences: changed ? [{ kind: "subject_changed", previous_key: state?.subject.key ?? null, subject: action.subject }] : [],
         effects: [
           { effect_id: `eff_${ctx.actId}_1`, kind: "refresh", target: `board:${reviewId}`, payload: null },
-          { effect_id: `eff_${ctx.actId}_2`, kind: "refresh", target: `check:${ctx.display.split("#")[0]}:${action.subject.head_sha}`, payload: null },
+          { effect_id: `eff_${ctx.actId}_2`, kind: "refresh", target: `check:${ctx.identity?.display.split("#")[0]}:${action.subject.head_sha}`, payload: null },
           ...(changed
             ? [{ effect_id: `eff_${ctx.actId}_3`, kind: "actionable" as const, target: `summon:req_${ctx.actId}_1`, payload: { text: "@codex review" } }]
             : []),
@@ -240,7 +240,8 @@ test("apply opens a Review: batch persisted, state cached, effects pending, rece
   });
   assert.equal(reducer.calls.decide.length, 1);
   assert.deepEqual(reducer.calls.decide[0], {
-    now: "2026-09-06T12:00:00.000Z", policy: policy(1), actId: "obs:run_1", principal: ADAPTER, expectedRevision: null, meter: null, display: DISPLAY,
+    now: "2026-09-06T12:00:00.000Z", policy: policy(1), actId: "obs:run_1", principal: ADAPTER, expectedRevision: null, meter: null,
+    identity: { key: KEY, display: DISPLAY },
   });
 
   const state = store.get(KEY);
@@ -371,7 +372,7 @@ test("B1 expected_revision fences seat and operator acts; adapter acts carry nul
   const adapter = store.apply(KEY, { actId: "obs:run_2", principal: ADAPTER, expectedRevision: null, action: observe(SHA_A) });
   assert.equal(applied(adapter).revision_after, 3);
   assert.equal(reducer.calls.decide.at(-1)?.expectedRevision, null);
-  assert.equal(reducer.calls.decide.at(-1)?.display, DISPLAY, "display comes from the row once the Review exists");
+  assert.equal(reducer.calls.decide.at(-1)?.identity?.display, DISPLAY, "display comes from the row once the Review exists");
 });
 
 // §5.B3 / §11 #7: review_batches is the truth; replay folds it without decide under another clock and policy.

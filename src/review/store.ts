@@ -26,6 +26,7 @@ import type {
   ReviewState,
 } from "./contract.js";
 import { validateAction } from "./contract.js";
+import type { DecideContext, ReviewIdentity, decide as reducerDecide, fold as reducerFold, read as reducerRead } from "./reducer.js";
 
 interface Row { [key: string]: unknown }
 
@@ -36,20 +37,17 @@ interface Row { [key: string]: unknown }
  * addition to the map's fields: the reducer needs it for `Review.display` and the
  * `check:<owner/repo>:<sha>` effect target, and the store is the party that holds it.
  */
-export interface DecideContext {
-  now: string;
-  policy: Policy;
-  actId: string;
-  principal: Principal;
-  expectedRevision: number | null;
-  meter: { reading: number; threshold: number } | null;
-  display: string;
-}
+/**
+ * The reducer's own context type (module map §2). The store adds nothing to it: the identity
+ * the reducer needs on an opening act (`ReviewIdentity`, §3.1) is built here from the key and
+ * the caller's `display`.
+ */
+export type { DecideContext, ReviewIdentity };
 
 export interface ReviewStoreDeps {
-  decide: (state: Review | null, action: Action, ctx: DecideContext) => Batch | Refusal;
-  fold: (state: Review | null, batch: Batch) => Review;
-  read: (state: Review, ctx: { now: string; policy: Policy }) => ReviewState;
+  decide: typeof reducerDecide;
+  fold: typeof reducerFold;
+  read: typeof reducerRead;
   clock: Clock;
 }
 
@@ -260,15 +258,19 @@ export class ReviewStore {
       });
     }
 
-    // §6.I: a Review keeps its policy version; the opening act takes the repository's latest.
-    const policy = this.policyFor(key, state);
+    // §6.I: a Review keeps its policy version; the opening act takes the repository's latest;
+    // `AdoptPolicy(version)` decides under the version it adopts (the reducer checks the two agree).
+    const policyVersion: number | "latest" = input.action.kind === "AdoptPolicy"
+      ? input.action.version
+      : state === null ? "latest" : state.policy_version;
+    const policy = this.policy(key.repository_id, policyVersion);
     if (policy === null) {
-      return this.refuse(key, input, reviewId, state, now, null, {
+      return this.refuse(key, input, reviewId, state, now, this.policyFor(key, state), {
         refused: true,
         code: "no_such_target",
-        detail: state === null
+        detail: policyVersion === "latest"
           ? `repository ${key.repository_id} has no review policy`
-          : `repository ${key.repository_id} has no review policy version ${state.policy_version}`,
+          : `repository ${key.repository_id} has no review policy version ${policyVersion}`,
       });
     }
 
@@ -277,6 +279,7 @@ export class ReviewStore {
       throw new ReviewStoreError(`apply: display is required to open review ${key.repository_id}:${key.pr_number}`);
     }
 
+    const identity: ReviewIdentity = { key, display };
     const ctx: DecideContext = {
       now,
       policy,
@@ -284,7 +287,7 @@ export class ReviewStore {
       principal: input.principal,
       expectedRevision: input.expectedRevision,
       meter: input.meter ?? null,
-      display,
+      identity,
     };
     const decided = this.deps.decide(state, shape.value, ctx);
     if (isRefusal(decided)) {
@@ -298,7 +301,7 @@ export class ReviewStore {
         `apply: reducer produced revision ${decided.revision} on top of ${currentRevision} for act ${input.actId}`,
       );
     }
-    const next = this.deps.fold(state, decided);
+    const next = this.deps.fold(state, decided, identity);
     if (next.revision !== decided.revision) {
       throw new ReviewStoreError(`apply: fold produced revision ${next.revision} for batch at ${decided.revision}`);
     }
@@ -399,6 +402,12 @@ export class ReviewStore {
     return row === undefined ? null : (JSON.parse(String(row.state_json)) as Review);
   }
 
+  /** `read` by Review id: an effect row (§8.1) names its Review by id, not by key. */
+  readById(reviewId: string): ReviewState | null {
+    const row = this.db.prepare("SELECT repository_id, pr_number FROM reviews WHERE review_id = ?").get(reviewId) as Row | undefined;
+    return row === undefined ? null : this.read({ repository_id: Number(row.repository_id), pr_number: Number(row.pr_number) });
+  }
+
   findByDisplay(display: string): ReviewKey | null {
     const row = this.db.prepare("SELECT repository_id, pr_number FROM reviews WHERE display = ?").get(display) as Row | undefined;
     return row === undefined ? null : { repository_id: Number(row.repository_id), pr_number: Number(row.pr_number) };
@@ -406,12 +415,15 @@ export class ReviewStore {
 
   /** §5.B3 truth: fold over `review_batches` in revision order; never calls `decide`, never emits. */
   replay(key: ReviewKey): Review {
+    const row = this.reviewRow(key);
     const batches = this.batches(key);
-    if (batches.length === 0) {
+    if (row === undefined || batches.length === 0) {
       throw new ReviewStoreError(`replay: no batches for review ${key.repository_id}:${key.pr_number}`);
     }
+    // §3.1: the opening batch carries no key or display; the reviews row is where they live.
+    const identity: ReviewIdentity = { key, display: String(row.display) };
     let state: Review | null = null;
-    for (const batch of batches) state = this.deps.fold(state, batch);
+    for (const batch of batches) state = this.deps.fold(state, batch, identity);
     return state as Review;
   }
 

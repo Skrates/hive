@@ -6,7 +6,8 @@ import { BrokerService, type SlackTransport } from "../broker/service.js";
 import { BrokerStore } from "../broker/store.js";
 import { SubscriptionInputSchema, type ReplaySnapshot, type SubscriptionInput } from "../domain.js";
 import type { Action, Policy, Principal, Receipt, ReviewKey, ReviewState } from "./contract.js";
-import type { ReviewApplyInput, ReviewHttpDeps, ReviewStorePort } from "./http.js";
+import type { ReviewHttpDeps, ReviewStorePort } from "./http.js";
+import type { ApplyInput } from "./store.js";
 
 const slack: SlackTransport = {
   async replay(): Promise<ReplaySnapshot> { throw new Error("not used"); },
@@ -24,7 +25,7 @@ const CLASSIFY: Action = { kind: "ClassifyFinding", finding_id: "fnd_05", priori
  * revision mismatch the way the reducer's B1 would, knows one review by display.
  */
 function fakeStore(revision = 3) {
-  const applied: Array<{ key: ReviewKey; input: ReviewApplyInput }> = [];
+  const applied: Array<{ key: ReviewKey; input: ApplyInput }> = [];
   const policies: Array<{ repositoryId: number; policy: Policy }> = [];
   const operators = new Map<string, string>();
   const state = { id: "rev_1", key: KEY, display: DISPLAY, revision } as unknown as ReviewState;

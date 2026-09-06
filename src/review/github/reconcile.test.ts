@@ -13,12 +13,9 @@ import {
   diffSha256,
   exemptionEvidence,
   reconcile,
-  type ApplyInput,
   type ReconcileStore,
-  type SourceRecordInput,
-  type SourceRecordRow,
 } from "./reconcile.js";
-import type { InboxDelivery } from "./webhook.js";
+import type { ApplyInput, InboxDelivery, SourceRecordInput, SourceRecordRow } from "../store.js";
 
 const FIXTURES = resolve(dirname(fileURLToPath(import.meta.url)), "../../../test/fixtures/codex");
 const CODEX = "chatgpt-codex-connector[bot]";

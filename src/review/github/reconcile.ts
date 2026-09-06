@@ -18,26 +18,15 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { Action, Policy, Principal, Receipt, RefusalCode, Review, ReviewKey, Subject } from "../contract.js";
 import type { Clock } from "../../time.js";
-import { CODEX_LOGINS, classifyCodexRecord } from "./classify.js";
+import { classifyCodexRecord } from "./classify.js";
 import type { GitHubChangedFile, GitHubPort, GitHubPullRequest, GitHubRecord, MeterPort } from "./port.js";
-import type { InboxDelivery } from "./webhook.js";
+import type { ApplyInput, InboxDelivery, SourceRecordInput, SourceRecordRow } from "../store.js";
+import { CODEX_LOGINS } from "../reducer.js";
 
 // ---------------------------------------------------------------------------------------
-// The store slice (module map §3), declared here because `store.ts` is another builder's
-// file; `ReviewStore` satisfies it structurally.
+// The slice of `ReviewStore` (module map §3) a reconcile run touches. Structural so a test
+// can hand in a fake; the row types are the store's own.
 // ---------------------------------------------------------------------------------------
-
-export interface ApplyInput {
-  actId: string;
-  principal: Principal;
-  expectedRevision: number | null;
-  action: Action;
-  display?: string;
-  meter?: { reading: number; threshold: number } | null;
-}
-
-export interface SourceRecordInput { recordKey: string; version: string; reviewId: string; authorLogin: string; body: unknown }
-export interface SourceRecordRow extends SourceRecordInput { classification: string | null; admittedActId: string | null }
 
 export interface ReconcileStore {
   apply(key: ReviewKey, input: ApplyInput): Receipt;

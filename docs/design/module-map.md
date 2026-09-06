@@ -70,20 +70,25 @@ Pure. No I/O, no `Date.now()`, no randomness. Everything it needs is in `ctx`.
 ```ts
 import type { Action, Batch, Policy, Principal, Refusal, Review, ReviewState } from "./contract.js";
 
+export interface ReviewIdentity { key: ReviewKey; display: string }   // §3.1; neither ObservePR nor the batch carries it
+
 export interface DecideContext {
   now: string;                                      // ISO UTC; the only clock
-  policy: Policy;                                   // the Review's version (§6.I), or the repo's latest when state is null
+  policy: Policy;                                   // the Review's version (§6.I), the repo's latest when state is null, or the adopted version for AdoptPolicy
   actId: string;
   principal: Principal;
   expectedRevision: number | null;                  // seat/operator must equal state.revision (§B1); adapter null
   meter: { reading: number; threshold: number } | null;   // §D2 routing input, fetched by the reconcile run
+  identity?: ReviewIdentity;                        // required when state is null (the store always passes it)
 }
 
 /** §4 + §6: authorization table, lifecycle gate, revision fence, then the verb's own rules. */
 export function decide(state: Review | null, action: Action, ctx: DecideContext): Batch | Refusal;
 
-/** §5.B3: applies consequences only; never re-derives, never emits. `fold(fold(s,b1),b2)` is replay. */
-export function fold(state: Review | null, batch: Batch): Review;
+/** §5.B3: applies consequences only; never re-derives, never emits. `fold(fold(s,b1),b2)` is replay. The opening batch needs the identity. */
+export function fold(state: Review | null, batch: Batch, identity?: ReviewIdentity): Review;
+
+export const CODEX_LOGINS: ReadonlySet<string>;   // the connector's bot logins — the one definition; the adapter imports it
 
 /** §3.6 / §6.H: requirement, blocking set, rounds, active holds, readiness with precedence-ordered reasons. */
 export function read(state: Review, ctx: { now: string; policy: Policy }): ReviewState;
@@ -124,7 +129,7 @@ GitHub inbox, source records, policies, operators. Runs against the broker's exi
 import type Database from "better-sqlite3";
 import type { Clock } from "../time.js";
 import type { Action, Batch, Effect, Policy, Principal, Receipt, Review, ReviewKey, ReviewState, ExternalResult } from "./contract.js";
-import type { DecideContext } from "./reducer.js";
+import type { DecideContext, ReviewIdentity } from "./reducer.js";   // re-exported by store.ts
 
 export interface ReviewStoreDeps {
   decide: typeof import("./reducer.js").decide;
@@ -132,6 +137,9 @@ export interface ReviewStoreDeps {
   read: typeof import("./reducer.js").read;
   clock: Clock;
 }
+// The store builds `ctx.identity` from the key and `ApplyInput.display` (or the reviews row) and hands the same
+// identity to `fold` on apply and on the first batch of `replay()`. `AdoptPolicy` decides under the adopted
+// version (`policy(repo, action.version)`), every other act under the Review's own version.
 
 export interface ApplyInput {
   actId: string;
@@ -159,6 +167,7 @@ export class ReviewStore {
   /** One transaction: Ajv → replay check by act_id → decide → fold → persist batch, state, effects → Receipt. */
   apply(key: ReviewKey, input: ApplyInput): Receipt;
   read(key: ReviewKey): ReviewState | null;
+  readById(reviewId: string): ReviewState | null;              // an effect row names its Review by id (publisher)
   get(key: ReviewKey): Review | null;
   findByDisplay(display: string): ReviewKey | null;
   /** §5.B3 truth: fold over review_batches in revision order; never calls decide, never emits. */
@@ -256,8 +265,11 @@ export interface SystemWakePort {
   postBoardLine(input: { channelId: string; threadTs: string | null; text: string }): { outboxId: number };
 }
 
+/** The slice of ReviewStore the publisher uses (readById, policy, effects.*); ReviewStore satisfies it structurally. */
+export interface PublisherStore { … }
+
 export class ReviewPublisher {
-  constructor(store: ReviewStore, ports: { github: ReviewGitHubPort | null; slack: SystemWakePort }, clock: Clock);
+  constructor(store: PublisherStore, ports: { github: ReviewGitHubPort | null; slack: SystemWakePort }, clock: Clock);
   /** One pass: claim pending effects by target, render refreshes from read(), check actionable applicability (§D7), dispatch, mark. Returns effects handled. */
   drainOnce(): Promise<number>;
 }
@@ -284,7 +296,7 @@ appended, not rewritten.
 ```ts
 // webhook.ts
 export function verifySignature(secret: string, rawBody: Buffer, header: string | undefined): boolean;   // X-Hub-Signature-256, timing-safe
-export function handleWebhook(store: ReviewStore, secret: string, input: { headers: Record<string, string | string[] | undefined>; rawBody: Buffer }):
+export function handleWebhook(store: ReviewStore, secret: string, input: { headers: Record<string, string | string[] | undefined>; rawBody: Buffer }, clock?: Clock):
   { status: 200 | 401 | 400; outcome: "accepted" | "duplicate" | "hmac_rejected" | "malformed" };   // persists to github_inbox and nothing else (§7)
 
 // port.ts
@@ -303,13 +315,14 @@ export interface GitHubPort {
 export interface MeterPort { read(policy: NonNullable<Policy["codex_meter"]>): Promise<{ reading: number; threshold: number; resetsAt: string | null } | null> }
 
 // classify.ts — one classification, fixture-driven (V-6 fixtures under test/fixtures/codex/)
-export type CodexClassification = "clean" | "findings" | "incomplete" | "quota_refusal" | "connector_error" | "unknown";
-export function classifyCodexRecord(record: GitHubRecord, context: { headSha: string }): {
+// "status" is the connector's in-place-edited progress board (verdict-less, never promoted; fixture-corrected).
+export type CodexClassification = "clean" | "findings" | "incomplete" | "quota_refusal" | "connector_error" | "status" | "unknown";
+export function classifyCodexRecord(record: GitHubRecord, context: { headSha: string; heads: string[]; repository: string; members: GitHubRecord[] }): {
   classification: CodexClassification;
   external?: ExternalResult;                                                       // clean | findings | incomplete
   availability?: { available: false; reason: "quota" | "connector"; until: string | null; evidence: string };
 };
-export const CODEX_LOGINS: ReadonlySet<string>;                                    // the connector's bot logins
+// CODEX_LOGINS lives in reducer.ts (§2); the adapter imports it.
 
 // reconcile.ts
 export interface ReconcileSummary { runId: string; key: ReviewKey; observed: boolean; recordsImported: number; admitted: string[]; refused: Array<{ actId: string; code: RefusalCode }>; durationMs: number }
@@ -337,11 +350,11 @@ The only builder who edits `src/broker/http.ts`, `src/cli.ts`, `src/edge/*`.
 ```ts
 // http.ts — mounted from BrokerHttpServer.route before its 404: `if (await routeReview(request, response, url, deps)) return;`
 export interface ReviewHttpDeps {
-  store: ReviewStore;
+  store: ReviewStorePort;                           // the slice of ReviewStore the routes use (apply/read/findByDisplay/putPolicy/operators)
   broker: BrokerStore;                              // assertLease / getDelivery for delivery custody; live registry for session custody
-  webhookSecret: string | null;                     // HIVE_GITHUB_WEBHOOK_SECRET; null ⇒ /v1/github/webhook is 404
+  webhook: WebhookHandler | null;                   // handleWebhook bound to store + secret by runtime.ts; null ⇒ /v1/github/webhook is 404
   adminToken: string;
-  reconcile: ((key: ReviewKey) => void) | null;     // scheduler.wake; null in M0
+  reconcile: ((key: ReviewKey) => void) | null;     // scheduler.wake; null while the adapter is disabled ⇒ POST …/reconcile is 503
 }
 export async function routeReview(request: IncomingMessage, response: ServerResponse, url: URL, deps: ReviewHttpDeps): Promise<boolean>;
 ```
@@ -353,7 +366,8 @@ reducer decides):
   `{ delivery_id, generation }` (fenced with `broker.assertLease(deliveryId, edgeId, generation)`;
   actor = that delivery's actor) or `{ session_token }` (edge-attested live session ⇒ actor; refused
   `unauthorized` when the edge cannot attest — M2 may declare session custody deferred) or an
-  operator bearer (`Authorization: Bearer <operator token>` ⇒ `{ kind: "operator", id }`). The body
+  operator bearer (`Authorization: Operator <token>` ⇒ `{ kind: "operator", id }` — a distinct scheme so an
+  operator token is never read as an edge credential). The body
   never names the actor. Returns the `Receipt` (HTTP 200 applied/replayed, 409 refused).
 - `POST /v1/review/:key/reconcile` — edge bearer; `{ kind: "system", caused_by: act_id }` wake to the
   scheduler; 202.
@@ -396,11 +410,22 @@ No builder edits another's files. A cross-cutting need (a signature here is wron
 builder's `deviations` output and the integrator amends this map; do not work around it with a shim
 (INV-35). Every rule named in §2–§6 above without a test is not implemented.
 
-## 8. Wiring (integrator, after the five land)
+## 8. Wiring (integrator, landed)
 
-`BrokerService` constructs `new ReviewStore(store.db, { decide, fold, read, clock })`, the
-`ReviewPublisher` (drained by the existing outbox ticker), the `ReconcileScheduler` (M1), and passes
-`ReviewHttpDeps` to `BrokerHttpServer`. Env: `HIVE_GITHUB_WEBHOOK_SECRET`, `HIVE_GITHUB_APP_ID`,
-`HIVE_GITHUB_APP_KEY_FILE` (M1), `HIVE_OPERATOR_TOKEN_FILE` (CLI, operator only). The acceptance
-runner for §11 is `src/review/acceptance.test.ts` (integrator), composing store + reducer + publisher
-with fake ports.
+`src/review/runtime.ts` — `bootReviewRuntime({ broker: BrokerStore, clock, adminToken, env, log })` — constructs
+`new ReviewStore(broker.db, { decide, fold, read, clock })`, the `ReviewPublisher` over `{ github, slack: broker }`
+(`BrokerStore` is the `SystemWakePort`), and, when the GitHub App is configured, the `AppGitHubPort`, the webhook
+handler bound to the secret, and the `ReconcileScheduler`; it returns the `ReviewHttpDeps` the `broker` command
+hands to `BrokerHttpServer`. The publisher drains on the broker's 5-second housekeeping tick ahead of the outbox
+drain (its Slack deliveries land in that outbox); `review.start()` arms the scheduler after Slack is up and
+`review.stop()` joins the shutdown.
+
+Env (broker): `HIVE_GITHUB_WEBHOOK_SECRET_FILE`, `HIVE_GITHUB_APP_ID`, `HIVE_GITHUB_APP_KEY_FILE` — secrets are
+owner-only (0600) files read by `src/review/secret-file.ts`, never bare values; all three or none. With none set,
+or with the named files absent, the broker boots with the adapter disabled and logs it once (webhook 404,
+reconcile 503, Slack board line only — M0); a partial set or a file readable beyond its owner is a boot failure.
+CLI (operator only): `HIVE_OPERATOR_TOKEN_FILE`, same reader.
+
+The acceptance runner for §11 is `src/review/acceptance.test.ts`: the real `BrokerStore` database, the real store
+with the real reducer, the real publisher over fake GitHub/Slack ports, and `reconcile` over a fake `GitHubPort`;
+one test per sequence (#1–#10) plus the M0 slice and the §B1/§B2 fence through the store.

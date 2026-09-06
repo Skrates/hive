@@ -13,6 +13,7 @@ import {
   type ReviewState,
 } from "./contract.js";
 import { parseReviewKey } from "./key.js";
+import type { ApplyInput } from "./store.js";
 
 /**
  * The review surface of the broker's HTTP API (design §5.A1–A2, §7 ingress, §9).
@@ -22,20 +23,12 @@ import { parseReviewKey } from "./key.js";
  * from what the caller could not have forged, and hand the act to the store.
  */
 
-/** What an act needs from the store (module map §3 `ReviewStore.apply`). */
-export interface ReviewApplyInput {
-  actId: string;
-  principal: Principal;
-  expectedRevision: number | null;
-  action: Action;
-}
-
 /**
  * The slice of `ReviewStore` (module map §3) these routes use. Structural, so
  * the real store satisfies it unchanged and a test can hand in a fake.
  */
 export interface ReviewStorePort {
-  apply(key: ReviewKey, input: ReviewApplyInput): Receipt;
+  apply(key: ReviewKey, input: ApplyInput): Receipt;
   read(key: ReviewKey): ReviewState | null;
   findByDisplay(display: string): ReviewKey | null;
   putPolicy(repositoryId: number, policy: Policy): void;

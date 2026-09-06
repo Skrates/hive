@@ -32,8 +32,6 @@
 import type { ExternalFinding, ExternalResult, FindingPriority } from "../contract.js";
 import type { GitHubRecord } from "./port.js";
 
-/** The connector's bot login (verified: `gh api users/chatgpt-codex-connector[bot]`, id 199175422). */
-export const CODEX_LOGINS: ReadonlySet<string> = new Set(["chatgpt-codex-connector[bot]"]);
 
 export type CodexClassification =
   | "clean"

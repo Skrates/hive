@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
 import test from "node:test";
 import type { Clock } from "../../time.js";
-import { handleWebhook, verifySignature, type InboxDelivery, type InboxStore } from "./webhook.js";
+import type { InboxDelivery } from "../store.js";
+import { handleWebhook, verifySignature, type InboxStore } from "./webhook.js";
 
 // Obviously fake: a test secret, never a real webhook secret.
 const SECRET = "test-webhook-secret-not-real";
