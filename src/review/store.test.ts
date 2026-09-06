@@ -191,6 +191,14 @@ function setup(): { db: Database.Database; store: ReviewStore; reducer: ReturnTy
   return { db, store, reducer };
 }
 
+/**
+ * Every due row, whatever its sink. `pendingByTarget` selects one sink's rows (§8.1: each sink
+ * publishes on its own pass); assertions about the queue as a whole ask both.
+ */
+function pendingEverySink(store: ReviewStore, now: string): ReturnType<ReviewStore["effects"]["pendingByTarget"]> {
+  return [...store.effects.pendingByTarget(now, "slack"), ...store.effects.pendingByTarget(now, "github")];
+}
+
 function open(store: ReviewStore, actId = "obs:run_1", headSha = SHA_A): ReturnType<ReviewStore["apply"]> {
   return store.apply(KEY, { actId, principal: ADAPTER, expectedRevision: null, action: observe(headSha), display: DISPLAY });
 }
@@ -462,7 +470,7 @@ test("effects: pendingByTarget never returns two rows for one target; claim is e
   store.apply(KEY, { actId: "01J_G1", principal: OPERATOR, expectedRevision: 1, action: grant(1) });
   store.apply(KEY, { actId: "01J_G2", principal: OPERATOR, expectedRevision: 2, action: grant(1) });
   const now = reducer.clock.now().toISOString();
-  const pending = store.effects.pendingByTarget(now);
+  const pending = pendingEverySink(store, now);
   const targets = pending.map((effect) => effect.target);
   assert.equal(new Set(targets).size, targets.length, "one row per target");
   const board = pending.find((effect) => effect.target === "board:slack:rev_obs:run_1");
@@ -472,15 +480,31 @@ test("effects: pendingByTarget never returns two rows for one target; claim is e
   assert.equal(summon?.effect_id, "eff_obs:run_1_3");
   assert.deepEqual(summon?.payload, { text: "@codex review" });
   assert.equal(summon?.status, "pending");
-  assert.equal(store.effects.pendingByTarget(now, 1).length, 1);
+  assert.equal(store.effects.pendingByTarget(now, "slack", 1).length, 1, "the limit is per sink");
 
   const claimed = store.effects.claim("eff_01J_G2_1");
   assert.equal(claimed?.status, "claimed");
   assert.equal(store.effects.claim("eff_01J_G2_1"), null, "a second claim loses");
   assert.equal(store.effects.claim("eff_nope"), null);
-  assert.ok(!store.effects.pendingByTarget(now).some((effect) => effect.effect_id === "eff_01J_G2_1"));
+  assert.ok(!pendingEverySink(store, now).some((effect) => effect.effect_id === "eff_01J_G2_1"));
   // With the newest claimed, the older board refreshes are still pending and the next-newest surfaces.
-  assert.equal(store.effects.pendingByTarget(now).find((effect) => effect.target === "board:slack:rev_obs:run_1")?.effect_id, "eff_01J_G1_1");
+  assert.equal(pendingEverySink(store, now).find((effect) => effect.target === "board:slack:rev_obs:run_1")?.effect_id, "eff_01J_G1_1");
+});
+
+// §8.1: each sink publishes on its own pass, so the queue is selected by sink.
+test("effects: pendingByTarget selects one sink's rows, and the limit is that sink's", () => {
+  const { store, reducer } = setup();
+  open(store);
+  const now = reducer.clock.now().toISOString();
+  const slack = store.effects.pendingByTarget(now, "slack").map((effect) => effect.target);
+  const github = store.effects.pendingByTarget(now, "github").map((effect) => effect.target);
+  assert.ok(slack.length > 0 && github.length > 0, "the fixture queues both sinks");
+  assert.ok(slack.every((target) => target.startsWith("board:slack:")), `slack pass: ${slack.join()}`);
+  assert.ok(github.every((target) => target.startsWith("board:github:") || target.startsWith("check:") || target.startsWith("summon:")), `github pass: ${github.join()}`);
+  assert.equal(slack.filter((target) => github.includes(target)).length, 0, "no row is in both passes");
+  // A GitHub backlog cannot crowd the Slack sink out of its own pass: the limit is per sink.
+  assert.equal(store.effects.pendingByTarget(now, "slack", 1).length, 1);
+  assert.equal(store.effects.pendingByTarget(now, "github", 1).length, 1);
 });
 
 test("effects: markSent / markObsolete / markFailed with backoff and a terminal bound", () => {
@@ -503,13 +527,13 @@ test("effects: markSent / markObsolete / markFailed with backoff and a terminal 
   store.effects.markFailed("eff_obs:run_1_2", later);
   const failedOnce = db.prepare("SELECT status, attempts, next_attempt_at FROM review_effects WHERE effect_id = ?").get("eff_obs:run_1_2") as { status: string; attempts: number; next_attempt_at: string };
   assert.deepEqual(failedOnce, { status: "pending", attempts: 1, next_attempt_at: later });
-  assert.equal(store.effects.pendingByTarget(now).length, 0, "not due yet");
-  assert.equal(store.effects.pendingByTarget(later).length, 1, "due at next_attempt_at");
+  assert.equal(pendingEverySink(store, now).length, 0, "not due yet");
+  assert.equal(pendingEverySink(store, later).length, 1, "due at next_attempt_at");
 
   for (let attempt = 1; attempt < REVIEW_EFFECT_MAX_ATTEMPTS; attempt += 1) store.effects.markFailed("eff_obs:run_1_2", later);
   const exhausted = db.prepare("SELECT status, attempts, next_attempt_at FROM review_effects WHERE effect_id = ?").get("eff_obs:run_1_2") as { status: string; attempts: number; next_attempt_at: string | null };
   assert.deepEqual(exhausted, { status: "failed", attempts: REVIEW_EFFECT_MAX_ATTEMPTS, next_attempt_at: null });
-  assert.equal(store.effects.pendingByTarget(later).length, 0);
+  assert.equal(pendingEverySink(store, later).length, 0);
   assert.throws(() => store.effects.markSent("eff_nope"), ReviewStoreError);
   assert.throws(() => store.effects.markFailed("eff_nope", later), ReviewStoreError);
 });
@@ -704,6 +728,6 @@ test("startup retries an interrupted claimed effect after backoff", () => {
   assert.equal(recovered.status, "pending");
   assert.equal(recovered.attempts, 1);
   assert.ok(recovered.next_attempt_at > reducer.clock.now().toISOString());
-  assert.ok(reopened.effects.pendingByTarget(recovered.next_attempt_at).some(row => row.effect_id === id));
+  assert.ok(pendingEverySink(reopened, recovered.next_attempt_at).some(row => row.effect_id === id));
   db.close();
 });

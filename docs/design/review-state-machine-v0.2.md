@@ -622,8 +622,18 @@ reads the policy by the Review's version; the batch records it (§B3).
   sink: check, thread and summon are GitHub; delivery, notice and announce are Slack. Every applied
   batch emits both board rows; the publisher retires the row of a sink this broker does not have
   (the GitHub comment in M0), and fails the row of a sink the policy should have named but did not.
-  Within a pass the Slack rows dispatch before the GitHub rows, and a GitHub call that has not
-  answered within the dispatch timeout fails its row rather than holding the pass.
+  **Each sink publishes on its own pass.** `drainOnce` starts one pass per sink, each with its own
+  single-flight fence, so a tick joins only the pass of a sink that is already busy and a row queued
+  for the idle sink leaves at once; per-target serialization is unchanged, and the board row leads
+  its sink's pass because it opens the Review's Slack thread. One global pass would have made Slack
+  delivery wait out the GitHub work already listed — up to the row limit times the dispatch timeout —
+  which is the coupling this section forbids. The pending-row query selects by sink; a target that
+  does not parse names no sink, so it is offered to every pass and the claim decides which one fails
+  it. A GitHub call that has not answered within the dispatch timeout fails its row rather than
+  holding its pass, and **the timeout aborts the call**: every `ReviewGitHubPort` method takes the
+  dispatch's `AbortSignal` and carries it onto the wire (the installation-token fetch included), so a
+  call the pass has given up on cannot land after the retry that replaced it and overwrite a newer
+  render or create a second board comment. No path is exempt; nothing stays claimed on a timeout.
 - **Publication is not broker housekeeping.** The broker's periodic tick runs the outbox drain and
   a publication pass independently, neither awaiting the other, each single-flight: a GitHub port
   that is slow, hung, or down delays no Hive delivery. The publisher's Slack rows land in that same

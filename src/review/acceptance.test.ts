@@ -266,6 +266,13 @@ class FakeSlack implements SystemWakePort {
   }
 }
 
+/** A promise that rejects when `signal` aborts, as an aborted request does. */
+function aborted(signal: AbortSignal): Promise<never> {
+  return new Promise<never>((_resolve, reject) => {
+    signal.addEventListener("abort", () => { reject(new Error("aborted")); }, { once: true });
+  });
+}
+
 /** The projection sink. `boardGate`, when set, holds the worker inside the board render (§11.5's delayed worker). */
 class FakeGitHub implements ReviewGitHubPort {
   checks: Array<{ headSha: string; conclusion: "success" | "failure"; title: string }> = [];
@@ -280,20 +287,27 @@ class FakeGitHub implements ReviewGitHubPort {
   down: Error | null = null;
   /** A port that accepts every call and never answers (bundle-1 #9: GitHub hung). */
   hang: Promise<never> | null = null;
-  async createOrUpdateCheckRun(input: { headSha: string; existingId: number | null; conclusion: "success" | "failure"; title: string }): Promise<{ checkRunId: number }> {
-    await this.reachable();
+  async createOrUpdateCheckRun(input: { headSha: string; existingId: number | null; conclusion: "success" | "failure"; title: string }, signal: AbortSignal): Promise<{ checkRunId: number }> {
+    await this.reachable(signal);
     this.checks.push({ headSha: input.headSha, conclusion: input.conclusion, title: input.title });
     this.checkEdits.push(input.existingId);
     return { checkRunId: input.existingId ?? this.checks.length };
   }
-  /** Whatever this port is doing to the caller — throwing, hanging, or answering. */
-  private async reachable(): Promise<void> {
+  /**
+   * Whatever this port is doing to the caller — throwing, hanging, or answering. A hung call
+   * ends when the dispatch's signal aborts it, as a real request does: nothing it carried
+   * reaches the sink afterwards.
+   */
+  private async reachable(signal: AbortSignal): Promise<void> {
     if (this.down !== null) throw this.down;
-    if (this.hang !== null) await this.hang;
+    if (this.hang !== null) {
+      await Promise.race([this.hang, aborted(signal)]);
+    }
+    if (signal.aborted) throw new Error("aborted");
   }
 
-  async createOrUpdateBoardComment(input: { existingId: number | null; body: string }): Promise<{ commentId: number }> {
-    await this.reachable();
+  async createOrUpdateBoardComment(input: { existingId: number | null; body: string }, signal: AbortSignal): Promise<{ commentId: number }> {
+    await this.reachable(signal);
     const gate = this.boardGate;
     if (gate !== null) {
       this.boardGate = null;
@@ -304,10 +318,10 @@ class FakeGitHub implements ReviewGitHubPort {
     this.boardEdits.push(input.existingId);
     return { commentId: input.existingId ?? 500 };
   }
-  async resolveThread(input: { commentId: number }): Promise<void> { await this.reachable(); this.threads.push({ commentId: input.commentId, op: "resolve" }); }
-  async unresolveThread(input: { commentId: number }): Promise<void> { await this.reachable(); this.threads.push({ commentId: input.commentId, op: "unresolve" }); }
-  async postComment(input: { body: string }): Promise<{ commentId: number; summonLogin: string }> {
-    await this.reachable();
+  async resolveThread(input: { commentId: number }, signal: AbortSignal): Promise<void> { await this.reachable(signal); this.threads.push({ commentId: input.commentId, op: "resolve" }); }
+  async unresolveThread(input: { commentId: number }, signal: AbortSignal): Promise<void> { await this.reachable(signal); this.threads.push({ commentId: input.commentId, op: "unresolve" }); }
+  async postComment(input: { body: string }, signal: AbortSignal): Promise<{ commentId: number; summonLogin: string }> {
+    await this.reachable(signal);
     this.comments.push(input.body);
     return { commentId: 700 + this.comments.length, summonLogin: "RationallyPrime" };
   }
@@ -1204,7 +1218,26 @@ test("bundle-1 #9: a hung GitHub port delays no Hive wake and no Slack board lin
   assert.ok(board.filter((r) => r.target.startsWith("board:github:")).every((r) => r.status === "pending" || r.status === "claimed"),
     "the GitHub sink has published nothing — its row waits on its own port, alone");
   assert.equal(github.boards.length, 0);
+
+  // F4 (Codex 3945383523): a Slack row queued *after* the hung pass began — too late to be in
+  // its listing — still leaves on the next tick. One global publication fence would have made it
+  // wait for every remaining GitHub row to answer or time out; the fences are per sink.
+  act({ kind: "GrantRounds", n: 1, reason: "queued while GitHub hangs" }, OPERATOR);
+  const nextTick = quiet(() => housekeepingTick({
+    sweep: () => broker.requeueExpiredLeases(),
+    publish: () => publisher.drainOnce(),
+    drainOutbox: () => service.drainOutbox(),
+    log: () => {},
+  }));
+  await new Promise((resolve) => setImmediate(resolve));
+  await service.drainOutbox();
+  assert.deepEqual(rows().filter((r) => r.target.startsWith("board:slack:")).map((r) => r.status), ["sent", "sent"],
+    "both Slack rows are out, the second queued after the GitHub pass hung");
+  assert.equal(posts.length, 3, "and the second board line reached Slack while GitHub is still hanging");
+  assert.equal(github.boards.length, 0, "GitHub has still published nothing");
+
   await tick;
+  await nextTick;
   broker.close();
 });
 

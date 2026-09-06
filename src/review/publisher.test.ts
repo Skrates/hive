@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { Policy, ReviewState, TransportRef } from "./contract.js";
+import { parseTarget, sinkOf, type EffectSink } from "./effects.js";
 import type { Clock } from "../time.js";
 import { AT, finding, fixedClaim, hold, policy, request, SHA_A, SHA_B, state } from "./fixtures.js";
 import {
@@ -94,9 +95,9 @@ class FakeReviewStore implements PublisherStore {
     return found;
   }
   readonly effects = {
-    pendingByTarget: (now: string): PublishableEffect[] => {
+    pendingByTarget: (now: string, sink: EffectSink): PublishableEffect[] => {
       const byTarget = new Map<string, Row>();
-      const eligible = this.rows.filter((r) => r.status === "pending" && (r.nextAttemptAt === null || r.nextAttemptAt <= now));
+      const eligible = this.rows.filter((r) => r.status === "pending" && (r.nextAttemptAt === null || r.nextAttemptAt <= now) && inSink(r.target, sink));
       for (const row of eligible) {
         const current = byTarget.get(row.target);
         if (current === undefined) { byTarget.set(row.target, row); continue; }
@@ -132,6 +133,15 @@ class FakeReviewStore implements PublisherStore {
   };
 }
 
+/** As the real store selects: by sink, with a target that does not parse offered to every pass. */
+function inSink(target: string, sink: EffectSink): boolean {
+  try {
+    return sinkOf(parseTarget(target)) === sink;
+  } catch {
+    return true;
+  }
+}
+
 class FakeSlack implements SystemWakePort {
   wakes: Array<{ actor: string; channelId: string; threadTs: string | null; text: string; dedupeKey: string }> = [];
   lines: Array<{ channelId: string; threadTs: string | null; text: string }> = [];
@@ -161,18 +171,31 @@ class FakeGitHub implements ReviewGitHubPort {
   gate: Promise<void> | null = null;
   /** A port whose responses carry no id (the App port's `?? 0` fallback). */
   noIds = false;
-  async createOrUpdateCheckRun(input: { headSha: string; existingId: number | null; conclusion: "success" | "failure"; title: string }): Promise<{ checkRunId: number }> {
+  /** As a real request does: once the dispatch's signal fires, the call does nothing on the wire. */
+  private refuseIfAborted(signal: AbortSignal): void {
+    if (signal.aborted) throw new Error("aborted");
+  }
+  async createOrUpdateCheckRun(input: { headSha: string; existingId: number | null; conclusion: "success" | "failure"; title: string }, signal: AbortSignal): Promise<{ checkRunId: number }> {
     if (this.gate !== null) await this.gate;
+    this.refuseIfAborted(signal);
     this.checks.push({ headSha: input.headSha, conclusion: input.conclusion, title: input.title, existingId: input.existingId });
     return { checkRunId: this.noIds ? 0 : input.existingId ?? this.checks.length };
   }
-  async createOrUpdateBoardComment(input: { existingId: number | null; body: string }): Promise<{ commentId: number }> {
+  async createOrUpdateBoardComment(input: { existingId: number | null; body: string }, signal: AbortSignal): Promise<{ commentId: number }> {
+    this.refuseIfAborted(signal);
     this.boards.push({ body: input.body, existingId: input.existingId });
     return { commentId: this.noIds ? 0 : input.existingId ?? 500 };
   }
-  async resolveThread(input: { commentId: number }): Promise<void> { this.threads.push({ commentId: input.commentId, op: "resolve" }); }
-  async unresolveThread(input: { commentId: number }): Promise<void> { this.threads.push({ commentId: input.commentId, op: "unresolve" }); }
-  async postComment(input: { body: string }): Promise<{ commentId: number; summonLogin: string }> {
+  async resolveThread(input: { commentId: number }, signal: AbortSignal): Promise<void> {
+    this.refuseIfAborted(signal);
+    this.threads.push({ commentId: input.commentId, op: "resolve" });
+  }
+  async unresolveThread(input: { commentId: number }, signal: AbortSignal): Promise<void> {
+    this.refuseIfAborted(signal);
+    this.threads.push({ commentId: input.commentId, op: "unresolve" });
+  }
+  async postComment(input: { body: string }, signal: AbortSignal): Promise<{ commentId: number; summonLogin: string }> {
+    this.refuseIfAborted(signal);
     this.comments.push(input.body);
     return { commentId: 700 + this.comments.length, summonLogin: "RationallyPrime" };
   }
@@ -228,22 +251,65 @@ test("the earlier job, if it is the one a worker picks up, still renders from re
   assert.deepEqual(github!.checks.map((c) => c.title), ["hold: human_gate"]);
 });
 
-test("refreshes are serialized per target: one row per target per pass, and passes never overlap", async () => {
-  const { store, github, publisher } = fixture({ github: true });
+// §8.1: a sink's passes never overlap — a second drain joins the running one rather than
+// dispatching its rows a second time — but the *other* sink's pass starts regardless.
+test("refreshes are serialized per target: a concurrent drain joins the running GitHub pass while a Slack row queued meanwhile still goes out", async () => {
+  const { store, slack, github, publisher } = fixture({ github: true });
   store.add({ effect_id: "eff_a_1", kind: "refresh", target: CHECK });
   store.add({ effect_id: "eff_a_2", kind: "refresh", target: BOARD_GITHUB });
   let release!: () => void;
   github!.gate = new Promise<void>((resolve) => { release = resolve; });
 
   const first = publisher.drainOnce();
+  // Its Slack pass found nothing and is over; its GitHub pass sits inside the gated call.
+  await new Promise((resolve) => setImmediate(resolve));
+  // Queued after that pass listed its rows …
+  store.add({ effect_id: "eff_slack", kind: "refresh", target: BOARD_SLACK });
   const second = publisher.drainOnce();
-  assert.equal(first, second, "a concurrent drain joins the in-flight pass");
+  await new Promise((resolve) => setImmediate(resolve));
+  // … and dispatched on its own sink's pass, with the GitHub pass still hung.
+  assert.deepEqual(slack.lines.length, 1, "the Slack row did not wait on GitHub");
+  assert.equal(store.row("eff_slack").status, "sent");
+  assert.equal(github!.checks.length, 0, "the GitHub pass is still inside its call");
+
   release();
   assert.equal(await first, 2);
-  assert.equal(github!.checks.length, 1);
+  assert.equal(await second, 3, "the joined GitHub pass plus the Slack row");
+  assert.equal(github!.checks.length, 1, "each GitHub row dispatched once, not once per drain");
   assert.equal(github!.boards.length, 1);
-  // The pass is over; a new one finds nothing pending.
+  // The passes are over; a new drain finds nothing pending.
   assert.equal(await publisher.drainOnce(), 0);
+});
+
+// F2 (Codex 3945383516): the time-box aborts the call, so a port that answers late answers into
+// nothing — no handle recorded, no second board comment on the retry.
+test("a GitHub call that outlives its dispatch timeout is aborted and records nothing when it finally answers", async () => {
+  const store = new FakeReviewStore();
+  const slack = new FakeSlack();
+  const github = new FakeGitHub();
+  const clock = new FakeClock();
+  store.policies.set("42:1", policy());
+  store.put(state());
+  const publisher = new ReviewPublisher(store, { github, slack }, clock, 5);
+  let release!: () => void;
+  github.gate = new Promise<void>((resolve) => { release = resolve; });
+  store.add({ effect_id: "eff_late", kind: "refresh", target: CHECK });
+
+  const quiet = console.error;
+  console.error = () => {};
+  try {
+    assert.equal(await publisher.drainOnce(), 0, "the row was failed on the timeout, not sent");
+  } finally {
+    console.error = quiet;
+  }
+  assert.equal(store.row("eff_late").status, "pending");
+  assert.equal(store.row("eff_late").attempts, 1);
+
+  // The port answers only now — after the abort — and its call reaches no sink.
+  release();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(github.checks, [], "the aborted call published nothing");
+  assert.deepEqual(store.handles, [], "and recorded no handle a retry would have to reconcile with");
 });
 
 test("board refresh in M0 (github: null) posts the Slack board line to the policy channel", async () => {
@@ -639,8 +705,8 @@ test("an uncertain summon retry carries the same request and effect identity wit
   store.put(state({ requests: [request({ id: "req_1" })] }));
   const post = github!.postComment.bind(github);
   let loseResponse = true;
-  github!.postComment = async input => {
-    const result = await post(input);
+  github!.postComment = async (input, signal) => {
+    const result = await post(input, signal);
     if (loseResponse) { loseResponse = false; throw new Error("response lost after GitHub accepted POST"); }
     return result;
   };

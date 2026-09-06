@@ -188,6 +188,9 @@ export class ReviewStore {
   /** §5.B3 truth: fold over review_batches in revision order; never calls decide, never emits. */
   replay(key: ReviewKey): Review;
   batches(key: ReviewKey): Batch[];
+  /** effects.pendingByTarget(now, sink, limit?) selects the due rows of one sink (§8.1 per-sink passes);
+   *  the sink is derived from the target with parseTarget/sinkOf, and an unparseable target is offered
+   *  to every pass so the defect is failed visibly. */
   /** Reviews with a pending request or activity in the last 24 h (§7 bounded reconcile). */
   active(since: string): ReviewKey[];
 
@@ -286,12 +289,14 @@ export function slackBoardLine(state: ReviewState, unknownRecords?: readonly Unk
 export function threadOps(before: Review | null, after: Review): Array<{ comment_id: number; op: "resolve" | "unresolve" }>;
 
 // publisher.ts
+/** Every method takes the dispatch's AbortSignal and carries it onto the wire: the publisher's
+ *  timeout aborts the call, so a call it gave up on cannot land after the retry (§8.1). */
 export interface ReviewGitHubPort {
-  createOrUpdateCheckRun(input: { repositoryId: number; headSha: string; existingId: number | null; name: string; conclusion: "success" | "failure"; title: string; summary: string }): Promise<{ checkRunId: number }>;
-  createOrUpdateBoardComment(input: { repositoryId: number; prNumber: number; existingId: number | null; body: string }): Promise<{ commentId: number }>;
-  resolveThread(input: { repositoryId: number; commentId: number }): Promise<void>;
-  unresolveThread(input: { repositoryId: number; commentId: number }): Promise<void>;
-  postComment(input: { repositoryId: number; prNumber: number; body: string }): Promise<{ commentId: number }>;   // summons
+  createOrUpdateCheckRun(input: { repositoryId: number; headSha: string; existingId: number | null; name: string; conclusion: "success" | "failure"; title: string; summary: string }, signal: AbortSignal): Promise<{ checkRunId: number }>;
+  createOrUpdateBoardComment(input: { repositoryId: number; prNumber: number; existingId: number | null; body: string }, signal: AbortSignal): Promise<{ commentId: number }>;
+  resolveThread(input: { repositoryId: number; commentId: number }, signal: AbortSignal): Promise<void>;
+  unresolveThread(input: { repositoryId: number; commentId: number }, signal: AbortSignal): Promise<void>;
+  postComment(input: { repositoryId: number; prNumber: number; body: string }, signal: AbortSignal): Promise<{ commentId: number }>;   // summons
 }
 
 /** Implemented on BrokerStore by the effects builder: system-origin Hive deliveries (§8.1 Slack). */
@@ -306,8 +311,11 @@ export interface PublisherStore { … }
 
 export class ReviewPublisher {
   constructor(store: PublisherStore, ports: { github: ReviewGitHubPort | null; slack: SystemWakePort }, clock: Clock);
-  /** One pass: claim pending effects by target, render refreshes from read(), check actionable applicability (§D7), dispatch, mark. Returns effects handled. */
+  /** One pass per sink (§8.1), each single-flight on its own: claim pending effects by target, render
+   *  refreshes from read(), check actionable applicability (§D7), dispatch, mark. Returns effects handled. */
   drainOnce(): Promise<number>;
+  /** Join every sink's in-flight pass before the broker closes its database. */
+  stop(): Promise<void>;
 }
 ```
 

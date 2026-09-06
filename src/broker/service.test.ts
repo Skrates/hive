@@ -341,6 +341,20 @@ test("the housekeeping tick drains the outbox while a review publication pass is
   await Promise.resolve();
   assert.equal(drained, true, "the outbox drained without waiting on publication");
   assert.equal(published, false);
+
+  // Bundle-1 #9 / F4: the tick fences nothing either. A later tick's publication starts while
+  // this one is still inside its hung GitHub call — the publisher's own single-flight is per
+  // sink, so what that later pass can dispatch (every Slack row queued meanwhile) it dispatches.
+  let secondPublished = false;
+  await housekeepingTick({
+    sweep: () => {},
+    publish: async () => { secondPublished = true; },
+    drainOutbox: async () => 1,
+    log: (what, error) => log.push([what, String(error)]),
+  });
+  assert.equal(secondPublished, true, "the next tick's publication did not wait on the hung one");
+  assert.equal(published, false, "which is still hung");
+
   releasePublish();
   await tick;
   assert.equal(published, true);
