@@ -436,7 +436,7 @@ type RefusalCode = "stale_revision" | "unauthorized" | "lifecycle" | "unknown_su
   arrives anyway.
 - **D7** A summon effect checks applicability at dispatch: the request must still be pending at the
   current subject, else the effect is marked `obsolete` and not sent.
-- **D8** (proposed; fork F-12) Conflict-aware summons. `ObservePR` carries GitHub's `mergeable`
+- **D8** (ruled 2026-09-06: F-12 → (a)) Conflict-aware summons. `ObservePR` carries GitHub's `mergeable`
   (`true | false | null`). While it is `false`, request transport is withheld (the request stays pending,
   attempts paused, the board and check say `conflicting against <base tip>`), and the author seat gets
   **one** delivery per subject saying so; `null` (not yet computed) never withholds. When `mergeable`
@@ -783,11 +783,15 @@ ticket; scope and authority govern `follow_up` · F-10 hive → weave-doctrine �
 §10.2 mechanism · F-11 P3 advisory from every source, provenance kept · Policy: Reviews keep their version;
 `AdoptPolicy` is explicit · Threads: resolutions drive the thread-resolution projection.
 
-### Open for your ruling (new in v0.2)
+**Ruled 2026-09-06 (evening, from the F-12/wd#167 docket):** F-12 → (a): transport withheld while
+`mergeable = false`, one author delivery per subject, no charge, transport resumes on the flip; `null` never
+withholds (D8). The author notice must leave while the conflict stands — it is not request transport and the
+publisher must not pause it (hive#68 follow-up). wd#167 was closed by Hákon at 14:39; KRA-1289, KRA-1121 and
+KRA-1362 are cancelled as superseded (§6.G2, §10.1, D8); the identical-patch re-exhaustion concern is carried
+as a cutover verification line (§10.2 step 4), not a ticket.
 
-- **F-12 Conflict-aware summons (D8, from KRA-1362).** (a) withhold transport while `mergeable = false`,
-  one author delivery per subject, no charge — recommended; (b) summon anyway and charge, as today;
-  (c) summon but do not charge — a second uncounted-head class, which G1 deliberately avoids.
-- **wd#167 (KRA-1289 + KRA-1121)** — Theoros's open PR encodes inheritance by patch equality and a
-  vendored-helper drift check; both halves are contradicted or mooted here. Recommendation: hold it now,
-  close as superseded at cutover step 0.
+### Formerly open (ruled 2026-09-06, recorded above)
+
+- **F-12 Conflict-aware summons (D8, from KRA-1362)** — ruled (a). (b) summon and charge, and (c) summon
+  without charging, were declined; (c) would have created a second uncharged-head class beside G2.
+- **wd#167 (KRA-1289 + KRA-1121)** — closed by Hákon; tickets cancelled as superseded.
