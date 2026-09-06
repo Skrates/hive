@@ -412,7 +412,9 @@ test("outbox rows drain once, back off after failure, and survive to retry", () 
   assert.equal(store.listUnsentOutbox().length, 0);
   clock.advance(retryBackoffMs(1) + 1);
   assert.equal(store.listUnsentOutbox().length, 1);
-  store.markOutboxSent(unsent[0]!.outboxId);
+  assert.equal(store.outboxMessageTs(unsent[0]!.outboxId), null, "no ts before the post");
+  store.markOutboxSent(unsent[0]!.outboxId, "100.9");
+  assert.equal(store.outboxMessageTs(unsent[0]!.outboxId), "100.9", "the posted ts is kept for threading");
   clock.advance(retryBackoffMs(2) + 1);
   assert.equal(store.listUnsentOutbox().length, 0);
   store.close();

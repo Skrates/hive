@@ -418,7 +418,11 @@ export class BrokerStore {
     }
   }
 
-  /** Forward-only schema step: pre-reaction databases gain the two nullable columns in place. */
+  /**
+   * Forward-only schema step: pre-reaction databases gain the two nullable reaction columns in
+   * place, and every database gains `message_ts` — the Slack ts a row was posted as, which the
+   * review publisher reads to thread a Review's later lines under its first (design §8.1).
+   */
   private ensureOutboxReactionColumns(): void {
     const columns = (this.db.pragma("table_info(outbox)") as { name: string }[]).map((c) => c.name);
     if (!columns.includes("reaction")) {
@@ -426,6 +430,9 @@ export class BrokerStore {
     }
     if (!columns.includes("reaction_targets_json")) {
       this.db.exec("ALTER TABLE outbox ADD COLUMN reaction_targets_json TEXT");
+    }
+    if (!columns.includes("message_ts")) {
+      this.db.exec("ALTER TABLE outbox ADD COLUMN message_ts TEXT");
     }
     // The single-timestamp shape never shipped past this branch; no dual readers survive it.
     if (columns.includes("reaction_target_ts")) {
@@ -1371,9 +1378,16 @@ export class BrokerStore {
     return rows.map(outboxFromRow);
   }
 
-  markOutboxSent(outboxId: number): void {
-    this.db.prepare("UPDATE outbox SET sent_at=?, attempts=attempts+1 WHERE outbox_id=?")
-      .run(iso(this.clock), outboxId);
+  /** `messageTs` is what Slack answered `chat.postMessage` with: the coordinate later posts thread under. */
+  markOutboxSent(outboxId: number, messageTs: string): void {
+    this.db.prepare("UPDATE outbox SET sent_at=?, message_ts=?, attempts=attempts+1 WHERE outbox_id=?")
+      .run(iso(this.clock), messageTs, outboxId);
+  }
+
+  /** The Slack ts an outbox row was posted as; null until it is sent (review publisher, `SystemWakePort`). */
+  outboxMessageTs(outboxId: number): string | null {
+    const row = this.db.prepare("SELECT message_ts FROM outbox WHERE outbox_id=?").get(outboxId) as Row | undefined;
+    return row === undefined || row.message_ts === null || row.message_ts === undefined ? null : String(row.message_ts);
   }
 
   markOutboxAttempt(outboxId: number): void {
