@@ -5,7 +5,8 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 import type { SeatWakeMint, SeatWakeReceipt } from "../domain.js";
 import { udsRequest, udsRequestJson } from "../local/uds.js";
-import { BrokerHttpError } from "./broker-client.js";
+import type { Receipt, ReviewState } from "../review/contract.js";
+import { BrokerHttpError, type ReviewActForward } from "./broker-client.js";
 import { EdgeControlServer } from "./control.js";
 import { LiveIngressRegistry } from "./live-registry.js";
 import type { EdgeService } from "./service.js";
@@ -18,6 +19,8 @@ function fixture(mintWake?: (input: SeatWakeMint) => Promise<SeatWakeReceipt>) {
   const live = new LiveIngressRegistry();
   const outcomes: OutcomeRecord[] = [];
   const mints: SeatWakeMint[] = [];
+  const reviewActs: Array<{ key: string; input: ReviewActForward }> = [];
+  const reviewReads: string[] = [];
   // The one dispatch this fake edge is running, and the token it issued for it.
   const dispatches = new Map([["token-of-the-running-turn", { deliveryId: 512, generation: 3 }]]);
   const edge = {
@@ -35,10 +38,27 @@ function fixture(mintWake?: (input: SeatWakeMint) => Promise<SeatWakeReceipt>) {
         if (mintWake) return mintWake(input);
         return { deliveryId: 77, actor: input.actor, from: "ariadne", channelId: "C1", threadTs: "100.1", created: true };
       },
+      async reviewRead(key: string): Promise<ReviewState> {
+        reviewReads.push(key);
+        if (key === "Skrates/hive#404") throw new BrokerHttpError(404, JSON.stringify({ error: "not_found" }));
+        return { revision: 4, display: key } as unknown as ReviewState;
+      },
+      async reviewReconcile(key: string) {
+        reviewReads.push(`reconcile:${key}`);
+        return { accepted: true };
+      },
+      async reviewAct(key: string, input: ReviewActForward): Promise<{ status: 200 | 409; receipt: Receipt }> {
+        reviewActs.push({ key, input });
+        const stale = input.expected_revision !== 4;
+        const receipt: Receipt = stale
+          ? { review_id: "rev_1", act_id: input.act_id, outcome: { refused: true, code: "stale_revision", detail: "at 4", current_revision: 4, state: null } }
+          : { review_id: "rev_1", act_id: input.act_id, outcome: { applied: true, revision_before: 4, revision_after: 5, batch_id: "bat_1", effects: [] } };
+        return { status: stale ? 409 : 200, receipt };
+      },
     },
   } as unknown as EdgeService;
   const server = new EdgeControlServer(edge, { socketPath });
-  return { root, socketPath, live, outcomes, mints, server };
+  return { root, socketPath, live, outcomes, mints, reviewActs, reviewReads, server };
 }
 
 test("the control plane binds an owner-only UDS socket and registers liveness", async (t) => {
@@ -304,4 +324,67 @@ test("a refused mint reaches the seat with the broker's own reason (R-3)", async
   const invalid = await udsRequest(socketPath, "POST", "/wake", { token: "", actor: "", text: "" });
   assert.equal(invalid.status, 400);
   assert.equal((JSON.parse(invalid.body) as { error: string }).error, "invalid_wake");
+});
+
+test("a review act presents the turn's token; the edge names the delivery custody and relays the Receipt, refusal included", async (t) => {
+  const { root, socketPath, reviewActs, server } = fixture();
+  t.after(async () => {
+    await server.stop();
+    rmSync(root, { recursive: true, force: true });
+  });
+  await server.start();
+
+  const action = { kind: "ClassifyFinding", finding_id: "fnd_05", priority: "P3" };
+  const applied = await udsRequest(socketPath, "POST", "/review/act", {
+    key: "Skrates/hive#7", token: "token-of-the-running-turn", act_id: "01J000000000000000000000AA", expected_revision: 4, action,
+  });
+  assert.equal(applied.status, 200);
+  assert.ok("applied" in (JSON.parse(applied.body) as Receipt).outcome);
+  // §5.A1: custody is the edge's own dispatch state, exactly as `/wake` names a mint source.
+  assert.deepEqual(reviewActs, [{
+    key: "Skrates/hive#7",
+    input: { act_id: "01J000000000000000000000AA", expected_revision: 4, action, custody: { delivery_id: 512, generation: 3 } },
+  }]);
+
+  // A refusal is a Receipt with its status, not a relay failure.
+  const stale = await udsRequest(socketPath, "POST", "/review/act", {
+    key: "Skrates/hive#7", token: "token-of-the-running-turn", act_id: "01J000000000000000000000AB", expected_revision: 3, action,
+  });
+  assert.equal(stale.status, 409);
+  const receipt = JSON.parse(stale.body) as Receipt;
+  assert.ok("refused" in receipt.outcome && receipt.outcome.code === "stale_revision");
+
+  // A token this edge never issued, or a body that tries to name custody, reaches no broker.
+  const foreign = await udsRequest(socketPath, "POST", "/review/act", {
+    key: "Skrates/hive#7", token: "a-token-this-edge-never-issued", act_id: "a", expected_revision: 4, action,
+  });
+  assert.equal(foreign.status, 403);
+  const named = await udsRequest(socketPath, "POST", "/review/act", {
+    key: "Skrates/hive#7", token: "token-of-the-running-turn", act_id: "a", expected_revision: 4, action, custody: { delivery_id: 1, generation: 1 },
+  });
+  assert.equal(named.status, 400);
+  assert.equal((JSON.parse(named.body) as { error: string }).error, "invalid custody");
+  const noExpect = await udsRequest(socketPath, "POST", "/review/act", {
+    key: "Skrates/hive#7", token: "token-of-the-running-turn", act_id: "a", action,
+  });
+  assert.equal(noExpect.status, 400);
+  assert.equal(reviewActs.length, 2);
+});
+
+test("review read and reconcile need only the socket and relay the broker's answer verbatim", async (t) => {
+  const { root, socketPath, reviewReads, server } = fixture();
+  t.after(async () => {
+    await server.stop();
+    rmSync(root, { recursive: true, force: true });
+  });
+  await server.start();
+
+  const state = await udsRequestJson<ReviewState>(socketPath, "POST", "/review/read", { key: "Skrates/hive#7" });
+  assert.equal(state.revision, 4);
+  const missing = await udsRequest(socketPath, "POST", "/review/read", { key: "Skrates/hive#404" });
+  assert.equal(missing.status, 404);
+  assert.equal((JSON.parse(missing.body) as { error: string }).error, "not_found");
+  const reconcile = await udsRequest(socketPath, "POST", "/review/reconcile", { key: "42:7" });
+  assert.equal(reconcile.status, 202);
+  assert.deepEqual(reviewReads, ["Skrates/hive#7", "Skrates/hive#404", "reconcile:42:7"]);
 });

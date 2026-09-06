@@ -2,7 +2,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { ProviderSchema, SeatWakeInputSchema } from "../domain.js";
 import { prepareSocketPath } from "../local/uds.js";
 import { parseAttestationWire } from "./attestation.js";
-import { BrokerHttpError } from "./broker-client.js";
+import { BrokerHttpError, type ReviewActForward } from "./broker-client.js";
 import { LiveIngressRegistryError } from "./live-registry.js";
 import type { EdgeService } from "./service.js";
 
@@ -138,6 +138,54 @@ export class EdgeControlServer {
       }
     }
 
+    // Design §9.1 / §5.A1: `hive review` reaches the broker through this socket.
+    // A read carries no seat identity (the socket is the authentication); a
+    // write presents the turn's dispatch token, which the edge turns into the
+    // delivery custody the broker fences — exactly the `/wake` shape above, and
+    // for the same reason: a body that could name a delivery could name a peer.
+    if (request.method === "POST" && request.url === "/review/read") {
+      const body = await readJson(request);
+      const key = requiredString(body.key, "key");
+      return this.relayBroker(response, 200, () => this.edge.broker.reviewRead(key));
+    }
+
+    if (request.method === "POST" && request.url === "/review/reconcile") {
+      const body = await readJson(request);
+      const key = requiredString(body.key, "key");
+      return this.relayBroker(response, 202, () => this.edge.broker.reviewReconcile(key));
+    }
+
+    if (request.method === "POST" && request.url === "/review/act") {
+      const body = await readJson(request);
+      const key = requiredString(body.key, "key");
+      const token = requiredString(body.token, "token");
+      const actId = requiredString(body.act_id, "act_id");
+      const expectedRevision = body.expected_revision;
+      if (!Number.isInteger(expectedRevision) || Number(expectedRevision) < 0) throw new Error("invalid expected_revision");
+      const action = body.action;
+      if (!action || typeof action !== "object" || Array.isArray(action)) throw new Error("missing action");
+      if ("actor" in body || "principal" in body || "custody" in body) throw new Error("invalid custody");
+      const source = this.edge.resolveMintSource(token);
+      if (!source) {
+        return json(response, 403, {
+          error: "unknown_dispatch_token",
+          detail: "no dispatch on this edge holds that token — a turn can act only while it is running",
+        });
+      }
+      try {
+        const { status, receipt } = await this.edge.broker.reviewAct(key, {
+          act_id: actId,
+          expected_revision: Number(expectedRevision),
+          action: action as ReviewActForward["action"],
+          custody: { delivery_id: source.deliveryId, generation: source.generation },
+        });
+        return json(response, status, receipt);
+      } catch (error) {
+        if (error instanceof BrokerHttpError) return json(response, error.status, parseErrorBody(error.responseBody));
+        throw error;
+      }
+    }
+
     if (request.method === "POST" && request.url === "/outcome") {
       const body = await readJson(request);
       const deliveryId = Number(body.deliveryId);
@@ -148,6 +196,16 @@ export class EdgeControlServer {
     }
 
     return json(response, 404, { error: "not_found" });
+  }
+
+  /** Relay a broker answer verbatim, its refusal envelope included. */
+  private async relayBroker(response: ServerResponse, status: number, call: () => Promise<unknown>): Promise<void> {
+    try {
+      return json(response, status, await call());
+    } catch (error) {
+      if (error instanceof BrokerHttpError) return json(response, error.status, parseErrorBody(error.responseBody));
+      throw error;
+    }
   }
 }
 
@@ -196,6 +254,8 @@ function safeControlError(error: unknown): string {
     || message === "invalid provider"
     || message === "invalid ttlMs"
     || message === "invalid deliveryId"
+    || message === "invalid expected_revision"
+    || message === "invalid custody"
     || message === "invalid attestation"
     || message.startsWith("missing ")
   ) return message;
