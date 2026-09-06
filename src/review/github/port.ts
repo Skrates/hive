@@ -264,7 +264,8 @@ export class AppGitHubPort implements GitHubPort {
     const token = isRecord(minted.json) ? str(minted.json.token) : "";
     const expiresAt = isRecord(minted.json) ? Date.parse(str(minted.json.expires_at)) : Number.NaN;
     if (token === "") throw new GitHubApiError(500, `/app/installations/${installationId}/access_tokens`, "no token in response");
-    this.tokens.set(installationId, { token, expiresAt: Number.isNaN(expiresAt) ? now + 55 * 60_000 : expiresAt });
+    if (!Number.isFinite(expiresAt)) throw new GitHubApiError(500, "installation token", "invalid expires_at");
+    this.tokens.set(installationId, { token, expiresAt });
     return token;
   }
 
@@ -441,7 +442,9 @@ export class AppGitHubPort implements GitHubPort {
     const result = input.existingId === null
       ? await this.repoRequest(input.repositoryId, "POST", "/check-runs", { body })
       : await this.repoRequest(input.repositoryId, "PATCH", `/check-runs/${input.existingId}`, { body });
-    return { checkRunId: (isRecord(result.json) ? num(result.json.id) : null) ?? input.existingId ?? 0 };
+    const checkRunId = isRecord(result.json) ? num(result.json.id) : null;
+    if (checkRunId === null || checkRunId < 1) throw new GitHubApiError(500, "check run", "response has no positive id");
+    return { checkRunId };
   }
 
   async createOrUpdateBoardComment(input: { repositoryId: number; prNumber: number; existingId: number | null; body: string }): Promise<{ commentId: number }> {

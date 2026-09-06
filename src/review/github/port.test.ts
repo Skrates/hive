@@ -229,3 +229,10 @@ test("a non-2xx answer is a GitHubApiError naming the status and the URL, never 
   await assert.rejects(() => p.getPullRequest(1054, 66), (error: unknown) => error instanceof GitHubApiError && error.status === 403 && error.url.endsWith("/repos/Skrates/hive/pulls/66"));
   await assert.rejects(() => p.getPullRequest(9999, 1), (error: unknown) => error instanceof GitHubApiError && error.status === 404);
 });
+
+
+test("a check-run response without a positive id fails before recording a fake handle", async () => {
+  const { port: p } = port(call => call.url.endsWith("/check-runs") ? { status: 201, json: {} } : undefined);
+  await assert.rejects(p.createOrUpdateCheckRun({ repositoryId: 1054, headSha: "a".repeat(40), existingId: null,
+    name: "weave/review", conclusion: "failure", title: "Pending", summary: "Pending review" }), /positive id/);
+});

@@ -190,7 +190,7 @@ test("GET /v1/deliveries refuses a busy declaration that names no slot (KRA-1364
   t.after(() => store.close());
   const edgeToken = store.createEdge("dev");
   const broker = new BrokerService(store, slack);
-  const server = new BrokerHttpServer(broker, { host: "127.0.0.1", port: 0, adminToken: "x".repeat(32) });
+  const server = new BrokerHttpServer(broker, { host: "127.0.0.1", port: 0, adminToken: "x".repeat(32), review: null });
   const { port } = await server.start();
   t.after(() => server.stop());
 

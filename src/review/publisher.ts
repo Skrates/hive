@@ -20,6 +20,7 @@ import { iso } from "../time.js";
 import type { Effect, Policy, ReviewState, TransportRef } from "./contract.js";
 import {
   announcePayload,
+  conflictPayload,
   applicability,
   deliveryPayload,
   parseTarget,
@@ -245,6 +246,7 @@ export class ReviewPublisher {
           if (existingId === null) this.store.projections.recordBoardComment(state.id, this.positiveId(commentId, "board comment"));
         }
         const slack = this.slackPolicy(state);
+        if (slack === null && github === null) throw new DispatchError("board has no configured publication destination");
         if (slack !== null) {
           const threadTs = this.slackThread(state);
           const { outboxId } = this.ports.slack.postBoardLine({ channelId: slack.channel_id, threadTs, text: slackBoardLine(state, unknown) });
@@ -282,6 +284,7 @@ export class ReviewPublisher {
       case "delivery":
       case "summon":
       case "announce":
+      case "conflict":
         throw new DispatchError(`${target.kind} is not a refresh target`);
     }
   }
@@ -295,6 +298,15 @@ export class ReviewPublisher {
     state: ReviewState,
   ): Promise<"sent" | "obsolete"> {
     switch (target.kind) {
+      case "conflict": {
+        const payload = conflictPayload(row.payload);
+        if (payload === null) throw new DispatchError("conflict notice carries no payload");
+        const slack = this.slackPolicy(state);
+        if (slack === null) throw new DispatchError("conflict notice has no Slack channel");
+        this.ports.slack.mintSystemWake({ actor: payload.actor, channelId: slack.channel_id,
+          threadTs: this.slackThread(state), text: payload.text, dedupeKey: payload.dedupe_key });
+        return "sent";
+      }
       case "delivery": {
         const payload = deliveryPayload(row.payload);
         if (payload === null) throw new DispatchError(`delivery effect ${row.effect_id} carries no delivery payload`);
@@ -332,9 +344,8 @@ export class ReviewPublisher {
         const payload = announcePayload(row.payload);
         if (payload === null) throw new DispatchError(`announce effect ${row.effect_id} carries no announce payload`);
         const slack = this.slackPolicy(state);
-        if (slack !== null) {
-          this.ports.slack.postBoardLine({ channelId: slack.channel_id, threadTs: this.slackThread(state), text: payload.text });
-        }
+        if (slack === null) throw new DispatchError("merge announcement has no Slack channel");
+        this.ports.slack.postBoardLine({ channelId: slack.channel_id, threadTs: this.slackThread(state), text: payload.text });
         return "sent";
       }
       case "check":

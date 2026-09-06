@@ -795,3 +795,7 @@ as a cutover verification line (§10.2 step 4), not a ticket.
 - **F-12 Conflict-aware summons (D8, from KRA-1362)** — ruled (a). (b) summon and charge, and (c) summon
   without charging, were declined; (c) would have created a second uncharged-head class beside G2.
 - **wd#167 (KRA-1289 + KRA-1121)** — closed by Hákon; tickets cancelled as superseded.
+
+### Deployment integration: conflict notices
+
+The D8 author notice uses a `conflict:<actor>:<subject-key>` actionable effect. It is independent of a review request, remains deliverable while the subject is conflicting, and becomes obsolete when the subject changes, the conflict clears, or the PR is no longer open. It does not count as review-request transport. This also permits a notice for a draft or exempt subject with no pending request.

@@ -917,11 +917,10 @@ function observe(tx: Transaction, action: ObservePRAction): Refusal | null {
   const isConflicting = action.observed.mergeable === false;
   if (!wasConflicting && isConflicting) {
     const author = tx.review.subject.author;
-    const withheld = pendingReviewRequestsAt(tx.review, tx.review.subject.key)[0];
-    if (author.kind === "seat" && withheld !== undefined) {
-      tx.effect("actionable", `delivery:${author.actor}:${withheld.id}`, {
+    if (author.kind === "seat") {
+      tx.effect("actionable", `conflict:${author.actor}:${tx.review.subject.key}`, {
         actor: author.actor,
-        request_id: withheld.id,
+        subject_key: tx.review.subject.key,
         text: `${tx.review.display} is conflicting against ${tx.review.subject.base_ref} tip ${action.observed.base_sha_now}; review transport is withheld until it is mergeable`,
         dedupe_key: `conflicting:${tx.review.id}:${tx.review.subject.key}`,
       });

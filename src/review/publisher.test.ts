@@ -547,3 +547,37 @@ test("Codex records the classifier could not read reach the board comment and th
   assert.match(github!.boards[0]!.body, /could not read[\s\S]*\[issue_comment:5550157393\]\(https:\/\/github\.com\/skrates\/hive\/pull\/7#issuecomment-5550157393\) by chatgpt-codex-connector\[bot\][^\n]*### Summary/u);
   assert.match(slack.lines[0]!.text, /unreadable codex records 1 \(issue_comment:5550157393\)/u);
 });
+
+
+test("conflict notices leave without a pending review request and obsolete when the conflict clears", async () => {
+  const { store, slack, publisher } = fixture({ github: true });
+  const current = state({ requests: [] });
+  current.observed.mergeable = false;
+  store.put(current);
+  const payload = { actor: "ariadne", subject_key: current.subject.key, text: "Resolve the conflict", dedupe_key: "conflict-1" };
+  store.add({ effect_id: "notice-1", kind: "actionable", target: `conflict:ariadne:${current.subject.key}`, payload });
+  assert.equal(await publisher.drainOnce(), 1);
+  assert.equal(slack.wakes.length, 1);
+  assert.equal(store.transport.length, 0, "a notice is not review-request transport");
+  current.observed.mergeable = true;
+  store.put(current);
+  store.add({ effect_id: "notice-2", kind: "actionable", target: `conflict:ariadne:${current.subject.key}`, payload });
+  assert.equal(await publisher.drainOnce(), 1);
+  assert.equal(store.row("notice-2").status, "obsolete");
+  assert.equal(slack.wakes.length, 1);
+});
+
+test("missing publication destinations leave board and announcement effects failed", async () => {
+  const { store, publisher } = fixture();
+  store.policies.set("42:1", policy({ slack: null }));
+  const current = state({ lifecycle: "merged" });
+  store.put(current);
+  store.add({ effect_id: "board-no-sink", reviewId: current.id, kind: "refresh", target: `board:${current.id}` });
+  store.add({ effect_id: "announce-no-sink", reviewId: current.id, kind: "actionable", target: `announce:${current.id}`, payload: { review_id: "rev_obs:run_1", text: "merged" } });
+  assert.equal(await publisher.drainOnce(), 0);
+  for (const id of ["board-no-sink", "announce-no-sink"]) {
+    assert.equal(store.row(id).status, "pending");
+    assert.equal(store.row(id).attempts, 1);
+    assert.ok(store.row(id).nextAttemptAt !== null);
+  }
+});

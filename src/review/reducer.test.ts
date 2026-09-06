@@ -845,8 +845,9 @@ test("§D8 mergeable=false withholds transport at dispatch and tells the author 
   // §D5: the one summon is queued at open; §D8: the publisher withholds it while conflicting.
   assert.ok(targets(batch).includes("summon:req_obs:c_1"));
   assert.equal(applicability(parseTarget("summon:req_obs:c_1"), conflicting), "withheld");
-  const notice = batch.effects.find((e) => e.target === "delivery:talos:req_obs:c_1");
+  const notice = batch.effects.find((e) => e.target === `conflict:talos:${H1}:main`);
   assert.ok(notice, "the author seat is told");
+  assert.equal(applicability(parseTarget(notice.target), conflicting), "applicable");
   const payload = notice.payload as { dedupe_key: string; text: string };
   assert.equal(payload.dedupe_key, `conflicting:${conflicting.id}:${H1}:main`);
   assert.match(payload.text, /conflicting against main/);

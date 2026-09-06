@@ -5,6 +5,7 @@ import { applicability, deliveryPayload, formatTarget, parseTarget, targetKind, 
 import { hold, request, review, SHA_A, SHA_B } from "./fixtures.js";
 
 const TARGETS: Array<[string, EffectTarget]> = [
+  [`conflict:ariadne:${SHA_A}:main`, { kind: "conflict", actor: "ariadne", subjectKey: `${SHA_A}:main` }],
   [`check:skrates/hive:${SHA_A}`, { kind: "check", repo: "skrates/hive", headSha: SHA_A }],
   ["board:rev_obs:run_1", { kind: "board", reviewId: "rev_obs:run_1" }],
   ["thread:9001", { kind: "thread", commentId: 9001 }],

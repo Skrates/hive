@@ -8,14 +8,15 @@
 import type { Effect, Request, Review } from "./contract.js";
 import { contractSchema } from "./contract.js";
 
-/** §8.1 — the six targets. `refresh` for check/board/thread, `actionable` for the rest. */
+/** §8.1 — the seven targets. `refresh` for check/board/thread, `actionable` for the rest. */
 export type EffectTarget =
   | { kind: "check"; repo: string; headSha: string }
   | { kind: "board"; reviewId: string }
   | { kind: "thread"; commentId: number }
   | { kind: "delivery"; actor: string; requestId: string }
   | { kind: "summon"; requestId: string }
-  | { kind: "announce"; reviewId: string };
+  | { kind: "announce"; reviewId: string }
+  | { kind: "conflict"; actor: string; subjectKey: string };
 
 /**
  * The grammar is single-sourced from the vendored contract's `Effect.target` pattern so a
@@ -51,6 +52,10 @@ export function parseTarget(target: string): EffectTarget {
       const split = rest.indexOf(":");
       return { kind: "delivery", actor: rest.slice(0, split), requestId: rest.slice(split + 1) };
     }
+    case "conflict": {
+      const split = rest.indexOf(":");
+      return { kind: "conflict", actor: rest.slice(0, split), subjectKey: rest.slice(split + 1) };
+    }
     case "summon":
       return { kind: "summon", requestId: rest };
     case "announce":
@@ -71,6 +76,8 @@ export function formatTarget(target: EffectTarget): string {
       return `thread:${target.commentId}`;
     case "delivery":
       return `delivery:${target.actor}:${target.requestId}`;
+    case "conflict":
+      return `conflict:${target.actor}:${target.subjectKey}`;
     case "summon":
       return `summon:${target.requestId}`;
     case "announce":
@@ -88,6 +95,7 @@ export function targetKind(target: EffectTarget): Effect["kind"] {
     case "delivery":
     case "summon":
     case "announce":
+    case "conflict":
       return "actionable";
   }
 }
@@ -101,6 +109,8 @@ export interface DeliveryPayload { actor: string; request_id: string; text: stri
 export interface SummonPayload { request_id: string; subject_key: string; text: string }
 /** §8.1: the merge announcement, emitted on `lifecycle_changed → merged`. */
 export interface AnnouncePayload { review_id: string; text: string }
+/** A conflict notice belongs to the subject, independently of review transport. */
+export interface ConflictPayload { actor: string; subject_key: string; text: string; dedupe_key: string }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -120,6 +130,17 @@ export function deliveryPayload(payload: Effect["payload"]): DeliveryPayload | n
   const dedupeKey = str(payload, "dedupe_key");
   if (actor === null || requestId === null || text === null || dedupeKey === null) return null;
   return { actor, request_id: requestId, text, dedupe_key: dedupeKey };
+}
+
+/** Read a conflict notice without inventing a pending review request. */
+export function conflictPayload(payload: Effect["payload"]): ConflictPayload | null {
+  if (!isRecord(payload)) return null;
+  const actor = str(payload, "actor");
+  const subjectKey = str(payload, "subject_key");
+  const text = str(payload, "text");
+  const dedupeKey = str(payload, "dedupe_key");
+  if (actor === null || subjectKey === null || text === null || dedupeKey === null) return null;
+  return { actor, subject_key: subjectKey, text, dedupe_key: dedupeKey };
 }
 
 /** Read a summon payload back; `null` when the row does not carry one. */
@@ -169,6 +190,8 @@ export function applicability(target: EffectTarget, review: Review): Applicabili
     case "thread":
       // A refresh never asks: it re-renders whatever the Review says now (§8.1).
       return "applicable";
+    case "conflict":
+      return review.lifecycle === "open" && target.subjectKey === review.subject.key && review.observed.mergeable === false ? "applicable" : "obsolete";
     case "announce":
       // §8.1: the announcement is the effect of `lifecycle: merged`; a Review that is not
       // merged has nothing to announce.
