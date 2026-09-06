@@ -64,6 +64,7 @@ test("drain stamps the row's reaction on the wake message and a reaction failure
     homeGraceMs: 2_000,
     spawnRateLimit: 1,
     maxAttempts: 3,
+    turnSlots: 1,
     expiresAt: null,
   });
   store.ingestEvent({
@@ -136,6 +137,7 @@ test("a hung reactions call never stalls the serialized drain that claim() waits
     homeGraceMs: 2_000,
     spawnRateLimit: 1,
     maxAttempts: 3,
+    turnSlots: 1,
     expiresAt: null,
   });
   store.ingestEvent({
@@ -189,6 +191,7 @@ function mintServiceFixture(): BrokerStore {
     homeGraceMs: 2_000,
     spawnRateLimit: 1,
     maxAttempts: 3,
+    turnSlots: 1,
     expiresAt: null,
   });
   store.upsertSubscription({
@@ -208,6 +211,7 @@ function mintServiceFixture(): BrokerStore {
     homeGraceMs: 2_000,
     spawnRateLimit: 1,
     maxAttempts: 3,
+    turnSlots: 1,
     expiresAt: null,
   });
   store.ingestEvent({

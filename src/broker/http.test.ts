@@ -184,3 +184,38 @@ test("POST /v1/wakes mints a seat wake, and refuses one that cannot be delivered
   const invalid = await post({ sourceDeliveryId: source.id, generation: source.leaseGeneration!, actor: "gnomon", text: "" });
   assert.equal(invalid.status, 400);
 });
+
+test("GET /v1/deliveries refuses a busy declaration that names no slot (KRA-1364)", async (t) => {
+  const store = new BrokerStore(":memory:");
+  t.after(() => store.close());
+  const edgeToken = store.createEdge("dev");
+  const broker = new BrokerService(store, slack);
+  const server = new BrokerHttpServer(broker, { host: "127.0.0.1", port: 0, adminToken: "x".repeat(32) });
+  const { port } = await server.start();
+  t.after(() => server.stop());
+
+  const claim = (busy: string): Promise<{ status: number; body: string }> =>
+    new Promise((resolve, reject) => {
+      const request = http.get({
+        host: "127.0.0.1",
+        port,
+        path: `/v1/deliveries?wait_ms=0&busy=${encodeURIComponent(busy)}`,
+        headers: { "x-hive-edge": "dev", authorization: `Bearer ${edgeToken}` },
+      }, (response) => {
+        const chunks: Buffer[] = [];
+        response.on("data", (chunk: Buffer) => chunks.push(chunk));
+        response.on("end", () => resolve({ status: response.statusCode ?? 0, body: Buffer.concat(chunks).toString("utf8") }));
+        response.on("error", reject);
+      });
+      request.on("error", reject);
+    });
+
+  // A pre-slot edge's declaration is a caller defect, answered with its reason (R-3).
+  const malformed = await claim("talos");
+  assert.equal(malformed.status, 400);
+  assert.match(malformed.body, /busy_malformed/);
+  assert.match(malformed.body, /actor:slot/);
+  // The slotted form is accepted; with nothing pending the long-poll answers empty.
+  const accepted = await claim("talos:1,talos:2");
+  assert.equal(accepted.status, 204);
+});

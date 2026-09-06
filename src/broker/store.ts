@@ -1,6 +1,7 @@
 import Database from "better-sqlite3";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import type {
+  BusySlot,
   CoalescedMessage,
   Delivery,
   DeliveryStatus,
@@ -13,7 +14,7 @@ import type {
   SubscriptionInput,
   TerminalDeliveryStatus,
 } from "../domain.js";
-import { canonicalActor, EVERYONE, isSlackMessageTs, retryBackoffMs } from "../domain.js";
+import { ACTOR_ID_PATTERN, busySlotKey, canonicalActor, EVERYONE, isSlackMessageTs, retryBackoffMs } from "../domain.js";
 import type { Clock } from "../time.js";
 import { iso, systemClock } from "../time.js";
 
@@ -56,6 +57,25 @@ export class LegacyDatabaseError extends Error {}
  * decision belongs to the operator, never to a migration (R-3).
  */
 export class ActorCaseCollisionError extends Error {}
+
+/**
+ * A persisted subscription whose actor id the addressing grammar
+ * (`ACTOR_ID_PATTERN`) cannot carry. Enrollment refuses such ids; a row
+ * written before the grammar existed would otherwise stay live and unclaimable
+ * (its busy wire form is `busy_malformed` on every claim), so the broker refuses
+ * to boot and names the row — the operator retires it (R-3).
+ */
+export class ActorGrammarError extends Error {}
+
+/**
+ * KRA-1364: a `turnSlots` reduction while a turn still runs in a slot above the
+ * new ceiling. Capacity is counted from the claiming edge's own busy
+ * declaration, so a running high slot on another edge would not be seen and a
+ * second turn could be admitted under the lowered ceiling. The upsert is refused
+ * until those turns finish; the message names the actor, the running slots and
+ * the requested ceiling (R-3).
+ */
+export class TurnSlotReductionError extends Error {}
 
 /**
  * KRA-1097 / ADR-0003 R-3: a seat's deliberate address that cannot be delivered
@@ -208,6 +228,7 @@ export class BrokerStore {
         home_grace_ms INTEGER NOT NULL,
         spawn_rate_limit INTEGER NOT NULL,
         max_attempts INTEGER NOT NULL,
+        turn_slots INTEGER NOT NULL DEFAULT 1,
         expires_at TEXT,
         updated_at TEXT NOT NULL,
         FOREIGN KEY(home_edge) REFERENCES edges(edge_id)
@@ -228,11 +249,13 @@ export class BrokerStore {
       );
 
       CREATE TABLE IF NOT EXISTS actor_leases (
-        actor TEXT PRIMARY KEY,
+        actor TEXT NOT NULL,
+        slot INTEGER NOT NULL,
         edge_id TEXT NOT NULL,
         generation INTEGER NOT NULL,
         expires_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
+        PRIMARY KEY(actor, slot),
         FOREIGN KEY(edge_id) REFERENCES edges(edge_id)
       );
 
@@ -243,6 +266,7 @@ export class BrokerStore {
         status TEXT NOT NULL,
         reasons_json TEXT NOT NULL DEFAULT '[]',
         lease_generation INTEGER,
+        lease_slot INTEGER,
         claimed_by TEXT,
         attempts INTEGER NOT NULL DEFAULT 0,
         next_attempt_at TEXT,
@@ -313,7 +337,27 @@ export class BrokerStore {
       );
     `);
     this.ensureOutboxReactionColumns();
+    this.ensureTurnSlotSchema();
     this.canonicalizePersistedActors();
+    this.refusePersistedActorsOutsideGrammar();
+  }
+
+  /**
+   * Every persisted actor must satisfy the one addressing grammar. Enrollment
+   * checks it (`SubscriptionInputSchema`), so this only ever fires on a database
+   * written before the grammar, or edited by hand — and then loudly: a row the
+   * WAKE/busy wire forms cannot name would sit live and undeliverable forever.
+   */
+  private refusePersistedActorsOutsideGrammar(): void {
+    const outside = (this.db.prepare("SELECT actor FROM subscriptions").all() as Row[])
+      .map((row) => String(row.actor))
+      .filter((actor) => !ACTOR_ID_PATTERN.test(actor));
+    if (outside.length === 0) return;
+    throw new ActorGrammarError(
+      `broker database holds subscription actor(s) outside the addressing grammar (${
+        outside.map((actor) => JSON.stringify(actor)).join(", ")
+      }); the wire forms cannot name them — delete the rows (hive delete-subscription) and restart`,
+    );
   }
 
   /**
@@ -440,6 +484,46 @@ export class BrokerStore {
     }
   }
 
+  /**
+   * Forward-only schema step (KRA-1364): a pre-slot database gains the
+   * `turn_slots` subscription column, the `lease_slot` delivery column, and
+   * an `actor_leases` keyed `(actor, slot)`. Live rows are carried, not
+   * dropped: every existing lease and every claimed delivery was slot 1 by
+   * construction (one lease per actor), and a turn in flight across the
+   * broker restart must still find its fence.
+   */
+  private ensureTurnSlotSchema(): void {
+    const columnsOf = (table: string): string[] =>
+      (this.db.pragma(`table_info(${table})`) as { name: string }[]).map((c) => c.name);
+    if (!columnsOf("subscriptions").includes("turn_slots")) {
+      this.db.exec("ALTER TABLE subscriptions ADD COLUMN turn_slots INTEGER NOT NULL DEFAULT 1");
+    }
+    this.db.transaction(() => {
+      if (!columnsOf("deliveries").includes("lease_slot")) {
+        this.db.exec("ALTER TABLE deliveries ADD COLUMN lease_slot INTEGER");
+        this.db.exec("UPDATE deliveries SET lease_slot=1 WHERE lease_generation IS NOT NULL");
+      }
+      if (!columnsOf("actor_leases").includes("slot")) {
+        this.db.exec(`
+          CREATE TABLE actor_leases_slotted (
+            actor TEXT NOT NULL,
+            slot INTEGER NOT NULL,
+            edge_id TEXT NOT NULL,
+            generation INTEGER NOT NULL,
+            expires_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(actor, slot),
+            FOREIGN KEY(edge_id) REFERENCES edges(edge_id)
+          );
+          INSERT INTO actor_leases_slotted(actor, slot, edge_id, generation, expires_at, updated_at)
+            SELECT actor, 1, edge_id, generation, expires_at, updated_at FROM actor_leases;
+          DROP TABLE actor_leases;
+          ALTER TABLE actor_leases_slotted RENAME TO actor_leases;
+        `);
+      }
+    })();
+  }
+
   private loadOrCreateBrokerUuid(): string {
     return this.db.transaction(() => {
       this.db.prepare(`
@@ -479,12 +563,13 @@ export class BrokerStore {
 
   upsertSubscription(input: SubscriptionInput): Subscription {
     const now = iso(this.clock);
+    this.refuseReductionUnderLeasedSlots(input.actor, input.turnSlots);
     this.db.prepare(`
       INSERT INTO subscriptions(
         actor, provider, provider_surface, provider_version, session_id, home_edge, workspace,
         edge_workspaces_json, wake_policy, permission_profile, account_profile, lease_ttl_ms,
-        delivery_ttl_ms, home_grace_ms, spawn_rate_limit, max_attempts, expires_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        delivery_ttl_ms, home_grace_ms, spawn_rate_limit, max_attempts, turn_slots, expires_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(actor) DO UPDATE SET
         provider=excluded.provider,
         provider_surface=excluded.provider_surface,
@@ -501,6 +586,7 @@ export class BrokerStore {
         home_grace_ms=excluded.home_grace_ms,
         spawn_rate_limit=excluded.spawn_rate_limit,
         max_attempts=excluded.max_attempts,
+        turn_slots=excluded.turn_slots,
         expires_at=excluded.expires_at,
         updated_at=excluded.updated_at
     `).run(
@@ -520,10 +606,33 @@ export class BrokerStore {
       input.homeGraceMs,
       input.spawnRateLimit,
       input.maxAttempts,
+      input.turnSlots,
       input.expiresAt,
       now,
     );
     return { ...input, updatedAt: now };
+  }
+
+  /**
+   * A ceiling can only come down over slots nobody is running in. A lease row
+   * outlives its turn (the sequential same-edge claim reuses it), so "held"
+   * means a claimed, non-terminal delivery in a slot above `turnSlots` — on any
+   * edge. Those refuse the upsert, so the fleet-wide limit is never undercut by
+   * a turn the lowered ceiling can no longer see.
+   */
+  private refuseReductionUnderLeasedSlots(actor: string, turnSlots: number): void {
+    const rows = this.db
+      .prepare(`
+        SELECT lease_slot, claimed_by FROM deliveries
+        WHERE actor = ? AND lease_slot > ? AND status IN ('claimed', 'accepted_local', 'dispatching', 'dispatched')
+        ORDER BY lease_slot
+      `)
+      .all(actor, turnSlots) as Array<{ lease_slot: number; claimed_by: string | null }>;
+    if (rows.length === 0) return;
+    const slots = rows.map((row) => `${row.lease_slot}@${row.claimed_by ?? "?"}`).join(", ");
+    throw new TurnSlotReductionError(
+      `subscription ${JSON.stringify(actor)}: turnSlots=${turnSlots} refused while turns run in slots above it (${slots}); let them finish, then retry`,
+    );
   }
 
   getSubscription(actor: string): Subscription | null {
@@ -1002,7 +1111,14 @@ export class BrokerStore {
     return row ? Number(row.delivery_id) : null;
   }
 
-  claimNext(edgeId: string, _after: number, busyActors: readonly string[] = []): Delivery | null {
+  claimNext(edgeId: string, _after: number, busy: readonly BusySlot[] = []): Delivery | null {
+    // The claiming edge declares the (actor, slot) turns it is still running.
+    // acquireLease cannot serialize these: a same-edge claim on a live lease
+    // shares the generation by design (a sequential edge's next claim after a
+    // finished turn), so only the edge's own declaration prevents two
+    // concurrent turns in one slot (multi-actor edge, 2026-08-11; per-actor
+    // slots, KRA-1364).
+    const busySlots = new Set(busy.map((entry) => busySlotKey(entry.actor, entry.slot)));
     return this.db.transaction(() => {
       // `after` remains a v1 compatibility hint only: broker-side eligibility
       // can change over time, so every pending delivery must remain visible.
@@ -1015,15 +1131,9 @@ export class BrokerStore {
 
       for (const row of rows) {
         const actor = String(row.actor);
-        // The claiming edge declares actors whose dispatches it is still
-        // running. acquireLease cannot serialize these: a same-edge claim on a
-        // live lease shares the generation by design (a sequential edge's next
-        // claim after a finished turn), so only the edge's own declaration
-        // prevents two concurrent turns for one actor (multi-actor edge,
-        // 2026-08-11).
-        if (busyActors.includes(actor)) continue;
         const subscription = this.getSubscription(actor);
         if (!subscription) continue;
+        if (this.atCapacity(actor, subscription.turnSlots, busySlots)) continue;
         const now = this.clock.now().getTime();
         if (row.next_attempt_at !== null && new Date(String(row.next_attempt_at)).getTime() > now) {
           continue;
@@ -1044,14 +1154,14 @@ export class BrokerStore {
           continue;
         }
 
-        const generation = this.acquireLease(actor, edgeId, subscription.leaseTtlMs);
-        if (generation === null) continue;
+        const lease = this.acquireLease(actor, edgeId, subscription, busySlots);
+        if (lease === null) continue;
         const nowIso = iso(this.clock);
         const claimed = this.db.prepare(`
           UPDATE deliveries
-          SET status='claimed', lease_generation=?, claimed_by=?, attempts=attempts+1, updated_at=?
+          SET status='claimed', lease_generation=?, lease_slot=?, claimed_by=?, attempts=attempts+1, updated_at=?
           WHERE delivery_id=? AND status='pending'
-        `).run(generation, edgeId, nowIso, Number(row.delivery_id));
+        `).run(lease.generation, lease.slot, edgeId, nowIso, Number(row.delivery_id));
         if (claimed.changes === 1) return this.getDelivery(Number(row.delivery_id));
       }
       return null;
@@ -1084,36 +1194,91 @@ export class BrokerStore {
       : { disposition: "skip", code: "home_grace_active" };
   }
 
-  private acquireLease(actor: string, edgeId: string, ttlMs: number): number | null {
-    const now = this.clock.now();
-    const row = this.db.prepare("SELECT * FROM actor_leases WHERE actor = ?").get(actor) as Row | undefined;
-    const expiresAt = new Date(now.getTime() + ttlMs).toISOString();
-    if (!row) {
-      this.db.prepare(`
-        INSERT INTO actor_leases(actor, edge_id, generation, expires_at, updated_at)
-        VALUES (?, ?, 1, ?, ?)
-      `).run(actor, edgeId, expiresAt, now.toISOString());
-      return 1;
+  /**
+   * An actor is at capacity when the edge declares at least `turnSlots` turns
+   * running for it — counted over every declared slot, not over `1..turnSlots`.
+   * The ceiling can move under a running turn (an operator lowers `turnSlots`
+   * from 2 to 1 while slot 2 is mid-turn); enumerating the current ceiling
+   * would stop seeing slot 2 and admit a second concurrent turn the moment
+   * slot 1 is free. Counting declared turns keeps the promise the ceiling
+   * makes: never more than `turnSlots` at once, whichever slots hold them.
+   */
+  private atCapacity(actor: string, turnSlots: number, busySlots: ReadonlySet<string>): boolean {
+    const prefix = `${actor}:`;
+    let running = 0;
+    for (const key of busySlots) {
+      if (key.startsWith(prefix)) running += 1;
     }
-    const currentEdge = String(row.edge_id);
-    const expired = new Date(String(row.expires_at)).getTime() <= now.getTime();
-    if (currentEdge !== edgeId && !expired) return null;
-    const generation = currentEdge === edgeId && !expired ? Number(row.generation) : Number(row.generation) + 1;
-    this.db.prepare(`
-      UPDATE actor_leases SET edge_id=?, generation=?, expires_at=?, updated_at=? WHERE actor=?
-    `).run(edgeId, generation, expiresAt, now.toISOString(), actor);
-    return generation;
+    return running >= turnSlots;
   }
 
-  renewLease(actor: string, edgeId: string, generation: number, ttlMs: number): boolean {
+  /**
+   * Take the lowest turn slot of `actor` this edge may hold right now. A slot
+   * is takeable when it has never been leased, when its lease expired (any
+   * edge; a fresh generation is minted), or when this same edge holds it live
+   * and is not running a turn in it (the generation is shared — the sequential
+   * edge's next claim). Generations come from `nextLeaseGeneration`, one
+   * counter per actor across its slots. A live lease on another edge, or a slot this edge
+   * declared busy, is skipped. With `turnSlots = 1` this is exactly the
+   * single-lease rule every seat ran under before slots existed.
+   */
+  private acquireLease(
+    actor: string,
+    edgeId: string,
+    subscription: Subscription,
+    busySlots: ReadonlySet<string>,
+  ): { slot: number; generation: number } | null {
+    const now = this.clock.now();
+    const expiresAt = new Date(now.getTime() + subscription.leaseTtlMs).toISOString();
+    for (let slot = 1; slot <= subscription.turnSlots; slot += 1) {
+      if (busySlots.has(busySlotKey(actor, slot))) continue;
+      const row = this.db.prepare("SELECT * FROM actor_leases WHERE actor=? AND slot=?").get(actor, slot) as Row | undefined;
+      if (!row) {
+        const generation = this.nextLeaseGeneration(actor);
+        this.db.prepare(`
+          INSERT INTO actor_leases(actor, slot, edge_id, generation, expires_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?)
+        `).run(actor, slot, edgeId, generation, expiresAt, now.toISOString());
+        return { slot, generation };
+      }
+      const currentEdge = String(row.edge_id);
+      const expired = new Date(String(row.expires_at)).getTime() <= now.getTime();
+      if (currentEdge !== edgeId && !expired) continue;
+      const generation = currentEdge === edgeId && !expired ? Number(row.generation) : this.nextLeaseGeneration(actor);
+      this.db.prepare(`
+        UPDATE actor_leases SET edge_id=?, generation=?, expires_at=?, updated_at=? WHERE actor=? AND slot=?
+      `).run(edgeId, generation, expiresAt, now.toISOString(), actor, slot);
+      return { slot, generation };
+    }
+    return null;
+  }
+
+  /**
+   * Generations are minted per actor, not per slot: the next one is above every
+   * generation any of the actor's slots has ever held. Transitions are fenced on
+   * `(delivery, generation)` and the fence joins the delivery to whichever slot
+   * it holds *now*; if slots minted their own generations, a delivery whose
+   * slot-1 lease lapsed and was reclaimed into slot 2 could meet a slot-2
+   * generation equal to the stale slot-1 one, and the abandoned attempt's
+   * callbacks would satisfy the new attempt's fence. With one counter per
+   * actor no two slots ever share a generation, so the stale callback is
+   * refused at every transition without carrying the slot through the API.
+   */
+  private nextLeaseGeneration(actor: string): number {
+    const row = this.db.prepare("SELECT COALESCE(MAX(generation), 0) + 1 AS next FROM actor_leases WHERE actor=?").get(actor) as Row;
+    return Number(row.next);
+  }
+
+  renewLease(actor: string, slot: number, edgeId: string, generation: number, ttlMs: number): boolean {
     const now = this.clock.now();
     const result = this.db.prepare(`
       UPDATE actor_leases SET expires_at=?, updated_at=?
-      WHERE actor=? AND edge_id=? AND generation=? AND expires_at>?
+      WHERE actor=? AND slot=? AND edge_id=? AND generation=? AND expires_at>?
     `).run(
       new Date(now.getTime() + ttlMs).toISOString(),
       now.toISOString(),
       actor,
+      slot,
       edgeId,
       generation,
       now.toISOString(),
@@ -1125,7 +1290,10 @@ export class BrokerStore {
     this.assertLease(deliveryId, edgeId, generation);
     const delivery = this.getDelivery(deliveryId);
     if (TERMINAL.has(delivery.status)) throw new InvalidTransitionError("terminal delivery has no renewable lease");
-    if (!this.renewLease(delivery.actor, edgeId, generation, delivery.subscription.leaseTtlMs)) {
+    if (
+      delivery.leaseSlot === null
+      || !this.renewLease(delivery.actor, delivery.leaseSlot, edgeId, generation, delivery.subscription.leaseTtlMs)
+    ) {
       throw new StaleLeaseError(`stale lease for delivery ${deliveryId}`);
     }
     return this.getDelivery(deliveryId);
@@ -1264,7 +1432,7 @@ export class BrokerStore {
       const rows = this.db.prepare(`
         SELECT d.delivery_id
         FROM deliveries d
-        JOIN actor_leases l ON l.actor=d.actor
+        JOIN actor_leases l ON l.actor=d.actor AND l.slot=d.lease_slot
         WHERE l.expires_at<=?
           AND (
             d.status IN ('claimed', 'accepted_local', 'dispatching')
@@ -1295,7 +1463,7 @@ export class BrokerStore {
     const nextAttemptAt = new Date(this.clock.now().getTime() + retryBackoffMs(delivery.attempts)).toISOString();
     this.db.prepare(`
       UPDATE deliveries
-      SET status='pending', lease_generation=NULL, claimed_by=NULL, next_attempt_at=?,
+      SET status='pending', lease_generation=NULL, lease_slot=NULL, claimed_by=NULL, next_attempt_at=?,
           accepted_at=NULL, dispatch_started_at=NULL, dispatched_at=NULL, updated_at=?
       WHERE delivery_id=? AND status IN ('claimed', 'accepted_local', 'dispatching', 'dispatched')
     `).run(nextAttemptAt, now, delivery.id);
@@ -1412,7 +1580,8 @@ export class BrokerStore {
              s.provider, s.provider_surface, s.provider_version, s.session_id, s.home_edge,
              s.workspace, s.edge_workspaces_json, s.wake_policy, s.permission_profile,
              s.account_profile, s.lease_ttl_ms, s.delivery_ttl_ms, s.home_grace_ms,
-             s.spawn_rate_limit, s.max_attempts, s.expires_at, s.updated_at AS subscription_updated_at
+             s.spawn_rate_limit, s.max_attempts, s.turn_slots, s.expires_at,
+             s.updated_at AS subscription_updated_at
       FROM deliveries d
       JOIN slack_events e ON e.event_id=d.event_id
       JOIN subscriptions s ON s.actor=d.actor
@@ -1448,7 +1617,7 @@ export class BrokerStore {
   assertLease(deliveryId: number, edgeId: string, generation: number): void {
     const row = this.db.prepare(`
       SELECT d.claimed_by, d.lease_generation, l.edge_id, l.generation, l.expires_at
-      FROM deliveries d JOIN actor_leases l ON l.actor=d.actor
+      FROM deliveries d JOIN actor_leases l ON l.actor=d.actor AND l.slot=d.lease_slot
       WHERE d.delivery_id=?
     `).get(deliveryId) as Row | undefined;
     const now = this.clock.now().getTime();
@@ -1526,6 +1695,7 @@ function subscriptionFromRow(row: Row): Subscription {
     homeGraceMs: Number(row.home_grace_ms),
     spawnRateLimit: Number(row.spawn_rate_limit),
     maxAttempts: Number(row.max_attempts),
+    turnSlots: Number(row.turn_slots),
     expiresAt: row.expires_at === null ? null : String(row.expires_at),
     updatedAt: String(row.updated_at),
   };
@@ -1557,6 +1727,7 @@ function deliveryFromRow(row: Row): Delivery {
     status: String(row.status) as DeliveryStatus,
     reasons: JSON.parse(String(row.reasons_json)) as Reason[],
     leaseGeneration: row.lease_generation === null ? null : Number(row.lease_generation),
+    leaseSlot: row.lease_slot === null ? null : Number(row.lease_slot),
     claimedBy: row.claimed_by === null ? null : String(row.claimed_by),
     attempts: Number(row.attempts),
     nextAttemptAt: row.next_attempt_at === null ? null : String(row.next_attempt_at),

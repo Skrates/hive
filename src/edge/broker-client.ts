@@ -1,4 +1,5 @@
 import type {
+  BusySlot,
   Delivery,
   DeliveryResultInput,
   Reason,
@@ -7,6 +8,7 @@ import type {
   SeatWakeReceipt,
   SubscriptionInput,
 } from "../domain.js";
+import { formatBusySlots } from "../domain.js";
 import type { Action, Receipt, ReviewState } from "../review/contract.js";
 
 /** A seat's review act as the edge forwards it: custody resolved, actor never named (§5.A1). */
@@ -36,8 +38,8 @@ export class BrokerClient {
     private readonly token: string,
   ) {}
 
-  async claim(after: number, waitMs = 25_000, busyActors: readonly string[] = []): Promise<Delivery | null> {
-    const busy = busyActors.length > 0 ? `&busy=${encodeURIComponent(busyActors.join(","))}` : "";
+  async claim(after: number, waitMs = 25_000, busySlots: readonly BusySlot[] = []): Promise<Delivery | null> {
+    const busy = busySlots.length > 0 ? `&busy=${encodeURIComponent(formatBusySlots(busySlots))}` : "";
     const response = await this.request(`/v1/deliveries?after=${after}&wait_ms=${waitMs}${busy}`, { method: "GET" });
     if (response.status === 204) return null;
     return this.json<Delivery>(response);
