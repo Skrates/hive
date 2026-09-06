@@ -91,6 +91,22 @@ function mintCustodyDetail(source: Delivery, edgeId: string, generation: number)
     + `(the ledger holds ${source.leaseGeneration ?? "none"}); this dispatch's lease has moved on`;
 }
 
+/**
+ * Review design §8.1: a system-origin delivery to a seat. `dedupeKey` is the whole of the
+ * mint's identity — the review publisher derives it from the effect it is dispatching, so a
+ * redelivery of the same effect is a replay, never a second wake.
+ */
+export interface SystemWakeMint {
+  actor: string;
+  channelId: string;
+  threadTs: string | null;
+  text: string;
+  dedupeKey: string;
+}
+
+/** The sender id every system-origin review wake carries (`senderKind: "app"`). */
+export const SYSTEM_WAKE_SENDER = "hive-review";
+
 export interface OutboxEntry {
   outboxId: number;
   deliveryId: number | null;
@@ -865,6 +881,113 @@ export class BrokerStore {
     })();
   }
 
+  /**
+   * Review design §8.1 (Slack): a system-origin Hive delivery — the "small `ingestEvent`
+   * extension" that carries a review request (burn digest, clean wake, exhaustion gate,
+   * retrospective) to a seat.
+   *
+   * What it shares with every other wake, deliberately: the ordinary ledger row, the
+   * ordinary outbox render stamped `hive_*` on the way out (so Slack admission drops it and
+   * it can never be re-ingested), the ordinary R-3 backoff/failure and R-6 outcome
+   * semantics. What differs from {@link mintSeatWake}: there is no source delivery and no
+   * Slack sender — the sender is the review machine itself (`senderKind: "app"`,
+   * `senderId: "hive-review"`), and identity is the caller's `dedupeKey`
+   * (`eventId = "review:" + dedupeKey`) so an at-least-once publisher that re-mints after a
+   * lost response gets the original delivery back and posts nothing new.
+   *
+   * R-3: a wake that would reach no one throws `SeatWakeRefusedError("unroutable_actor")`
+   * — the publisher marks the effect failed and retries behind backoff; nothing is
+   * dead-lettered silently.
+   */
+  mintSystemWake(input: SystemWakeMint): { deliveryId: number } {
+    return this.db.transaction(() => {
+      if (input.threadTs !== null && !isSlackMessageTs(input.threadTs)) {
+        throw new SeatWakeRefusedError(
+          "invalid_thread",
+          `thread coordinate \`${input.threadTs}\` is not a Slack message timestamp`,
+        );
+      }
+      const target = canonicalActor(input.actor);
+      if (target === EVERYONE) {
+        throw new SeatWakeRefusedError(
+          "broadcast_forbidden",
+          "`everyone` is a human-only broadcast target; a review request names one seat",
+        );
+      }
+      const eventId = `review:${input.dedupeKey}`;
+      const replayed = this.deliveryIdForEvent(eventId);
+      if (replayed !== null) return { deliveryId: replayed };
+
+      const subscription = this.getSubscription(target);
+      if (!subscription || isExpired(subscription.expiresAt, this.clock.now())) {
+        throw new SeatWakeRefusedError(
+          "unroutable_actor",
+          `no live subscription for actor \`${target}\` — this review request would reach no one`,
+        );
+      }
+      const digest = createHash("sha256").update(input.dedupeKey).digest("hex").slice(0, 16);
+      const ingest = this.ingestEvent({
+        eventId,
+        workspaceId: this.workspaceIdForChannel(input.channelId),
+        channelId: input.channelId,
+        // The outbox column is NOT NULL; a top-level post (no thread yet) rides as the empty
+        // coordinate, which the Slack sender must translate to "no thread_ts".
+        threadTs: input.threadTs ?? "",
+        // No Slack message exists yet — the render is enqueued below (see isSlackMessageTs).
+        messageTs: `review:${digest}`,
+        senderId: SYSTEM_WAKE_SENDER,
+        senderKind: "app",
+        actor: target,
+        text: input.text,
+        raw: { type: "system_wake", source: "system", dedupeKey: input.dedupeKey },
+        receivedAt: iso(this.clock),
+      });
+      const deliveryId = ingest.deliveryId ?? this.deliveryIdForEvent(eventId);
+      if (deliveryId === null) {
+        // The subscription check above proved the actor routable; the ledger disagreeing with
+        // itself mid-transaction is rolled back whole — the event row included.
+        throw new SeatWakeRefusedError(
+          "unroutable_actor",
+          `system wake for \`${target}\` produced no delivery`,
+        );
+      }
+      if (ingest.created) {
+        this.enqueueOutbox(this.getDelivery(deliveryId), systemWakeRender(target, deliveryId, input.text));
+      }
+      return { deliveryId };
+    })();
+  }
+
+  /**
+   * Review design §8.1 / §10.3 M0: the Slack board line — a plain thread notice on the
+   * ordinary outbox. `threadTs: null` posts at the channel's top level (empty coordinate,
+   * see {@link mintSystemWake}).
+   */
+  postBoardLine(input: { channelId: string; threadTs: string | null; text: string }): { outboxId: number } {
+    const result = this.db.prepare(`
+      INSERT INTO outbox(delivery_id, channel_id, thread_ts, text, created_at)
+      VALUES (NULL, ?, ?, ?, ?)
+    `).run(input.channelId, input.threadTs ?? "", input.text, iso(this.clock));
+    return { outboxId: Number(result.lastInsertRowid) };
+  }
+
+  /**
+   * The Slack workspace a channel belongs to, as this broker has seen it. One broker serves
+   * one workspace (`SlackIngress` is constructed with a single id), so the most recent event
+   * in the channel — or, before any, in any channel — names it; a broker that has never seen
+   * Slack at all records `"system"`.
+   */
+  private workspaceIdForChannel(channelId: string): string {
+    const inChannel = this.db.prepare(
+      "SELECT workspace_id FROM slack_events WHERE channel_id=? ORDER BY received_at DESC LIMIT 1",
+    ).get(channelId) as Row | undefined;
+    if (inChannel) return String(inChannel.workspace_id);
+    const any = this.db.prepare(
+      "SELECT workspace_id FROM slack_events ORDER BY received_at DESC LIMIT 1",
+    ).get() as Row | undefined;
+    return any ? String(any.workspace_id) : "system";
+  }
+
   /** The delivery an event belongs to, whether it opened one or coalesced into one. */
   private deliveryIdForEvent(eventId: string): number | null {
     const row = this.db.prepare("SELECT delivery_id FROM delivery_events WHERE event_id=?")
@@ -1348,6 +1471,11 @@ export class BrokerStore {
  */
 function seatWakeRender(from: string, target: string, deliveryId: number, text: string): string {
   return `🐝 wake minted by ${from} → ${target} (delivery ${deliveryId})\n\n${text}`;
+}
+
+/** The commons render of a system-origin review wake: the review machine addressed a seat. */
+function systemWakeRender(target: string, deliveryId: number, text: string): string {
+  return `🐝 review wake ${SYSTEM_WAKE_SENDER} → ${target} (delivery ${deliveryId})\n\n${text}`;
 }
 
 function outcomePost(delivery: Delivery, text: string): string {
