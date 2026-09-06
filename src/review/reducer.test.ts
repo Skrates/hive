@@ -16,6 +16,7 @@ import type {
   ReviewState,
 } from "./contract.js";
 import { validateBatch, validateReview, validateReviewState } from "./contract.js";
+import { applicability, parseTarget } from "./effects.js";
 import {
   AUTHORIZATION_TABLE,
   authorize,
@@ -533,20 +534,25 @@ test("§C2 a subject change cancels pending requests at the old subject, release
   assert.ok(targets(batch).includes(`check:Owner/repo:${H2}`));
 });
 
-test("§C3 closed pauses: requests stay pending, transport is paused, readiness is false; reopen resumes", () => {
+test("§C3 closed pauses: requests stay pending, transport is paused at dispatch, readiness is false; reopen queues nothing", () => {
   const review = opened();
-  const closed = apply(review, observe({ lifecycle: "closed" }), ADAPTER).state;
-  assert.equal(pending(closed).length, 1);
-  assert.deepEqual(state(closed).readiness, { ready: false, subject_key: closed.subject.key, reasons: ["closed", { required_request_pending: [pending(closed)[0]?.id ?? ""] }, { requirement_unsatisfied: [closed.subject.key] }] });
-  // A request opened while closed queues no transport …
-  const held = apply(closed, { kind: "OpenRequest", request_kind: "review", mode: "appeal", assignee: "ariadne", subject_key: closed.subject.key, required: true, names: [], reason: "r" }, OPERATOR);
-  assert.ok(!targets(held.batch).some((t) => t.startsWith("delivery:") || t.startsWith("summon:")));
-  // … and the reopen resumes it, with history intact.
+  const closed = apply(review, observe({ lifecycle: "closed" }), ADAPTER);
+  assert.equal(pending(closed.state).length, 1);
+  assert.ok(!closed.batch.effects.some((e) => e.kind === "actionable"), "closing queues no transport");
+  assert.deepEqual(state(closed.state).readiness, { ready: false, subject_key: closed.state.subject.key, reasons: ["closed", { required_request_pending: [pending(closed.state)[0]?.id ?? ""] }, { requirement_unsatisfied: [closed.state.subject.key] }] });
+  // A request opened while closed queues its one transport effect (§D5); the publisher withholds it while closed (§8.1).
+  const held = apply(closed.state, { kind: "OpenRequest", request_kind: "review", mode: "appeal", assignee: "ariadne", subject_key: closed.state.subject.key, required: true, names: [], reason: "r" }, OPERATOR);
+  const delivery = `delivery:ariadne:${pending(held.state, "ariadne")[0]?.id}`;
+  assert.deepEqual(targets(held.batch).filter((t) => t.startsWith("delivery:") || t.startsWith("summon:")), [delivery]);
+  assert.equal(applicability(parseTarget(delivery), held.state), "withheld", "paused while closed");
+  assert.equal(applicability(parseTarget(`summon:${pending(held.state, "codex")[0]?.id}`), held.state), "withheld");
+  // The reopen resumes with history intact and queues no second transport: the withheld rows become applicable.
   const reopened = apply(held.state, observe({ lifecycle: "open" }), ADAPTER);
   assert.equal(pending(reopened.state).length, 2);
-  const summons = targets(reopened.batch).filter((t) => t.startsWith("summon:") || t.startsWith("delivery:"));
-  assert.equal(summons.length, 2);
-  assert.ok(summons.includes(`delivery:ariadne:${pending(held.state, "ariadne")[0]?.id}`));
+  assert.deepEqual(reopened.state.requests, held.state.requests);
+  assert.ok(!reopened.batch.effects.some((e) => e.kind === "actionable"), "no duplicate summons or delivery on reopen");
+  assert.equal(applicability(parseTarget(delivery), reopened.state), "applicable");
+  assert.equal(applicability(parseTarget(`summon:${pending(held.state, "codex")[0]?.id}`), reopened.state), "applicable");
 });
 
 test("§C3 merged is terminal: only Release, RetractAnswer and ResolveFinding(follow_up) pass; the merge announces", () => {
@@ -716,12 +722,14 @@ test("§D5 transport: a seat assignee gets a delivery with a dedupe key; codex g
   assert.match(payload.text, /second opinion/);
 });
 
-test("§D8 mergeable=false withholds transport and tells the author once per subject; a flip to true resumes; null never withholds", () => {
+test("§D8 mergeable=false withholds transport at dispatch and tells the author once per subject; a flip to true queues nothing; null never withholds", () => {
   const { state: conflicting, batch } = apply(null, observe({ mergeable: false }), ADAPTER, { actId: "obs:c" });
   assert.ok(kinds(batch).includes("mergeable_observed"));
   assert.equal(conflicting.observed.mergeable, false);
   assert.equal(pending(conflicting).length, 1, "the request is still opened");
-  assert.ok(!targets(batch).some((t) => t.startsWith("summon:")), "no summon while conflicting");
+  // §D5: the one summon is queued at open; §D8: the publisher withholds it while conflicting.
+  assert.ok(targets(batch).includes("summon:req_obs:c_1"));
+  assert.equal(applicability(parseTarget("summon:req_obs:c_1"), conflicting), "withheld");
   const notice = batch.effects.find((e) => e.target === "delivery:talos:req_obs:c_1");
   assert.ok(notice, "the author seat is told");
   const payload = notice.payload as { dedupe_key: string; text: string };
@@ -730,17 +738,19 @@ test("§D8 mergeable=false withholds transport and tells the author once per sub
   // Still conflicting: nothing new.
   const still = apply(conflicting, observe({ mergeable: false, seenAt: T1 }), ADAPTER);
   assert.ok(!still.batch.effects.some((e) => e.kind === "actionable"));
-  // Flip to true: the summon goes out, no further author notice.
+  // Flip to true: no second summon, no further author notice; the withheld row is now applicable.
   const resumed = apply(still.state, observe({ mergeable: true, seenAt: T2 }), ADAPTER);
   assert.deepEqual(kinds(resumed.batch), ["observed_refreshed", "mergeable_observed"]);
-  assert.ok(targets(resumed.batch).includes("summon:req_obs:c_1"));
-  assert.ok(!targets(resumed.batch).some((t) => t.startsWith("delivery:")));
+  assert.ok(!resumed.batch.effects.some((e) => e.kind === "actionable"));
+  assert.equal(applicability(parseTarget("summon:req_obs:c_1"), resumed.state), "applicable");
   // null never withholds.
   const unknown = apply(null, observe({ mergeable: null }), ADAPTER, { actId: "obs:n" });
   assert.ok(targets(unknown.batch).includes("summon:req_obs:n_1"));
-  // A human author gets no seat delivery; transport is still withheld.
+  assert.equal(applicability(parseTarget("summon:req_obs:n_1"), unknown.state), "applicable");
+  // A human author gets no seat delivery; the summon is queued and withheld all the same.
   const human = apply(null, observe({ mergeable: false, author: { kind: "human", login: "hakon" } }), ADAPTER);
-  assert.ok(!human.batch.effects.some((e) => e.kind === "actionable"));
+  assert.ok(!human.batch.effects.some((e) => e.target.startsWith("delivery:")));
+  assert.equal(human.batch.effects.filter((e) => e.kind === "actionable").length, 1);
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -1081,13 +1091,15 @@ test("§G1 / §G2 a charge is recorded once per subject; retraction keeps it; a 
   assert.equal(granted.budget.granted, 2);
 });
 
-test("§G3 holds: any active hold ⇒ not ready; blocks.summons pauses transport; release resumes it", () => {
+test("§G3 holds: any active hold ⇒ not ready; blocks.summons pauses transport at dispatch; release queues nothing", () => {
   const draft = opened({ draft: true });
   const held = apply(draft, { kind: "Hold", hold: { kind: "stack", reason: "on top of #6", release_on: "explicit", blocks: { readiness: true, summons: true } } }, seat("talos")).state;
   const flipped = apply(held, observe({ draft: false }), ADAPTER);
-  assert.equal(pending(flipped.state).length, 0, "a summons-blocking hold suppresses the auto-request");
+  assert.equal(pending(flipped.state).length, 0, "a summons-blocking hold suppresses the auto-request (§C2)");
   const requested = apply(flipped.state, { kind: "OpenRequest", request_kind: "review", mode: "initial", assignee: "codex", subject_key: held.subject.key, required: true, names: [], reason: "r" }, OPERATOR);
-  assert.ok(!targets(requested.batch).some((t) => t.startsWith("summon:")), "transport paused by the hold");
+  const summon = `summon:${pending(requested.state)[0]?.id}`;
+  assert.ok(targets(requested.batch).includes(summon), "the one summon is queued at open (§D5)");
+  assert.equal(applicability(parseTarget(summon), requested.state), "withheld", "transport paused by the hold");
   assert.deepEqual(state(requested.state).readiness, {
     ready: false,
     subject_key: held.subject.key,
@@ -1098,7 +1110,8 @@ test("§G3 holds: any active hold ⇒ not ready; blocks.summons pauses transport
   assert.equal(refusal(requested.state, { kind: "Release", hold_id: hold.id, reason: "r" }, seat("ariadne")).code, "unauthorized");
   const released = apply(requested.state, { kind: "Release", hold_id: hold.id, reason: "landed" }, seat("talos"));
   assert.deepEqual(kinds(released.batch), ["hold_released"]);
-  assert.ok(targets(released.batch).includes(`summon:${pending(requested.state)[0]?.id}`), "release resumes transport");
+  assert.ok(!released.batch.effects.some((e) => e.kind === "actionable"), "release queues no second summons");
+  assert.equal(applicability(parseTarget(summon), released.state), "applicable", "the withheld row resumes at dispatch");
   assert.equal(refusal(released.state, { kind: "Release", hold_id: hold.id, reason: "r" }, OPERATOR).code, "no_such_target");
   assert.equal(refusal(released.state, { kind: "Release", hold_id: "hold_nope", reason: "r" }, OPERATOR).code, "no_such_target");
   // The system may release a subject_change hold, never an explicit one.

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { validateEffect } from "./contract.js";
 import { applicability, deliveryPayload, formatTarget, parseTarget, targetKind, type EffectTarget } from "./effects.js";
-import { request, review, SHA_A, SHA_B } from "./fixtures.js";
+import { hold, request, review, SHA_A, SHA_B } from "./fixtures.js";
 
 const TARGETS: Array<[string, EffectTarget]> = [
   [`check:skrates/hive:${SHA_A}`, { kind: "check", repo: "skrates/hive", headSha: SHA_A }],
@@ -64,6 +64,31 @@ test("applicability: pending at the current subject ⇒ applicable; otherwise ob
   const unknown = review({ requests: [request()] });
   unknown.observed = { ...unknown.observed, mergeable: null };
   assert.equal(applicability(summon, unknown), "applicable");
+});
+
+// §6.C3: closed pauses transport, merged is terminal; §6.G3: a summons-blocking hold pauses
+// review-request transport only — the exhaustion episode's retrospective and gate delivery
+// (§6.G4) go out under the exhaustion hold that blocks summons.
+test("applicability: closed withholds, merged obsoletes, a summons-blocking hold withholds review requests but not the retrospective", () => {
+  const summon: EffectTarget = { kind: "summon", requestId: "req_obs:run_1_1" };
+  const delivery: EffectTarget = { kind: "delivery", actor: "talos", requestId: "req_obs:run_1_1" };
+  assert.equal(applicability(summon, review({ lifecycle: "closed", requests: [request()] })), "withheld");
+  assert.equal(applicability(delivery, review({ lifecycle: "closed", requests: [request()] })), "withheld");
+  assert.equal(applicability(summon, review({ lifecycle: "merged", requests: [request()] })), "obsolete");
+  assert.equal(applicability(delivery, review({ lifecycle: "merged", requests: [request()] })), "obsolete");
+
+  const retro = request({ id: "req_retro", kind: "retrospective", mode: null, assignee: "theoros", required: false });
+  const blocking = hold({ id: "hold_x", kind: "exhaustion", by: { kind: "system", caused_by: "ans_1" }, blocks: { readiness: true, summons: true } });
+  const heldReview = review({ requests: [request(), retro], holds: [blocking] });
+  assert.equal(applicability(summon, heldReview), "withheld");
+  assert.equal(applicability(delivery, heldReview), "withheld");
+  assert.equal(applicability({ kind: "delivery", actor: "theoros", requestId: "req_retro" }, heldReview), "applicable", "the retrospective goes out under the hold");
+  assert.equal(applicability({ kind: "delivery", actor: "talos", requestId: "req_retro" }, heldReview), "applicable", "so does the author's gate delivery");
+
+  const readinessOnly = review({ requests: [request()], holds: [hold({ blocks: { readiness: true, summons: false } })] });
+  assert.equal(applicability(summon, readinessOnly), "applicable", "a hold that does not block summons pauses nothing");
+  const releasedHold = review({ requests: [request()], holds: [hold({ ...blocking, released: { by: { kind: "operator", id: "hakon" }, at: "2026-09-06T13:00:00.000Z", reason: "granted" } })] });
+  assert.equal(applicability(summon, releasedHold), "applicable", "a released hold pauses nothing");
 });
 
 test("applicability: announce needs a merged Review; refreshes always apply", () => {

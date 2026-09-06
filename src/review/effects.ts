@@ -145,14 +145,20 @@ export function announcePayload(payload: Effect["payload"]): AnnouncePayload | n
 // Applicability
 
 /**
- * §6.D7 / §6.D8 / §8.1 — what an actionable job learns when it re-checks the current Review
- * at dispatch time.
+ * §6.D7 / §6.D8 / §6.C3 / §6.G3 / §8.1 — what an actionable job learns when it re-checks the
+ * current Review at dispatch time. Opening a request queues its one transport effect (§D5);
+ * this predicate is the one place transport is paused and resumed, so a pause never needs a
+ * second effect when it lifts (a closed PR reopening, a conflict clearing, a hold releasing).
  *
  * - `applicable`: dispatch now.
  * - `obsolete`: the world moved on (the request is no longer pending at the current subject,
- *   the Review is not merged for an announce); the row is marked and never sent.
- * - `withheld`: §D8 — the PR is `mergeable === false`; the request stays pending and so does
- *   the row. Not obsolete: transport resumes when `mergeable` flips.
+ *   the Review is merged — terminal for new work — or, for an announce, not merged); the row
+ *   is marked and never sent.
+ * - `withheld`: the request stays pending and so does the row — §C3 the PR is closed
+ *   ("transport paused"), §D8 the PR is `mergeable === false`, or §G3 a summons-blocking hold
+ *   is active and the request is a review request (the exhaustion episode's own retrospective
+ *   and gate delivery go out under the exhaustion hold it places, §G4). Not obsolete: the row
+ *   is dispatched by a later pass once the condition clears.
  */
 export type Applicability = "applicable" | "obsolete" | "withheld";
 
@@ -174,8 +180,13 @@ export function applicability(target: EffectTarget, review: Review): Applicabili
       if (request === undefined) return "obsolete";
       if (request.status !== "pending") return "obsolete";
       if (request.subject_key !== review.subject.key) return "obsolete";
+      // §C3: merged is terminal for new work; closed pauses.
+      if (review.lifecycle === "merged") return "obsolete";
+      if (review.lifecycle === "closed") return "withheld";
       // §D8: `false` withholds; `null` (not yet computed) never does.
       if (review.observed.mergeable === false) return "withheld";
+      // §G3: `blocks.summons` pauses transport for review requests while the hold is active.
+      if (request.kind === "review" && review.holds.some((hold) => hold.released === null && hold.blocks.summons)) return "withheld";
       return "applicable";
     }
   }

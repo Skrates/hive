@@ -321,11 +321,6 @@ function satisfyingAnswers(review: Review, subjectKey: string): Answer[] {
   });
 }
 
-/** §6.D5/§C3/§G3/§D8: whether a request's transport may be queued right now. */
-function transportAllowed(review: Review): boolean {
-  return review.lifecycle === "open" && review.observed.mergeable !== false && !summonsBlocked(review);
-}
-
 function roundsMax(policy: Policy): number {
   return policy.rounds_max ?? DEFAULT_ROUNDS_MAX;
 }
@@ -528,8 +523,6 @@ type EffectPayload = Record<string, unknown> | null;
 class Transaction {
   readonly consequences: Consequence[] = [];
   readonly effects: Effect[] = [];
-  /** Request ids whose transport this batch already queued (a resume never doubles an open). */
-  readonly transported = new Set<string>();
   readonly before: Review | null;
   review: Review;
   private readonly counters = new Map<string, number>();
@@ -684,13 +677,17 @@ function applyVerb(tx: Transaction, action: Action): Refusal | null {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Transport (§D5, §D8, §C3, §G3)
+// Transport (§D5)
 // ---------------------------------------------------------------------------------------------
 
-/** §D5: one effect per opening — a Hive delivery to a seat, a summon comment for `codex`. */
-function emitTransport(tx: Transaction, request: Request, force = false): void {
-  if (!force && !transportAllowed(tx.review)) return;
-  tx.transported.add(request.id);
+/**
+ * §D5: one effect per opening — a Hive delivery to a seat, a summon comment for `codex` —
+ * queued unconditionally. Pausing (§C3 closed, §D8 conflicting, §G3 summons-blocking hold) and
+ * resuming are the publisher's applicability check on that one row (§8.1, `effects.ts`); the
+ * reducer never queues a second transport for the same opening, so a reopen, a conflict
+ * clearing or a release cannot double a summons.
+ */
+function emitTransport(tx: Transaction, request: Request): void {
   const review = tx.review;
   if (request.assignee === "codex") {
     tx.effect("actionable", `summon:${request.id}`, {
@@ -707,17 +704,6 @@ function emitTransport(tx: Transaction, request: Request, force = false): void {
     text: `${review.display}: ${mode} request ${request.id} at ${request.subject_key} — ${request.reason}`,
     dedupe_key: `request:${request.id}:${tx.ctx.actId}`,
   });
-}
-
-/**
- * §D8 / §C3 / §G3: transport paused by a conflict, a close or a summons-blocking hold resumes
- * for every review request still pending at the current subject when the pause lifts.
- */
-function resumeTransport(tx: Transaction): void {
-  if (!transportAllowed(tx.review)) return;
-  for (const request of pendingReviewRequestsAt(tx.review, tx.review.subject.key)) {
-    if (!tx.transported.has(request.id)) emitTransport(tx, request);
-  }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -784,7 +770,6 @@ interface OpenSpec {
   reason: string;
   supersedes: string | null;
   openedBy: Principal;
-  forceTransport?: boolean;
 }
 
 function open(tx: Transaction, spec: OpenSpec): Request {
@@ -805,7 +790,7 @@ function open(tx: Transaction, spec: OpenSpec): Request {
     answered_by: null,
   };
   tx.record({ kind: "request_opened", request });
-  emitTransport(tx, request, spec.forceTransport === true);
+  emitTransport(tx, request);
   return request;
 }
 
@@ -919,16 +904,14 @@ function observe(tx: Transaction, action: ObservePRAction): Refusal | null {
   if (subjectChanged) openInitialIfDue(tx, "subject_changed");
   else if (before !== null && before.draft && !action.draft) openInitialIfDue(tx, "ready_for_review");
 
-  // §C3: closed → open resumes transport; → merged announces.
-  if (before !== null && before.lifecycle === "closed" && action.lifecycle === "open") resumeTransport(tx);
+  // §C3: → merged announces. A reopen queues nothing: the paused transport rows resume at dispatch (§8.1).
   if (before !== null && before.lifecycle !== "merged" && action.lifecycle === "merged") {
     tx.effect("actionable", `announce:${tx.review.id}`, { review_id: tx.review.id, text: `${tx.review.display} merged` });
   }
 
-  // §D8: a flip out of `false` resumes transport; a flip into `false` tells the author once per subject.
+  // §D8: a flip into `false` tells the author once per subject; a flip out of it resumes the withheld rows at dispatch.
   const wasConflicting = before !== null && before.observed.mergeable === false;
   const isConflicting = action.observed.mergeable === false;
-  if (wasConflicting && !isConflicting) resumeTransport(tx);
   if (!wasConflicting && isConflicting) {
     const author = tx.review.subject.author;
     const withheld = pendingReviewRequestsAt(tx.review, tx.review.subject.key)[0];
@@ -1069,13 +1052,13 @@ function admitAnswer(tx: Transaction, request: Request, answerId: string, normal
     if (!tx.review.charges.some((c) => c.subject_key === request.subject_key)) {
       tx.record({ kind: "charge_recorded", charge: { subject_key: request.subject_key, answer_id: answerId, at: tx.ctx.now } });
     }
-    checkExhaustion(tx, request);
+    checkExhaustion(tx);
   }
   return admitted;
 }
 
 /** §G4: exhaustion is an episode — opened once while the predicate holds, closed by `GrantRounds`. */
-function checkExhaustion(tx: Transaction, answered: Request): void {
+function checkExhaustion(tx: Transaction): void {
   const review = tx.review;
   if (openEpisode(review) !== undefined) return;
   if (!review.findings.some(isBlocking)) return;
@@ -1096,11 +1079,12 @@ function checkExhaustion(tx: Transaction, answered: Request): void {
   const episode: ExhaustionEpisode = { id: tx.mint("ep"), opened_at: tx.ctx.now, hold_id: hold.id, closed: null };
   tx.record({ kind: "episode_opened", episode });
 
-  // §G5: the retrospective is an obligation with `required: false`; its transport is the episode's own act.
+  // §G5: the retrospective is an obligation with `required: false`; its transport goes out under the
+  // exhaustion hold (the publisher withholds only review requests under a summons-blocking hold, §G3).
   const retrospectiveActor = tx.ctx.policy.retrospective_actor;
-  let retrospective: Request | undefined;
-  if (!hasPending(review, retrospectiveActor, review.subject.key, "retrospective")) {
-    retrospective = open(tx, {
+  const retrospective =
+    review.requests.find((r) => r.status === "pending" && r.kind === "retrospective" && r.assignee === retrospectiveActor && r.subject_key === review.subject.key)
+    ?? open(tx, {
       kind: "retrospective",
       mode: null,
       assignee: retrospectiveActor,
@@ -1110,12 +1094,12 @@ function checkExhaustion(tx: Transaction, answered: Request): void {
       reason: `exhaustion:${episode.id}`,
       supersedes: null,
       openedBy: tx.system,
-      forceTransport: true,
     });
-  }
   const author = review.subject.author;
   if (author.kind === "seat") {
-    const requestId = retrospective?.id ?? answered.id;
+    // The gate delivery names the retrospective request: pending until the episode's work is done, so the
+    // publisher's §D7 check finds it applicable (the answered review request would already be obsolete).
+    const requestId = retrospective.id;
     tx.effect("actionable", `delivery:${author.actor}:${requestId}`, {
       actor: author.actor,
       request_id: requestId,
@@ -1553,7 +1537,10 @@ function placeHold(tx: Transaction, action: Extract<Action, { kind: "Hold" }>): 
   return null;
 }
 
-/** §G3: a released summons-blocking hold resumes transport; releasing an exhaustion hold closes its episode. */
+/**
+ * §G3: releasing an exhaustion hold closes its episode. A released summons-blocking hold queues
+ * nothing: the withheld transport rows resume at dispatch (§8.1).
+ */
 function release(tx: Transaction, action: Extract<Action, { kind: "Release" }>): Refusal | null {
   const hold = tx.review.holds.find((h) => h.id === action.hold_id);
   if (hold === undefined) return refuse("no_such_target", `hold ${action.hold_id} does not exist`);
@@ -1563,7 +1550,6 @@ function release(tx: Transaction, action: Extract<Action, { kind: "Release" }>):
   if (episode !== undefined) {
     tx.record({ kind: "episode_closed", episode_id: episode.id, close: { at: tx.ctx.now, by: tx.ctx.principal } });
   }
-  if (hold.blocks.summons) resumeTransport(tx);
   return null;
 }
 
@@ -1576,7 +1562,6 @@ function grantRounds(tx: Transaction, action: Extract<Action, { kind: "GrantRoun
   const hold = tx.review.holds.find((h) => h.id === episode.hold_id);
   if (hold !== undefined && hold.released === null) {
     tx.record({ kind: "hold_released", hold_id: hold.id, release: { by: tx.ctx.principal, at: tx.ctx.now, reason: `rounds_granted: ${action.reason}` } });
-    if (hold.blocks.summons) resumeTransport(tx);
   }
   return null;
 }

@@ -3,7 +3,8 @@
  *
  * One pass (`drainOnce`) claims at most one pending effect per target, renders refreshes
  * from `read()` *now*, re-checks actionable applicability against the current Review
- * (§6.D7/§6.D8), dispatches through the ports, and marks the row. Publication is serialized
+ * (§6.D7/§6.D8/§6.C3/§6.G3 — the one place request transport pauses and resumes), dispatches
+ * through the ports, and marks the row. Publication is serialized
  * per target: the store hands out one row per target and passes never overlap, so a delayed
  * worker can never publish an older verdict — it never carried one.
  */
