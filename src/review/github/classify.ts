@@ -249,15 +249,18 @@ function inlineFindings(body: string, repository: string, commentId: number): Ex
 // ---------------------------------------------------------------------------------------
 
 function result(record: GitHubRecord, verdict: ExternalResult["verdict"], head: string, findings: ExternalFinding[]): ExternalResult {
-  return {
-    schema_version: "1",
-    source: "codex",
+  const common = {
+    schema_version: "1" as const,
+    source: "codex" as const,
     reviewed_head: head,
-    verdict,
-    findings,
     source_record: { kind: record.kind, id: record.id, version: record.version },
     submitted_at: record.version,
   };
+  if (verdict === "clean") return { ...common, verdict, findings: [] };
+  if (verdict === "incomplete") return { ...common, verdict, findings };
+  const [first, ...rest] = findings;
+  if (first === undefined) throw new Error("a findings verdict requires at least one finding");
+  return { ...common, verdict, findings: [first, ...rest] };
 }
 
 function unknown(detail: string): ClassifiedRecord {

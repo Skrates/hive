@@ -207,7 +207,7 @@ function external(o: Partial<ExternalResult> & { comments?: Array<{ id: number; 
       source_record: { kind: "review", id: 5001, version: T0 },
       submitted_at: T0,
       ...rest,
-    },
+    } as ExternalResult,
   };
 }
 

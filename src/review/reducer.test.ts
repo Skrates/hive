@@ -288,7 +288,7 @@ function external(o: Partial<ExternalResult> & { comments?: Array<{ id: number; 
       source_record: { kind: "review", id: 5001, version: T0 },
       submitted_at: T0,
       ...rest,
-    },
+    } as ExternalResult,
   };
 }
 
@@ -1315,7 +1315,7 @@ test("§G5 the retrospective is a non-gating request answered by a testimony; it
   const answered = apply(clean, { kind: "Answer", request_id: retro.id, subject_key: clean.subject.key, submission: { arm: "testimony", testimony: { cause: "budget", scars: ["s1"], deliverable: { report_ref: "retro-1" } } } }, seat("theoros"));
   assert.deepEqual(kinds(answered.batch), ["answer_admitted", "request_answered"]);
   assert.equal(answered.state.charges.length, 1);
-  assert.equal(refusal(withRetro, { kind: "OpenRequest", request_kind: "retrospective", mode: "initial", assignee: "x", subject_key: review.subject.key, required: false, names: [], reason: "r" }, OPERATOR).code, "malformed");
+  assert.equal(refusal(withRetro, { kind: "OpenRequest", request_kind: "retrospective", mode: "initial", assignee: "x", subject_key: review.subject.key, required: false, names: [], reason: "r" } as unknown as Action, OPERATOR).code, "malformed");
 });
 
 // ---------------------------------------------------------------------------------------------
