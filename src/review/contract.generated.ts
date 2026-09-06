@@ -1,7 +1,7 @@
 /* eslint-disable */
 /**
  * GENERATED — do not edit. Source: contracts/schemas/review-contract.schema.json,
- * vendored from weave-doctrine@e957857e38c24b529e39404286fc0e71012be979 (see contracts/SOURCE).
+ * vendored from weave-doctrine@5661942dca10328a52db9740047a28f16afc0038 (see contracts/SOURCE).
  * Regenerate with `bun run check:contracts`.
  */
 

@@ -323,6 +323,7 @@ export interface ReconcileSchedulerDeps extends ReconcileDeps {
 }
 
 const DAY_MS = 24 * 60 * 60_000;
+const REVIEW_APP_LOGIN = "weave-review[bot]";
 
 interface Lane { running: Promise<void> | null; pending: boolean; after: Array<(runId: string) => void> }
 
@@ -385,9 +386,20 @@ export class ReconcileScheduler {
     if (deliveries.length === 0) return;
     const byKey = new Map<string, { key: ReviewKey; ids: string[] }>();
     const orphans: string[] = [];
+    const ownPublications: string[] = [];
+    const unenrolled: string[] = [];
     for (const delivery of deliveries) {
+      const payload = delivery.payload as { sender?: { login?: string } };
+      if (delivery.event === "issue_comment" && payload?.sender?.login === REVIEW_APP_LOGIN) {
+        ownPublications.push(delivery.deliveryId);
+        continue;
+      }
       if (delivery.repositoryId === null || delivery.prNumber === null) {
         orphans.push(delivery.deliveryId);
+        continue;
+      }
+      if (this.deps.store.policy(delivery.repositoryId, "latest") === null) {
+        unenrolled.push(delivery.deliveryId);
         continue;
       }
       const laneKey = `${delivery.repositoryId}:${delivery.prNumber}`;
@@ -396,6 +408,9 @@ export class ReconcileScheduler {
       byKey.set(laneKey, group);
     }
     if (orphans.length > 0) this.deps.store.inbox.markReconciled(orphans, `skip:${this.mintRunId()}`);
+    // Persisted notifications remain auditable; only enrolled external PR activity wakes review.
+    if (ownPublications.length > 0) this.deps.store.inbox.markReconciled(ownPublications, `skip:own-publication:${this.mintRunId()}`);
+    if (unenrolled.length > 0) this.deps.store.inbox.markReconciled(unenrolled, `skip:unenrolled:${this.mintRunId()}`);
     for (const group of byKey.values()) {
       this.wake(group.key, (runId) => this.deps.store.inbox.markReconciled(group.ids, runId));
     }

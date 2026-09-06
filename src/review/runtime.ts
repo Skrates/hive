@@ -108,7 +108,7 @@ export function bootReviewRuntime(input: ReviewRuntimeInput): ReviewRuntime {
       github: null,
       http: { store, broker, webhook: null, adminToken: input.adminToken, reconcile: null },
       start: () => {},
-      stop: async () => {},
+      stop: () => publisher.stop(),
     };
   }
 
@@ -130,6 +130,6 @@ export function bootReviewRuntime(input: ReviewRuntimeInput): ReviewRuntime {
       reconcile: (key: ReviewKey) => scheduler.wake(key),
     },
     start: () => scheduler.start(),
-    stop: () => scheduler.stop(),
+    stop: async () => { await scheduler.stop(); await publisher.stop(); },
   };
 }

@@ -131,6 +131,11 @@ export class ReviewPublisher {
     return pass;
   }
 
+  /** Join a claimed dispatch before the broker closes its database on shutdown. */
+  async stop(): Promise<void> {
+    await this.inFlight;
+  }
+
   private async pass(): Promise<number> {
     const rows = this.store.effects.pendingByTarget(iso(this.clock));
     let handled = 0;

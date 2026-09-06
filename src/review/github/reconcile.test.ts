@@ -522,3 +522,39 @@ test("scheduler: a run that throws leaves its inbox deliveries unreconciled; the
   assert.deepEqual(store.inbox.unreconciled(), []);
   await scheduler.stop();
 });
+
+
+test("scheduler records own publication webhooks as skipped without reconciling", async () => {
+  const { store, github, deps } = setup(H2);
+  store.deliveries.push({ deliveryId: "own-board", event: "issue_comment", repositoryId: 1054, prNumber: 66,
+    payload: { sender: { login: "weave-review[bot]" }, action: "edited" }, receivedAt: "t" });
+  const scheduler = new ReconcileScheduler({ ...deps, log: () => undefined });
+  scheduler.drainInbox();
+  await scheduler.idle();
+  assert.equal(github.pullRequestCalls.length, 0);
+  assert.ok(store.reconciled[0]?.runId.startsWith("skip:own-publication:"));
+  store.deliveries.push({ deliveryId: "codex-result", event: "issue_comment", repositoryId: 1054, prNumber: 66,
+    payload: { sender: { login: CODEX }, action: "edited" }, receivedAt: "t" });
+  scheduler.drainInbox();
+  await scheduler.idle();
+  assert.equal(github.pullRequestCalls.length, 1, "other senders still trigger reconciliation");
+  await scheduler.stop();
+});
+
+test("unenrolled traffic cannot starve a later enrolled PR behind the inbox page", async () => {
+  const { store, github, deps } = setup(H2);
+  const all = store.inbox.unreconciled;
+  store.inbox.unreconciled = () => all().slice(0, 100);
+  for (let n = 0; n < 100; n += 1) store.deliveries.push({ deliveryId: `unenrolled-${n}`, event: "pull_request",
+    repositoryId: 99, prNumber: n + 1, payload: {}, receivedAt: "t" });
+  store.deliveries.push({ deliveryId: "enrolled", event: "pull_request", repositoryId: 1054, prNumber: 66, payload: {}, receivedAt: "t" });
+  const scheduler = new ReconcileScheduler({ ...deps, log: () => undefined });
+  scheduler.drainInbox();
+  await scheduler.idle();
+  scheduler.drainInbox();
+  await scheduler.idle();
+  assert.equal(github.pullRequestCalls.length, 1);
+  assert.ok(store.reconciled.some(r => r.runId.startsWith("skip:unenrolled:") && r.ids.length === 100));
+  assert.equal(store.inbox.unreconciled().length, 0);
+  await scheduler.stop();
+});

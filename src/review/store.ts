@@ -18,6 +18,7 @@
  */
 import type Database from "better-sqlite3";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { retryBackoffMs } from "../domain.js";
 import type { Clock } from "../time.js";
 import { iso } from "../time.js";
 import type {
@@ -197,6 +198,12 @@ export class ReviewStore {
 
   constructor(private readonly db: Database.Database, private readonly deps: ReviewStoreDeps) {
     this.migrate();
+    // The broker owns one ReviewStore. A prior process may have died after claiming
+    // but before recording the remote outcome: retry with the ordinary backoff.
+    const interrupted = this.db.prepare("SELECT effect_id, attempts FROM review_effects WHERE status = 'claimed'").all() as Row[];
+    for (const row of interrupted) {
+      this.effects.markFailed(String(row.effect_id), new Date(this.deps.clock.now().getTime() + retryBackoffMs(Number(row.attempts) + 1)).toISOString());
+    }
     // §5 "apply is serialized per Review": better-sqlite3 transactions are synchronous and
     // exclusive within the process, so two acts on one Review never interleave.
     this.applyTx = this.db.transaction((key: ReviewKey, input: ApplyInput) => this.applyInTransaction(key, input));

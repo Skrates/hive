@@ -692,3 +692,18 @@ test("source records: unknown(reviewId) lists the live records classified unknow
   store.sourceRecords.markAdmitted("issue_comment:55", "v2", "src:issue_comment:55:v2");
   assert.deepEqual(store.sourceRecords.unknown(reviewId), []);
 });
+
+
+test("startup retries an interrupted claimed effect after backoff", () => {
+  const { db, store, reducer } = setup();
+  open(store);
+  const id = "eff_obs:run_1_2";
+  assert.ok(store.effects.claim(id));
+  const reopened = new ReviewStore(db, reducer);
+  const recovered = db.prepare("SELECT status, attempts, next_attempt_at FROM review_effects WHERE effect_id = ?").get(id) as { status: string; attempts: number; next_attempt_at: string };
+  assert.equal(recovered.status, "pending");
+  assert.equal(recovered.attempts, 1);
+  assert.ok(recovered.next_attempt_at > reducer.clock.now().toISOString());
+  assert.ok(reopened.effects.pendingByTarget(recovered.next_attempt_at).some(row => row.effect_id === id));
+  db.close();
+});
