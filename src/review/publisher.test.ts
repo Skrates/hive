@@ -48,7 +48,7 @@ class FakeReviewStore implements PublisherStore {
     for (const h of this.handles.filter((candidate) => candidate.reviewId === reviewId)) {
       if (h.handle === "board_comment_id") merged.projection_handles.board_comment_id = Number(h.value);
       else if (h.handle === "check_run_id") merged.projection_handles.check_run_ids[h.key] = Number(h.value);
-      else if (h.handle === "slack_thread_ts") merged.projection_handles.slack_thread_ts = String(h.value);
+      else if (h.handle === "slack_thread_ts" && h.key === this.policy(merged.key.repository_id, merged.policy_version)?.slack?.channel_id) merged.projection_handles.slack_thread_ts = String(h.value);
     }
     for (const t of this.transport.filter((candidate) => candidate.reviewId === reviewId)) {
       merged.requests.find((r) => r.id === t.requestId)?.transport.push(t.ref);
@@ -58,10 +58,10 @@ class FakeReviewStore implements PublisherStore {
   readonly projections = {
     recordBoardComment: (reviewId: string, commentId: number): void => { this.handles.push({ reviewId, handle: "board_comment_id", key: "", value: commentId }); },
     recordCheckRun: (reviewId: string, headSha: string, checkRunId: number): void => { this.handles.push({ reviewId, handle: "check_run_id", key: headSha, value: checkRunId }); },
-    recordSlackThread: (reviewId: string, threadTs: string): void => { this.handles.push({ reviewId, handle: "slack_thread_ts", key: "", value: threadTs }); },
-    recordSlackBoardOutbox: (reviewId: string, outboxId: number): void => { this.handles.push({ reviewId, handle: "slack_board_outbox_id", key: "", value: outboxId }); },
-    slackBoardOutboxId: (reviewId: string): number | null => {
-      const found = this.handles.find((h) => h.reviewId === reviewId && h.handle === "slack_board_outbox_id");
+    recordSlackThread: (reviewId: string, channelId: string, threadTs: string): void => { this.handles.push({ reviewId, handle: "slack_thread_ts", key: channelId, value: threadTs }); },
+    recordSlackBoardOutbox: (reviewId: string, channelId: string, outboxId: number): void => { this.handles.push({ reviewId, handle: "slack_board_outbox_id", key: channelId, value: outboxId }); },
+    slackBoardOutboxId: (reviewId: string, channelId: string): number | null => {
+      const found = this.handles.find((h) => h.reviewId === reviewId && h.handle === "slack_board_outbox_id" && h.key === channelId);
       return found === undefined ? null : Number(found.value);
     },
     recordTransport: (reviewId: string, effectId: string, requestId: string, ref: TransportRef): void => {
@@ -172,19 +172,20 @@ class FakeGitHub implements ReviewGitHubPort {
   }
   async resolveThread(input: { commentId: number }): Promise<void> { this.threads.push({ commentId: input.commentId, op: "resolve" }); }
   async unresolveThread(input: { commentId: number }): Promise<void> { this.threads.push({ commentId: input.commentId, op: "unresolve" }); }
-  async postComment(input: { body: string }): Promise<{ commentId: number }> {
+  async postComment(input: { body: string }): Promise<{ commentId: number; summonLogin: string }> {
     this.comments.push(input.body);
-    return { commentId: 700 + this.comments.length };
+    return { commentId: 700 + this.comments.length, summonLogin: "RationallyPrime" };
   }
 }
 
-function fixture(options: { github?: boolean } = {}) {
+function fixture(options: { github?: boolean; threadReady?: boolean } = {}) {
   const store = new FakeReviewStore();
   const slack = new FakeSlack();
   const github = options.github === true ? new FakeGitHub() : null;
   const clock = new FakeClock();
   store.policies.set("42:1", policy());
   store.put(state());
+  if (options.threadReady !== false) store.projections.recordSlackThread("rev_obs:run_1", "C0123ABCD", "1700.1");
   const publisher = new ReviewPublisher(store, { github, slack }, clock);
   return { store, slack, github, clock, publisher };
 }
@@ -246,7 +247,7 @@ test("refreshes are serialized per target: one row per target per pass, and pass
 });
 
 test("board refresh in M0 (github: null) posts the Slack board line to the policy channel", async () => {
-  const { store, slack, publisher } = fixture();
+  const { store, slack, publisher } = fixture({ threadReady: false });
   store.add({ effect_id: "eff_1", kind: "refresh", target: BOARD_SLACK });
   assert.equal(await publisher.drainOnce(), 1);
   assert.equal(slack.lines.length, 1);
@@ -257,7 +258,7 @@ test("board refresh in M0 (github: null) posts the Slack board line to the polic
 });
 
 test("board refresh with a GitHub port edits the board comment in place and still posts the Slack line", async () => {
-  const { store, slack, github, publisher } = fixture({ github: true });
+  const { store, slack, github, publisher } = fixture({ github: true, threadReady: false });
   store.put(state({ projection_handles: { board_comment_id: 314, check_run_ids: {}, slack_thread_ts: "1700.5" } }));
   store.add({ effect_id: "eff_1", kind: "refresh", target: BOARD_GITHUB });
   store.add({ effect_id: "eff_2", kind: "refresh", target: BOARD_SLACK });
@@ -315,7 +316,8 @@ test("an applicable summon posts the comment; a summon at a superseded subject i
   store.add({ effect_id: "eff_1", kind: "actionable", target: "summon:req_1", payload: { request_id: "req_1", subject_key: `${SHA_A}:main`, text: "@codex review" } });
   store.add({ effect_id: "eff_2", kind: "actionable", target: "summon:req_2", payload: { request_id: "req_2", subject_key: `${SHA_B}:main`, text: "@codex review" } });
   assert.equal(await publisher.drainOnce(), 2);
-  assert.deepEqual(github!.comments, ["@codex review"]);
+  assert.equal(github!.comments.length, 1);
+  assert.match(github!.comments[0]!, /^@codex review\n\nHive request req_2; effect eff_2; attempt 1\./u);
   assert.equal(store.row("eff_1").status, "obsolete");
   assert.equal(store.row("eff_2").status, "sent");
 });
@@ -349,7 +351,8 @@ test("mergeable false keeps summons and deliveries pending, not obsolete", async
   const mergeable = state({ requests: conflicting.requests });
   store.put(mergeable);
   assert.equal(await publisher.drainOnce(), 2);
-  assert.deepEqual(github!.comments, ["@codex review"]);
+  assert.equal(github!.comments.length, 1);
+  assert.match(github!.comments[0]!, /^@codex review\n\nHive request req_1; effect eff_1; attempt 1\./u);
   assert.equal(slack.wakes.length, 1);
 });
 
@@ -377,7 +380,7 @@ test("the conflict notice is dispatched while the summons and deliveries it expl
   assert.deepEqual(slack.wakes, [{
     actor: "talos",
     channelId: "C0123ABCD",
-    threadTs: null,
+    threadTs: "1700.1",
     text: "conflicting against main tip abc",
     dedupeKey: `conflicting:${conflicting.id}:${SHA_A}:main`,
   }]);
@@ -399,7 +402,7 @@ test("the conflict notice is dispatched while the summons and deliveries it expl
 // §8.1 / R-3: a delivery is a system-origin Hive wake, self-identifying by its dedupe key;
 // a redelivery of the same effect is a replay at the port, never a second wake.
 test("a delivery mints a system wake with the payload's dedupe key, and re-dispatch is a replay", async () => {
-  const { store, slack, publisher } = fixture();
+  const { store, slack, publisher } = fixture({ threadReady: false });
   store.put(state({ requests: [request({ id: "req_2", assignee: "talos" })], projection_handles: { board_comment_id: null, check_run_ids: {}, slack_thread_ts: "1700.5" } }));
   store.add({ effect_id: "eff_2", kind: "actionable", target: "delivery:talos:req_2", payload: { actor: "talos", request_id: "req_2", text: "please burn", dedupe_key: "eff_2" } });
   assert.equal(await publisher.drainOnce(), 1);
@@ -522,17 +525,17 @@ test("check-run ids are recorded per head: POST once, PATCH after, and a new hea
 });
 
 test("the Slack thread: the first board line opens it; once the outbox has posted it, later lines and deliveries thread under it", async () => {
-  const { store, slack, publisher } = fixture();
+  const { store, slack, publisher } = fixture({ threadReady: false });
   store.put(state({ requests: [request({ id: "req_2", assignee: "talos" })] }));
   store.add({ effect_id: "eff_1", kind: "refresh", target: BOARD_SLACK });
   await publisher.drainOnce();
   assert.equal(slack.lines[0]!.threadTs, null, "the first line is the thread's top-level post");
-  assert.equal(store.projections.slackBoardOutboxId("rev_obs:run_1"), 1);
+  assert.equal(store.projections.slackBoardOutboxId("rev_obs:run_1", "C0123ABCD"), 1);
   // The outbox has not drained yet: the next line still posts at the top level rather than waiting or vanishing.
   store.add({ effect_id: "eff_2", kind: "refresh", target: BOARD_SLACK });
   await publisher.drainOnce();
   assert.equal(slack.lines[1]!.threadTs, null);
-  assert.equal(store.projections.slackBoardOutboxId("rev_obs:run_1"), 1, "the first row stays the thread opener");
+  assert.equal(store.projections.slackBoardOutboxId("rev_obs:run_1", "C0123ABCD"), 1, "the first row stays the thread opener");
   // Drained: the ts is learned, recorded once, and everything after threads under it.
   slack.posted.set(1, "1700.1");
   store.add({ effect_id: "eff_3", kind: "refresh", target: BOARD_SLACK });
@@ -540,7 +543,7 @@ test("the Slack thread: the first board line opens it; once the outbox has poste
   assert.equal(await publisher.drainOnce(), 2);
   assert.equal(slack.lines[2]!.threadTs, "1700.1");
   assert.equal(slack.wakes[0]!.threadTs, "1700.1");
-  assert.deepEqual(store.handles.filter((h) => h.handle === "slack_thread_ts"), [{ reviewId: "rev_obs:run_1", handle: "slack_thread_ts", key: "", value: "1700.1" }]);
+  assert.deepEqual(store.handles.filter((h) => h.handle === "slack_thread_ts"), [{ reviewId: "rev_obs:run_1", handle: "slack_thread_ts", key: "C0123ABCD", value: "1700.1" }]);
   assert.equal(store.readById("rev_obs:run_1")?.projection_handles.slack_thread_ts, "1700.1");
 });
 
@@ -551,9 +554,10 @@ test("a dispatched delivery records {delivery_id} and a summon records {summon_c
   store.add({ effect_id: "eff_1", kind: "actionable", target: "summon:req_1", payload: { request_id: "req_1", subject_key: `${SHA_A}:main`, text: "@codex review" } });
   store.add({ effect_id: "eff_2", kind: "actionable", target: "delivery:talos:req_2", payload: { actor: "talos", request_id: "req_2", text: "please burn", dedupe_key: "eff_2" } });
   assert.equal(await publisher.drainOnce(), 2);
-  assert.deepEqual(github!.comments, ["@codex review"]);
+  assert.equal(github!.comments.length, 1);
+  assert.match(github!.comments[0]!, /^@codex review\n\nHive request req_1; effect eff_1; attempt 1\./u);
   const read = store.readById("rev_obs:run_1");
-  assert.deepEqual(read?.requests.find((r) => r.id === "req_1")?.transport, [{ summon_comment_id: 701 }]);
+  assert.deepEqual(read?.requests.find((r) => r.id === "req_1")?.transport, [{ summon_comment_id: 701, summon_login: "RationallyPrime" }]);
   assert.deepEqual(read?.requests.find((r) => r.id === "req_2")?.transport, [{ delivery_id: 1 }]);
   // At-least-once: the same effect re-queued reaches the port again and the reference stays one.
   store.row("eff_2").status = "pending";
@@ -563,7 +567,7 @@ test("a dispatched delivery records {delivery_id} and a summon records {summon_c
 });
 
 test("a port that answers without an id fails the row visibly instead of recording nothing", async () => {
-  const { store, github, publisher } = fixture({ github: true });
+  const { store, github, publisher } = fixture({ github: true, threadReady: false });
   github!.noIds = true;
   store.add({ effect_id: "eff_1", kind: "refresh", target: BOARD_GITHUB });
   const quiet = console.error;
@@ -628,4 +632,46 @@ test("missing publication destinations leave board and announcement effects fail
     assert.equal(store.row(id).attempts, 1);
     assert.ok(store.row(id).nextAttemptAt !== null);
   }
+});
+
+test("an uncertain summon retry carries the same request and effect identity with a new attempt", async () => {
+  const { store, github, publisher, clock } = fixture({ github: true });
+  store.put(state({ requests: [request({ id: "req_1" })] }));
+  const post = github!.postComment.bind(github);
+  let loseResponse = true;
+  github!.postComment = async input => {
+    const result = await post(input);
+    if (loseResponse) { loseResponse = false; throw new Error("response lost after GitHub accepted POST"); }
+    return result;
+  };
+  store.add({ effect_id: "eff_retry", kind: "actionable", target: "summon:req_1", payload: { request_id: "req_1", subject_key: `${SHA_A}:main`, text: "@codex review" } });
+  await publisher.drainOnce();
+  assert.equal(store.row("eff_retry").status, "pending");
+  clock.advance(60_000);
+  await publisher.drainOnce();
+  assert.equal(store.row("eff_retry").status, "sent");
+  assert.equal(github!.comments.length, 2, "at-least-once permits a duplicate after uncertainty");
+  assert.match(github!.comments[0]!, /request req_1; effect eff_retry; attempt 1\./u);
+  assert.match(github!.comments[1]!, /request req_1; effect eff_retry; attempt 2\./u);
+});
+
+test("a rerouted wake waits for the replacement channel's board parent without spending attempts", async () => {
+  const { store, slack, publisher } = fixture();
+  store.policies.set("42:2", { ...policy(), version: 2, slack: { channel_id: "C_NEW" } });
+  store.put(state({ policy_version: 2, requests: [request({ id: "req_new", assignee: "ariadne" })] }));
+  store.add({ effect_id: "eff_wake", kind: "actionable", target: "delivery:ariadne:req_new", payload: { actor: "ariadne", request_id: "req_new", text: "review", dedupe_key: "eff_wake" } });
+  store.add({ effect_id: "eff_board", kind: "refresh", target: BOARD_SLACK });
+  await publisher.drainOnce();
+  assert.equal(slack.lines.length, 1);
+  assert.equal(slack.lines[0]!.channelId, "C_NEW");
+  assert.equal(slack.lines[0]!.threadTs, null);
+  assert.equal(slack.wakes.length, 0);
+  assert.equal(store.row("eff_wake").status, "pending");
+  assert.equal(store.row("eff_wake").attempts, 0);
+  slack.posted.set(1, "1800.1");
+  await publisher.drainOnce();
+  assert.equal(slack.wakes.length, 1);
+  assert.equal(slack.wakes[0]!.channelId, "C_NEW");
+  assert.equal(slack.wakes[0]!.threadTs, "1800.1");
+  assert.equal(store.row("eff_wake").status, "sent");
 });

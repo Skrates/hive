@@ -1,7 +1,7 @@
 {
   "expect": {
     "code": "malformed",
-    "why": "consequences are the closed set of materialized state changes (§5.B3)"
+    "why": "consequences are the closed set of materialized state changes (\u00a75.B3)"
   },
   "instance": {
     "admitted_at": "2026-09-06T12:00:00.000Z",

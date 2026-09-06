@@ -35,6 +35,7 @@ import type {
   TransportRef,
 } from "./contract.js";
 import { validateAction } from "./contract.js";
+import { BOARD_SINKS } from "./effects.js";
 import type { DecideContext, ReviewIdentity, decide as reducerDecide, fold as reducerFold, read as reducerRead } from "./reducer.js";
 
 interface Row { [key: string]: unknown }
@@ -58,6 +59,7 @@ export interface ReviewStoreDeps {
   fold: typeof reducerFold;
   read: typeof reducerRead;
   clock: Clock;
+  onEffectExhausted?: (notice: { channelId: string | null; threadTs: string | null; text: string }) => void;
 }
 
 export interface ApplyInput {
@@ -372,7 +374,7 @@ export class ReviewStore {
       ON CONFLICT(review_id) DO UPDATE SET
         display = excluded.display, revision = excluded.revision, policy_version = excluded.policy_version,
         state_json = excluded.state_json, updated_at = excluded.updated_at
-    `).run(next.id, key.repository_id, key.pr_number, display, next.revision, next.policy_version, JSON.stringify(next), now);
+    `).run(next.id, key.repository_id, key.pr_number, display, next.revision, next.policy_version, JSON.stringify(next), decided.consequences.length > 0 || row === undefined ? now : String(row.updated_at));
     const insertEffect = this.db.prepare(`
       INSERT INTO review_effects(effect_id, review_id, revision, kind, target, payload_json, status, attempts)
       VALUES (?, ?, ?, ?, ?, ?, 'pending', 0)
@@ -465,7 +467,7 @@ export class ReviewStore {
       const value = String(row.value);
       if (handle === "board_comment_id") state.projection_handles.board_comment_id = Number(value);
       else if (handle === "check_run_id") state.projection_handles.check_run_ids[String(row.key)] = Number(value);
-      else if (handle === "slack_thread_ts") state.projection_handles.slack_thread_ts = value;
+      else if (handle === "slack_thread_ts" && row.key === this.policy(state.key.repository_id, state.policy_version)?.slack?.channel_id) state.projection_handles.slack_thread_ts = value;
     }
     const transport = this.db.prepare(
       "SELECT request_id, ref_json FROM review_transport WHERE review_id = ? ORDER BY rowid",
@@ -543,6 +545,10 @@ export class ReviewStore {
     });
   }
 
+  publishedSummon(commentId: number): boolean {
+    return this.db.prepare("SELECT 1 FROM review_transport WHERE json_extract(ref_json, '$.summon_comment_id') = ? LIMIT 1").get(commentId) !== undefined;
+  }
+
   /** §7 bounded reconcile: Reviews with a pending request, or any activity since `since`. */
   active(since: string): ReviewKey[] {
     const rows = this.db.prepare(`
@@ -556,7 +562,7 @@ export class ReviewStore {
 
   private reviewRow(key: ReviewKey): Row | undefined {
     return this.db.prepare(
-      "SELECT review_id, display, revision, policy_version, state_json FROM reviews WHERE repository_id = ? AND pr_number = ?",
+      "SELECT review_id, display, revision, policy_version, state_json, updated_at FROM reviews WHERE repository_id = ? AND pr_number = ?",
     ).get(key.repository_id, key.pr_number) as Row | undefined;
   }
 
@@ -647,13 +653,17 @@ export class ReviewStore {
      */
     markFailed: (effectId: string, nextAttemptAt: string): void => {
       this.db.transaction(() => {
-        const row = this.db.prepare("SELECT attempts FROM review_effects WHERE effect_id = ?").get(effectId) as Row | undefined;
-        if (row === undefined) throw new ReviewStoreError(`no effect ${effectId}`);
-        const attempts = Number(row.attempts) + 1;
-        const status: EffectStatus = attempts >= REVIEW_EFFECT_MAX_ATTEMPTS ? "failed" : "pending";
-        this.db.prepare(
-          "UPDATE review_effects SET status = ?, attempts = ?, next_attempt_at = ? WHERE effect_id = ?",
-        ).run(status, attempts, status === "failed" ? null : nextAttemptAt, effectId);
+        const before = this.db.prepare("SELECT status FROM review_effects WHERE effect_id = ?").get(effectId) as Row | undefined;
+        if (before?.status === "failed") return;
+        this.updateEffect(effectId, "UPDATE review_effects SET status = 'pending', attempts = attempts + 1, next_attempt_at = ? WHERE effect_id = ?", nextAttemptAt);
+        this.db.prepare("UPDATE review_effects SET status = 'failed', next_attempt_at = NULL WHERE effect_id = ? AND attempts >= ?").run(effectId, REVIEW_EFFECT_MAX_ATTEMPTS);
+        const row = this.db.prepare("SELECT review_id, status, target, attempts FROM review_effects WHERE effect_id = ?").get(effectId) as Row;
+        if (row.status === "failed" && this.deps.onEffectExhausted !== undefined) {
+          const state = this.readById(String(row.review_id));
+          const channelId = state === null ? null : this.policy(state.key.repository_id, state.policy_version)?.slack?.channel_id ?? null;
+          this.deps.onEffectExhausted({ channelId, threadTs: state?.projection_handles.slack_thread_ts ?? null,
+            text: `Review publication failed after ${row.attempts} attempts: ${state?.display ?? row.review_id}; target ${row.target}; effect ${effectId}. Operator action is required.` });
+        }
       })();
     },
 
@@ -680,17 +690,17 @@ export class ReviewStore {
       this.recordHandle(reviewId, "check_run_id", headSha, String(checkRunId));
     },
     /** The Review's Slack thread: the first board line's message ts; later lines and deliveries thread under it. */
-    recordSlackThread: (reviewId: string, threadTs: string): void => {
-      this.recordHandle(reviewId, "slack_thread_ts", "", threadTs);
+    recordSlackThread: (reviewId: string, channelId: string, threadTs: string): void => {
+      this.recordHandle(reviewId, "slack_thread_ts", channelId, threadTs);
     },
     /** The outbox row of the first board line, kept until its message ts is known. */
-    recordSlackBoardOutbox: (reviewId: string, outboxId: number): void => {
-      this.recordHandle(reviewId, "slack_board_outbox_id", "", String(outboxId));
+    recordSlackBoardOutbox: (reviewId: string, channelId: string, outboxId: number): void => {
+      this.recordHandle(reviewId, "slack_board_outbox_id", channelId, String(outboxId));
     },
-    slackBoardOutboxId: (reviewId: string): number | null => {
+    slackBoardOutboxId: (reviewId: string, channelId: string): number | null => {
       const row = this.db.prepare(
-        "SELECT value FROM review_projection_handles WHERE review_id = ? AND handle = 'slack_board_outbox_id' AND key = ''",
-      ).get(reviewId) as Row | undefined;
+        "SELECT value FROM review_projection_handles WHERE review_id = ? AND handle = 'slack_board_outbox_id' AND key = ?",
+      ).get(reviewId, channelId) as Row | undefined;
       return row === undefined ? null : Number(row.value);
     },
     /** §6.D5: the reference a dispatched transport effect obtained; keyed by effect so a re-dispatch updates, never doubles. */
@@ -764,12 +774,14 @@ export class ReviewStore {
             INSERT INTO source_records(record_key, version, review_id, author_login, body_json, classification, admitted_act_id)
             VALUES (?, ?, ?, ?, ?, NULL, NULL)
           `).run(record.recordKey, record.version, record.reviewId, record.authorLogin, bodyJson);
+          this.db.prepare("UPDATE reviews SET updated_at = ? WHERE review_id = ?").run(iso(this.deps.clock), record.reviewId);
           return "new";
         }
         if (existing.author_login === record.authorLogin && existing.body_json === bodyJson) return "same";
         this.db.prepare(
           "UPDATE source_records SET author_login = ?, body_json = ? WHERE record_key = ? AND version = ?",
         ).run(record.authorLogin, bodyJson, record.recordKey, record.version);
+        this.db.prepare("UPDATE reviews SET updated_at = ? WHERE review_id = ?").run(iso(this.deps.clock), record.reviewId);
         return "updated";
       })();
     },
@@ -794,12 +806,22 @@ export class ReviewStore {
     },
 
     setClassification: (recordKey: string, version: string, classification: string): void => {
-      this.updateSourceRecord(
-        recordKey,
-        version,
-        "UPDATE source_records SET classification = ? WHERE record_key = ? AND version = ?",
-        classification,
-      );
+      this.db.transaction(() => {
+        const row = this.db.prepare("SELECT review_id, classification FROM source_records WHERE record_key = ? AND version = ?").get(recordKey, version) as Row | undefined;
+        if (row === undefined) throw new ReviewStoreError(`no source record ${recordKey}@${version}`);
+        if (row.classification === classification) return;
+        this.updateSourceRecord(recordKey, version, "UPDATE source_records SET classification = ? WHERE record_key = ? AND version = ?", classification);
+        if (classification === "unknown" || row.classification === "unknown") {
+          const reviewId = String(row.review_id);
+          // §8.1: the board is one row per sink, so a classification change refreshes each of
+          // them on its own row — the same shape the reducer emits, and for the same reason.
+          const queue = this.db.prepare(`INSERT OR IGNORE INTO review_effects(effect_id, review_id, revision, kind, target, payload_json, status)
+            SELECT ?, review_id, revision, 'refresh', ?, NULL, 'pending' FROM reviews WHERE review_id = ?`);
+          for (const sink of BOARD_SINKS) {
+            queue.run(`source:${recordKey}:${version}:${classification}:${sink}`, `board:${sink}:${reviewId}`, reviewId);
+          }
+        }
+      })();
     },
   };
 

@@ -1,0 +1,16 @@
+{
+  "instance": {
+    "findings": [],
+    "reviewed_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "schema_version": "1",
+    "source": "codex",
+    "source_record": {
+      "id": 5001,
+      "kind": "review",
+      "version": "2026-09-06T11:59:00Z"
+    },
+    "submitted_at": "2000-02-29T00:00:00Z",
+    "verdict": "clean"
+  },
+  "model": "external_result"
+}

@@ -268,7 +268,7 @@ function answerAction(requestId: string, subjectKey: string, r: ReviewReport): A
   return { kind: "Answer", request_id: requestId, subject_key: subjectKey, submission: { arm: "reviewkit", report: r } };
 }
 
-function external(o: Partial<ExternalResult> & { comments?: Array<{ id: number; title?: string; priority?: AdmittedFinding["priority"] }> } = {}): Action {
+function external(o: Partial<ExternalResult> & { comments?: Array<{ id: number; kind?: "review_comment" | "issue_comment"; title?: string; priority?: AdmittedFinding["priority"] }> } = {}): Action {
   const { comments, ...rest } = o;
   return {
     kind: "AdmitExternalResult",
@@ -278,7 +278,7 @@ function external(o: Partial<ExternalResult> & { comments?: Array<{ id: number; 
       reviewed_head: H1,
       verdict: comments === undefined || comments.length === 0 ? "clean" : "findings",
       findings: (comments ?? []).map((c) => ({
-        container_kind: "review_comment",
+        container_kind: c.kind ?? "review_comment",
         container_id: c.id,
         locator: 0,
         path: "src/x.py",
@@ -290,7 +290,7 @@ function external(o: Partial<ExternalResult> & { comments?: Array<{ id: number; 
       source_record: { kind: "review", id: 5001, version: T0 },
       submitted_at: T0,
       ...rest,
-    },
+    } as ExternalResult,
   };
 }
 
@@ -519,10 +519,10 @@ test("§C1 an unchanged subject preserves judgments and never suppresses the oth
   assert.deepEqual(pending(next).map((r) => r.id), pending(review).map((r) => r.id));
   assert.equal(next.observed.base_sha_now, BASE2);
   assert.equal(next.observed.mergeable, null);
-  // The same observation again changes nothing but still refreshes the projections.
+  // The same facts, even at a later observation time, cause no new publication.
   const again = apply(next, observe({ lifecycle: "closed", draft: true, mergeable: null, seenAt: T1, baseShaNow: BASE2 }), ADAPTER);
   assert.deepEqual(kinds(again.batch), []);
-  assert.deepEqual(targets(again.batch), [`board:github:${next.id}`, `board:slack:${next.id}`, `check:Owner/repo:${H1}`]);
+  assert.deepEqual(targets(again.batch), []);
 });
 
 test("§C2 a subject change cancels pending requests at the old subject, releases subject_change holds and opens the initial request", () => {
@@ -1004,6 +1004,7 @@ test("§D8 mergeable=false withholds transport at dispatch and tells the author 
   const notice = batch.effects.find((e) => e.target === `notice:talos:${H1}:main`);
   assert.ok(notice, "the author seat is told");
   const payload = notice.payload as { actor: string; dedupe_key: string; text: string };
+  assert.deepEqual(Object.keys(payload).sort(), ["actor", "dedupe_key", "text"]);
   assert.equal(payload.actor, "talos");
   assert.equal(payload.dedupe_key, `conflicting:${conflicting.id}:${H1}:main`);
   assert.match(payload.text, /conflicting against main/);
@@ -1471,7 +1472,7 @@ test("§G5 the retrospective is a non-gating request answered by a testimony; it
   const answered = apply(clean, { kind: "Answer", request_id: retro.id, subject_key: clean.subject.key, submission: { arm: "testimony", testimony: { cause: "budget", scars: ["s1"], deliverable: { report_ref: "retro-1" } } } }, seat("theoros"));
   assert.deepEqual(kinds(answered.batch), ["answer_admitted", "request_answered"]);
   assert.equal(answered.state.charges.length, 1);
-  assert.equal(refusal(withRetro, { kind: "OpenRequest", request_kind: "retrospective", mode: "initial", assignee: "x", subject_key: review.subject.key, required: false, names: [], reason: "r" }, OPERATOR).code, "malformed");
+  assert.equal(refusal(withRetro, { kind: "OpenRequest", request_kind: "retrospective", mode: "initial", assignee: "x", subject_key: review.subject.key, required: false, names: [], reason: "r" } as unknown as Action, OPERATOR).code, "malformed");
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -1543,6 +1544,22 @@ test("§8.1 a comment-sourced finding whose status changes refreshes its thread;
   const { review: rk, finding } = withFinding();
   const rkClosed = apply(rk, { kind: "ResolveFinding", finding_id: finding, resolution: { kind: "refuted", evidence: "e" } }, OPERATOR, { policy: SEAT_POLICY });
   assert.ok(!targets(rkClosed.batch).some((t) => t.startsWith("thread:")));
+  const issue = apply(review, external({ comments: [{ id: 888, kind: "issue_comment" }], source_record: { kind: "issue_comment", id: 888, version: T0 } }), ADAPTER).state;
+  const issueFinding = issue.findings[0]!;
+  assert.deepEqual(issueFinding.source, { container_kind: "issue_comment", comment_id: 888, locator: 0 });
+  const issueClosed = apply(issue, { kind: "ResolveFinding", finding_id: issueFinding.id, resolution: { kind: "fixed", evidence: "e", commits: [H2] } }, seat("talos"));
+  assert.ok(!targets(issueClosed.batch).some(t => t.startsWith("thread:")), "issue comments have no resolvable review thread");
+});
+
+test("a PR first observed closed opens its initial request on reopening at the same subject", () => {
+  const closed = apply(null, observe({ lifecycle: "closed" }), ADAPTER).state;
+  assert.equal(closed.requests.length, 0);
+  const reopened = apply(closed, observe({ lifecycle: "open" }), ADAPTER);
+  assert.equal(pending(reopened.state, "codex").length, 1);
+  assert.equal(reopened.batch.effects.filter(e => e.target.startsWith("summon:")).length, 1);
+  const repeated = apply(reopened.state, observe(), ADAPTER);
+  assert.equal(repeated.state.requests.length, 1);
+  assert.deepEqual(repeated.batch.effects, []);
 });
 
 // ---------------------------------------------------------------------------------------------

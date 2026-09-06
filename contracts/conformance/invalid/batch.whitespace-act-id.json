@@ -1,13 +1,13 @@
 {
   "expect": {
     "code": "malformed",
-    "why": "effect targets follow the \u00a78.1 grammar"
+    "why": "act ids must contain no whitespace"
   },
   "instance": {
     "admitted_at": "2026-09-06T12:00:00.000Z",
     "batch_id": "bat_01J_1",
     "command": {
-      "act_id": "obs:run_01J",
+      "act_id": "act\n",
       "action": {
         "draft": false,
         "exemption": null,
@@ -97,10 +97,24 @@
     ],
     "effects": [
       {
-        "effect_id": "e1",
+        "effect_id": "eff_obs:run_01J_1",
+        "kind": "actionable",
+        "payload": null,
+        "target": "summon:req_obs:run_01J_1"
+      },
+      {
+        "effect_id": "eff_obs:run_01J_2",
         "kind": "refresh",
         "payload": null,
-        "target": "slack:C1"
+        "target": "check:Owner/repo:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      {
+        "effect_id": "eff_obs:run_01J_3",
+        "kind": "refresh",
+        "payload": {
+          "note": "opened"
+        },
+        "target": "board:github:rev_01J"
       }
     ],
     "policy_version": 1,

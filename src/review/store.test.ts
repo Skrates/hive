@@ -635,7 +635,7 @@ test("projection facts: handles are recorded outside the fold, merged into get/r
 
   store.projections.recordBoardComment(reviewId, 500);
   store.projections.recordCheckRun(reviewId, SHA_A, 9);
-  store.projections.recordSlackThread(reviewId, "1700.5");
+  store.projections.recordSlackThread(reviewId, "C0123ABCD", "1700.5");
   const expected = { board_comment_id: 500, check_run_ids: { [SHA_A]: 9 }, slack_thread_ts: "1700.5" };
   assert.deepEqual(store.get(KEY)?.projection_handles, expected, "get merges the handles");
   assert.deepEqual(store.read(KEY)?.projection_handles, expected, "read merges the handles");
@@ -650,9 +650,9 @@ test("projection facts: handles are recorded outside the fold, merged into get/r
   assert.deepEqual(store.get(KEY)?.projection_handles, { board_comment_id: 501, check_run_ids: { [SHA_A]: 9, [SHA_B]: 10 }, slack_thread_ts: "1700.5" });
 
   // The first board line's outbox row is kept until its ts is known; it is not a contract handle.
-  assert.equal(store.projections.slackBoardOutboxId(reviewId), null);
-  store.projections.recordSlackBoardOutbox(reviewId, 77);
-  assert.equal(store.projections.slackBoardOutboxId(reviewId), 77);
+  assert.equal(store.projections.slackBoardOutboxId(reviewId, "C0123ABCD"), null);
+  store.projections.recordSlackBoardOutbox(reviewId, "C0123ABCD", 77);
+  assert.equal(store.projections.slackBoardOutboxId(reviewId, "C0123ABCD"), 77);
   assert.equal(count(db, "SELECT count(*) AS n FROM review_projection_handles WHERE review_id = ?", reviewId), 5);
 
   // A transport reference must name a request the Review has; otherwise the fact is a defect, refused loudly on read.

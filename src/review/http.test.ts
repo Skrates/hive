@@ -249,6 +249,11 @@ test("POST acts: a body that names an actor is refused; a malformed action is 40
   assert.equal(unknownKind.status, 400);
   const noActId = await act({ ...base, act_id: "" });
   assert.equal(noActId.status, 400);
+  for (const actId of ["bad id", "bad\nid", "\tbad", "bad\n"]) {
+    const invalidId = await act({ ...base, act_id: actId });
+    assert.equal(invalidId.status, 400);
+    assert.equal((invalidId.json() as { error: string }).error, "malformed");
+  }
   const noExpect = await act({ ...base, expected_revision: null });
   assert.equal(noExpect.status, 400);
   assert.equal(fake.applied.length, 0);

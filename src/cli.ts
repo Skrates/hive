@@ -55,6 +55,7 @@ program.command("broker")
       clock: systemClock,
       adminToken: config.HIVE_ADMIN_TOKEN,
       env: config,
+      failureChannelId: policy.channelIds.values().next().value,
       log: (line) => console.error(line),
     });
     const http = new BrokerHttpServer(broker, {
@@ -349,6 +350,7 @@ const BrokerConfig = z.object({
   HIVE_GITHUB_WEBHOOK_SECRET_FILE: z.string().min(1).optional(),
   HIVE_GITHUB_APP_ID: z.string().min(1).optional(),
   HIVE_GITHUB_APP_KEY_FILE: z.string().min(1).optional(),
+  HIVE_GITHUB_SUMMON_TOKEN_FILE: z.string().min(1).optional(),
 });
 
 const EdgeConfig = z.object({

@@ -8,7 +8,7 @@
  * `HIVE_GITHUB_WEBHOOK_SECRET_FILE` and `HIVE_GITHUB_APP_KEY_FILE` (§7: tier-2 secrets on
  * the dev box), never bare environment variables; `HIVE_GITHUB_APP_ID` is the App's id.
  *
- * Configuration is all-or-nothing: with none of the three names set, the broker boots with
+ * Configuration is all-or-nothing: with none of the four names set, the broker boots with
  * the GitHub adapter disabled and says so once (M0, the App does not exist yet — §1 F-2);
  * M0's Slack board line still publishes. Anything else that is not a complete, readable
  * configuration is a boot failure: a partial set, a file readable beyond its owner, or a
@@ -32,12 +32,14 @@ export interface ReviewRuntimeEnv {
   HIVE_GITHUB_WEBHOOK_SECRET_FILE?: string | undefined;
   HIVE_GITHUB_APP_ID?: string | undefined;
   HIVE_GITHUB_APP_KEY_FILE?: string | undefined;
+  HIVE_GITHUB_SUMMON_TOKEN_FILE?: string | undefined;
 }
 
 export interface ReviewRuntimeInput {
   broker: BrokerStore;
   clock: Clock;
   adminToken: string;
+  failureChannelId?: string | undefined;
   env: ReviewRuntimeEnv;
   log: (line: string) => void;
   /** Test seam for the App port; production uses undici. */
@@ -58,12 +60,12 @@ export interface ReviewRuntime {
 
 export class ReviewRuntimeConfigError extends Error {}
 
-const GITHUB_ENV = ["HIVE_GITHUB_WEBHOOK_SECRET_FILE", "HIVE_GITHUB_APP_ID", "HIVE_GITHUB_APP_KEY_FILE"] as const;
+const GITHUB_ENV = ["HIVE_GITHUB_WEBHOOK_SECRET_FILE", "HIVE_GITHUB_APP_ID", "HIVE_GITHUB_APP_KEY_FILE", "HIVE_GITHUB_SUMMON_TOKEN_FILE"] as const;
 
-interface GitHubConfig { appId: string; webhookSecret: string; privateKeyPem: string }
+interface GitHubConfig { appId: string; webhookSecret: string; privateKeyPem: string; summonToken: string }
 
 /**
- * All three present ⇒ config; none named ⇒ null with the reason (the only disabled state);
+ * All four present ⇒ config; none named ⇒ null with the reason (the only disabled state);
  * partial ⇒ throws. A named file that cannot be read — absent, empty, or readable beyond its
  * owner — throws {@link ReviewRuntimeConfigError} (absent) or `SecretFileError` (the rest).
  */
@@ -73,13 +75,14 @@ function githubConfig(env: ReviewRuntimeEnv): { config: GitHubConfig } | { confi
   if (named.length < GITHUB_ENV.length) {
     const missing = GITHUB_ENV.filter((name) => !named.includes(name));
     throw new ReviewRuntimeConfigError(
-      `GitHub adapter is partially configured: ${named.join(", ")} set but ${missing.join(", ")} not; set all three or none`,
+      `GitHub adapter is partially configured: ${named.join(", ")} set but ${missing.join(", ")} not; set all four or none`,
     );
   }
   const appId = env.HIVE_GITHUB_APP_ID as string;
   const webhookSecret = readSecret("HIVE_GITHUB_WEBHOOK_SECRET_FILE", env.HIVE_GITHUB_WEBHOOK_SECRET_FILE as string);
   const privateKeyPem = readSecret("HIVE_GITHUB_APP_KEY_FILE", env.HIVE_GITHUB_APP_KEY_FILE as string);
-  return { config: { appId, webhookSecret, privateKeyPem } };
+  const summonToken = readSecret("HIVE_GITHUB_SUMMON_TOKEN_FILE", env.HIVE_GITHUB_SUMMON_TOKEN_FILE as string);
+  return { config: { appId, webhookSecret, privateKeyPem, summonToken } };
 }
 
 function readSecret(name: string, path: string): string {
@@ -87,7 +90,7 @@ function readSecret(name: string, path: string): string {
     return readOwnerOnlyFile(path);
   } catch (error) {
     if (error instanceof Error && "code" in error && error.code === "ENOENT") {
-      throw new ReviewRuntimeConfigError(`${name} names ${path}, which does not exist; the GitHub adapter refuses to boot without it (unset all three names to run without the adapter)`);
+      throw new ReviewRuntimeConfigError(`${name} names ${path}, which does not exist; the GitHub adapter refuses to boot without it (unset all four names to run without the adapter)`);
     }
     throw error;
   }
@@ -95,7 +98,13 @@ function readSecret(name: string, path: string): string {
 
 export function bootReviewRuntime(input: ReviewRuntimeInput): ReviewRuntime {
   const { broker, clock, log } = input;
-  const store = new ReviewStore(broker.db, { decide, fold, read, clock });
+  const store = new ReviewStore(broker.db, { decide, fold, read, clock,
+    onEffectExhausted: notice => {
+      const channelId = notice.channelId ?? input.failureChannelId;
+      if (channelId === undefined) throw new Error("no channel configured for review failure notices");
+      broker.postBoardLine({ channelId, threadTs: notice.channelId === null ? null : notice.threadTs, text: notice.text });
+    },
+  });
   const resolved = githubConfig(input.env);
 
   if (resolved.config === null) {
@@ -112,8 +121,8 @@ export function bootReviewRuntime(input: ReviewRuntimeInput): ReviewRuntime {
     };
   }
 
-  const { appId, webhookSecret, privateKeyPem } = resolved.config;
-  const github = new AppGitHubPort(input.fetch === undefined ? { appId, privateKeyPem, clock } : { appId, privateKeyPem, clock, fetch: input.fetch });
+  const { appId, webhookSecret, privateKeyPem, summonToken } = resolved.config;
+  const github = new AppGitHubPort(input.fetch === undefined ? { appId, privateKeyPem, summonToken, clock } : { appId, privateKeyPem, summonToken, clock, fetch: input.fetch });
   const publisher = new ReviewPublisher(store, { github, slack: broker }, clock);
   const scheduler = new ReconcileScheduler({ store, github, clock, log });
   log(`[review] GitHub adapter enabled as App ${appId}: webhook ingress on /v1/github/webhook, reconcile scheduler armed`);

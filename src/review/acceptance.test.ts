@@ -23,6 +23,7 @@ import type {
   AppliedOutcome,
   ExternalResult,
   Finding,
+  FindingsExternalResult,
   ObservePRAction,
   Policy,
   Principal,
@@ -35,7 +36,7 @@ import type {
 } from "./contract.js";
 import { validateReview, validateReviewState } from "./contract.js";
 import { classifyCodexRecord } from "./github/classify.js";
-import { issueCommentRecord, reviewCommentRecord, reviewRecord, type GitHubChangedFile, type GitHubPort, type GitHubPullRequest, type GitHubRecord } from "./github/port.js";
+import { issueCommentRecord, reviewCommentRecord, reviewRecord, type GitHubChangedFile, type GitHubPort, type GitHubPullRequest, type GitHubReaction, type GitHubRecord } from "./github/port.js";
 import { ReconcileScheduler, reconcile } from "./github/reconcile.js";
 import { handleWebhook } from "./github/webhook.js";
 import { ReviewPublisher, type ReviewGitHubPort, type SystemWakePort } from "./publisher.js";
@@ -111,16 +112,20 @@ function codexRecord(name: string): GitHubRecord {
 }
 
 /** The one classification, as the reconciler runs it: the record's own `ExternalResult`. */
-function classified(name: string, o: { repository: string; head: string; members?: GitHubRecord[] }): ExternalResult {
+function classified(name: string, o: { repository: string; head: string; members?: GitHubRecord[] }): FindingsExternalResult {
   const result = classifyCodexRecord(codexRecord(name), {
     headSha: o.head,
     heads: [o.head],
     repository: o.repository,
     members: o.members ?? [],
+    reviews: [],
+    reviewComments: [],
+    prReactions: [],
   });
   assert.equal(result.classification, "findings", result.detail);
   assert.ok(result.external !== undefined);
-  return result.external;
+  assert.equal(result.external.verdict, "findings");
+  return result.external as FindingsExternalResult;
 }
 
 interface ObserveOverrides {
@@ -234,7 +239,7 @@ function external(o: Partial<ExternalResult> & { comments?: Array<{ id: number; 
       source_record: { kind: "review", id: 5001, version: T0 },
       submitted_at: T0,
       ...rest,
-    },
+    } as ExternalResult,
   };
 }
 
@@ -301,10 +306,10 @@ class FakeGitHub implements ReviewGitHubPort {
   }
   async resolveThread(input: { commentId: number }): Promise<void> { await this.reachable(); this.threads.push({ commentId: input.commentId, op: "resolve" }); }
   async unresolveThread(input: { commentId: number }): Promise<void> { await this.reachable(); this.threads.push({ commentId: input.commentId, op: "unresolve" }); }
-  async postComment(input: { body: string }): Promise<{ commentId: number }> {
+  async postComment(input: { body: string }): Promise<{ commentId: number; summonLogin: string }> {
     await this.reachable();
     this.comments.push(input.body);
-    return { commentId: 700 + this.comments.length };
+    return { commentId: 700 + this.comments.length, summonLogin: "RationallyPrime" };
   }
 }
 
@@ -313,6 +318,7 @@ class FakeGitHubPort implements GitHubPort {
   pr: GitHubPullRequest;
   pulls = 0;
   issueComments: GitHubRecord[] = [];
+  prReactions: GitHubReaction[] = [];
   files: GitHubChangedFile[] = [{ path: "src/x.py", sha: "1".repeat(40), status: "modified" }];
   /** Canonical template blobs by path (§6.C6 verbatim_copy). */
   blobs = new Map<string, string>();
@@ -326,6 +332,7 @@ class FakeGitHubPort implements GitHubPort {
   async listReviews(): Promise<GitHubRecord[]> { return []; }
   async listReviewComments(): Promise<GitHubRecord[]> { return []; }
   async listIssueComments(): Promise<GitHubRecord[]> { return [...this.issueComments]; }
+  async listIssueReactions(): Promise<GitHubReaction[]> { return this.prReactions; }
   async listFiles(): Promise<GitHubChangedFile[]> { return [...this.files]; }
   async getBlobSha(_r: number, _ref: string, path: string): Promise<string | null> { return this.blobs.get(path) ?? null; }
   async listFailedDeliveries(): Promise<Array<{ id: number; guid: string }>> { return []; }
@@ -937,9 +944,10 @@ test("§8.1 one board comment and one check run per head, created once and edite
   await core.publisher.drainOnce();
   assert.deepEqual(github.boardEdits, [null], "the first board refresh creates");
   assert.deepEqual(github.checkEdits, [null]);
-  assert.deepEqual(github.comments, ["@codex review"]);
+  assert.equal(github.comments.length, 1);
+  assert.match(github.comments[0]!, /^@codex review\n\nHive request req_obs:run1_1; effect eff_obs:run1_1; attempt 1\./u);
   assert.deepEqual(core.review().projection_handles, { board_comment_id: 500, check_run_ids: { [H1]: 1 }, slack_thread_ts: null });
-  assert.deepEqual(core.pending("codex")[0]?.transport, [{ summon_comment_id: 701 }], "the summon comment id is the request's reference");
+  assert.deepEqual(core.pending("codex")[0]?.transport, [{ summon_comment_id: 701, summon_login: "RationallyPrime" }], "the summon comment id is the request's reference");
   assert.equal(core.slack.lines.length, 1);
   assert.equal(core.slack.lines[0]?.threadTs, null, "the first line opens the thread");
 
@@ -1060,9 +1068,9 @@ test("§8.1 a review envelope's member comments are thread containers: one refre
   // A second finding in the *first* member's container — the case `threadState` must not decide
   // off the first match. The connector writes one finding per member comment; the state machine
   // must still be right when a container carries two.
-  const second: ExternalResult = {
+  const second: FindingsExternalResult = {
     ...envelope,
-    findings: [{ ...(envelope.findings[0] as ExternalResult["findings"][number]), locator: 1, title: "A second finding in the same member comment" }],
+    findings: [{ ...envelope.findings[0], locator: 1, title: "A second finding in the same member comment" }],
     source_record: { ...envelope.source_record, version: "2026-09-06T13:00:00Z" },
   };
   core.applied({ kind: "AdmitExternalResult", result: second }, ADAPTER, { actId: "src:review:5125461304:v2" });
@@ -1263,4 +1271,69 @@ test("bundle-1 #9: a GitHub call that never answers fails its row on the dispatc
   const stuck = rows().filter((r) => r.target.startsWith("board:github:") || r.target.startsWith("check:") || r.target.startsWith("summon:"));
   assert.ok(stuck.every((r) => r.status === "pending"), "timed out, attempts spent, behind backoff — not claimed forever");
   broker.close();
+});
+
+test("quiet sweep observations age out without republishing; source activity remains visible", async () => {
+  const core = new Core();
+  core.applied(observe(), ADAPTER);
+  core.applied(external(), ADAPTER);
+  await core.publisher.drainOnce();
+  const before = core.effectRows().length;
+  core.clock.advance(25 * 60 * MINUTE);
+  const observed = observe();
+  observed.observed.seen_at = core.clock.now().toISOString();
+  core.applied(observed, ADAPTER);
+  assert.equal(core.effectRows().length, before, "polling alone creates no publication");
+  assert.deepEqual(core.store.active(new Date(core.clock.now().getTime() - 24 * 60 * MINUTE).toISOString()), []);
+  core.store.sourceRecords.upsert({ recordKey: "issue_comment:123", version: core.clock.now().toISOString(), reviewId: core.review().id, authorLogin: CODEX_LOGIN, body: { text: "new unknown record" } });
+  core.store.sourceRecords.setClassification("issue_comment:123", core.clock.now().toISOString(), "unknown");
+  assert.deepEqual(core.store.active(core.clock.now().toISOString()), [KEY], "a new source record is real activity");
+  assert.equal(core.effectRows().length, before + 2, "unknown records queue their own board refresh, one row per sink (§8.1)");
+  core.store.sourceRecords.setClassification("issue_comment:123", core.clock.now().toISOString(), "unknown");
+  assert.equal(core.effectRows().length, before + 2, "resampling the same classification adds nothing");
+  core.close();
+});
+
+test("adopting a new Slack channel starts a new thread and later publications use its parent", async () => {
+  const core = new Core();
+  core.applied(observe(), ADAPTER);
+  await core.publisher.drainOnce();
+  core.applied({ kind: "GrantRounds", n: 1, reason: "record old parent" }, OPERATOR);
+  await core.publisher.drainOnce();
+  assert.equal(core.review().projection_handles.slack_thread_ts, "1700.1");
+  core.store.putPolicy(KEY.repository_id, { ...POLICY, version: 2, slack: { channel_id: "C_NEW" } });
+  core.applied({ kind: "AdoptPolicy", version: 2 }, OPERATOR);
+  assert.equal(core.review().projection_handles.slack_thread_ts, null);
+  await core.publisher.drainOnce();
+  assert.equal(core.slack.lines.at(-1)?.channelId, "C_NEW");
+  assert.equal(core.slack.lines.at(-1)?.threadTs, null);
+  core.applied({ kind: "GrantRounds", n: 1, reason: "record new parent" }, OPERATOR);
+  await core.publisher.drainOnce();
+  assert.equal(core.slack.lines.at(-1)?.threadTs, "1700.3");
+  assert.equal(core.store.projections.slackBoardOutboxId(core.review().id, "C0123ABCD"), 1);
+  assert.equal(core.store.projections.slackBoardOutboxId(core.review().id, "C_NEW"), 3);
+  core.close();
+});
+
+test("Codex clean completion reaches readiness when the PR approval arrives after the summary edit", async () => {
+  const core = new Core();
+  const port = new FakeGitHubPort(H1);
+  const summary = issueCommentRecord({ id: 999, user: { login: CODEX_LOGIN }, updated_at: T0,
+    body: `<!-- codex-pull-request-review-summary -->\n\n| 📝 **Code Review** | ✅ **Completed** | \`${H1.slice(0,7)}\` | Manual request |` });
+  port.issueComments = [summary];
+  const deps = { store: core.store, github: port, clock: core.clock };
+  await reconcile(deps, KEY, "before-approval");
+  assert.equal(core.state().readiness.ready, false);
+  port.prReactions = [{ id: 99, content: "+1", authorLogin: CODEX_LOGIN, createdAt: T0 }];
+  await reconcile(deps, KEY, "after-approval");
+  assert.equal(core.state().readiness.ready, true);
+  assert.equal(core.review().answers.length, 1);
+  await core.publisher.drainOnce();
+  assert.equal(core.github!.checks.at(-1)?.conclusion, "success");
+  await reconcile(deps, KEY, "again");
+  assert.equal(core.review().answers.length, 1, "the unchanged summary version is admitted once");
+  port.pr.headSha = H2;
+  await reconcile(deps, KEY, "new-head-old-approval");
+  assert.equal(core.state().readiness.ready, false, "the prior head's summary/reaction cannot satisfy a new subject");
+  core.close();
 });

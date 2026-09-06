@@ -1,7 +1,7 @@
 /* eslint-disable */
 /**
  * GENERATED — do not edit. Source: contracts/schemas/review-contract.schema.json,
- * vendored from weave-doctrine@5431513babe1d552b07d55ead9be45323fcf9fa0 (see contracts/SOURCE).
+ * vendored from weave-doctrine@6431420cc4c94743618c715c9a5ffa902f0e6325 (see contracts/SOURCE).
  * Regenerate with `bun run check:contracts`.
  */
 
@@ -13,7 +13,7 @@ export type Action =
   | ObservePRAction
   | AdmitExternalResultAction
   | SetReviewerAvailabilityAction
-  | OpenRequestAction
+  | (OpenReviewRequestAction | OpenRetrospectiveRequestAction)
   | CancelRequestAction
   | AnswerAction
   | RetractAnswerAction
@@ -51,11 +51,6 @@ export type SourceRecordKind = "review" | "review_comment" | "issue_comment";
 export type FindingPriority = "P0" | "P1" | "P2" | "P3" | "unknown";
 /**
  * This interface was referenced by `ReviewContract`'s JSON-Schema
- * via the `definition` "ExternalVerdict".
- */
-export type ExternalVerdict = "clean" | "findings" | "incomplete";
-/**
- * This interface was referenced by `ReviewContract`'s JSON-Schema
  * via the `definition` "AvailabilityReason".
  */
 export type AvailabilityReason = "quota" | "connector" | "meter";
@@ -64,11 +59,6 @@ export type AvailabilityReason = "quota" | "connector" | "meter";
  * via the `definition` "ReviewMode".
  */
 export type ReviewMode = "initial" | "closure" | "appeal";
-/**
- * This interface was referenced by `ReviewContract`'s JSON-Schema
- * via the `definition` "RequestKind".
- */
-export type RequestKind = "review" | "retrospective";
 /**
  * This interface was referenced by `ReviewContract`'s JSON-Schema
  * via the `definition` "Completion".
@@ -135,6 +125,11 @@ export type AnswerSubmission = ReviewkitSubmission | TestimonySubmission;
  * via the `definition` "Availability".
  */
 export type Availability = Available | Unavailable;
+/**
+ * This interface was referenced by `ReviewContract`'s JSON-Schema
+ * via the `definition` "RequestKind".
+ */
+export type RequestKind = "review" | "retrospective";
 /**
  * §3.4 / §6.D — the *obligation's* status, never its transport's.
  *
@@ -215,6 +210,12 @@ export type Consequence =
   | RoundsGranted
   | PolicyAdopted
   | MergeableObserved;
+/**
+ * This interface was referenced by `ReviewContract`'s JSON-Schema
+ * via the `definition` "ExternalResult".
+ */
+export type ExternalResult =
+  CleanExternalResult | FindingsExternalResult | IncompleteExternalResult;
 /**
  * This interface was referenced by `ReviewContract`'s JSON-Schema
  * via the `definition` "FindingSource".
@@ -430,20 +431,50 @@ export interface HumanAuthor {
  */
 export interface AdmitExternalResultAction {
   kind: "AdmitExternalResult";
-  result: ExternalResult;
+  result: CleanExternalResult | FindingsExternalResult | IncompleteExternalResult;
 }
 /**
  * This interface was referenced by `ReviewContract`'s JSON-Schema
- * via the `definition` "ExternalResult".
+ * via the `definition` "CleanExternalResult".
  */
-export interface ExternalResult {
-  findings: ExternalFinding[];
+export interface CleanExternalResult {
+  /**
+   * @maxItems 0
+   */
+  findings: [];
   reviewed_head: string;
   schema_version: "1";
   source: "codex";
   source_record: SourceRef;
   submitted_at: string;
-  verdict: ExternalVerdict;
+  verdict: "clean";
+}
+/**
+ * §7: a GitHub record by kind, id and version (``updated_at``/``submitted_at``).
+ *
+ * This interface was referenced by `ReviewContract`'s JSON-Schema
+ * via the `definition` "SourceRef".
+ */
+export interface SourceRef {
+  id: number;
+  kind: SourceRecordKind;
+  version: string;
+}
+/**
+ * This interface was referenced by `ReviewContract`'s JSON-Schema
+ * via the `definition` "FindingsExternalResult".
+ */
+export interface FindingsExternalResult {
+  /**
+   * @minItems 1
+   */
+  findings: [ExternalFinding, ...ExternalFinding[]];
+  reviewed_head: string;
+  schema_version: "1";
+  source: "codex";
+  source_record: SourceRef;
+  submitted_at: string;
+  verdict: "findings";
 }
 /**
  * No fingerprint, falsifier or evidence is invented for Codex; provenance is the container.
@@ -460,7 +491,7 @@ export interface ExternalResult {
 export interface ExternalFinding {
   body: string;
   container_id: number;
-  container_kind: SourceRecordKind;
+  container_kind: "review_comment" | "issue_comment";
   line: number | null;
   locator: number;
   path: string;
@@ -468,15 +499,17 @@ export interface ExternalFinding {
   title: string;
 }
 /**
- * §7: a GitHub record by kind, id and version (``updated_at``/``submitted_at``).
- *
  * This interface was referenced by `ReviewContract`'s JSON-Schema
- * via the `definition` "SourceRef".
+ * via the `definition` "IncompleteExternalResult".
  */
-export interface SourceRef {
-  id: number;
-  kind: SourceRecordKind;
-  version: string;
+export interface IncompleteExternalResult {
+  findings: ExternalFinding[];
+  reviewed_head: string;
+  schema_version: "1";
+  source: "codex";
+  source_record: SourceRef;
+  submitted_at: string;
+  verdict: "incomplete";
 }
 /**
  * §6.D3. ``available = false`` requires ``reason`` (reducer-checked).
@@ -493,18 +526,30 @@ export interface SetReviewerAvailabilityAction {
   until: string | null;
 }
 /**
- * §3.4 / §6.D. The obligation's kind is ``request_kind`` (``kind`` names the verb).
- *
  * This interface was referenced by `ReviewContract`'s JSON-Schema
- * via the `definition` "OpenRequestAction".
+ * via the `definition` "OpenReviewRequestAction".
  */
-export interface OpenRequestAction {
+export interface OpenReviewRequestAction {
   assignee: string;
   kind: "OpenRequest";
-  mode: ReviewMode | null;
+  mode: ReviewMode;
   names: string[];
   reason: string;
-  request_kind: RequestKind;
+  request_kind: "review";
+  required: boolean;
+  subject_key: string;
+}
+/**
+ * This interface was referenced by `ReviewContract`'s JSON-Schema
+ * via the `definition` "OpenRetrospectiveRequestAction".
+ */
+export interface OpenRetrospectiveRequestAction {
+  assignee: string;
+  kind: "OpenRequest";
+  mode: null;
+  names: string[];
+  reason: string;
+  request_kind: "retrospective";
   required: boolean;
   subject_key: string;
 }
@@ -978,7 +1023,7 @@ export interface Command {
     | ObservePRAction
     | AdmitExternalResultAction
     | SetReviewerAvailabilityAction
-    | OpenRequestAction
+    | (OpenReviewRequestAction | OpenRetrospectiveRequestAction)
     | CancelRequestAction
     | AnswerAction
     | RetractAnswerAction
@@ -1149,6 +1194,7 @@ export interface DeliveryRef {
  */
 export interface SummonRef {
   summon_comment_id: number;
+  summon_login: string;
 }
 /**
  * §6.D — the only discharge of a required obligation short of an answer or an exemption.
@@ -1320,7 +1366,7 @@ export interface ReviewkitFindingSource {
  */
 export interface CommentFindingSource {
   comment_id: number;
-  container_kind: SourceRecordKind;
+  container_kind: "review_comment" | "issue_comment";
   locator: number;
 }
 /**

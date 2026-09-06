@@ -6,9 +6,9 @@
  * App JWT (`node:crypto`), exchanging it for cached installation tokens, and talking REST
  * and GraphQL over `undici`. It also carries the projection writes the module map's
  * `ReviewGitHubPort` (§4) names — check runs, board comment, summons, thread resolution —
- * so the App is the broker's single GitHub identity (F-1).
+ * the App owns projections, and only Codex summons use the connected user token (§7, V-1).
  *
- * Nothing here is live-tested; `port.test.ts` proves the JWT and request shaping against a
+ * The 2026-09-06 V-1 probe confirmed Codex refuses the App identity. `port.test.ts` proves JWT and request shaping against a
  * fake fetch. Rate-limit and retry policy are deliberately minimal: a non-2xx is thrown as
  * `GitHubApiError` and the reconcile run that hit it reports it; the 5-minute sweep (§7
  * "Gaps") is the retry.
@@ -55,6 +55,8 @@ export interface GitHubRecord {
   raw: unknown;
 }
 
+export interface GitHubReaction { id: number; content: string; authorLogin: string; createdAt: string }
+
 export interface GitHubChangedFile { path: string; sha: string; status: string }
 
 export interface GitHubPort {
@@ -63,6 +65,7 @@ export interface GitHubPort {
   listReviewComments(repositoryId: number, prNumber: number): Promise<GitHubRecord[]>;
   listIssueComments(repositoryId: number, prNumber: number): Promise<GitHubRecord[]>;
   listFiles(repositoryId: number, prNumber: number): Promise<GitHubChangedFile[]>;
+  listIssueReactions(repositoryId: number, prNumber: number): Promise<GitHubReaction[]>;
   /** §6.C6 `verbatim_copy`: the blob sha of `path` at `ref`, null when absent. */
   getBlobSha?(repositoryId: number, ref: string, path: string): Promise<string | null>;
   /** §7 "Gaps": failed deliveries since `since` (ISO), asked on broker start. */
@@ -147,6 +150,8 @@ export interface AppGitHubPortOptions {
   appId: string;
   /** PEM private key of the App (tier-2 secret on the dev box, §7); never logged. */
   privateKeyPem: string;
+  /** Connected user token used only for Codex summons (live V-1 probe). */
+  summonToken: string;
   clock: Clock;
   fetch?: FetchLike;
   baseUrl?: string;
@@ -374,6 +379,11 @@ export class AppGitHubPort implements GitHubPort {
     return rows.filter(isRecord).map(issueCommentRecord);
   }
 
+  async listIssueReactions(repositoryId: number, prNumber: number): Promise<GitHubReaction[]> {
+    const rows = await this.repoPages(repositoryId, `/issues/${prNumber}/reactions`);
+    return rows.filter(isRecord).map(row => ({ id: num(row.id) ?? 0, content: str(row.content), authorLogin: isRecord(row.user) ? str(row.user.login) : "", createdAt: str(row.created_at) }));
+  }
+
   async listFiles(repositoryId: number, prNumber: number): Promise<GitHubChangedFile[]> {
     const rows = await this.repoPages(repositoryId, `/pulls/${prNumber}/files`);
     return rows.filter(isRecord).map((row) => ({ path: str(row.filename), sha: str(row.sha), status: str(row.status) }));
@@ -454,9 +464,16 @@ export class AppGitHubPort implements GitHubPort {
     return { commentId: (isRecord(result.json) ? num(result.json.id) : null) ?? input.existingId ?? 0 };
   }
 
-  async postComment(input: { repositoryId: number; prNumber: number; body: string }): Promise<{ commentId: number }> {
-    const result = await this.repoRequest(input.repositoryId, "POST", `/issues/${input.prNumber}/comments`, { body: { body: input.body } });
-    return { commentId: (isRecord(result.json) ? num(result.json.id) : null) ?? 0 };
+  async postComment(input: { repositoryId: number; prNumber: number; body: string }): Promise<{ commentId: number; summonLogin: string }> {
+    const home = await this.home(input.repositoryId);
+    const result = await this.tokenRequest(this.options.summonToken, "POST", `/repos/${home.fullName}/issues/${input.prNumber}/comments`, { body: { body: input.body } });
+    const row = isRecord(result.json) ? result.json : {};
+    const commentId = num(row.id);
+    const summonLogin = isRecord(row.user) ? str(row.user.login) : "";
+    if (commentId === null || !Number.isInteger(commentId) || commentId < 1 || !summonLogin) {
+      throw new GitHubApiError(result.status, `/repos/${home.fullName}/issues/${input.prNumber}/comments`, "summon response omitted its comment id or author login");
+    }
+    return { commentId, summonLogin };
   }
 
   async resolveThread(input: { repositoryId: number; commentId: number }): Promise<void> {

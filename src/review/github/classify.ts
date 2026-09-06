@@ -15,8 +15,9 @@
  * - a clean round is an `issue_comment` `Codex Review: Didn't find any major issues. <flourish>`
  *   with the same footer; there is no 👍 comment — the connector reacts 👀 while running and
  *   removes it when done, and a reaction is not a source record;
- * - `<!-- codex-pull-request-review-summary -->` is the connector's own progress board,
- *   edited in place (Running → Completed / Failed): recognised, verdict-less, `status`;
+ * - the current connector also completes a clean run via its summary plus a PR 👍;
+ *   only a completed summary at the current head, a Codex-authored approval reaction,
+ *   and no contradicting review at that head admit clean. Either signal alone is status;
  * - `You have reached your Codex usage limits[ for code reviews].` is the quota refusal;
  *   `To use Codex here, …` (unconnected repo) and `Codex Review: Something went wrong. …`
  *   (transient) are connector errors — availability signals, never verdicts (§6.D3);
@@ -30,7 +31,8 @@
  * comment. §6.F5: a badge-less finding is priority `unknown` — admitted, visible, blocking.
  */
 import type { ExternalFinding, ExternalResult, FindingPriority } from "../contract.js";
-import type { GitHubRecord } from "./port.js";
+import { CODEX_LOGINS } from "../reducer.js";
+import type { GitHubReaction, GitHubRecord } from "./port.js";
 
 
 export type CodexClassification =
@@ -56,6 +58,9 @@ export interface ClassifyContext {
   repository: string;
   /** For a `review` record: its member `review_comment`s (raw `pull_request_review_id` = id). */
   members: GitHubRecord[];
+  reviews: GitHubRecord[];
+  reviewComments: GitHubRecord[];
+  prReactions: GitHubReaction[];
 }
 
 export interface ClassifiedRecord {
@@ -215,6 +220,8 @@ function splitFinding(text: string): { title: string; body: string } | null {
  * a standalone `review_comment`, and a task-channel `## Review Finding` issue comment.
  */
 function memberFinding(member: GitHubRecord): ExternalFinding | null {
+  // §3.5: a `review` envelope is never itself a finding container — its member comments are.
+  if (member.kind === "review") return null;
   const split = splitFinding(member.body);
   if (split === null) return null;
   return {
@@ -267,15 +274,18 @@ function inlineFindings(body: string, repository: string, commentId: number): Ex
 // ---------------------------------------------------------------------------------------
 
 function result(record: GitHubRecord, verdict: ExternalResult["verdict"], head: string, findings: ExternalFinding[]): ExternalResult {
-  return {
-    schema_version: "1",
-    source: "codex",
+  const common = {
+    schema_version: "1" as const,
+    source: "codex" as const,
     reviewed_head: head,
-    verdict,
-    findings,
     source_record: { kind: record.kind, id: record.id, version: record.version },
     submitted_at: record.version,
   };
+  if (verdict === "clean") return { ...common, verdict, findings: [] };
+  if (verdict === "incomplete") return { ...common, verdict, findings };
+  const [first, ...rest] = findings;
+  if (first === undefined) throw new Error("a findings verdict requires at least one finding");
+  return { ...common, verdict, findings: [first, ...rest] };
 }
 
 function unknown(detail: string): ClassifiedRecord {
@@ -302,6 +312,20 @@ export function classifyCodexRecord(record: GitHubRecord, context: ClassifyConte
     return { classification: "quota_refusal", availability: { available: false, reason: "quota", until: null, evidence }, detail: evidence };
   }
   if (body.startsWith(SUMMARY_MARKER)) {
+    const rows = body.split("\n").filter(line => /^\|[^|]*\*\*Code Review\*\*[^|]*\|/u.test(line));
+    const cells = rows.length === 1 ? rows[0]!.split("|") : [];
+    const commitish = /^\s*`([0-9a-f]{7,40})`\s*$/u.exec(cells[3] ?? "")?.[1] ?? null;
+    const head = expandHead(commitish, context.heads);
+    const completed = (cells[2] ?? "").includes("✅ **Completed**");
+    const approval = context.prReactions.find(r => r.content === "+1" && CODEX_LOGINS.has(r.authorLogin));
+    const reviewAtHead = context.reviews.some(r => CODEX_LOGINS.has(r.authorLogin) && r.commitId === head);
+    const inline = context.reviewComments.filter(r => CODEX_LOGINS.has(r.authorLogin) && r.commitId === head);
+    const contradicted = reviewAtHead || inline.length > 0;
+    // A reaction carries no head. The completed summary binds it to the current subject;
+    // any review at that head is admitted through its own envelope, never overwritten here.
+    if (record.kind === "issue_comment" && CODEX_LOGINS.has(record.authorLogin) && completed && head === context.headSha && approval !== undefined && !contradicted) {
+      return { classification: "clean", external: result(record, "clean", head, []), detail: `completed summary at ${head} with Codex PR approval reaction ${approval.id}` };
+    }
     const state = /\|\s*📝[^|]*\|\s*([^|]+?)\s*\|/u.exec(body)?.[1]?.replace(/<relative-time[^>]*>.*?<\/relative-time>/gu, "").trim() ?? "";
     return { classification: "status", detail: `connector progress board: ${state || "no row"}` };
   }

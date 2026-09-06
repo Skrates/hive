@@ -1,7 +1,7 @@
 {
   "expect": {
     "code": "malformed",
-    "why": "ObservePR carries the reconcile run's §6.C6 exemption evidence (null when none); the reducer never recomputes it"
+    "why": "ObservePR carries the reconcile run's \u00a76.C6 exemption evidence (null when none); the reducer never recomputes it"
   },
   "instance": {
     "draft": false,

@@ -144,7 +144,7 @@ function requestLine(request: Request): string {
   const transport = request.transport.length === 0
     ? "no transport yet"
     : request.transport
-      .map((ref) => ("delivery_id" in ref ? `delivery ${ref.delivery_id}` : `summon comment ${ref.summon_comment_id}`))
+      .map((ref) => ("delivery_id" in ref ? `delivery ${ref.delivery_id}` : `summon comment ${ref.summon_comment_id} by ${ref.summon_login}`))
       .join(", ");
   const names = request.names.length === 0 ? "" : ` naming ${request.names.join(", ")}`;
   const supersedes = request.supersedes === null ? "" : ` (supersedes ${request.supersedes})`;

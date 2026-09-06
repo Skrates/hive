@@ -393,7 +393,6 @@ function observedEqual(a: Observed, b: Observed): boolean {
     a.base_sha_now === b.base_sha_now &&
     a.head_ref === b.head_ref &&
     a.mergeable === b.mergeable &&
-    a.seen_at === b.seen_at &&
     a.title === b.title
   );
 }
@@ -679,12 +678,16 @@ export function decide(state: Review | null, action: Action, ctx: DecideContext)
       tx.effect("refresh", `thread:${finding.source.comment_id}`, null);
     }
   }
-  // Module map §2: every applied batch refreshes the board and the check at the current head.
+  // Module map §2: every batch that changed something refreshes the board and the check at the
+  // current head. A batch with no consequences is an audit batch — its facts are unchanged, so
+  // it has no new publication work and emits nothing.
   // §8.1: the board has one row per sink, always both — the reducer is pure and cannot know
   // which sinks this broker has, so the publisher marks an unconfigured sink's row obsolete
   // (the GitHub comment in M0) exactly as it already does for a check without a GitHub port.
-  for (const sink of BOARD_SINKS) tx.effect("refresh", `board:${sink}:${tx.review.id}`, null);
-  tx.effect("refresh", `check:${repoOf(tx.review.display)}:${tx.review.subject.head_sha}`, null);
+  if (tx.consequences.length > 0) {
+    for (const sink of BOARD_SINKS) tx.effect("refresh", `board:${sink}:${tx.review.id}`, null);
+    tx.effect("refresh", `check:${repoOf(tx.review.display)}:${tx.review.subject.head_sha}`, null);
+  }
   return tx.batch(action);
 }
 

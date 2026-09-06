@@ -10,6 +10,7 @@ const PRIVATE_KEY_PEM = privateKey.export({ type: "pkcs8", format: "pem" }).toSt
 const NOW = new Date("2026-09-06T12:00:00.000Z");
 const clock: Clock = { now: () => NOW };
 const APP_ID = "424242";
+const FAKE_SUMMON_TOKEN = "connected-user-token-fake";
 const FAKE_INSTALLATION_TOKEN = "installation-token-fake-not-real";
 
 interface Call { method: string; url: string; headers: Record<string, string>; body: unknown }
@@ -54,7 +55,7 @@ const PR_JSON = {
 
 function port(route: Route) {
   const { fetch, calls } = fakeFetch((call) => appRoutes(call) ?? route(call));
-  return { port: new AppGitHubPort({ appId: APP_ID, privateKeyPem: PRIVATE_KEY_PEM, clock, fetch }), calls };
+  return { port: new AppGitHubPort({ appId: APP_ID, privateKeyPem: PRIVATE_KEY_PEM, summonToken: FAKE_SUMMON_TOKEN, clock, fetch }), calls };
 }
 
 test("App JWT: RS256 over {iat, exp, iss} with skew, verifiable with the public key, cached", () => {
@@ -193,8 +194,8 @@ test("projections: check run create/update, board comment create/update, summons
   const { port: p, calls } = port((call) => {
     if (call.url.endsWith("/check-runs") && call.method === "POST") return { status: 201, json: { id: 900 } };
     if (call.url.endsWith("/check-runs/900") && call.method === "PATCH") return { json: { id: 900 } };
-    if (call.url.endsWith("/issues/66/comments") && call.method === "POST") return { status: 201, json: { id: 7000 } };
-    if (call.url.endsWith("/issues/comments/7000") && call.method === "PATCH") return { json: { id: 7000 } };
+    if (call.url.endsWith("/issues/66/comments") && call.method === "POST") return { status: 201, json: { id: 7000, user: { login: "RationallyPrime" } } };
+    if (call.url.endsWith("/issues/comments/7000") && call.method === "PATCH") return { json: { id: 7000, user: { login: "RationallyPrime" } } };
     if (call.url.endsWith("/pulls/comments/3944094503")) return { json: { node_id: "PRRC_1", pull_request_url: "https://api.github.com/repos/Skrates/hive/pulls/66" } };
     if (call.url.endsWith("/graphql")) {
       const body = call.body as { query: string; variables: Record<string, unknown> };
@@ -214,7 +215,10 @@ test("projections: check run create/update, board comment create/update, summons
   assert.deepEqual(await p.createOrUpdateBoardComment({ repositoryId: 1054, prNumber: 66, existingId: null, body: "board" }), { commentId: 7000 });
   await p.createOrUpdateBoardComment({ repositoryId: 1054, prNumber: 66, existingId: 7000, body: "board 2" });
   assert.deepEqual(calls.find((c) => c.url.endsWith("/issues/comments/7000"))?.body, { body: "board 2" });
-  assert.deepEqual(await p.postComment({ repositoryId: 1054, prNumber: 66, body: "@codex review" }), { commentId: 7000 });
+  assert.deepEqual(await p.postComment({ repositoryId: 1054, prNumber: 66, body: "@codex review" }), { commentId: 7000, summonLogin: "RationallyPrime" });
+  const commentPosts = calls.filter(c => c.url.endsWith("/issues/66/comments") && c.method === "POST");
+  assert.equal(commentPosts[0]?.headers.authorization, `Bearer ${FAKE_INSTALLATION_TOKEN}`, "the App owns the board");
+  assert.equal(commentPosts[1]?.headers.authorization, `Bearer ${FAKE_SUMMON_TOKEN}`, "only summons use the connected user");
   await p.resolveThread({ repositoryId: 1054, commentId: 3944094503 });
   const mutation = calls.filter((c) => c.url.endsWith("/graphql")).at(-1)?.body as { query: string; variables: { id: string } };
   assert.ok(mutation.query.includes("resolveReviewThread"));
@@ -228,6 +232,13 @@ test("a non-2xx answer is a GitHubApiError naming the status and the URL, never 
   const { port: p } = port((call) => (call.url.endsWith("/pulls/66") ? { status: 403, json: { message: "rate limited" } } : undefined));
   await assert.rejects(() => p.getPullRequest(1054, 66), (error: unknown) => error instanceof GitHubApiError && error.status === 403 && error.url.endsWith("/repos/Skrates/hive/pulls/66"));
   await assert.rejects(() => p.getPullRequest(9999, 1), (error: unknown) => error instanceof GitHubApiError && error.status === 404);
+});
+
+test("PR reactions are read under App authentication with author identity", async () => {
+  const { port: p, calls } = port(call => call.url.includes("/issues/66/reactions?")
+    ? { json: [{ id: 7, content: "+1", user: { login: "chatgpt-codex-connector[bot]" }, created_at: "2026-09-06T12:00:00Z" }] } : undefined);
+  assert.deepEqual(await p.listIssueReactions(1054, 66), [{ id: 7, content: "+1", authorLogin: "chatgpt-codex-connector[bot]", createdAt: "2026-09-06T12:00:00Z" }]);
+  assert.equal(calls.at(-1)?.headers.authorization, `Bearer ${FAKE_INSTALLATION_TOKEN}`);
 });
 
 

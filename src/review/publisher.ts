@@ -52,7 +52,7 @@ export interface ReviewGitHubPort {
   resolveThread(input: { repositoryId: number; commentId: number }): Promise<void>;
   unresolveThread(input: { repositoryId: number; commentId: number }): Promise<void>;
   /** Summons ("@codex review"). */
-  postComment(input: { repositoryId: number; prNumber: number; body: string }): Promise<{ commentId: number }>;
+  postComment(input: { repositoryId: number; prNumber: number; body: string }): Promise<{ commentId: number; summonLogin: string }>;
 }
 
 /** Implemented on `BrokerStore`: system-origin Hive deliveries and the board line (§8.1 Slack). */
@@ -80,9 +80,9 @@ export interface PublisherStore {
   readonly projections: {
     recordBoardComment(reviewId: string, commentId: number): void;
     recordCheckRun(reviewId: string, headSha: string, checkRunId: number): void;
-    recordSlackThread(reviewId: string, threadTs: string): void;
-    recordSlackBoardOutbox(reviewId: string, outboxId: number): void;
-    slackBoardOutboxId(reviewId: string): number | null;
+    recordSlackThread(reviewId: string, channelId: string, threadTs: string): void;
+    recordSlackBoardOutbox(reviewId: string, channelId: string, outboxId: number): void;
+    slackBoardOutboxId(reviewId: string, channelId: string): number | null;
     recordTransport(reviewId: string, effectId: string, requestId: string, ref: TransportRef): void;
   };
   /** §7 step 3: Codex records classified `unknown`, surfaced on the board and never promoted. */
@@ -195,24 +195,34 @@ export class ReviewPublisher {
    * publishing an older verdict — so a slow GitHub call delays whatever follows it; ordering
    * by sink makes what follows only other GitHub work. Sink independence itself comes from
    * the targets being distinct rows; this is about a hung await, which no marking can undo.
+   *
+   * `board:slack` leads its own sink's rows because it is the row that opens the Review's
+   * Slack thread, and every other Slack row waits unclaimed until that thread exists. The
+   * opener still only reaches the outbox in this pass, so the wait is one tick either way;
+   * leading keeps that tick from becoming two.
+   *
    * A target that does not parse sorts last: `handle` fails it without touching a port.
    */
   private slackFirst(rows: PublishableEffect[]): PublishableEffect[] {
+    const slackBoard: PublishableEffect[] = [];
     const slack: PublishableEffect[] = [];
     const github: PublishableEffect[] = [];
     const unparsed: PublishableEffect[] = [];
     for (const row of rows) {
-      let sink: EffectSink | null;
+      let target: EffectTarget | null;
       try {
-        sink = sinkOf(parseTarget(row.target));
+        target = parseTarget(row.target);
       } catch {
-        sink = null;
+        target = null;
       }
-      if (sink === "slack") slack.push(row);
-      else if (sink === "github") github.push(row);
+      const sink: EffectSink | null = target === null ? null : sinkOf(target);
+      if (sink === "slack") {
+        if (target !== null && target.kind === "board") slackBoard.push(row);
+        else slack.push(row);
+      } else if (sink === "github") github.push(row);
       else unparsed.push(row);
     }
-    return [...slack, ...github, ...unparsed];
+    return [...slackBoard, ...slack, ...github, ...unparsed];
   }
 
   private async handle(row: PublishableEffect): Promise<boolean> {
@@ -239,6 +249,15 @@ export class ReviewPublisher {
       if (applicability(target, review) === "withheld") return false;
       // M0 has no GitHub port; a summon must neither be lost nor marked, so it waits.
       if (target.kind === "summon" && this.ports.github === null) return false;
+      // Slack actionables wait unclaimed for the channel's board opener to drain: the thread
+      // ts only exists once the outbox has posted the board line, so this row cannot name a
+      // thread yet. The wait is always at least one tick — `board:slack` sorts ahead of these
+      // rows in this same pass (§8.1, `slackFirst`) but only queues the opener into the
+      // outbox. `housekeepingTick` drains that outbox independently of this pass on the same
+      // tick, so the ts is recorded before the next pass looks at these rows again.
+      if (applicability(target, review) === "applicable" &&
+        (target.kind === "delivery" || target.kind === "notice" || target.kind === "announce") &&
+        this.slackPolicy(review) !== null && this.slackThread(review) === null) return false;
     }
 
     if (row.kind === "refresh") {
@@ -334,8 +353,8 @@ export class ReviewPublisher {
         const threadTs = this.slackThread(state);
         const { outboxId } = this.ports.slack.postBoardLine({ channelId: slack.channel_id, threadTs, text: slackBoardLine(state, unknown) });
         // The first line opens the Review's thread; its ts is learned once the outbox drains it.
-        if (threadTs === null && this.store.projections.slackBoardOutboxId(state.id) === null) {
-          this.store.projections.recordSlackBoardOutbox(state.id, outboxId);
+        if (threadTs === null && this.store.projections.slackBoardOutboxId(state.id, slack.channel_id) === null) {
+          this.store.projections.recordSlackBoardOutbox(state.id, slack.channel_id, outboxId);
         }
         return "sent";
       }
@@ -414,12 +433,12 @@ export class ReviewPublisher {
         if (payload === null) throw new DispatchError(`summon effect ${row.effect_id} carries no summon payload`);
         const github = this.ports.github;
         if (github === null) throw new DispatchError("summon dispatched without a GitHub port");
-        const { commentId } = await github.postComment({
+        const { commentId, summonLogin } = await github.postComment({
           repositoryId: state.key.repository_id,
           prNumber: state.key.pr_number,
-          body: payload.text,
+          body: `${payload.text}\n\nHive request ${target.requestId}; effect ${row.effect_id}; attempt ${row.attempts + 1}. Repeated delivery of this request is a retry of the same review obligation.`,
         });
-        this.store.projections.recordTransport(state.id, row.effect_id, target.requestId, { summon_comment_id: this.positiveId(commentId, "summon comment") });
+        this.store.projections.recordTransport(state.id, row.effect_id, target.requestId, { summon_comment_id: this.positiveId(commentId, "summon comment"), summon_login: summonLogin });
         return "sent";
       }
       case "announce": {
@@ -440,17 +459,18 @@ export class ReviewPublisher {
   /**
    * The Review's Slack thread: the recorded ts, or — the first board line having been queued
    * but its ts not yet recorded — the ts the outbox posted it as, recorded now. Null while the
-   * first line is still unsent (that post then lands at the channel top level, visibly, rather
-   * than waiting on the outbox).
+   * first line is still unsent; Slack actionables remain pending until its coordinate is known.
    */
   private slackThread(state: ReviewState): string | null {
+    const channel = this.slackPolicy(state)?.channel_id;
+    if (channel === undefined) return null;
     const recorded = state.projection_handles.slack_thread_ts;
     if (recorded !== null) return recorded;
-    const outboxId = this.store.projections.slackBoardOutboxId(state.id);
+    const outboxId = this.store.projections.slackBoardOutboxId(state.id, channel);
     if (outboxId === null) return null;
     const ts = this.ports.slack.outboxMessageTs(outboxId);
     if (ts === null) return null;
-    this.store.projections.recordSlackThread(state.id, ts);
+    this.store.projections.recordSlackThread(state.id, channel, ts);
     return ts;
   }
 

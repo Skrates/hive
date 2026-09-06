@@ -1,8 +1,8 @@
 # Vendored review contract (design §2.1)
 
 source_repo: weave-doctrine
-source_sha: 5431513babe1d552b07d55ead9be45323fcf9fa0
-source_branch: gnomon/b1-integration
+source_sha: 6431420cc4c94743618c715c9a5ffa902f0e6325
+source_branch: gnomon/review-contract
 authority: skills/code-review/scripts/src/weave_reviewkit/contract.py
 
 # The exact command that produced schemas/review-contract.schema.json, run in

@@ -12,7 +12,14 @@
           "$ref": "#/$defs/SetReviewerAvailabilityAction"
         },
         {
-          "$ref": "#/$defs/OpenRequestAction"
+          "oneOf": [
+            {
+              "$ref": "#/$defs/OpenReviewRequestAction"
+            },
+            {
+              "$ref": "#/$defs/OpenRetrospectiveRequestAction"
+            }
+          ]
         },
         {
           "$ref": "#/$defs/CancelRequestAction"
@@ -81,7 +88,17 @@
           "type": "string"
         },
         "result": {
-          "$ref": "#/$defs/ExternalResult"
+          "oneOf": [
+            {
+              "$ref": "#/$defs/CleanExternalResult"
+            },
+            {
+              "$ref": "#/$defs/FindingsExternalResult"
+            },
+            {
+              "$ref": "#/$defs/IncompleteExternalResult"
+            }
+          ]
         }
       },
       "required": [
@@ -99,6 +116,7 @@
           "anyOf": [
             {
               "minLength": 1,
+              "pattern": "^[!-~]+$(?![\\s\\S])",
               "type": "string"
             },
             {
@@ -114,11 +132,13 @@
         },
         "id": {
           "minLength": 1,
+          "pattern": "^[!-~]+$(?![\\s\\S])",
           "type": "string"
         },
         "line": {
           "anyOf": [
             {
+              "minimum": 1,
               "type": "integer"
             },
             {
@@ -144,6 +164,7 @@
         },
         "review_id": {
           "minLength": 1,
+          "pattern": "^[!-~]+$(?![\\s\\S])",
           "type": "string"
         },
         "reviewer_disposition": {
@@ -230,11 +251,12 @@
       "additionalProperties": false,
       "properties": {
         "admitted_at": {
-          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$",
+          "pattern": "^(?:[0-9]{4}-(?:(?:01|03|05|07|08|10|12)-(?:0[1-9]|[12][0-9]|3[01])|(?:04|06|09|11)-(?:0[1-9]|[12][0-9]|30)|02-(?:0[1-9]|1[0-9]|2[0-8]))|(?:[0-9]{2}(?:0[48]|[2468][048]|[13579][26])|(?:[02468][048]|[13579][26])00)-02-29)T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,9})?Z$",
           "type": "string"
         },
         "id": {
           "minLength": 1,
+          "pattern": "^[!-~]+$(?![\\s\\S])",
           "type": "string"
         },
         "normalized": {
@@ -265,6 +287,7 @@
         },
         "request_id": {
           "minLength": 1,
+          "pattern": "^[!-~]+$(?![\\s\\S])",
           "type": "string"
         },
         "status": {
@@ -297,6 +320,7 @@
         },
         "request_id": {
           "minLength": 1,
+          "pattern": "^[!-~]+$(?![\\s\\S])",
           "type": "string"
         },
         "subject_key": {
@@ -346,6 +370,7 @@
       "properties": {
         "answer_id": {
           "minLength": 1,
+          "pattern": "^[!-~]+$(?![\\s\\S])",
           "type": "string"
         },
         "kind": {
@@ -392,11 +417,13 @@
         },
         "batch_id": {
           "minLength": 1,
+          "pattern": "^[!-~]+$(?![\\s\\S])",
           "type": "string"
         },
         "effects": {
           "items": {
             "minLength": 1,
+            "pattern": "^[!-~]+$(?![\\s\\S])",
             "type": "string"
           },
           "type": "array"
@@ -489,11 +516,12 @@
       "description": "\u00a75.B3 \u2014 the materialized transition; replay folds these and never calls ``decide``.",
       "properties": {
         "admitted_at": {
-          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$",
+          "pattern": "^(?:[0-9]{4}-(?:(?:01|03|05|07|08|10|12)-(?:0[1-9]|[12][0-9]|3[01])|(?:04|06|09|11)-(?:0[1-9]|[12][0-9]|30)|02-(?:0[1-9]|1[0-9]|2[0-8]))|(?:[0-9]{2}(?:0[48]|[2468][048]|[13579][26])|(?:[02468][048]|[13579][26])00)-02-29)T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,9})?Z$",
           "type": "string"
         },
         "batch_id": {
           "minLength": 1,
+          "pattern": "^[!-~]+$(?![\\s\\S])",
           "type": "string"
         },
         "command": {
@@ -620,6 +648,7 @@
         "blocking_findings": {
           "items": {
             "minLength": 1,
+            "pattern": "^[!-~]+$(?![\\s\\S])",
             "type": "string"
           },
           "type": "array"
@@ -662,6 +691,7 @@
         },
         "request_id": {
           "minLength": 1,
+          "pattern": "^[!-~]+$(?![\\s\\S])",
           "type": "string"
         }
       },
@@ -679,10 +709,11 @@
       "properties": {
         "answer_id": {
           "minLength": 1,
+          "pattern": "^[!-~]+$(?![\\s\\S])",
           "type": "string"
         },
         "at": {
-          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$",
+          "pattern": "^(?:[0-9]{4}-(?:(?:01|03|05|07|08|10|12)-(?:0[1-9]|[12][0-9]|3[01])|(?:04|06|09|11)-(?:0[1-9]|[12][0-9]|30)|02-(?:0[1-9]|1[0-9]|2[0-8]))|(?:[0-9]{2}(?:0[48]|[2468][048]|[13579][26])|(?:[02468][048]|[13579][26])00)-02-29)T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,9})?Z$",
           "type": "string"
         },
         "subject_key": {
@@ -722,6 +753,7 @@
       "properties": {
         "finding_id": {
           "minLength": 1,
+          "pattern": "^[!-~]+$(?![\\s\\S])",
           "type": "string"
         },
         "kind": {
@@ -738,6 +770,52 @@
         "priority"
       ],
       "title": "ClassifyFindingAction",
+      "type": "object"
+    },
+    "CleanExternalResult": {
+      "additionalProperties": false,
+      "properties": {
+        "findings": {
+          "items": {
+            "$ref": "#/$defs/ExternalFinding"
+          },
+          "maxItems": 0,
+          "type": "array"
+        },
+        "reviewed_head": {
+          "pattern": "^[0-9a-f]{40}$",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": "1",
+          "type": "string"
+        },
+        "source": {
+          "const": "codex",
+          "type": "string"
+        },
+        "source_record": {
+          "$ref": "#/$defs/SourceRef"
+        },
+        "submitted_at": {
+          "pattern": "^(?:[0-9]{4}-(?:(?:01|03|05|07|08|10|12)-(?:0[1-9]|[12][0-9]|3[01])|(?:04|06|09|11)-(?:0[1-9]|[12][0-9]|30)|02-(?:0[1-9]|1[0-9]|2[0-8]))|(?:[0-9]{2}(?:0[48]|[2468][048]|[13579][26])|(?:[02468][048]|[13579][26])00)-02-29)T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,9})?Z$",
+          "type": "string"
+        },
+        "verdict": {
+          "const": "clean",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_version",
+        "source",
+        "reviewed_head",
+        "source_record",
+        "submitted_at",
+        "verdict",
+        "findings"
+      ],
+      "title": "CleanExternalResult",
       "type": "object"
     },
     "CodexMeter": {
@@ -771,6 +849,7 @@
       "properties": {
         "act_id": {
           "minLength": 1,
+          "pattern": "^[!-~]+$(?![\\s\\S])",
           "type": "string"
         },
         "action": {
@@ -785,7 +864,14 @@
               "$ref": "#/$defs/SetReviewerAvailabilityAction"
             },
             {
-              "$ref": "#/$defs/OpenRequestAction"
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/OpenReviewRequestAction"
+                },
+                {
+                  "$ref": "#/$defs/OpenRetrospectiveRequestAction"
+                }
+              ]
             },
             {
               "$ref": "#/$defs/CancelRequestAction"
@@ -875,7 +961,11 @@
           "type": "integer"
         },
         "container_kind": {
-          "$ref": "#/$defs/SourceRecordKind"
+          "enum": [
+            "review_comment",
+            "issue_comment"
+          ],
+          "type": "string"
         },
         "locator": {
           "minimum": 0,
@@ -997,11 +1087,12 @@
       "additionalProperties": false,
       "properties": {
         "at": {
-          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$",
+          "pattern": "^(?:[0-9]{4}-(?:(?:01|03|05|07|08|10|12)-(?:0[1-9]|[12][0-9]|3[01])|(?:04|06|09|11)-(?:0[1-9]|[12][0-9]|30)|02-(?:0[1-9]|1[0-9]|2[0-8]))|(?:[0-9]{2}(?:0[48]|[2468][048]|[13579][26])|(?:[02468][048]|[13579][26])00)-02-29)T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,9})?Z$",
           "type": "string"
         },
         "by": {
           "minLength": 1,
+          "pattern": "^[!-~]+$(?![\\s\\S])",
           "type": "string"
         },
         "prior": {
@@ -1217,6 +1308,7 @@
       "properties": {
         "effect_id": {
           "minLength": 1,
+          "pattern": "^[!-~]+$(?![\\s\\S])",
           "type": "string"
         },
         "kind": {
@@ -1260,7 +1352,7 @@
       "additionalProperties": false,
       "properties": {
         "at": {
-          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$",
+          "pattern": "^(?:[0-9]{4}-(?:(?:01|03|05|07|08|10|12)-(?:0[1-9]|[12][0-9]|3[01])|(?:04|06|09|11)-(?:0[1-9]|[12][0-9]|30)|02-(?:0[1-9]|1[0-9]|2[0-8]))|(?:[0-9]{2}(?:0[48]|[2468][048]|[13579][26])|(?:[02468][048]|[13579][26])00)-02-29)T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,9})?Z$",
           "type": "string"
         },
         "by": {
@@ -1295,6 +1387,7 @@
         },
         "episode_id": {
           "minLength": 1,
+          "pattern": "^[!-~]+$(?![\\s\\S])",
           "type": "string"
         },
         "kind": {
@@ -1473,14 +1566,16 @@
         },
         "hold_id": {
           "minLength": 1,
+          "pattern": "^[!-~]+$(?![\\s\\S])",
           "type": "string"
         },
         "id": {
           "minLength": 1,
+          "pattern": "^[!-~]+$(?![\\s\\S])",
           "type": "string"
         },
         "opened_at": {
-          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$",
+          "pattern": "^(?:[0-9]{4}-(?:(?:01|03|05|07|08|10|12)-(?:0[1-9]|[12][0-9]|3[01])|(?:04|06|09|11)-(?:0[1-9]|[12][0-9]|30)|02-(?:0[1-9]|1[0-9]|2[0-8]))|(?:[0-9]{2}(?:0[48]|[2468][048]|[13579][26])|(?:[02468][048]|[13579][26])00)-02-29)T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,9})?Z$",
           "type": "string"
         }
       },
@@ -1498,7 +1593,7 @@
       "description": "\u00a76.G3: exhaustion, owner_decision, transport_exhausted and operator release only\nexplicitly.",
       "properties": {
         "at": {
-          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$",
+          "pattern": "^(?:[0-9]{4}-(?:(?:01|03|05|07|08|10|12)-(?:0[1-9]|[12][0-9]|3[01])|(?:04|06|09|11)-(?:0[1-9]|[12][0-9]|30)|02-(?:0[1-9]|1[0-9]|2[0-8]))|(?:[0-9]{2}(?:0[48]|[2468][048]|[13579][26])|(?:[02468][048]|[13579][26])00)-02-29)T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,9})?Z$",
           "type": "string"
         },
         "blocks": {
@@ -1522,6 +1617,7 @@
         },
         "id": {
           "minLength": 1,
+          "pattern": "^[!-~]+$(?![\\s\\S])",
           "type": "string"
         },
         "kind": {
@@ -1608,11 +1704,16 @@
           "type": "integer"
         },
         "container_kind": {
-          "$ref": "#/$defs/SourceRecordKind"
+          "enum": [
+            "review_comment",
+            "issue_comment"
+          ],
+          "type": "string"
         },
         "line": {
           "anyOf": [
             {
+              "minimum": 1,
               "type": "integer"
             },
             {
@@ -1648,57 +1749,18 @@
       "type": "object"
     },
     "ExternalResult": {
-      "additionalProperties": false,
-      "properties": {
-        "findings": {
-          "items": {
-            "$ref": "#/$defs/ExternalFinding"
-          },
-          "type": "array"
+      "oneOf": [
+        {
+          "$ref": "#/$defs/CleanExternalResult"
         },
-        "reviewed_head": {
-          "pattern": "^[0-9a-f]{40}$",
-          "type": "string"
+        {
+          "$ref": "#/$defs/FindingsExternalResult"
         },
-        "schema_version": {
-          "const": "1",
-          "type": "string"
-        },
-        "source": {
-          "const": "codex",
-          "type": "string"
-        },
-        "source_record": {
-          "$ref": "#/$defs/SourceRef"
-        },
-        "submitted_at": {
-          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$",
-          "type": "string"
-        },
-        "verdict": {
-          "$ref": "#/$defs/ExternalVerdict"
+        {
+          "$ref": "#/$defs/IncompleteExternalResult"
         }
-      },
-      "required": [
-        "schema_version",
-        "source",
-        "reviewed_head",
-        "verdict",
-        "findings",
-        "source_record",
-        "submitted_at"
       ],
-      "title": "ExternalResult",
-      "type": "object"
-    },
-    "ExternalVerdict": {
-      "enum": [
-        "clean",
-        "findings",
-        "incomplete"
-      ],
-      "title": "ExternalVerdict",
-      "type": "string"
+      "title": "ExternalResult"
     },
     "Falsifier": {
       "additionalProperties": false,
@@ -1913,6 +1975,7 @@
         },
         "finding_id": {
           "minLength": 1,
+          "pattern": "^[!-~]+$(?![\\s\\S])",
           "type": "string"
         }
       },
@@ -1940,6 +2003,7 @@
       "properties": {
         "finding_id": {
           "minLength": 1,
+          "pattern": "^[!-~]+$(?![\\s\\S])",
           "type": "string"
         },
         "kind": {
@@ -2002,6 +2066,7 @@
         },
         "finding_id": {
           "minLength": 1,
+          "pattern": "^[!-~]+$(?![\\s\\S])",
           "type": "string"
         },
         "kind": {
@@ -2021,7 +2086,7 @@
       "additionalProperties": false,
       "properties": {
         "at": {
-          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$",
+          "pattern": "^(?:[0-9]{4}-(?:(?:01|03|05|07|08|10|12)-(?:0[1-9]|[12][0-9]|3[01])|(?:04|06|09|11)-(?:0[1-9]|[12][0-9]|30)|02-(?:0[1-9]|1[0-9]|2[0-8]))|(?:[0-9]{2}(?:0[48]|[2468][048]|[13579][26])|(?:[02468][048]|[13579][26])00)-02-29)T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,9})?Z$",
           "type": "string"
         },
         "by": {
@@ -2042,6 +2107,7 @@
         },
         "other": {
           "minLength": 1,
+          "pattern": "^[!-~]+$(?![\\s\\S])",
           "type": "string"
         },
         "relation": {
@@ -2063,6 +2129,7 @@
       "properties": {
         "finding_id": {
           "minLength": 1,
+          "pattern": "^[!-~]+$(?![\\s\\S])",
           "type": "string"
         },
         "kind": {
@@ -2185,6 +2252,7 @@
       "properties": {
         "finding_id": {
           "minLength": 1,
+          "pattern": "^[!-~]+$(?![\\s\\S])",
           "type": "string"
         },
         "kind": {
@@ -2227,6 +2295,52 @@
         }
       ],
       "title": "FindingStatus"
+    },
+    "FindingsExternalResult": {
+      "additionalProperties": false,
+      "properties": {
+        "findings": {
+          "items": {
+            "$ref": "#/$defs/ExternalFinding"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "reviewed_head": {
+          "pattern": "^[0-9a-f]{40}$",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": "1",
+          "type": "string"
+        },
+        "source": {
+          "const": "codex",
+          "type": "string"
+        },
+        "source_record": {
+          "$ref": "#/$defs/SourceRef"
+        },
+        "submitted_at": {
+          "pattern": "^(?:[0-9]{4}-(?:(?:01|03|05|07|08|10|12)-(?:0[1-9]|[12][0-9]|3[01])|(?:04|06|09|11)-(?:0[1-9]|[12][0-9]|30)|02-(?:0[1-9]|1[0-9]|2[0-8]))|(?:[0-9]{2}(?:0[48]|[2468][048]|[13579][26])|(?:[02468][048]|[13579][26])00)-02-29)T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,9})?Z$",
+          "type": "string"
+        },
+        "verdict": {
+          "const": "findings",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_version",
+        "source",
+        "reviewed_head",
+        "source_record",
+        "submitted_at",
+        "verdict",
+        "findings"
+      ],
+      "title": "FindingsExternalResult",
+      "type": "object"
     },
     "FixedResolutionRequest": {
       "additionalProperties": false,
@@ -2407,7 +2521,7 @@
       "additionalProperties": false,
       "properties": {
         "at": {
-          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$",
+          "pattern": "^(?:[0-9]{4}-(?:(?:01|03|05|07|08|10|12)-(?:0[1-9]|[12][0-9]|3[01])|(?:04|06|09|11)-(?:0[1-9]|[12][0-9]|30)|02-(?:0[1-9]|1[0-9]|2[0-8]))|(?:[0-9]{2}(?:0[48]|[2468][048]|[13579][26])|(?:[02468][048]|[13579][26])00)-02-29)T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,9})?Z$",
           "type": "string"
         },
         "by": {
@@ -2443,6 +2557,7 @@
       "properties": {
         "hold_id": {
           "minLength": 1,
+          "pattern": "^[!-~]+$(?![\\s\\S])",
           "type": "string"
         },
         "kind": {
@@ -2489,6 +2604,51 @@
         "login"
       ],
       "title": "HumanAuthor",
+      "type": "object"
+    },
+    "IncompleteExternalResult": {
+      "additionalProperties": false,
+      "properties": {
+        "findings": {
+          "items": {
+            "$ref": "#/$defs/ExternalFinding"
+          },
+          "type": "array"
+        },
+        "reviewed_head": {
+          "pattern": "^[0-9a-f]{40}$",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": "1",
+          "type": "string"
+        },
+        "source": {
+          "const": "codex",
+          "type": "string"
+        },
+        "source_record": {
+          "$ref": "#/$defs/SourceRef"
+        },
+        "submitted_at": {
+          "pattern": "^(?:[0-9]{4}-(?:(?:01|03|05|07|08|10|12)-(?:0[1-9]|[12][0-9]|3[01])|(?:04|06|09|11)-(?:0[1-9]|[12][0-9]|30)|02-(?:0[1-9]|1[0-9]|2[0-8]))|(?:[0-9]{2}(?:0[48]|[2468][048]|[13579][26])|(?:[02468][048]|[13579][26])00)-02-29)T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,9})?Z$",
+          "type": "string"
+        },
+        "verdict": {
+          "const": "incomplete",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_version",
+        "source",
+        "reviewed_head",
+        "source_record",
+        "submitted_at",
+        "verdict",
+        "findings"
+      ],
+      "title": "IncompleteExternalResult",
       "type": "object"
     },
     "Lifecycle": {
@@ -2722,7 +2882,7 @@
           ]
         },
         "seen_at": {
-          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$",
+          "pattern": "^(?:[0-9]{4}-(?:(?:01|03|05|07|08|10|12)-(?:0[1-9]|[12][0-9]|3[01])|(?:04|06|09|11)-(?:0[1-9]|[12][0-9]|30)|02-(?:0[1-9]|1[0-9]|2[0-8]))|(?:[0-9]{2}(?:0[48]|[2468][048]|[13579][26])|(?:[02468][048]|[13579][26])00)-02-29)T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,9})?Z$",
           "type": "string"
         },
         "title": {
@@ -2758,9 +2918,8 @@
       "title": "ObservedRefreshed",
       "type": "object"
     },
-    "OpenRequestAction": {
+    "OpenRetrospectiveRequestAction": {
       "additionalProperties": false,
-      "description": "\u00a73.4 / \u00a76.D. The obligation's kind is ``request_kind`` (``kind`` names the verb).",
       "properties": {
         "assignee": {
           "pattern": "^[a-z0-9-]+$",
@@ -2771,18 +2930,12 @@
           "type": "string"
         },
         "mode": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ReviewMode"
-            },
-            {
-              "type": "null"
-            }
-          ]
+          "type": "null"
         },
         "names": {
           "items": {
             "minLength": 1,
+            "pattern": "^[!-~]+$(?![\\s\\S])",
             "type": "string"
           },
           "type": "array"
@@ -2791,7 +2944,8 @@
           "type": "string"
         },
         "request_kind": {
-          "$ref": "#/$defs/RequestKind"
+          "const": "retrospective",
+          "type": "string"
         },
         "required": {
           "type": "boolean"
@@ -2803,15 +2957,65 @@
       },
       "required": [
         "kind",
-        "request_kind",
-        "mode",
         "assignee",
         "subject_key",
         "required",
         "names",
-        "reason"
+        "reason",
+        "request_kind",
+        "mode"
       ],
-      "title": "OpenRequestAction",
+      "title": "OpenRetrospectiveRequestAction",
+      "type": "object"
+    },
+    "OpenReviewRequestAction": {
+      "additionalProperties": false,
+      "properties": {
+        "assignee": {
+          "pattern": "^[a-z0-9-]+$",
+          "type": "string"
+        },
+        "kind": {
+          "const": "OpenRequest",
+          "type": "string"
+        },
+        "mode": {
+          "$ref": "#/$defs/ReviewMode"
+        },
+        "names": {
+          "items": {
+            "minLength": 1,
+            "pattern": "^[!-~]+$(?![\\s\\S])",
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "request_kind": {
+          "const": "review",
+          "type": "string"
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "subject_key": {
+          "pattern": "^[0-9a-f]{40}:.+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "assignee",
+        "subject_key",
+        "required",
+        "names",
+        "reason",
+        "request_kind",
+        "mode"
+      ],
+      "title": "OpenReviewRequestAction",
       "type": "object"
     },
     "OperatorPrincipal": {
@@ -3142,6 +3346,7 @@
       "properties": {
         "act_id": {
           "minLength": 1,
+          "pattern": "^[!-~]+$(?![\\s\\S])",
           "type": "string"
         },
         "outcome": {
@@ -3161,6 +3366,7 @@
           "anyOf": [
             {
               "minLength": 1,
+              "pattern": "^[!-~]+$(?![\\s\\S])",
               "type": "string"
             },
             {
@@ -3304,6 +3510,7 @@
       "properties": {
         "hold_id": {
           "minLength": 1,
+          "pattern": "^[!-~]+$(?![\\s\\S])",
           "type": "string"
         },
         "kind": {
@@ -3336,6 +3543,7 @@
       "properties": {
         "batch_id": {
           "minLength": 1,
+          "pattern": "^[!-~]+$(?![\\s\\S])",
           "type": "string"
         },
         "replayed": {
@@ -3385,6 +3593,7 @@
           "anyOf": [
             {
               "minLength": 1,
+              "pattern": "^[!-~]+$(?![\\s\\S])",
               "type": "string"
             },
             {
@@ -3408,6 +3617,7 @@
         },
         "id": {
           "minLength": 1,
+          "pattern": "^[!-~]+$(?![\\s\\S])",
           "type": "string"
         },
         "kind": {
@@ -3426,12 +3636,13 @@
         "names": {
           "items": {
             "minLength": 1,
+            "pattern": "^[!-~]+$(?![\\s\\S])",
             "type": "string"
           },
           "type": "array"
         },
         "opened_at": {
-          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$",
+          "pattern": "^(?:[0-9]{4}-(?:(?:01|03|05|07|08|10|12)-(?:0[1-9]|[12][0-9]|3[01])|(?:04|06|09|11)-(?:0[1-9]|[12][0-9]|30)|02-(?:0[1-9]|1[0-9]|2[0-8]))|(?:[0-9]{2}(?:0[48]|[2468][048]|[13579][26])|(?:[02468][048]|[13579][26])00)-02-29)T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,9})?Z$",
           "type": "string"
         },
         "opened_by": {
@@ -3458,7 +3669,7 @@
         },
         "retransports": {
           "items": {
-            "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$",
+            "pattern": "^(?:[0-9]{4}-(?:(?:01|03|05|07|08|10|12)-(?:0[1-9]|[12][0-9]|3[01])|(?:04|06|09|11)-(?:0[1-9]|[12][0-9]|30)|02-(?:0[1-9]|1[0-9]|2[0-8]))|(?:[0-9]{2}(?:0[48]|[2468][048]|[13579][26])|(?:[02468][048]|[13579][26])00)-02-29)T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,9})?Z$",
             "type": "string"
           },
           "type": "array"
@@ -3474,6 +3685,7 @@
           "anyOf": [
             {
               "minLength": 1,
+              "pattern": "^[!-~]+$(?![\\s\\S])",
               "type": "string"
             },
             {
@@ -3525,6 +3737,7 @@
       "properties": {
         "answer_id": {
           "minLength": 1,
+          "pattern": "^[!-~]+$(?![\\s\\S])",
           "type": "string"
         },
         "kind": {
@@ -3533,6 +3746,7 @@
         },
         "request_id": {
           "minLength": 1,
+          "pattern": "^[!-~]+$(?![\\s\\S])",
           "type": "string"
         }
       },
@@ -3549,7 +3763,7 @@
       "description": "\u00a76.D \u2014 the named act that discharged an obligation without an answer.\n\nRetained on the request because it is the evidence the reducer's obligation restoration\nconsults: an operator's cancellation at a subject stands until that subject changes.",
       "properties": {
         "at": {
-          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$",
+          "pattern": "^(?:[0-9]{4}-(?:(?:01|03|05|07|08|10|12)-(?:0[1-9]|[12][0-9]|3[01])|(?:04|06|09|11)-(?:0[1-9]|[12][0-9]|30)|02-(?:0[1-9]|1[0-9]|2[0-8]))|(?:[0-9]{2}(?:0[48]|[2468][048]|[13579][26])|(?:[02468][048]|[13579][26])00)-02-29)T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,9})?Z$",
           "type": "string"
         },
         "by": {
@@ -3586,7 +3800,7 @@
       "description": "\u00a76.D \u2014 the only discharge of a required obligation short of an answer or an exemption.\n\n``by`` and ``at`` are materialized onto ``Request.cancellation`` so the reducer can tell an\noperator's decision from the system's bookkeeping (\u00a76.D9).",
       "properties": {
         "at": {
-          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$",
+          "pattern": "^(?:[0-9]{4}-(?:(?:01|03|05|07|08|10|12)-(?:0[1-9]|[12][0-9]|3[01])|(?:04|06|09|11)-(?:0[1-9]|[12][0-9]|30)|02-(?:0[1-9]|1[0-9]|2[0-8]))|(?:[0-9]{2}(?:0[48]|[2468][048]|[13579][26])|(?:[02468][048]|[13579][26])00)-02-29)T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,9})?Z$",
           "type": "string"
         },
         "by": {
@@ -3615,6 +3829,7 @@
         },
         "request_id": {
           "minLength": 1,
+          "pattern": "^[!-~]+$(?![\\s\\S])",
           "type": "string"
         }
       },
@@ -3675,6 +3890,7 @@
         "names": {
           "items": {
             "minLength": 1,
+            "pattern": "^[!-~]+$(?![\\s\\S])",
             "type": "string"
           },
           "type": "array"
@@ -3685,6 +3901,7 @@
         },
         "request_id": {
           "minLength": 1,
+          "pattern": "^[!-~]+$(?![\\s\\S])",
           "type": "string"
         },
         "required": {
@@ -3693,6 +3910,7 @@
         },
         "supersedes": {
           "minLength": 1,
+          "pattern": "^[!-~]+$(?![\\s\\S])",
           "type": "string"
         }
       },
@@ -3713,7 +3931,7 @@
       "description": "\u00a76.D6 \u2014 housekeeping queued one more transport effect for a stalled request.",
       "properties": {
         "at": {
-          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$",
+          "pattern": "^(?:[0-9]{4}-(?:(?:01|03|05|07|08|10|12)-(?:0[1-9]|[12][0-9]|3[01])|(?:04|06|09|11)-(?:0[1-9]|[12][0-9]|30)|02-(?:0[1-9]|1[0-9]|2[0-8]))|(?:[0-9]{2}(?:0[48]|[2468][048]|[13579][26])|(?:[02468][048]|[13579][26])00)-02-29)T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,9})?Z$",
           "type": "string"
         },
         "attempt": {
@@ -3726,6 +3944,7 @@
         },
         "request_id": {
           "minLength": 1,
+          "pattern": "^[!-~]+$(?![\\s\\S])",
           "type": "string"
         }
       },
@@ -3762,6 +3981,7 @@
         },
         "request_id": {
           "minLength": 1,
+          "pattern": "^[!-~]+$(?![\\s\\S])",
           "type": "string"
         }
       },
@@ -3779,6 +3999,7 @@
         "required_request_pending": {
           "items": {
             "minLength": 1,
+            "pattern": "^[!-~]+$(?![\\s\\S])",
             "type": "string"
           },
           "type": "array"
@@ -3829,6 +4050,7 @@
         "by": {
           "items": {
             "minLength": 1,
+            "pattern": "^[!-~]+$(?![\\s\\S])",
             "type": "string"
           },
           "type": "array"
@@ -3856,6 +4078,7 @@
         "pending": {
           "items": {
             "minLength": 1,
+            "pattern": "^[!-~]+$(?![\\s\\S])",
             "type": "string"
           },
           "type": "array"
@@ -3883,6 +4106,7 @@
         "requirement_unsatisfied": {
           "items": {
             "minLength": 1,
+            "pattern": "^[!-~]+$(?![\\s\\S])",
             "type": "string"
           },
           "type": "array"
@@ -3899,7 +4123,7 @@
       "description": "\u00a73.5 / \u00a76.F3.",
       "properties": {
         "at": {
-          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$",
+          "pattern": "^(?:[0-9]{4}-(?:(?:01|03|05|07|08|10|12)-(?:0[1-9]|[12][0-9]|3[01])|(?:04|06|09|11)-(?:0[1-9]|[12][0-9]|30)|02-(?:0[1-9]|1[0-9]|2[0-8]))|(?:[0-9]{2}(?:0[48]|[2468][048]|[13579][26])|(?:[02468][048]|[13579][26])00)-02-29)T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,9})?Z$",
           "type": "string"
         },
         "by": {
@@ -3929,6 +4153,7 @@
           "anyOf": [
             {
               "minLength": 1,
+              "pattern": "^[!-~]+$(?![\\s\\S])",
               "type": "string"
             },
             {
@@ -4032,6 +4257,7 @@
       "properties": {
         "finding_id": {
           "minLength": 1,
+          "pattern": "^[!-~]+$(?![\\s\\S])",
           "type": "string"
         },
         "kind": {
@@ -4077,6 +4303,7 @@
       "properties": {
         "answer_id": {
           "minLength": 1,
+          "pattern": "^[!-~]+$(?![\\s\\S])",
           "type": "string"
         },
         "kind": {
@@ -4171,6 +4398,7 @@
         },
         "id": {
           "minLength": 1,
+          "pattern": "^[!-~]+$(?![\\s\\S])",
           "type": "string"
         },
         "key": {
@@ -4614,6 +4842,7 @@
         },
         "id": {
           "minLength": 1,
+          "pattern": "^[!-~]+$(?![\\s\\S])",
           "type": "string"
         },
         "key": {
@@ -4808,6 +5037,7 @@
         },
         "other": {
           "minLength": 1,
+          "pattern": "^[!-~]+$(?![\\s\\S])",
           "type": "string"
         }
       },
@@ -4913,7 +5143,7 @@
         "until": {
           "anyOf": [
             {
-              "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$",
+              "pattern": "^(?:[0-9]{4}-(?:(?:01|03|05|07|08|10|12)-(?:0[1-9]|[12][0-9]|3[01])|(?:04|06|09|11)-(?:0[1-9]|[12][0-9]|30)|02-(?:0[1-9]|1[0-9]|2[0-8]))|(?:[0-9]{2}(?:0[48]|[2468][048]|[13579][26])|(?:[02468][048]|[13579][26])00)-02-29)T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,9})?Z$",
               "type": "string"
             },
             {
@@ -5015,7 +5245,7 @@
           "type": "string"
         },
         "first_seen_at": {
-          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$",
+          "pattern": "^(?:[0-9]{4}-(?:(?:01|03|05|07|08|10|12)-(?:0[1-9]|[12][0-9]|3[01])|(?:04|06|09|11)-(?:0[1-9]|[12][0-9]|30)|02-(?:0[1-9]|1[0-9]|2[0-8]))|(?:[0-9]{2}(?:0[48]|[2468][048]|[13579][26])|(?:[02468][048]|[13579][26])00)-02-29)T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,9})?Z$",
           "type": "string"
         },
         "head_sha": {
@@ -5091,7 +5321,7 @@
       "description": "\u00a76.G3: only ``human_gate`` and ``stack`` may release on subject change.",
       "properties": {
         "at": {
-          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$",
+          "pattern": "^(?:[0-9]{4}-(?:(?:01|03|05|07|08|10|12)-(?:0[1-9]|[12][0-9]|3[01])|(?:04|06|09|11)-(?:0[1-9]|[12][0-9]|30)|02-(?:0[1-9]|1[0-9]|2[0-8]))|(?:[0-9]{2}(?:0[48]|[2468][048]|[13579][26])|(?:[02468][048]|[13579][26])00)-02-29)T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,9})?Z$",
           "type": "string"
         },
         "blocks": {
@@ -5115,6 +5345,7 @@
         },
         "id": {
           "minLength": 1,
+          "pattern": "^[!-~]+$(?![\\s\\S])",
           "type": "string"
         },
         "kind": {
@@ -5210,10 +5441,15 @@
         "summon_comment_id": {
           "minimum": 1,
           "type": "integer"
+        },
+        "summon_login": {
+          "minLength": 1,
+          "type": "string"
         }
       },
       "required": [
-        "summon_comment_id"
+        "summon_comment_id",
+        "summon_login"
       ],
       "title": "SummonRef",
       "type": "object"
@@ -5320,13 +5556,13 @@
           "$ref": "#/$defs/AvailabilityReason"
         },
         "since": {
-          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$",
+          "pattern": "^(?:[0-9]{4}-(?:(?:01|03|05|07|08|10|12)-(?:0[1-9]|[12][0-9]|3[01])|(?:04|06|09|11)-(?:0[1-9]|[12][0-9]|30)|02-(?:0[1-9]|1[0-9]|2[0-8]))|(?:[0-9]{2}(?:0[48]|[2468][048]|[13579][26])|(?:[02468][048]|[13579][26])00)-02-29)T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,9})?Z$",
           "type": "string"
         },
         "until": {
           "anyOf": [
             {
-              "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$",
+              "pattern": "^(?:[0-9]{4}-(?:(?:01|03|05|07|08|10|12)-(?:0[1-9]|[12][0-9]|3[01])|(?:04|06|09|11)-(?:0[1-9]|[12][0-9]|30)|02-(?:0[1-9]|1[0-9]|2[0-8]))|(?:[0-9]{2}(?:0[48]|[2468][048]|[13579][26])|(?:[02468][048]|[13579][26])00)-02-29)T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,9})?Z$",
               "type": "string"
             },
             {

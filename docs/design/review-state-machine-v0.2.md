@@ -247,7 +247,7 @@ interface AdmittedFinding {
   review_id: ReviewId; subject_key: string;       // where it was raised
   raised_by: ActorId | "codex"; answer_id: string | null;   // null for unsolicited external evidence
   source: { fingerprint: string; semantic_key: string }
-        | { container_kind: "review" | "review_comment" | "issue_comment"; comment_id: number; locator: number };
+        | { container_kind: "review_comment" | "issue_comment"; comment_id: number; locator: number };
                                                   // native identity, retained: source container + item
   priority: "P0" | "P1" | "P2" | "P3" | "unknown";
   reviewer_disposition: "must-fix" | "owner-decision" | "follow-up" | "noise" | null;   // reviewkit only
@@ -397,13 +397,15 @@ type RefusalCode = "stale_revision" | "unauthorized" | "lifecycle" | "unknown_su
 - **C1** `ObservePR` is a whole-state observation: the reducer diffs it against the Review and derives
   each consequence independently — a subject change, a lifecycle transition, a draft flip, a metadata
   refresh. An unchanged subject preserves judgments; it never suppresses the other consequences (the v0.1
-  no-op defect).
+  no-op defect). When only the observation time changes, the audit batch records the observation
+  without refreshing projections or renewing the Review's activity window.
 - **C2** Subject change: pending requests at the old subject are cancelled (`subject_changed`); holds with
   `release_on: subject_change` release; the exemption is recomputed; then, unless draft, exempt, closed,
   merged, or a summons-blocking hold is active, the system opens the initial required request per policy
   and routing (§D).
 - **C3** Lifecycle: `open → closed` pauses (pending requests stay pending, transport paused, readiness
-  false); `closed → open` resumes with history intact; `→ merged` is terminal for new work: every act but
+  false); `closed → open` resumes with history intact and opens the initial request if the Review
+  was first observed closed and has never had a review request at this subject; `→ merged` is terminal for new work: every act but
   `read`, `Release`, `ResolveFinding(follow_up)` and `RetractAnswer` (lineage hygiene) is refused
   `lifecycle`.
 - **C4** Draft: no auto-request while draft; `draft → ready-for-review` at an unchanged subject opens the
@@ -628,7 +630,8 @@ reads the policy by the Review's version; the batch records it (§B3).
   outbox and go out on the tick that finds them.
 - A `notice` is a standing message to an actor about a subject, named by the subject rather than by a
   request. It is **not request transport**: the §D8 pause never withholds it (it is what explains the
-  pause), and it goes obsolete only when the Review has left the subject it names.
+  pause), and it goes obsolete only when the Review has left the subject it names. Its payload is
+  exactly `actor`, `text`, and `dedupe_key`; the subject is carried by the target.
 - `thread:<comment_id>` names the **container**, and only a `review_comment` container has a GitHub
   review thread: a finding whose container is an `issue_comment` never queues a `thread:` effect. The
   thread renders from every finding in that container — resolved once all of them are closed,
@@ -637,7 +640,10 @@ reads the policy by the Review's version; the batch records it (§B3).
   pending refreshes for the same target coalesce into the newest. A delayed worker can never publish an
   older verdict because it never carries one.
 - An actionable job re-checks applicability against the current Review before dispatch (§D7) and marks
-  itself `obsolete` otherwise. At-least-once remains; duplicates are self-identifying by `effect_id`.
+  itself `obsolete` otherwise. At-least-once remains; summon comments identify the request,
+  `effect_id`, and attempt. Interrupted claims retry after backoff; the 50th failed attempt
+  atomically queues a durable failure notice in the Review's Slack thread (or the broker channel
+  when the Review has no Slack channel).
 - **Check run `weave/review`** at the current head: `success` ⇔ `readiness.ready`; otherwise `failure`
   with the first reason in precedence order: merged > closed > hold > exhausted > required request pending
   > requirement unsatisfied > blocking findings > draft. **`neutral`/`skipped` are never published**
@@ -646,10 +652,12 @@ reads the policy by the Review's version; the batch records it (§B3).
   only comment the belt writes and it carries no marker. It renders open and resolved findings with their
   resolutions (including "fixed, claimed by talos @ sha, unconfirmed"), requests with transport
   references, holds, charges, the exhaustion gate text, and unknown-severity findings prominently.
-- **Thread resolution** (ruled): a finding with a GitHub source comment gets its review thread resolved
+- **Thread resolution** (ruled): a finding whose source is a GitHub `review_comment` gets its review thread resolved
   when its status becomes closed and un-resolved when it becomes contested or re-opened — GraphQL
   `resolveReviewThread`/`unresolveReviewThread` under the App. The merge skill's "zero open threads" limb
-  stays and now agrees with the Review by construction.
+  stays and now agrees with the Review by construction. `issue_comment` findings never emit a
+  review-thread operation. Slack thread and opener handles are keyed by channel, so adopting a
+  policy with a different channel opens a thread in that channel.
 - **Slack**: deliveries to seats (burn digest, clean wake, gate, retrospective) are Hive deliveries minted
   with a `system` origin — a small `ingestEvent` extension, otherwise the ordinary ledger, outbox, R-3/R-6.
   The merge announcement (today's `announce-machine-merge` job) is the `announce` effect of
@@ -825,7 +833,7 @@ section. **Tickets, reconciled against Linear on 2026-09-06** (bodies read throu
 ### Verification items (facts to establish, not forks)
 
 - **V-0** live probe: can a fine-grained PAT create a check run today? (Decides nothing; records the truth.)
-- **V-1** does Codex honour `@codex review` from the App identity?
+- **V-1 — verified 2026-09-06: no.** App summon [5561560923](https://github.com/Skrates/hive/pull/68#issuecomment-5561560923) received the connector's connect-account refusal. Codex summons therefore use the connected user token from `HIVE_GITHUB_SUMMON_TOKEN_FILE`; the returned `summon_login` is recorded with the comment id. App credentials continue to own all projections.
 - **V-2** can the dev box tunnel reach the host-network broker (ingress → tailnet IP or a host `cloudflared`)?
 - **V-3** required check pinned to the App on weave-doctrine's ruleset, strict policy, proven with a real PR.
 - **V-4** what fraction of historical Codex findings are badge-less (the adapter keeps them as `unknown`).
@@ -857,3 +865,9 @@ as a cutover verification line (§10.2 step 4), not a ticket.
 - **F-12 Conflict-aware summons (D8, from KRA-1362)** — ruled (a). (b) summon and charge, and (c) summon
   without charging, were declined; (c) would have created a second uncharged-head class beside G2.
 - **wd#167 (KRA-1289 + KRA-1121)** — closed by Hákon; tickets cancelled as superseded.
+
+### Live completion and publication clarifications (2026-09-06)
+
+Current Codex clean completion can consist of a completed summary at the current head plus a Codex-authored PR approval reaction, with no review envelope or inline findings at that head. Either signal alone is status. The pending-request sweep observes a reaction that arrives after the summary webhook; the summary version is admitted once.
+
+Slack actionables remain unclaimed until the channel's board opener has a posted timestamp. Board refreshes run first; the normal broker outbox drains before the next publisher pass. Connected-user summon webhooks whose comment IDs are already recorded are skipped as own publications. An uncertain POST without a recorded response can still cause one bounded reconciliation; no-op observations create no feedback cycle.
