@@ -1,0 +1,24 @@
+# Vendored review contract (design §2.1)
+
+source_repo: weave-doctrine
+source_sha: 84af72b31f0a9c98a2b3798a7345360cc4a29ca6
+source_branch: gnomon/review-contract
+authority: skills/code-review/scripts/src/weave_reviewkit/contract.py
+
+# The exact command that produced schemas/review-contract.schema.json, run in
+# weave-doctrine at source_sha from skills/code-review/scripts/:
+export_command: uv run reviewkit schema --out ../schemas
+
+# What is vendored and from where (paths relative to the weave-doctrine checkout):
+#   schemas/review-contract.schema.json  <- skills/code-review/schemas/review-contract.schema.json
+#   conformance/valid/*.json             <- skills/code-review/schemas/conformance/valid/*.json
+#   conformance/invalid/*.json           <- skills/code-review/schemas/conformance/invalid/*.json
+#
+# Only review-contract.schema.json is vendored: its $defs already hold ReviewReport and
+# ReviewResolution, so vendoring the standalone review-report / review-resolution files too
+# would generate every reviewkit type twice.
+#
+# Re-vendor: copy the three items above, update source_sha, run `bun run check:contracts`
+# (regenerates src/review/contract.generated.ts and fails on drift), commit both.
+# Drift between this copy and weave-doctrine's export is a ticket and a re-vendor PR, never a
+# tolerant reader.

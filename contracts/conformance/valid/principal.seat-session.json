@@ -1,0 +1,10 @@
+{
+  "instance": {
+    "actor": "gnomon",
+    "custody": {
+      "session_id": "sess_01"
+    },
+    "kind": "seat"
+  },
+  "model": "principal"
+}

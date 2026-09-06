@@ -1,0 +1,111 @@
+{
+  "instance": {
+    "kind": "Answer",
+    "request_id": "req_01",
+    "subject_key": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:main",
+    "submission": {
+      "arm": "reviewkit",
+      "report": {
+        "appeal_fingerprint": null,
+        "author": "talos",
+        "automatic_chain_terminal": false,
+        "base_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "blind_spots": [],
+        "chain_id": "Owner/repo#7:aaaaaaaaaaaa",
+        "completion": "complete",
+        "coverage": [
+          {
+            "area": "durable recovery",
+            "finding_id": "F1",
+            "id": "A1",
+            "next_step": null,
+            "paths": [
+              "src/x.py"
+            ],
+            "reason": null,
+            "status": "finding"
+          }
+        ],
+        "created_at": "2026-09-06T12:00:00.000Z",
+        "findings": [
+          {
+            "confidence": "high",
+            "contract_basis": {
+              "authority": "data-integrity-invariant",
+              "expectation": "A durable value survives process replay.",
+              "reference": "KRA-1"
+            },
+            "diff_anchor": {
+              "end_line": 12,
+              "note": null,
+              "path": "src/x.py",
+              "start_line": 10
+            },
+            "disposition": "must-fix",
+            "evidence": [
+              {
+                "command": null,
+                "control": null,
+                "coordinates": [],
+                "kind": "preimage-control",
+                "observed": null,
+                "statement": "Head returns zero while the merge base returns the persisted value."
+              }
+            ],
+            "failure": "The changed branch returns an empty accumulator and silently drops the durable value.",
+            "falsifier": {
+              "command": null,
+              "control": null,
+              "description": "Persist one million, replay with an empty accumulator, and assert one million.",
+              "expected_failure": null,
+              "status": "demonstrated"
+            },
+            "fingerprint": "ifp-sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "id": "F1",
+            "impact": "The pursuit is undercharged and later ceiling decisions use a false total.",
+            "introduced_by": "The diff added an early return before the durable record lookup.",
+            "look_here_first": [
+              {
+                "end_line": 12,
+                "note": null,
+                "path": "src/x.py",
+                "start_line": 10
+              }
+            ],
+            "material_cure_regression": false,
+            "parent_fingerprint": null,
+            "priority": "P2",
+            "reachability": "A failed attempt persists the value, the process exits, and replay enters this branch.",
+            "repair_boundary": "Replay must consult durable evidence before any empty-process-local fallback.",
+            "reviewer_designed": false,
+            "semantic_key": "behavior; entry=x; contract=returns the persisted value; effect=returns zero",
+            "suggested_remedy": null,
+            "title": "Returns zero instead of the persisted value"
+          }
+        ],
+        "generation": 0,
+        "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "merge_base_sha": "cccccccccccccccccccccccccccccccccccccccc",
+        "mode": "initial",
+        "orchestration": "single-reviewer",
+        "orchestration_reason": "one persistence seam",
+        "overall_assessment": "Bounded exact-head review.",
+        "packet_scope_fingerprint": "scope-sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "parent_report_id": null,
+        "parent_resolution_id": null,
+        "pr_number": 7,
+        "questions": [],
+        "recommendation": "changes-requested",
+        "report_id": "review-0001",
+        "repository": "Owner/repo",
+        "reviewer": "ariadne",
+        "reviewer_authored_scope": false,
+        "reviewer_designed_parent_cure": false,
+        "schema_version": "1",
+        "self_review": false,
+        "verification": []
+      }
+    }
+  },
+  "model": "action"
+}

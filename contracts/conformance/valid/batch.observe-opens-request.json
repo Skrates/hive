@@ -1,0 +1,118 @@
+{
+  "instance": {
+    "admitted_at": "2026-09-06T12:00:00.000Z",
+    "batch_id": "bat_01J_1",
+    "command": {
+      "act_id": "obs:run_01J",
+      "action": {
+        "draft": false,
+        "kind": "ObservePR",
+        "lifecycle": "open",
+        "observed": {
+          "author_login": "talos-weave",
+          "base_sha_now": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "head_ref": "feature",
+          "mergeable": true,
+          "seen_at": "2026-09-06T12:00:00.000Z",
+          "title": "Fix x"
+        },
+        "subject": {
+          "author": {
+            "actor": "talos",
+            "kind": "seat"
+          },
+          "base_ref": "main",
+          "base_sha_at_first_sight": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "changed_paths": [
+            "src/x.py"
+          ],
+          "diff_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "first_seen_at": "2026-09-06T12:00:00.000Z",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "key": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:main",
+          "merge_base_sha": "cccccccccccccccccccccccccccccccccccccccc"
+        }
+      },
+      "expected_revision": null,
+      "principal": {
+        "event_login": "chatgpt-codex-connector[bot]",
+        "kind": "adapter",
+        "reconcile_run": "run_01J",
+        "source": "github"
+      }
+    },
+    "consequences": [
+      {
+        "kind": "subject_changed",
+        "previous_key": null,
+        "subject": {
+          "author": {
+            "actor": "talos",
+            "kind": "seat"
+          },
+          "base_ref": "main",
+          "base_sha_at_first_sight": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "changed_paths": [
+            "src/x.py"
+          ],
+          "diff_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "first_seen_at": "2026-09-06T12:00:00.000Z",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "key": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:main",
+          "merge_base_sha": "cccccccccccccccccccccccccccccccccccccccc"
+        }
+      },
+      {
+        "kind": "mergeable_observed",
+        "mergeable": true
+      },
+      {
+        "kind": "request_opened",
+        "request": {
+          "answered_by": null,
+          "assignee": "codex",
+          "id": "req_obs:run_01J_1",
+          "kind": "review",
+          "mode": "initial",
+          "names": [],
+          "opened_at": "2026-09-06T12:00:00.000Z",
+          "opened_by": {
+            "caused_by": "obs:run_01J",
+            "kind": "system"
+          },
+          "reason": "routing_by_round.first",
+          "required": true,
+          "status": "pending",
+          "subject_key": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:main",
+          "supersedes": null,
+          "transport": []
+        }
+      }
+    ],
+    "effects": [
+      {
+        "effect_id": "eff_obs:run_01J_1",
+        "kind": "actionable",
+        "payload": null,
+        "target": "summon:req_obs:run_01J_1"
+      },
+      {
+        "effect_id": "eff_obs:run_01J_2",
+        "kind": "refresh",
+        "payload": null,
+        "target": "check:Owner/repo:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      {
+        "effect_id": "eff_obs:run_01J_3",
+        "kind": "refresh",
+        "payload": {
+          "note": "opened"
+        },
+        "target": "board:rev_01J"
+      }
+    ],
+    "policy_version": 1,
+    "revision": 1
+  },
+  "model": "batch"
+}

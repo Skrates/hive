@@ -1,0 +1,15 @@
+{
+  "instance": {
+    "hold": {
+      "blocks": {
+        "readiness": true,
+        "summons": true
+      },
+      "kind": "operator",
+      "reason": "freeze",
+      "release_on": "explicit"
+    },
+    "kind": "Hold"
+  },
+  "model": "action"
+}

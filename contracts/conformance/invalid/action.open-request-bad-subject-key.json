@@ -1,0 +1,20 @@
+{
+  "expect": {
+    "code": "malformed",
+    "why": "subject_key is `<head_sha>:<base_ref>`"
+  },
+  "instance": {
+    "assignee": "ariadne",
+    "kind": "OpenRequest",
+    "mode": "closure",
+    "names": [
+      "fnd_01",
+      "fnd_02"
+    ],
+    "reason": "burn landed",
+    "request_kind": "review",
+    "required": true,
+    "subject_key": "main"
+  },
+  "model": "action"
+}

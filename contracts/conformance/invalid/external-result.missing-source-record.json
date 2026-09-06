@@ -1,0 +1,24 @@
+{
+  "expect": {
+    "code": "malformed",
+    "why": "provenance is the record (\u00a72.3)"
+  },
+  "instance": {
+    "findings": [
+      {
+        "body": "The loop skips the last record.",
+        "line": 12,
+        "path": "src/x.py",
+        "priority": "P1",
+        "source_comment_id": 9001,
+        "title": "Off-by-one in replay window"
+      }
+    ],
+    "reviewed_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "schema_version": "1",
+    "source": "codex",
+    "submitted_at": "2026-09-06T12:00:00.000Z",
+    "verdict": "findings"
+  },
+  "model": "external_result"
+}

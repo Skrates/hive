@@ -1,0 +1,8 @@
+{
+  "instance": {
+    "kind": "GrantRounds",
+    "n": 2,
+    "reason": "one more burn"
+  },
+  "model": "action"
+}

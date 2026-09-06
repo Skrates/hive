@@ -1,0 +1,5283 @@
+{
+  "$defs": {
+    "Action": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/ObservePRAction"
+        },
+        {
+          "$ref": "#/$defs/AdmitExternalResultAction"
+        },
+        {
+          "$ref": "#/$defs/SetReviewerAvailabilityAction"
+        },
+        {
+          "$ref": "#/$defs/OpenRequestAction"
+        },
+        {
+          "$ref": "#/$defs/CancelRequestAction"
+        },
+        {
+          "$ref": "#/$defs/AnswerAction"
+        },
+        {
+          "$ref": "#/$defs/RetractAnswerAction"
+        },
+        {
+          "$ref": "#/$defs/ResolveFindingAction"
+        },
+        {
+          "$ref": "#/$defs/ClassifyFindingAction"
+        },
+        {
+          "$ref": "#/$defs/HoldAction"
+        },
+        {
+          "$ref": "#/$defs/ReleaseAction"
+        },
+        {
+          "$ref": "#/$defs/GrantRoundsAction"
+        },
+        {
+          "$ref": "#/$defs/AdoptPolicyAction"
+        }
+      ],
+      "title": "Action"
+    },
+    "AdapterPrincipal": {
+      "additionalProperties": false,
+      "properties": {
+        "event_login": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "kind": {
+          "const": "adapter",
+          "type": "string"
+        },
+        "reconcile_run": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "source": {
+          "const": "github",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "source",
+        "reconcile_run",
+        "event_login"
+      ],
+      "title": "AdapterPrincipal",
+      "type": "object"
+    },
+    "AdmitExternalResultAction": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "AdmitExternalResult",
+          "type": "string"
+        },
+        "result": {
+          "$ref": "#/$defs/ExternalResult"
+        }
+      },
+      "required": [
+        "kind",
+        "result"
+      ],
+      "title": "AdmitExternalResultAction",
+      "type": "object"
+    },
+    "AdmittedFinding": {
+      "additionalProperties": false,
+      "description": "\u00a73.5 \u2014 an obligation with an immutable id and its native source identity.",
+      "properties": {
+        "answer_id": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "correlation_hints": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "line": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "links": {
+          "items": {
+            "$ref": "#/$defs/FindingLink"
+          },
+          "type": "array"
+        },
+        "path": {
+          "type": "string"
+        },
+        "priority": {
+          "$ref": "#/$defs/FindingPriority"
+        },
+        "raised_by": {
+          "pattern": "^[a-z0-9-]+$",
+          "type": "string"
+        },
+        "review_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "reviewer_disposition": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Disposition"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReviewkitFindingSource"
+            },
+            {
+              "$ref": "#/$defs/CommentFindingSource"
+            }
+          ]
+        },
+        "status": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FindingOpen"
+            },
+            {
+              "$ref": "#/$defs/FindingClosed"
+            },
+            {
+              "$ref": "#/$defs/FindingContested"
+            }
+          ]
+        },
+        "subject_key": {
+          "pattern": "^[0-9a-f]{40}:.+$",
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "review_id",
+        "subject_key",
+        "raised_by",
+        "answer_id",
+        "source",
+        "priority",
+        "reviewer_disposition",
+        "title",
+        "path",
+        "line",
+        "status",
+        "links",
+        "correlation_hints"
+      ],
+      "title": "AdmittedFinding",
+      "type": "object"
+    },
+    "AdoptPolicyAction": {
+      "additionalProperties": false,
+      "description": "\u00a76.I.",
+      "properties": {
+        "kind": {
+          "const": "AdoptPolicy",
+          "type": "string"
+        },
+        "version": {
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "kind",
+        "version"
+      ],
+      "title": "AdoptPolicyAction",
+      "type": "object"
+    },
+    "Answer": {
+      "additionalProperties": false,
+      "properties": {
+        "admitted_at": {
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$",
+          "type": "string"
+        },
+        "id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "normalized": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NormalizedResult"
+            },
+            {
+              "$ref": "#/$defs/Testimony"
+            }
+          ]
+        },
+        "principal": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/SeatPrincipal"
+            },
+            {
+              "$ref": "#/$defs/OperatorPrincipal"
+            },
+            {
+              "$ref": "#/$defs/AdapterPrincipal"
+            },
+            {
+              "$ref": "#/$defs/SystemPrincipal"
+            }
+          ]
+        },
+        "request_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/AnswerStatus"
+        },
+        "subject_key": {
+          "pattern": "^[0-9a-f]{40}:.+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "request_id",
+        "subject_key",
+        "principal",
+        "admitted_at",
+        "normalized",
+        "status"
+      ],
+      "title": "Answer",
+      "type": "object"
+    },
+    "AnswerAction": {
+      "additionalProperties": false,
+      "description": "\u00a76.E1 \u2014 binds the request, the subject and the report; nothing else discharges.",
+      "properties": {
+        "kind": {
+          "const": "Answer",
+          "type": "string"
+        },
+        "request_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "subject_key": {
+          "pattern": "^[0-9a-f]{40}:.+$",
+          "type": "string"
+        },
+        "submission": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/ReviewkitSubmission"
+            },
+            {
+              "$ref": "#/$defs/TestimonySubmission"
+            }
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "request_id",
+        "subject_key",
+        "submission"
+      ],
+      "title": "AnswerAction",
+      "type": "object"
+    },
+    "AnswerAdmitted": {
+      "additionalProperties": false,
+      "properties": {
+        "answer": {
+          "$ref": "#/$defs/Answer"
+        },
+        "kind": {
+          "const": "answer_admitted",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "answer"
+      ],
+      "title": "AnswerAdmitted",
+      "type": "object"
+    },
+    "AnswerRetracted": {
+      "additionalProperties": false,
+      "properties": {
+        "answer_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "kind": {
+          "const": "answer_retracted",
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "answer_id",
+        "reason"
+      ],
+      "title": "AnswerRetracted",
+      "type": "object"
+    },
+    "AnswerStatus": {
+      "enum": [
+        "standing",
+        "retracted"
+      ],
+      "title": "AnswerStatus",
+      "type": "string"
+    },
+    "AnswerSubmission": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/ReviewkitSubmission"
+        },
+        {
+          "$ref": "#/$defs/TestimonySubmission"
+        }
+      ],
+      "title": "AnswerSubmission"
+    },
+    "AppliedOutcome": {
+      "additionalProperties": false,
+      "properties": {
+        "applied": {
+          "const": true,
+          "type": "boolean"
+        },
+        "batch_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "effects": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "revision_after": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "revision_before": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "applied",
+        "revision_before",
+        "revision_after",
+        "batch_id",
+        "effects"
+      ],
+      "title": "AppliedOutcome",
+      "type": "object"
+    },
+    "Availability": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Available"
+        },
+        {
+          "$ref": "#/$defs/Unavailable"
+        }
+      ],
+      "title": "Availability"
+    },
+    "AvailabilityReason": {
+      "enum": [
+        "quota",
+        "connector",
+        "meter"
+      ],
+      "title": "AvailabilityReason",
+      "type": "string"
+    },
+    "AvailabilitySet": {
+      "additionalProperties": false,
+      "properties": {
+        "availability": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Available"
+            },
+            {
+              "$ref": "#/$defs/Unavailable"
+            }
+          ]
+        },
+        "kind": {
+          "const": "availability_set",
+          "type": "string"
+        },
+        "reviewer": {
+          "pattern": "^[a-z0-9-]+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "reviewer",
+        "availability"
+      ],
+      "title": "AvailabilitySet",
+      "type": "object"
+    },
+    "Available": {
+      "additionalProperties": false,
+      "properties": {
+        "available": {
+          "const": true,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "available"
+      ],
+      "title": "Available",
+      "type": "object"
+    },
+    "Batch": {
+      "additionalProperties": false,
+      "description": "\u00a75.B3 \u2014 the materialized transition; replay folds these and never calls ``decide``.",
+      "properties": {
+        "admitted_at": {
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$",
+          "type": "string"
+        },
+        "batch_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "command": {
+          "$ref": "#/$defs/Command"
+        },
+        "consequences": {
+          "items": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/SubjectChanged"
+              },
+              {
+                "$ref": "#/$defs/LifecycleChanged"
+              },
+              {
+                "$ref": "#/$defs/DraftChanged"
+              },
+              {
+                "$ref": "#/$defs/ObservedRefreshed"
+              },
+              {
+                "$ref": "#/$defs/ExemptionSet"
+              },
+              {
+                "$ref": "#/$defs/RequestOpened"
+              },
+              {
+                "$ref": "#/$defs/RequestCancelled"
+              },
+              {
+                "$ref": "#/$defs/RequestAnswered"
+              },
+              {
+                "$ref": "#/$defs/RequestUnanswerable"
+              },
+              {
+                "$ref": "#/$defs/AnswerAdmitted"
+              },
+              {
+                "$ref": "#/$defs/AnswerRetracted"
+              },
+              {
+                "$ref": "#/$defs/FindingAdmitted"
+              },
+              {
+                "$ref": "#/$defs/FindingResolved"
+              },
+              {
+                "$ref": "#/$defs/FindingContestedConsequence"
+              },
+              {
+                "$ref": "#/$defs/FindingLinked"
+              },
+              {
+                "$ref": "#/$defs/FindingClassified"
+              },
+              {
+                "$ref": "#/$defs/HoldPlaced"
+              },
+              {
+                "$ref": "#/$defs/HoldReleased"
+              },
+              {
+                "$ref": "#/$defs/ChargeRecorded"
+              },
+              {
+                "$ref": "#/$defs/EpisodeOpened"
+              },
+              {
+                "$ref": "#/$defs/EpisodeClosed"
+              },
+              {
+                "$ref": "#/$defs/AvailabilitySet"
+              },
+              {
+                "$ref": "#/$defs/RoundsGranted"
+              },
+              {
+                "$ref": "#/$defs/PolicyAdopted"
+              },
+              {
+                "$ref": "#/$defs/MergeableObserved"
+              }
+            ]
+          },
+          "type": "array"
+        },
+        "effects": {
+          "items": {
+            "$ref": "#/$defs/Effect"
+          },
+          "type": "array"
+        },
+        "policy_version": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "revision": {
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "batch_id",
+        "revision",
+        "command",
+        "admitted_at",
+        "policy_version",
+        "consequences",
+        "effects"
+      ],
+      "title": "Batch",
+      "type": "object"
+    },
+    "BlockingFindingsReason": {
+      "additionalProperties": false,
+      "properties": {
+        "blocking_findings": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "blocking_findings"
+      ],
+      "title": "BlockingFindingsReason",
+      "type": "object"
+    },
+    "Budget": {
+      "additionalProperties": false,
+      "properties": {
+        "granted": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rounds_max": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "rounds_max",
+        "granted"
+      ],
+      "title": "Budget",
+      "type": "object"
+    },
+    "CancelRequestAction": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "CancelRequest",
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "request_id": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "request_id",
+        "reason"
+      ],
+      "title": "CancelRequestAction",
+      "type": "object"
+    },
+    "Charge": {
+      "additionalProperties": false,
+      "description": "\u00a76.G1 \u2014 recorded once per subject on its first complete accepted answer.",
+      "properties": {
+        "answer_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "at": {
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$",
+          "type": "string"
+        },
+        "subject_key": {
+          "pattern": "^[0-9a-f]{40}:.+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "subject_key",
+        "answer_id",
+        "at"
+      ],
+      "title": "Charge",
+      "type": "object"
+    },
+    "ChargeRecorded": {
+      "additionalProperties": false,
+      "properties": {
+        "charge": {
+          "$ref": "#/$defs/Charge"
+        },
+        "kind": {
+          "const": "charge_recorded",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "charge"
+      ],
+      "title": "ChargeRecorded",
+      "type": "object"
+    },
+    "ClassifyFindingAction": {
+      "additionalProperties": false,
+      "description": "\u00a76.F5 \u2014 assigns a known priority; ``unknown`` is not a classification.",
+      "properties": {
+        "finding_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "kind": {
+          "const": "ClassifyFinding",
+          "type": "string"
+        },
+        "priority": {
+          "$ref": "#/$defs/Priority"
+        }
+      },
+      "required": [
+        "kind",
+        "finding_id",
+        "priority"
+      ],
+      "title": "ClassifyFindingAction",
+      "type": "object"
+    },
+    "CodexMeter": {
+      "additionalProperties": false,
+      "properties": {
+        "pool": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "threshold": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "type": "number"
+        },
+        "url": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "url",
+        "pool",
+        "threshold"
+      ],
+      "title": "CodexMeter",
+      "type": "object"
+    },
+    "Command": {
+      "additionalProperties": false,
+      "description": "\u00a75.B1-B2: the admitted command as recorded in the batch.",
+      "properties": {
+        "act_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "action": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/ObservePRAction"
+            },
+            {
+              "$ref": "#/$defs/AdmitExternalResultAction"
+            },
+            {
+              "$ref": "#/$defs/SetReviewerAvailabilityAction"
+            },
+            {
+              "$ref": "#/$defs/OpenRequestAction"
+            },
+            {
+              "$ref": "#/$defs/CancelRequestAction"
+            },
+            {
+              "$ref": "#/$defs/AnswerAction"
+            },
+            {
+              "$ref": "#/$defs/RetractAnswerAction"
+            },
+            {
+              "$ref": "#/$defs/ResolveFindingAction"
+            },
+            {
+              "$ref": "#/$defs/ClassifyFindingAction"
+            },
+            {
+              "$ref": "#/$defs/HoldAction"
+            },
+            {
+              "$ref": "#/$defs/ReleaseAction"
+            },
+            {
+              "$ref": "#/$defs/GrantRoundsAction"
+            },
+            {
+              "$ref": "#/$defs/AdoptPolicyAction"
+            }
+          ]
+        },
+        "expected_revision": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "principal": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/SeatPrincipal"
+            },
+            {
+              "$ref": "#/$defs/OperatorPrincipal"
+            },
+            {
+              "$ref": "#/$defs/AdapterPrincipal"
+            },
+            {
+              "$ref": "#/$defs/SystemPrincipal"
+            }
+          ]
+        }
+      },
+      "required": [
+        "act_id",
+        "principal",
+        "action",
+        "expected_revision"
+      ],
+      "title": "Command",
+      "type": "object"
+    },
+    "CommentDeliverable": {
+      "additionalProperties": false,
+      "properties": {
+        "comment_id": {
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "comment_id"
+      ],
+      "title": "CommentDeliverable",
+      "type": "object"
+    },
+    "CommentFindingSource": {
+      "additionalProperties": false,
+      "properties": {
+        "comment_id": {
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "comment_id"
+      ],
+      "title": "CommentFindingSource",
+      "type": "object"
+    },
+    "Completion": {
+      "enum": [
+        "complete",
+        "incomplete"
+      ],
+      "title": "Completion",
+      "type": "string"
+    },
+    "Confidence": {
+      "enum": [
+        "high",
+        "medium",
+        "low"
+      ],
+      "title": "Confidence",
+      "type": "string"
+    },
+    "Consequence": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/SubjectChanged"
+        },
+        {
+          "$ref": "#/$defs/LifecycleChanged"
+        },
+        {
+          "$ref": "#/$defs/DraftChanged"
+        },
+        {
+          "$ref": "#/$defs/ObservedRefreshed"
+        },
+        {
+          "$ref": "#/$defs/ExemptionSet"
+        },
+        {
+          "$ref": "#/$defs/RequestOpened"
+        },
+        {
+          "$ref": "#/$defs/RequestCancelled"
+        },
+        {
+          "$ref": "#/$defs/RequestAnswered"
+        },
+        {
+          "$ref": "#/$defs/RequestUnanswerable"
+        },
+        {
+          "$ref": "#/$defs/AnswerAdmitted"
+        },
+        {
+          "$ref": "#/$defs/AnswerRetracted"
+        },
+        {
+          "$ref": "#/$defs/FindingAdmitted"
+        },
+        {
+          "$ref": "#/$defs/FindingResolved"
+        },
+        {
+          "$ref": "#/$defs/FindingContestedConsequence"
+        },
+        {
+          "$ref": "#/$defs/FindingLinked"
+        },
+        {
+          "$ref": "#/$defs/FindingClassified"
+        },
+        {
+          "$ref": "#/$defs/HoldPlaced"
+        },
+        {
+          "$ref": "#/$defs/HoldReleased"
+        },
+        {
+          "$ref": "#/$defs/ChargeRecorded"
+        },
+        {
+          "$ref": "#/$defs/EpisodeOpened"
+        },
+        {
+          "$ref": "#/$defs/EpisodeClosed"
+        },
+        {
+          "$ref": "#/$defs/AvailabilitySet"
+        },
+        {
+          "$ref": "#/$defs/RoundsGranted"
+        },
+        {
+          "$ref": "#/$defs/PolicyAdopted"
+        },
+        {
+          "$ref": "#/$defs/MergeableObserved"
+        }
+      ],
+      "title": "Consequence"
+    },
+    "Contest": {
+      "additionalProperties": false,
+      "properties": {
+        "at": {
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$",
+          "type": "string"
+        },
+        "by": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "prior": {
+          "$ref": "#/$defs/Resolution"
+        }
+      },
+      "required": [
+        "by",
+        "at",
+        "prior"
+      ],
+      "title": "Contest",
+      "type": "object"
+    },
+    "ContractBasis": {
+      "additionalProperties": false,
+      "properties": {
+        "authority": {
+          "enum": [
+            "owner-decision",
+            "acceptance-criteria",
+            "public-contract",
+            "ratified-design",
+            "schema-or-law",
+            "repository-doc",
+            "data-integrity-invariant",
+            "unconfirmed-product-choice"
+          ],
+          "type": "string"
+        },
+        "expectation": {
+          "type": "string"
+        },
+        "reference": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "authority",
+        "reference",
+        "expectation"
+      ],
+      "title": "ContractBasis",
+      "type": "object"
+    },
+    "Coordinate": {
+      "additionalProperties": false,
+      "properties": {
+        "end_line": {
+          "exclusiveMinimum": 0,
+          "type": "integer"
+        },
+        "note": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "path": {
+          "type": "string"
+        },
+        "start_line": {
+          "exclusiveMinimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "path",
+        "start_line",
+        "end_line"
+      ],
+      "title": "Coordinate",
+      "type": "object"
+    },
+    "CoverageArea": {
+      "additionalProperties": false,
+      "properties": {
+        "area": {
+          "minLength": 3,
+          "type": "string"
+        },
+        "finding_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "id": {
+          "pattern": "^A[1-9][0-9]*$",
+          "type": "string"
+        },
+        "next_step": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "paths": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "status": {
+          "$ref": "#/$defs/CoverageStatus"
+        }
+      },
+      "required": [
+        "id",
+        "area",
+        "paths",
+        "status"
+      ],
+      "title": "CoverageArea",
+      "type": "object"
+    },
+    "CoverageStatus": {
+      "enum": [
+        "finding",
+        "reviewed-no-issue",
+        "not-review-relevant",
+        "not-covered"
+      ],
+      "title": "CoverageStatus",
+      "type": "string"
+    },
+    "DeliveryCustody": {
+      "additionalProperties": false,
+      "properties": {
+        "delivery_id": {
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "delivery_id"
+      ],
+      "title": "DeliveryCustody",
+      "type": "object"
+    },
+    "DeliveryRef": {
+      "additionalProperties": false,
+      "properties": {
+        "delivery_id": {
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "delivery_id"
+      ],
+      "title": "DeliveryRef",
+      "type": "object"
+    },
+    "Disposition": {
+      "enum": [
+        "must-fix",
+        "owner-decision",
+        "follow-up",
+        "noise"
+      ],
+      "title": "Disposition",
+      "type": "string"
+    },
+    "DraftChanged": {
+      "additionalProperties": false,
+      "properties": {
+        "draft": {
+          "type": "boolean"
+        },
+        "kind": {
+          "const": "draft_changed",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "draft"
+      ],
+      "title": "DraftChanged",
+      "type": "object"
+    },
+    "Effect": {
+      "additionalProperties": false,
+      "description": "\u00a78.1 \u2014 an outbox row with its own id; ``target`` follows the \u00a78.1 grammar.",
+      "properties": {
+        "effect_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/EffectKind"
+        },
+        "payload": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "target": {
+          "pattern": "^(check:\\S+:[0-9a-f]{40}|board:\\S+|thread:[1-9][0-9]*|delivery:[a-z0-9-]+:\\S+|summon:\\S+|announce:\\S+)$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "effect_id",
+        "kind",
+        "target",
+        "payload"
+      ],
+      "title": "Effect",
+      "type": "object"
+    },
+    "EffectKind": {
+      "description": "\u00a78.1: refresh targets re-render from ``read()``; actionable targets check applicability.",
+      "enum": [
+        "refresh",
+        "actionable"
+      ],
+      "title": "EffectKind",
+      "type": "string"
+    },
+    "EpisodeClose": {
+      "additionalProperties": false,
+      "properties": {
+        "at": {
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$",
+          "type": "string"
+        },
+        "by": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/SeatPrincipal"
+            },
+            {
+              "$ref": "#/$defs/OperatorPrincipal"
+            },
+            {
+              "$ref": "#/$defs/AdapterPrincipal"
+            },
+            {
+              "$ref": "#/$defs/SystemPrincipal"
+            }
+          ]
+        }
+      },
+      "required": [
+        "at",
+        "by"
+      ],
+      "title": "EpisodeClose",
+      "type": "object"
+    },
+    "EpisodeClosed": {
+      "additionalProperties": false,
+      "properties": {
+        "close": {
+          "$ref": "#/$defs/EpisodeClose"
+        },
+        "episode_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "kind": {
+          "const": "episode_closed",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "episode_id",
+        "close"
+      ],
+      "title": "EpisodeClosed",
+      "type": "object"
+    },
+    "EpisodeOpened": {
+      "additionalProperties": false,
+      "properties": {
+        "episode": {
+          "$ref": "#/$defs/ExhaustionEpisode"
+        },
+        "kind": {
+          "const": "episode_opened",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "episode"
+      ],
+      "title": "EpisodeOpened",
+      "type": "object"
+    },
+    "EvidenceItem": {
+      "additionalProperties": false,
+      "properties": {
+        "command": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "control": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "coordinates": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Coordinate"
+          },
+          "type": "array"
+        },
+        "kind": {
+          "$ref": "#/$defs/EvidenceKind"
+        },
+        "observed": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "statement": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "statement"
+      ],
+      "title": "EvidenceItem",
+      "type": "object"
+    },
+    "EvidenceKind": {
+      "enum": [
+        "static-path",
+        "contract",
+        "test",
+        "probe",
+        "preimage-control",
+        "mutation-control",
+        "production-observation",
+        "history",
+        "tool-output"
+      ],
+      "title": "EvidenceKind",
+      "type": "string"
+    },
+    "Exemption": {
+      "additionalProperties": false,
+      "description": "\u00a76.C6.",
+      "properties": {
+        "evidence": {
+          "type": "string"
+        },
+        "reason": {
+          "$ref": "#/$defs/ExemptionReason"
+        },
+        "subject_key": {
+          "pattern": "^[0-9a-f]{40}:.+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason",
+        "evidence",
+        "subject_key"
+      ],
+      "title": "Exemption",
+      "type": "object"
+    },
+    "ExemptionReason": {
+      "enum": [
+        "skill_only",
+        "exempt_paths",
+        "verbatim_copy"
+      ],
+      "title": "ExemptionReason",
+      "type": "string"
+    },
+    "ExemptionSet": {
+      "additionalProperties": false,
+      "properties": {
+        "exemption": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Exemption"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "kind": {
+          "const": "exemption_set",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "exemption"
+      ],
+      "title": "ExemptionSet",
+      "type": "object"
+    },
+    "ExhaustionEpisode": {
+      "additionalProperties": false,
+      "description": "\u00a76.G4.",
+      "properties": {
+        "closed": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EpisodeClose"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "hold_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "opened_at": {
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "opened_at",
+        "hold_id",
+        "closed"
+      ],
+      "title": "ExhaustionEpisode",
+      "type": "object"
+    },
+    "ExplicitHold": {
+      "additionalProperties": false,
+      "description": "\u00a76.G3: exhaustion, owner_decision, unanswerable and operator release only explicitly.",
+      "properties": {
+        "at": {
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$",
+          "type": "string"
+        },
+        "blocks": {
+          "$ref": "#/$defs/HoldBlocks"
+        },
+        "by": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/SeatPrincipal"
+            },
+            {
+              "$ref": "#/$defs/OperatorPrincipal"
+            },
+            {
+              "$ref": "#/$defs/AdapterPrincipal"
+            },
+            {
+              "$ref": "#/$defs/SystemPrincipal"
+            }
+          ]
+        },
+        "id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "exhaustion",
+            "owner_decision",
+            "unanswerable",
+            "operator"
+          ],
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "release_on": {
+          "const": "explicit",
+          "type": "string"
+        },
+        "released": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HoldRelease"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "by",
+        "at",
+        "reason",
+        "release_on",
+        "blocks",
+        "released"
+      ],
+      "title": "ExplicitHold",
+      "type": "object"
+    },
+    "ExplicitHoldSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "blocks": {
+          "$ref": "#/$defs/HoldBlocks"
+        },
+        "kind": {
+          "enum": [
+            "exhaustion",
+            "owner_decision",
+            "unanswerable",
+            "operator"
+          ],
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "release_on": {
+          "const": "explicit",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "reason",
+        "release_on",
+        "blocks"
+      ],
+      "title": "ExplicitHoldSpec",
+      "type": "object"
+    },
+    "ExternalFinding": {
+      "additionalProperties": false,
+      "description": "No fingerprint, falsifier or evidence is invented for Codex; provenance is the comment.",
+      "properties": {
+        "body": {
+          "type": "string"
+        },
+        "line": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "path": {
+          "type": "string"
+        },
+        "priority": {
+          "$ref": "#/$defs/FindingPriority"
+        },
+        "source_comment_id": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "source_comment_id",
+        "path",
+        "line",
+        "priority",
+        "title",
+        "body"
+      ],
+      "title": "ExternalFinding",
+      "type": "object"
+    },
+    "ExternalResult": {
+      "additionalProperties": false,
+      "properties": {
+        "findings": {
+          "items": {
+            "$ref": "#/$defs/ExternalFinding"
+          },
+          "type": "array"
+        },
+        "reviewed_head": {
+          "pattern": "^[0-9a-f]{40}$",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": "1",
+          "type": "string"
+        },
+        "source": {
+          "const": "codex",
+          "type": "string"
+        },
+        "source_record": {
+          "$ref": "#/$defs/SourceRef"
+        },
+        "submitted_at": {
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$",
+          "type": "string"
+        },
+        "verdict": {
+          "$ref": "#/$defs/ExternalVerdict"
+        }
+      },
+      "required": [
+        "schema_version",
+        "source",
+        "reviewed_head",
+        "verdict",
+        "findings",
+        "source_record",
+        "submitted_at"
+      ],
+      "title": "ExternalResult",
+      "type": "object"
+    },
+    "ExternalVerdict": {
+      "enum": [
+        "clean",
+        "findings",
+        "incomplete"
+      ],
+      "title": "ExternalVerdict",
+      "type": "string"
+    },
+    "Falsifier": {
+      "additionalProperties": false,
+      "properties": {
+        "command": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "control": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "description": {
+          "type": "string"
+        },
+        "expected_failure": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "status": {
+          "$ref": "#/$defs/FalsifierStatus"
+        }
+      },
+      "required": [
+        "status",
+        "description"
+      ],
+      "title": "Falsifier",
+      "type": "object"
+    },
+    "FalsifierStatus": {
+      "enum": [
+        "demonstrated",
+        "proposed",
+        "not-practical"
+      ],
+      "title": "FalsifierStatus",
+      "type": "string"
+    },
+    "Finding": {
+      "additionalProperties": false,
+      "properties": {
+        "confidence": {
+          "$ref": "#/$defs/Confidence"
+        },
+        "contract_basis": {
+          "$ref": "#/$defs/ContractBasis"
+        },
+        "diff_anchor": {
+          "$ref": "#/$defs/Coordinate"
+        },
+        "disposition": {
+          "$ref": "#/$defs/Disposition"
+        },
+        "evidence": {
+          "items": {
+            "$ref": "#/$defs/EvidenceItem"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "failure": {
+          "minLength": 20,
+          "type": "string"
+        },
+        "falsifier": {
+          "$ref": "#/$defs/Falsifier"
+        },
+        "fingerprint": {
+          "type": "string"
+        },
+        "id": {
+          "pattern": "^F[1-9][0-9]*$",
+          "type": "string"
+        },
+        "impact": {
+          "minLength": 10,
+          "type": "string"
+        },
+        "introduced_by": {
+          "minLength": 15,
+          "type": "string"
+        },
+        "look_here_first": {
+          "items": {
+            "$ref": "#/$defs/Coordinate"
+          },
+          "maxItems": 2,
+          "minItems": 1,
+          "type": "array"
+        },
+        "material_cure_regression": {
+          "default": false,
+          "type": "boolean"
+        },
+        "parent_fingerprint": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "priority": {
+          "$ref": "#/$defs/Priority"
+        },
+        "reachability": {
+          "minLength": 20,
+          "type": "string"
+        },
+        "repair_boundary": {
+          "minLength": 15,
+          "type": "string"
+        },
+        "reviewer_designed": {
+          "default": false,
+          "type": "boolean"
+        },
+        "semantic_key": {
+          "minLength": 20,
+          "type": "string"
+        },
+        "suggested_remedy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SuggestedRemedy"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "title": {
+          "minLength": 8,
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "semantic_key",
+        "fingerprint",
+        "priority",
+        "disposition",
+        "title",
+        "diff_anchor",
+        "look_here_first",
+        "contract_basis",
+        "failure",
+        "reachability",
+        "impact",
+        "introduced_by",
+        "evidence",
+        "falsifier",
+        "repair_boundary",
+        "confidence"
+      ],
+      "title": "Finding",
+      "type": "object"
+    },
+    "FindingAdmitted": {
+      "additionalProperties": false,
+      "properties": {
+        "finding": {
+          "$ref": "#/$defs/AdmittedFinding"
+        },
+        "kind": {
+          "const": "finding_admitted",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "finding"
+      ],
+      "title": "FindingAdmitted",
+      "type": "object"
+    },
+    "FindingAnswer": {
+      "additionalProperties": false,
+      "description": "\u00a72.3: one per finding the request named.",
+      "properties": {
+        "answer": {
+          "$ref": "#/$defs/FindingAnswerKind"
+        },
+        "evidence": {
+          "type": "string"
+        },
+        "finding_id": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "finding_id",
+        "answer",
+        "evidence"
+      ],
+      "title": "FindingAnswer",
+      "type": "object"
+    },
+    "FindingAnswerKind": {
+      "description": "\u00a72.3 ``FindingAnswer.answer`` \u2014 the closure reviewer's word on a named finding.",
+      "enum": [
+        "fixed",
+        "standing",
+        "refuted",
+        "referred"
+      ],
+      "title": "FindingAnswerKind",
+      "type": "string"
+    },
+    "FindingClassified": {
+      "additionalProperties": false,
+      "properties": {
+        "finding_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "kind": {
+          "const": "finding_classified",
+          "type": "string"
+        },
+        "priority": {
+          "$ref": "#/$defs/Priority"
+        }
+      },
+      "required": [
+        "kind",
+        "finding_id",
+        "priority"
+      ],
+      "title": "FindingClassified",
+      "type": "object"
+    },
+    "FindingClosed": {
+      "additionalProperties": false,
+      "properties": {
+        "open": {
+          "const": false,
+          "type": "boolean"
+        },
+        "resolution": {
+          "$ref": "#/$defs/Resolution"
+        }
+      },
+      "required": [
+        "open",
+        "resolution"
+      ],
+      "title": "FindingClosed",
+      "type": "object"
+    },
+    "FindingContested": {
+      "additionalProperties": false,
+      "properties": {
+        "contested": {
+          "$ref": "#/$defs/Contest"
+        },
+        "open": {
+          "const": true,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "open",
+        "contested"
+      ],
+      "title": "FindingContested",
+      "type": "object"
+    },
+    "FindingContestedConsequence": {
+      "additionalProperties": false,
+      "properties": {
+        "contest": {
+          "$ref": "#/$defs/Contest"
+        },
+        "finding_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "kind": {
+          "const": "finding_contested",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "finding_id",
+        "contest"
+      ],
+      "title": "FindingContestedConsequence",
+      "type": "object"
+    },
+    "FindingLink": {
+      "additionalProperties": false,
+      "properties": {
+        "at": {
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$",
+          "type": "string"
+        },
+        "by": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/SeatPrincipal"
+            },
+            {
+              "$ref": "#/$defs/OperatorPrincipal"
+            },
+            {
+              "$ref": "#/$defs/AdapterPrincipal"
+            },
+            {
+              "$ref": "#/$defs/SystemPrincipal"
+            }
+          ]
+        },
+        "other": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "relation": {
+          "const": "same_as",
+          "type": "string"
+        }
+      },
+      "required": [
+        "other",
+        "relation",
+        "by",
+        "at"
+      ],
+      "title": "FindingLink",
+      "type": "object"
+    },
+    "FindingLinked": {
+      "additionalProperties": false,
+      "properties": {
+        "finding_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "kind": {
+          "const": "finding_linked",
+          "type": "string"
+        },
+        "link": {
+          "$ref": "#/$defs/FindingLink"
+        }
+      },
+      "required": [
+        "kind",
+        "finding_id",
+        "link"
+      ],
+      "title": "FindingLinked",
+      "type": "object"
+    },
+    "FindingOpen": {
+      "additionalProperties": false,
+      "properties": {
+        "open": {
+          "const": true,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "open"
+      ],
+      "title": "FindingOpen",
+      "type": "object"
+    },
+    "FindingPriority": {
+      "description": "\u00a73.5 / \u00a76.F5: ``unknown`` is admitted, visible and blocking until classified.",
+      "enum": [
+        "P0",
+        "P1",
+        "P2",
+        "P3",
+        "unknown"
+      ],
+      "title": "FindingPriority",
+      "type": "string"
+    },
+    "FindingResolution": {
+      "additionalProperties": false,
+      "properties": {
+        "affected_paths": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "claimed_behavior": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "commits": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "disposition": {
+          "$ref": "#/$defs/ResolutionDisposition"
+        },
+        "falsifier": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "falsifier_result": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "fingerprint": {
+          "type": "string"
+        },
+        "notes": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "reviewer_remedy_followed": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "fingerprint",
+        "disposition",
+        "claimed_behavior",
+        "affected_paths",
+        "reviewer_remedy_followed"
+      ],
+      "title": "FindingResolution",
+      "type": "object"
+    },
+    "FindingResolved": {
+      "additionalProperties": false,
+      "properties": {
+        "finding_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "kind": {
+          "const": "finding_resolved",
+          "type": "string"
+        },
+        "resolution": {
+          "$ref": "#/$defs/Resolution"
+        }
+      },
+      "required": [
+        "kind",
+        "finding_id",
+        "resolution"
+      ],
+      "title": "FindingResolved",
+      "type": "object"
+    },
+    "FindingSource": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ReviewkitFindingSource"
+        },
+        {
+          "$ref": "#/$defs/CommentFindingSource"
+        }
+      ],
+      "title": "FindingSource"
+    },
+    "FindingStatus": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/FindingOpen"
+        },
+        {
+          "$ref": "#/$defs/FindingClosed"
+        },
+        {
+          "$ref": "#/$defs/FindingContested"
+        }
+      ],
+      "title": "FindingStatus"
+    },
+    "FixedResolutionRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "commits": {
+          "items": {
+            "pattern": "^[0-9a-f]{40}$",
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "evidence": {
+          "type": "string"
+        },
+        "kind": {
+          "const": "fixed",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "evidence",
+        "commits"
+      ],
+      "title": "FixedResolutionRequest",
+      "type": "object"
+    },
+    "FollowUpResolutionRequest": {
+      "additionalProperties": false,
+      "description": "\u00a76.F3 \u2014 the ticket id is format-checked here; Linear I/O stays out of the transaction.",
+      "properties": {
+        "evidence": {
+          "type": "string"
+        },
+        "kind": {
+          "const": "follow_up",
+          "type": "string"
+        },
+        "ticket": {
+          "pattern": "^[A-Z][A-Z0-9]*-[1-9][0-9]*$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "evidence",
+        "ticket"
+      ],
+      "title": "FollowUpResolutionRequest",
+      "type": "object"
+    },
+    "GrantRoundsAction": {
+      "additionalProperties": false,
+      "description": "\u00a76.G1 \u2014 changes the allowance, not history; closes an open episode (\u00a7G4).",
+      "properties": {
+        "kind": {
+          "const": "GrantRounds",
+          "type": "string"
+        },
+        "n": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "n",
+        "reason"
+      ],
+      "title": "GrantRoundsAction",
+      "type": "object"
+    },
+    "Hold": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/SubjectClearableHold"
+        },
+        {
+          "$ref": "#/$defs/ExplicitHold"
+        }
+      ],
+      "title": "Hold"
+    },
+    "HoldAction": {
+      "additionalProperties": false,
+      "properties": {
+        "hold": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/SubjectClearableHoldSpec"
+            },
+            {
+              "$ref": "#/$defs/ExplicitHoldSpec"
+            }
+          ]
+        },
+        "kind": {
+          "const": "Hold",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "hold"
+      ],
+      "title": "HoldAction",
+      "type": "object"
+    },
+    "HoldBlocks": {
+      "additionalProperties": false,
+      "properties": {
+        "readiness": {
+          "const": true,
+          "type": "boolean"
+        },
+        "summons": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "readiness",
+        "summons"
+      ],
+      "title": "HoldBlocks",
+      "type": "object"
+    },
+    "HoldPlaced": {
+      "additionalProperties": false,
+      "properties": {
+        "hold": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/SubjectClearableHold"
+            },
+            {
+              "$ref": "#/$defs/ExplicitHold"
+            }
+          ]
+        },
+        "kind": {
+          "const": "hold_placed",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "hold"
+      ],
+      "title": "HoldPlaced",
+      "type": "object"
+    },
+    "HoldReason": {
+      "additionalProperties": false,
+      "properties": {
+        "hold": {
+          "enum": [
+            "human_gate",
+            "stack",
+            "exhaustion",
+            "owner_decision",
+            "unanswerable",
+            "operator"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "hold"
+      ],
+      "title": "HoldReason",
+      "type": "object"
+    },
+    "HoldRelease": {
+      "additionalProperties": false,
+      "properties": {
+        "at": {
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$",
+          "type": "string"
+        },
+        "by": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/SeatPrincipal"
+            },
+            {
+              "$ref": "#/$defs/OperatorPrincipal"
+            },
+            {
+              "$ref": "#/$defs/AdapterPrincipal"
+            },
+            {
+              "$ref": "#/$defs/SystemPrincipal"
+            }
+          ]
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "by",
+        "at",
+        "reason"
+      ],
+      "title": "HoldRelease",
+      "type": "object"
+    },
+    "HoldReleased": {
+      "additionalProperties": false,
+      "properties": {
+        "hold_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "kind": {
+          "const": "hold_released",
+          "type": "string"
+        },
+        "release": {
+          "$ref": "#/$defs/HoldRelease"
+        }
+      },
+      "required": [
+        "kind",
+        "hold_id",
+        "release"
+      ],
+      "title": "HoldReleased",
+      "type": "object"
+    },
+    "HoldSpec": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/SubjectClearableHoldSpec"
+        },
+        {
+          "$ref": "#/$defs/ExplicitHoldSpec"
+        }
+      ],
+      "title": "HoldSpec"
+    },
+    "HumanAuthor": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "human",
+          "type": "string"
+        },
+        "login": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "login"
+      ],
+      "title": "HumanAuthor",
+      "type": "object"
+    },
+    "Lifecycle": {
+      "description": "\u00a76.C3: closed pauses, reopened resumes, merged is terminal.",
+      "enum": [
+        "open",
+        "closed",
+        "merged"
+      ],
+      "title": "Lifecycle",
+      "type": "string"
+    },
+    "LifecycleChanged": {
+      "additionalProperties": false,
+      "properties": {
+        "after": {
+          "$ref": "#/$defs/Lifecycle"
+        },
+        "before": {
+          "$ref": "#/$defs/Lifecycle"
+        },
+        "kind": {
+          "const": "lifecycle_changed",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "before",
+        "after"
+      ],
+      "title": "LifecycleChanged",
+      "type": "object"
+    },
+    "MergeableObserved": {
+      "additionalProperties": false,
+      "description": "\u00a76.D8.",
+      "properties": {
+        "kind": {
+          "const": "mergeable_observed",
+          "type": "string"
+        },
+        "mergeable": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "mergeable"
+      ],
+      "title": "MergeableObserved",
+      "type": "object"
+    },
+    "NormalizedResult": {
+      "additionalProperties": false,
+      "description": "\u00a72.3 \u2014 the one interpretation of both report arms.",
+      "properties": {
+        "answers": {
+          "items": {
+            "$ref": "#/$defs/FindingAnswer"
+          },
+          "type": "array"
+        },
+        "completion": {
+          "$ref": "#/$defs/Completion"
+        },
+        "findings": {
+          "items": {
+            "$ref": "#/$defs/AdmittedFinding"
+          },
+          "type": "array"
+        },
+        "provenance": {
+          "$ref": "#/$defs/Provenance"
+        },
+        "reviewer": {
+          "pattern": "^[a-z0-9-]+$",
+          "type": "string"
+        },
+        "subject_key": {
+          "pattern": "^[0-9a-f]{40}:.+$",
+          "type": "string"
+        },
+        "verdict": {
+          "$ref": "#/$defs/NormalizedVerdict"
+        }
+      },
+      "required": [
+        "completion",
+        "verdict",
+        "findings",
+        "answers",
+        "reviewer",
+        "subject_key",
+        "provenance"
+      ],
+      "title": "NormalizedResult",
+      "type": "object"
+    },
+    "NormalizedVerdict": {
+      "enum": [
+        "clean",
+        "findings"
+      ],
+      "title": "NormalizedVerdict",
+      "type": "string"
+    },
+    "NotReady": {
+      "additionalProperties": false,
+      "properties": {
+        "ready": {
+          "const": false,
+          "type": "boolean"
+        },
+        "reasons": {
+          "items": {
+            "anyOf": [
+              {
+                "enum": [
+                  "merged",
+                  "closed",
+                  "draft",
+                  "exhausted",
+                  "incomplete_answer"
+                ],
+                "type": "string"
+              },
+              {
+                "$ref": "#/$defs/HoldReason"
+              },
+              {
+                "$ref": "#/$defs/RequirementUnsatisfiedReason"
+              },
+              {
+                "$ref": "#/$defs/RequiredRequestPendingReason"
+              },
+              {
+                "$ref": "#/$defs/BlockingFindingsReason"
+              }
+            ]
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "subject_key": {
+          "pattern": "^[0-9a-f]{40}:.+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "ready",
+        "subject_key",
+        "reasons"
+      ],
+      "title": "NotReady",
+      "type": "object"
+    },
+    "ObservePRAction": {
+      "additionalProperties": false,
+      "description": "\u00a76.C1 \u2014 a whole-state observation; the reducer derives each consequence independently.",
+      "properties": {
+        "draft": {
+          "type": "boolean"
+        },
+        "kind": {
+          "const": "ObservePR",
+          "type": "string"
+        },
+        "lifecycle": {
+          "$ref": "#/$defs/Lifecycle"
+        },
+        "observed": {
+          "$ref": "#/$defs/Observed"
+        },
+        "subject": {
+          "$ref": "#/$defs/Subject"
+        }
+      },
+      "required": [
+        "kind",
+        "subject",
+        "lifecycle",
+        "draft",
+        "observed"
+      ],
+      "title": "ObservePRAction",
+      "type": "object"
+    },
+    "Observed": {
+      "additionalProperties": false,
+      "description": "\u00a73.3 metadata refreshed by observation; ``mergeable`` is GitHub's tri-state (\u00a76.D8).",
+      "properties": {
+        "author_login": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "base_sha_now": {
+          "pattern": "^[0-9a-f]{40}$",
+          "type": "string"
+        },
+        "head_ref": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "mergeable": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "seen_at": {
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$",
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "title",
+        "author_login",
+        "head_ref",
+        "base_sha_now",
+        "mergeable",
+        "seen_at"
+      ],
+      "title": "Observed",
+      "type": "object"
+    },
+    "ObservedRefreshed": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "observed_refreshed",
+          "type": "string"
+        },
+        "observed": {
+          "$ref": "#/$defs/Observed"
+        }
+      },
+      "required": [
+        "kind",
+        "observed"
+      ],
+      "title": "ObservedRefreshed",
+      "type": "object"
+    },
+    "OpenRequestAction": {
+      "additionalProperties": false,
+      "description": "\u00a73.4 / \u00a76.D. The obligation's kind is ``request_kind`` (``kind`` names the verb).",
+      "properties": {
+        "assignee": {
+          "pattern": "^[a-z0-9-]+$",
+          "type": "string"
+        },
+        "kind": {
+          "const": "OpenRequest",
+          "type": "string"
+        },
+        "mode": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReviewMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "names": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "request_kind": {
+          "$ref": "#/$defs/RequestKind"
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "subject_key": {
+          "pattern": "^[0-9a-f]{40}:.+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "request_kind",
+        "mode",
+        "assignee",
+        "subject_key",
+        "required",
+        "names",
+        "reason"
+      ],
+      "title": "OpenRequestAction",
+      "type": "object"
+    },
+    "OperatorPrincipal": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "kind": {
+          "const": "operator",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "id"
+      ],
+      "title": "OperatorPrincipal",
+      "type": "object"
+    },
+    "OwnerDecisionResolutionRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "evidence": {
+          "type": "string"
+        },
+        "kind": {
+          "const": "owner_decision",
+          "type": "string"
+        },
+        "resolution_text": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "evidence",
+        "resolution_text"
+      ],
+      "title": "OwnerDecisionResolutionRequest",
+      "type": "object"
+    },
+    "Policy": {
+      "additionalProperties": false,
+      "description": "\u00a79.2 \u2014 versioned per repository; a Review keeps the version it opened under (\u00a76.I).",
+      "properties": {
+        "author_aliases": {
+          "additionalProperties": {
+            "pattern": "^[a-z0-9-]+$",
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "burn_actor": {
+          "pattern": "^[a-z0-9-]+$",
+          "type": "string"
+        },
+        "closure_by_seat": {
+          "type": "boolean"
+        },
+        "codex_meter": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CodexMeter"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "exempt_roots": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "retrospective_actor": {
+          "pattern": "^[a-z0-9-]+$",
+          "type": "string"
+        },
+        "reviewer_set": {
+          "items": {
+            "pattern": "^[a-z0-9-]+$",
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "rounds_max": {
+          "default": 7,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "routing_by_round": {
+          "$ref": "#/$defs/RoutingByRound"
+        },
+        "slack": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SlackPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "stall_window_s": {
+          "default": 1200,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "substitute_actor": {
+          "pattern": "^[a-z0-9-]+$",
+          "type": "string"
+        },
+        "transport_bound": {
+          "default": 2,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "version": {
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "version",
+        "reviewer_set",
+        "substitute_actor",
+        "burn_actor",
+        "retrospective_actor",
+        "closure_by_seat",
+        "routing_by_round",
+        "exempt_roots",
+        "author_aliases",
+        "codex_meter",
+        "slack"
+      ],
+      "title": "Policy",
+      "type": "object"
+    },
+    "PolicyAdopted": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "policy_adopted",
+          "type": "string"
+        },
+        "version": {
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "kind",
+        "version"
+      ],
+      "title": "PolicyAdopted",
+      "type": "object"
+    },
+    "Principal": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/SeatPrincipal"
+        },
+        {
+          "$ref": "#/$defs/OperatorPrincipal"
+        },
+        {
+          "$ref": "#/$defs/AdapterPrincipal"
+        },
+        {
+          "$ref": "#/$defs/SystemPrincipal"
+        }
+      ],
+      "title": "Principal"
+    },
+    "Priority": {
+      "enum": [
+        "P0",
+        "P1",
+        "P2",
+        "P3"
+      ],
+      "title": "Priority",
+      "type": "string"
+    },
+    "ProductGateResolutionRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "evidence": {
+          "type": "string"
+        },
+        "kind": {
+          "const": "product_gate",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "evidence"
+      ],
+      "title": "ProductGateResolutionRequest",
+      "type": "object"
+    },
+    "ProjectionHandles": {
+      "additionalProperties": false,
+      "description": "\u00a78.1 handles the projections edit in place.",
+      "properties": {
+        "board_comment_id": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "check_run_ids": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "type": "object"
+        },
+        "slack_thread_ts": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "board_comment_id",
+        "check_run_ids",
+        "slack_thread_ts"
+      ],
+      "title": "ProjectionHandles",
+      "type": "object"
+    },
+    "Provenance": {
+      "additionalProperties": false,
+      "properties": {
+        "arm": {
+          "$ref": "#/$defs/ReportArm"
+        },
+        "record": {
+          "$ref": "#/$defs/SourceRef"
+        },
+        "report_ref": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "arm",
+        "record",
+        "report_ref"
+      ],
+      "title": "Provenance",
+      "type": "object"
+    },
+    "Readiness": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Ready"
+        },
+        {
+          "$ref": "#/$defs/NotReady"
+        }
+      ],
+      "title": "Readiness"
+    },
+    "Ready": {
+      "additionalProperties": false,
+      "properties": {
+        "ready": {
+          "const": true,
+          "type": "boolean"
+        },
+        "subject_key": {
+          "pattern": "^[0-9a-f]{40}:.+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "ready",
+        "subject_key"
+      ],
+      "title": "Ready",
+      "type": "object"
+    },
+    "Reason": {
+      "anyOf": [
+        {
+          "enum": [
+            "merged",
+            "closed",
+            "draft",
+            "exhausted",
+            "incomplete_answer"
+          ],
+          "type": "string"
+        },
+        {
+          "$ref": "#/$defs/HoldReason"
+        },
+        {
+          "$ref": "#/$defs/RequirementUnsatisfiedReason"
+        },
+        {
+          "$ref": "#/$defs/RequiredRequestPendingReason"
+        },
+        {
+          "$ref": "#/$defs/BlockingFindingsReason"
+        }
+      ],
+      "title": "Reason"
+    },
+    "Receipt": {
+      "additionalProperties": false,
+      "description": "\u00a74. ``review_id`` is null when the refusal precedes the Review's existence.",
+      "properties": {
+        "act_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "outcome": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AppliedOutcome"
+            },
+            {
+              "$ref": "#/$defs/ReplayedOutcome"
+            },
+            {
+              "$ref": "#/$defs/RefusedOutcome"
+            }
+          ]
+        },
+        "review_id": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "review_id",
+        "act_id",
+        "outcome"
+      ],
+      "title": "Receipt",
+      "type": "object"
+    },
+    "ReceiptOutcome": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AppliedOutcome"
+        },
+        {
+          "$ref": "#/$defs/ReplayedOutcome"
+        },
+        {
+          "$ref": "#/$defs/RefusedOutcome"
+        }
+      ],
+      "title": "ReceiptOutcome"
+    },
+    "Recommendation": {
+      "enum": [
+        "block",
+        "changes-requested",
+        "discuss",
+        "pass-with-caveat",
+        "pass"
+      ],
+      "title": "Recommendation",
+      "type": "string"
+    },
+    "Refusal": {
+      "additionalProperties": false,
+      "description": "What ``decide`` returns instead of a batch (\u00a75.B3).",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/RefusalCode"
+        },
+        "detail": {
+          "type": "string"
+        },
+        "refused": {
+          "const": true,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "refused",
+        "code",
+        "detail"
+      ],
+      "title": "Refusal",
+      "type": "object"
+    },
+    "RefusalCode": {
+      "description": "\u00a74 Receipt \u2014 the closed set of refusal codes.",
+      "enum": [
+        "stale_revision",
+        "unauthorized",
+        "lifecycle",
+        "unknown_subject",
+        "self_review",
+        "malformed",
+        "unanswered_findings",
+        "not_assignee",
+        "duplicate_request",
+        "no_such_target"
+      ],
+      "title": "RefusalCode",
+      "type": "string"
+    },
+    "RefusedOutcome": {
+      "additionalProperties": false,
+      "description": "\u00a75.B4 \u2014 appended to ``review_attempts``; ``state`` is null before the Review exists.",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/RefusalCode"
+        },
+        "current_revision": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "detail": {
+          "type": "string"
+        },
+        "refused": {
+          "const": true,
+          "type": "boolean"
+        },
+        "state": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReviewState"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "refused",
+        "code",
+        "detail",
+        "current_revision",
+        "state"
+      ],
+      "title": "RefusedOutcome",
+      "type": "object"
+    },
+    "RefutedResolutionRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "evidence": {
+          "type": "string"
+        },
+        "kind": {
+          "const": "refuted",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "evidence"
+      ],
+      "title": "RefutedResolutionRequest",
+      "type": "object"
+    },
+    "ReleaseAction": {
+      "additionalProperties": false,
+      "properties": {
+        "hold_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "kind": {
+          "const": "Release",
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "hold_id",
+        "reason"
+      ],
+      "title": "ReleaseAction",
+      "type": "object"
+    },
+    "ReleaseOn": {
+      "enum": [
+        "explicit",
+        "subject_change"
+      ],
+      "title": "ReleaseOn",
+      "type": "string"
+    },
+    "ReplayedOutcome": {
+      "additionalProperties": false,
+      "description": "\u00a75.B2 \u2014 the act id was already admitted; nothing changed.",
+      "properties": {
+        "batch_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "replayed": {
+          "const": true,
+          "type": "boolean"
+        },
+        "revision_at_apply": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "replayed",
+        "revision_at_apply",
+        "batch_id"
+      ],
+      "title": "ReplayedOutcome",
+      "type": "object"
+    },
+    "ReportArm": {
+      "enum": [
+        "reviewkit",
+        "external"
+      ],
+      "title": "ReportArm",
+      "type": "string"
+    },
+    "ReportDeliverable": {
+      "additionalProperties": false,
+      "properties": {
+        "report_ref": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "report_ref"
+      ],
+      "title": "ReportDeliverable",
+      "type": "object"
+    },
+    "Request": {
+      "additionalProperties": false,
+      "description": "\u00a73.4 \u2014 an obligation. ``names`` is non-empty only for closure/appeal (reducer-checked).",
+      "properties": {
+        "answered_by": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "assignee": {
+          "pattern": "^[a-z0-9-]+$",
+          "type": "string"
+        },
+        "id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/RequestKind"
+        },
+        "mode": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReviewMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "names": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "opened_at": {
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$",
+          "type": "string"
+        },
+        "opened_by": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/SeatPrincipal"
+            },
+            {
+              "$ref": "#/$defs/OperatorPrincipal"
+            },
+            {
+              "$ref": "#/$defs/AdapterPrincipal"
+            },
+            {
+              "$ref": "#/$defs/SystemPrincipal"
+            }
+          ]
+        },
+        "reason": {
+          "type": "string"
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "status": {
+          "$ref": "#/$defs/RequestStatus"
+        },
+        "subject_key": {
+          "pattern": "^[0-9a-f]{40}:.+$",
+          "type": "string"
+        },
+        "supersedes": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "transport": {
+          "items": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/DeliveryRef"
+              },
+              {
+                "$ref": "#/$defs/SummonRef"
+              }
+            ]
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "mode",
+        "assignee",
+        "subject_key",
+        "required",
+        "names",
+        "status",
+        "opened_by",
+        "opened_at",
+        "reason",
+        "supersedes",
+        "transport",
+        "answered_by"
+      ],
+      "title": "Request",
+      "type": "object"
+    },
+    "RequestAnswered": {
+      "additionalProperties": false,
+      "properties": {
+        "answer_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "kind": {
+          "const": "request_answered",
+          "type": "string"
+        },
+        "request_id": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "request_id",
+        "answer_id"
+      ],
+      "title": "RequestAnswered",
+      "type": "object"
+    },
+    "RequestCancelled": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "request_cancelled",
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "request_id": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "request_id",
+        "reason"
+      ],
+      "title": "RequestCancelled",
+      "type": "object"
+    },
+    "RequestKind": {
+      "enum": [
+        "review",
+        "retrospective"
+      ],
+      "title": "RequestKind",
+      "type": "string"
+    },
+    "RequestOpened": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "request_opened",
+          "type": "string"
+        },
+        "request": {
+          "$ref": "#/$defs/Request"
+        }
+      },
+      "required": [
+        "kind",
+        "request"
+      ],
+      "title": "RequestOpened",
+      "type": "object"
+    },
+    "RequestStatus": {
+      "enum": [
+        "pending",
+        "answered",
+        "cancelled",
+        "unanswerable"
+      ],
+      "title": "RequestStatus",
+      "type": "string"
+    },
+    "RequestUnanswerable": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "request_unanswerable",
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "request_id": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "request_id",
+        "reason"
+      ],
+      "title": "RequestUnanswerable",
+      "type": "object"
+    },
+    "RequiredRequestPendingReason": {
+      "additionalProperties": false,
+      "properties": {
+        "required_request_pending": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "required_request_pending"
+      ],
+      "title": "RequiredRequestPendingReason",
+      "type": "object"
+    },
+    "Requirement": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/RequirementSatisfied"
+        },
+        {
+          "$ref": "#/$defs/RequirementExempt"
+        },
+        {
+          "$ref": "#/$defs/RequirementUnsatisfied"
+        }
+      ],
+      "title": "Requirement"
+    },
+    "RequirementExempt": {
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "const": "exempt",
+          "type": "string"
+        },
+        "subject_key": {
+          "pattern": "^[0-9a-f]{40}:.+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "subject_key",
+        "status"
+      ],
+      "title": "RequirementExempt",
+      "type": "object"
+    },
+    "RequirementSatisfied": {
+      "additionalProperties": false,
+      "properties": {
+        "by": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "status": {
+          "const": "satisfied",
+          "type": "string"
+        },
+        "subject_key": {
+          "pattern": "^[0-9a-f]{40}:.+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "subject_key",
+        "status",
+        "by"
+      ],
+      "title": "RequirementSatisfied",
+      "type": "object"
+    },
+    "RequirementUnsatisfied": {
+      "additionalProperties": false,
+      "properties": {
+        "pending": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "status": {
+          "const": "unsatisfied",
+          "type": "string"
+        },
+        "subject_key": {
+          "pattern": "^[0-9a-f]{40}:.+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "subject_key",
+        "status",
+        "pending"
+      ],
+      "title": "RequirementUnsatisfied",
+      "type": "object"
+    },
+    "RequirementUnsatisfiedReason": {
+      "additionalProperties": false,
+      "properties": {
+        "requirement_unsatisfied": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "requirement_unsatisfied"
+      ],
+      "title": "RequirementUnsatisfiedReason",
+      "type": "object"
+    },
+    "Resolution": {
+      "additionalProperties": false,
+      "description": "\u00a73.5 / \u00a76.F3.",
+      "properties": {
+        "at": {
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$",
+          "type": "string"
+        },
+        "by": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/SeatPrincipal"
+            },
+            {
+              "$ref": "#/$defs/OperatorPrincipal"
+            },
+            {
+              "$ref": "#/$defs/AdapterPrincipal"
+            },
+            {
+              "$ref": "#/$defs/SystemPrincipal"
+            }
+          ]
+        },
+        "commits": {
+          "items": {
+            "pattern": "^[0-9a-f]{40}$",
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "confirmed_by": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "evidence": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/ResolutionKind"
+        },
+        "resolution_text": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ticket": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Z][A-Z0-9]*-[1-9][0-9]*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "by",
+        "at",
+        "evidence",
+        "commits",
+        "ticket",
+        "resolution_text",
+        "confirmed_by"
+      ],
+      "title": "Resolution",
+      "type": "object"
+    },
+    "ResolutionDisposition": {
+      "enum": [
+        "fixed",
+        "refuted",
+        "accepted",
+        "deferred",
+        "owner-decision"
+      ],
+      "title": "ResolutionDisposition",
+      "type": "string"
+    },
+    "ResolutionKind": {
+      "description": "\u00a76.F3 \u2014 the closed set of ways a finding leaves the standing set.",
+      "enum": [
+        "fixed",
+        "refuted",
+        "withdrawn",
+        "product_gate",
+        "follow_up",
+        "owner_decision"
+      ],
+      "title": "ResolutionKind",
+      "type": "string"
+    },
+    "ResolutionRequest": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/FixedResolutionRequest"
+        },
+        {
+          "$ref": "#/$defs/RefutedResolutionRequest"
+        },
+        {
+          "$ref": "#/$defs/WithdrawnResolutionRequest"
+        },
+        {
+          "$ref": "#/$defs/ProductGateResolutionRequest"
+        },
+        {
+          "$ref": "#/$defs/FollowUpResolutionRequest"
+        },
+        {
+          "$ref": "#/$defs/OwnerDecisionResolutionRequest"
+        },
+        {
+          "$ref": "#/$defs/SameAsResolutionRequest"
+        }
+      ],
+      "title": "ResolutionRequest"
+    },
+    "ResolveFindingAction": {
+      "additionalProperties": false,
+      "properties": {
+        "finding_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "kind": {
+          "const": "ResolveFinding",
+          "type": "string"
+        },
+        "resolution": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/FixedResolutionRequest"
+            },
+            {
+              "$ref": "#/$defs/RefutedResolutionRequest"
+            },
+            {
+              "$ref": "#/$defs/WithdrawnResolutionRequest"
+            },
+            {
+              "$ref": "#/$defs/ProductGateResolutionRequest"
+            },
+            {
+              "$ref": "#/$defs/FollowUpResolutionRequest"
+            },
+            {
+              "$ref": "#/$defs/OwnerDecisionResolutionRequest"
+            },
+            {
+              "$ref": "#/$defs/SameAsResolutionRequest"
+            }
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "finding_id",
+        "resolution"
+      ],
+      "title": "ResolveFindingAction",
+      "type": "object"
+    },
+    "RetractAnswerAction": {
+      "additionalProperties": false,
+      "properties": {
+        "answer_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "kind": {
+          "const": "RetractAnswer",
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "answer_id",
+        "reason"
+      ],
+      "title": "RetractAnswerAction",
+      "type": "object"
+    },
+    "Review": {
+      "additionalProperties": false,
+      "description": "\u00a73.3 \u2014 the durable record. ``review_batches`` is the truth; this is its fold (\u00a75.B3).",
+      "properties": {
+        "answers": {
+          "items": {
+            "$ref": "#/$defs/Answer"
+          },
+          "type": "array"
+        },
+        "availability": {
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/Available"
+              },
+              {
+                "$ref": "#/$defs/Unavailable"
+              }
+            ]
+          },
+          "type": "object"
+        },
+        "budget": {
+          "$ref": "#/$defs/Budget"
+        },
+        "charges": {
+          "items": {
+            "$ref": "#/$defs/Charge"
+          },
+          "type": "array"
+        },
+        "display": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "draft": {
+          "type": "boolean"
+        },
+        "episodes": {
+          "items": {
+            "$ref": "#/$defs/ExhaustionEpisode"
+          },
+          "type": "array"
+        },
+        "exemption": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Exemption"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "findings": {
+          "items": {
+            "$ref": "#/$defs/AdmittedFinding"
+          },
+          "type": "array"
+        },
+        "holds": {
+          "items": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/SubjectClearableHold"
+              },
+              {
+                "$ref": "#/$defs/ExplicitHold"
+              }
+            ]
+          },
+          "type": "array"
+        },
+        "id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "key": {
+          "$ref": "#/$defs/ReviewKey"
+        },
+        "lifecycle": {
+          "$ref": "#/$defs/Lifecycle"
+        },
+        "observed": {
+          "$ref": "#/$defs/Observed"
+        },
+        "policy_version": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "projection_handles": {
+          "$ref": "#/$defs/ProjectionHandles"
+        },
+        "requests": {
+          "items": {
+            "$ref": "#/$defs/Request"
+          },
+          "type": "array"
+        },
+        "revision": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "subject": {
+          "$ref": "#/$defs/Subject"
+        },
+        "subjects": {
+          "items": {
+            "$ref": "#/$defs/Subject"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "key",
+        "display",
+        "revision",
+        "policy_version",
+        "subject",
+        "subjects",
+        "lifecycle",
+        "draft",
+        "observed",
+        "requests",
+        "answers",
+        "findings",
+        "holds",
+        "charges",
+        "budget",
+        "episodes",
+        "availability",
+        "exemption",
+        "projection_handles"
+      ],
+      "title": "Review",
+      "type": "object"
+    },
+    "ReviewKey": {
+      "additionalProperties": false,
+      "description": "\u00a73.1: GitHub's stable ids; ``owner/repo#n`` is display only.",
+      "properties": {
+        "pr_number": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "repository_id": {
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "repository_id",
+        "pr_number"
+      ],
+      "title": "ReviewKey",
+      "type": "object"
+    },
+    "ReviewMode": {
+      "enum": [
+        "initial",
+        "closure",
+        "appeal"
+      ],
+      "title": "ReviewMode",
+      "type": "string"
+    },
+    "ReviewQuestion": {
+      "additionalProperties": false,
+      "properties": {
+        "authority_needed": {
+          "type": "string"
+        },
+        "id": {
+          "pattern": "^Q[1-9][0-9]*$",
+          "type": "string"
+        },
+        "question": {
+          "type": "string"
+        },
+        "settlement_criterion": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "question",
+        "settlement_criterion",
+        "authority_needed"
+      ],
+      "title": "ReviewQuestion",
+      "type": "object"
+    },
+    "ReviewReport": {
+      "additionalProperties": false,
+      "properties": {
+        "appeal_fingerprint": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "author": {
+          "type": "string"
+        },
+        "automatic_chain_terminal": {
+          "type": "boolean"
+        },
+        "base_sha": {
+          "type": "string"
+        },
+        "blind_spots": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "chain_id": {
+          "type": "string"
+        },
+        "completion": {
+          "$ref": "#/$defs/Completion"
+        },
+        "coverage": {
+          "items": {
+            "$ref": "#/$defs/CoverageArea"
+          },
+          "type": "array"
+        },
+        "created_at": {
+          "type": "string"
+        },
+        "findings": {
+          "items": {
+            "$ref": "#/$defs/Finding"
+          },
+          "type": "array"
+        },
+        "generation": {
+          "maximum": 1,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "head_sha": {
+          "type": "string"
+        },
+        "merge_base_sha": {
+          "type": "string"
+        },
+        "mode": {
+          "$ref": "#/$defs/ReviewMode"
+        },
+        "orchestration": {
+          "enum": [
+            "single-reviewer",
+            "parallel-specialists"
+          ],
+          "type": "string"
+        },
+        "orchestration_reason": {
+          "type": "string"
+        },
+        "overall_assessment": {
+          "default": "",
+          "type": "string"
+        },
+        "packet_scope_fingerprint": {
+          "type": "string"
+        },
+        "parent_report_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "parent_resolution_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "pr_number": {
+          "exclusiveMinimum": 0,
+          "type": "integer"
+        },
+        "questions": {
+          "items": {
+            "$ref": "#/$defs/ReviewQuestion"
+          },
+          "type": "array"
+        },
+        "recommendation": {
+          "$ref": "#/$defs/Recommendation"
+        },
+        "report_id": {
+          "type": "string"
+        },
+        "repository": {
+          "type": "string"
+        },
+        "reviewer": {
+          "type": "string"
+        },
+        "reviewer_authored_scope": {
+          "default": false,
+          "type": "boolean"
+        },
+        "reviewer_designed_parent_cure": {
+          "default": false,
+          "type": "boolean"
+        },
+        "schema_version": {
+          "const": "1",
+          "default": "1",
+          "type": "string"
+        },
+        "self_review": {
+          "default": false,
+          "type": "boolean"
+        },
+        "verification": {
+          "items": {
+            "$ref": "#/$defs/VerificationRecord"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "chain_id",
+        "generation",
+        "mode",
+        "automatic_chain_terminal",
+        "repository",
+        "pr_number",
+        "packet_scope_fingerprint",
+        "base_sha",
+        "head_sha",
+        "merge_base_sha",
+        "reviewer",
+        "author",
+        "completion",
+        "orchestration",
+        "orchestration_reason",
+        "recommendation"
+      ],
+      "title": "ReviewReport",
+      "type": "object"
+    },
+    "ReviewResolution": {
+      "additionalProperties": false,
+      "properties": {
+        "findings": {
+          "items": {
+            "$ref": "#/$defs/FindingResolution"
+          },
+          "type": "array"
+        },
+        "head_after": {
+          "type": "string"
+        },
+        "head_before": {
+          "type": "string"
+        },
+        "parent_report_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "pr_number": {
+          "exclusiveMinimum": 0,
+          "type": "integer"
+        },
+        "repository": {
+          "pattern": "^[^/]+/[^/]+$",
+          "type": "string"
+        },
+        "resolution_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "resolver": {
+          "pattern": "^[a-z0-9-]+$",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": "1",
+          "default": "1",
+          "type": "string"
+        }
+      },
+      "required": [
+        "resolution_id",
+        "parent_report_id",
+        "repository",
+        "pr_number",
+        "head_before",
+        "head_after",
+        "resolver",
+        "findings"
+      ],
+      "title": "ReviewResolution",
+      "type": "object"
+    },
+    "ReviewState": {
+      "additionalProperties": false,
+      "description": "\u00a73.6 \u2014 ``Review`` plus what ``read()`` derives; never stored.",
+      "properties": {
+        "active_holds": {
+          "items": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/SubjectClearableHold"
+              },
+              {
+                "$ref": "#/$defs/ExplicitHold"
+              }
+            ]
+          },
+          "type": "array"
+        },
+        "advisories": {
+          "items": {
+            "$ref": "#/$defs/AdmittedFinding"
+          },
+          "type": "array"
+        },
+        "answers": {
+          "items": {
+            "$ref": "#/$defs/Answer"
+          },
+          "type": "array"
+        },
+        "availability": {
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/Available"
+              },
+              {
+                "$ref": "#/$defs/Unavailable"
+              }
+            ]
+          },
+          "type": "object"
+        },
+        "blocking_findings": {
+          "items": {
+            "$ref": "#/$defs/AdmittedFinding"
+          },
+          "type": "array"
+        },
+        "budget": {
+          "$ref": "#/$defs/Budget"
+        },
+        "charges": {
+          "items": {
+            "$ref": "#/$defs/Charge"
+          },
+          "type": "array"
+        },
+        "display": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "draft": {
+          "type": "boolean"
+        },
+        "episodes": {
+          "items": {
+            "$ref": "#/$defs/ExhaustionEpisode"
+          },
+          "type": "array"
+        },
+        "exemption": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Exemption"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "findings": {
+          "items": {
+            "$ref": "#/$defs/AdmittedFinding"
+          },
+          "type": "array"
+        },
+        "holds": {
+          "items": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/SubjectClearableHold"
+              },
+              {
+                "$ref": "#/$defs/ExplicitHold"
+              }
+            ]
+          },
+          "type": "array"
+        },
+        "id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "key": {
+          "$ref": "#/$defs/ReviewKey"
+        },
+        "lifecycle": {
+          "$ref": "#/$defs/Lifecycle"
+        },
+        "observed": {
+          "$ref": "#/$defs/Observed"
+        },
+        "policy_version": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "projection_handles": {
+          "$ref": "#/$defs/ProjectionHandles"
+        },
+        "readiness": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Ready"
+            },
+            {
+              "$ref": "#/$defs/NotReady"
+            }
+          ]
+        },
+        "requests": {
+          "items": {
+            "$ref": "#/$defs/Request"
+          },
+          "type": "array"
+        },
+        "requirement": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/RequirementSatisfied"
+            },
+            {
+              "$ref": "#/$defs/RequirementExempt"
+            },
+            {
+              "$ref": "#/$defs/RequirementUnsatisfied"
+            }
+          ]
+        },
+        "revision": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rounds_consumed": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rounds_remaining": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "subject": {
+          "$ref": "#/$defs/Subject"
+        },
+        "subjects": {
+          "items": {
+            "$ref": "#/$defs/Subject"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "key",
+        "display",
+        "revision",
+        "policy_version",
+        "subject",
+        "subjects",
+        "lifecycle",
+        "draft",
+        "observed",
+        "requests",
+        "answers",
+        "findings",
+        "holds",
+        "charges",
+        "budget",
+        "episodes",
+        "availability",
+        "exemption",
+        "projection_handles",
+        "requirement",
+        "blocking_findings",
+        "advisories",
+        "rounds_consumed",
+        "rounds_remaining",
+        "active_holds",
+        "readiness"
+      ],
+      "title": "ReviewState",
+      "type": "object"
+    },
+    "ReviewkitFindingSource": {
+      "additionalProperties": false,
+      "properties": {
+        "fingerprint": {
+          "pattern": "^ifp-sha256:[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "semantic_key": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "fingerprint",
+        "semantic_key"
+      ],
+      "title": "ReviewkitFindingSource",
+      "type": "object"
+    },
+    "ReviewkitSubmission": {
+      "additionalProperties": false,
+      "properties": {
+        "arm": {
+          "const": "reviewkit",
+          "type": "string"
+        },
+        "report": {
+          "$ref": "#/$defs/ReviewReport"
+        }
+      },
+      "required": [
+        "arm",
+        "report"
+      ],
+      "title": "ReviewkitSubmission",
+      "type": "object"
+    },
+    "RoundsGranted": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "rounds_granted",
+          "type": "string"
+        },
+        "n": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "n",
+        "reason"
+      ],
+      "title": "RoundsGranted",
+      "type": "object"
+    },
+    "RoutingByRound": {
+      "additionalProperties": false,
+      "description": "\u00a76.D2 (KRA-1131): Codex holds round one; the substitute every later round.",
+      "properties": {
+        "first": {
+          "pattern": "^[a-z0-9-]+$",
+          "type": "string"
+        },
+        "later": {
+          "pattern": "^[a-z0-9-]+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "first",
+        "later"
+      ],
+      "title": "RoutingByRound",
+      "type": "object"
+    },
+    "SameAsResolutionRequest": {
+      "additionalProperties": false,
+      "description": "\u00a76.F2 \u2014 an explicit link; contests the other finding's resolution if it has one.",
+      "properties": {
+        "evidence": {
+          "type": "string"
+        },
+        "kind": {
+          "const": "same_as",
+          "type": "string"
+        },
+        "other": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "evidence",
+        "other"
+      ],
+      "title": "SameAsResolutionRequest",
+      "type": "object"
+    },
+    "SeatAuthor": {
+      "additionalProperties": false,
+      "properties": {
+        "actor": {
+          "pattern": "^[a-z0-9-]+$",
+          "type": "string"
+        },
+        "kind": {
+          "const": "seat",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "actor"
+      ],
+      "title": "SeatAuthor",
+      "type": "object"
+    },
+    "SeatPrincipal": {
+      "additionalProperties": false,
+      "properties": {
+        "actor": {
+          "pattern": "^[a-z0-9-]+$",
+          "type": "string"
+        },
+        "custody": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeliveryCustody"
+            },
+            {
+              "$ref": "#/$defs/SessionCustody"
+            }
+          ]
+        },
+        "kind": {
+          "const": "seat",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "actor",
+        "custody"
+      ],
+      "title": "SeatPrincipal",
+      "type": "object"
+    },
+    "SessionCustody": {
+      "additionalProperties": false,
+      "properties": {
+        "session_id": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id"
+      ],
+      "title": "SessionCustody",
+      "type": "object"
+    },
+    "SetReviewerAvailabilityAction": {
+      "additionalProperties": false,
+      "description": "\u00a76.D3. ``available = false`` requires ``reason`` (reducer-checked).",
+      "properties": {
+        "available": {
+          "type": "boolean"
+        },
+        "evidence": {
+          "type": "string"
+        },
+        "kind": {
+          "const": "SetReviewerAvailability",
+          "type": "string"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AvailabilityReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reviewer": {
+          "pattern": "^[a-z0-9-]+$",
+          "type": "string"
+        },
+        "until": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "reviewer",
+        "available",
+        "reason",
+        "until",
+        "evidence"
+      ],
+      "title": "SetReviewerAvailabilityAction",
+      "type": "object"
+    },
+    "SlackPolicy": {
+      "additionalProperties": false,
+      "description": "Where system-origin deliveries and the board line go.",
+      "properties": {
+        "channel_id": {
+          "pattern": "^[CGD][A-Z0-9]+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "channel_id"
+      ],
+      "title": "SlackPolicy",
+      "type": "object"
+    },
+    "SourceRecordKind": {
+      "description": "\u00a77 source records: GitHub reviews, review comments, issue comments.",
+      "enum": [
+        "review",
+        "review_comment",
+        "issue_comment"
+      ],
+      "title": "SourceRecordKind",
+      "type": "string"
+    },
+    "SourceRef": {
+      "additionalProperties": false,
+      "description": "\u00a77: a GitHub record by kind, id and version (``updated_at``/``submitted_at``).",
+      "properties": {
+        "id": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "kind": {
+          "$ref": "#/$defs/SourceRecordKind"
+        },
+        "version": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "id",
+        "version"
+      ],
+      "title": "SourceRef",
+      "type": "object"
+    },
+    "Subject": {
+      "additionalProperties": false,
+      "description": "\u00a73.3: the current code binding; ``key`` is ``f\"{head_sha}:{base_ref}\"`` (reducer-checked).",
+      "properties": {
+        "author": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/SeatAuthor"
+            },
+            {
+              "$ref": "#/$defs/HumanAuthor"
+            }
+          ]
+        },
+        "base_ref": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "base_sha_at_first_sight": {
+          "pattern": "^[0-9a-f]{40}$",
+          "type": "string"
+        },
+        "changed_paths": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "diff_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "first_seen_at": {
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$",
+          "type": "string"
+        },
+        "head_sha": {
+          "pattern": "^[0-9a-f]{40}$",
+          "type": "string"
+        },
+        "key": {
+          "pattern": "^[0-9a-f]{40}:.+$",
+          "type": "string"
+        },
+        "merge_base_sha": {
+          "pattern": "^[0-9a-f]{40}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "head_sha",
+        "base_ref",
+        "base_sha_at_first_sight",
+        "merge_base_sha",
+        "diff_sha256",
+        "changed_paths",
+        "author",
+        "first_seen_at"
+      ],
+      "title": "Subject",
+      "type": "object"
+    },
+    "SubjectAuthor": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/SeatAuthor"
+        },
+        {
+          "$ref": "#/$defs/HumanAuthor"
+        }
+      ],
+      "title": "SubjectAuthor"
+    },
+    "SubjectChanged": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "subject_changed",
+          "type": "string"
+        },
+        "previous_key": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{40}:.+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "subject": {
+          "$ref": "#/$defs/Subject"
+        }
+      },
+      "required": [
+        "kind",
+        "subject",
+        "previous_key"
+      ],
+      "title": "SubjectChanged",
+      "type": "object"
+    },
+    "SubjectClearableHold": {
+      "additionalProperties": false,
+      "description": "\u00a76.G3: only ``human_gate`` and ``stack`` may release on subject change.",
+      "properties": {
+        "at": {
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$",
+          "type": "string"
+        },
+        "blocks": {
+          "$ref": "#/$defs/HoldBlocks"
+        },
+        "by": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/SeatPrincipal"
+            },
+            {
+              "$ref": "#/$defs/OperatorPrincipal"
+            },
+            {
+              "$ref": "#/$defs/AdapterPrincipal"
+            },
+            {
+              "$ref": "#/$defs/SystemPrincipal"
+            }
+          ]
+        },
+        "id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "human_gate",
+            "stack"
+          ],
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "release_on": {
+          "$ref": "#/$defs/ReleaseOn"
+        },
+        "released": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HoldRelease"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "by",
+        "at",
+        "reason",
+        "release_on",
+        "blocks",
+        "released"
+      ],
+      "title": "SubjectClearableHold",
+      "type": "object"
+    },
+    "SubjectClearableHoldSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "blocks": {
+          "$ref": "#/$defs/HoldBlocks"
+        },
+        "kind": {
+          "enum": [
+            "human_gate",
+            "stack"
+          ],
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "release_on": {
+          "$ref": "#/$defs/ReleaseOn"
+        }
+      },
+      "required": [
+        "kind",
+        "reason",
+        "release_on",
+        "blocks"
+      ],
+      "title": "SubjectClearableHoldSpec",
+      "type": "object"
+    },
+    "SuggestedRemedy": {
+      "additionalProperties": false,
+      "properties": {
+        "authority": {
+          "enum": [
+            "non-authoritative",
+            "reviewer-designed"
+          ],
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "authority",
+        "description"
+      ],
+      "title": "SuggestedRemedy",
+      "type": "object"
+    },
+    "SummonRef": {
+      "additionalProperties": false,
+      "properties": {
+        "summon_comment_id": {
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "summon_comment_id"
+      ],
+      "title": "SummonRef",
+      "type": "object"
+    },
+    "SystemPrincipal": {
+      "additionalProperties": false,
+      "properties": {
+        "caused_by": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "kind": {
+          "const": "system",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "caused_by"
+      ],
+      "title": "SystemPrincipal",
+      "type": "object"
+    },
+    "Testimony": {
+      "additionalProperties": false,
+      "description": "\u00a73.4 / \u00a76.G5 \u2014 the retrospective's answer names its deliverable.",
+      "properties": {
+        "cause": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "deliverable": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CommentDeliverable"
+            },
+            {
+              "$ref": "#/$defs/ReportDeliverable"
+            }
+          ]
+        },
+        "scars": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "cause",
+        "scars",
+        "deliverable"
+      ],
+      "title": "Testimony",
+      "type": "object"
+    },
+    "TestimonySubmission": {
+      "additionalProperties": false,
+      "properties": {
+        "arm": {
+          "const": "testimony",
+          "type": "string"
+        },
+        "testimony": {
+          "$ref": "#/$defs/Testimony"
+        }
+      },
+      "required": [
+        "arm",
+        "testimony"
+      ],
+      "title": "TestimonySubmission",
+      "type": "object"
+    },
+    "TransportRef": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/DeliveryRef"
+        },
+        {
+          "$ref": "#/$defs/SummonRef"
+        }
+      ],
+      "title": "TransportRef"
+    },
+    "Unavailable": {
+      "additionalProperties": false,
+      "description": "\u00a76.D3 \u2014 a recorded condition with a clearing rule, never a bare flag.",
+      "properties": {
+        "available": {
+          "const": false,
+          "type": "boolean"
+        },
+        "evidence": {
+          "type": "string"
+        },
+        "reason": {
+          "$ref": "#/$defs/AvailabilityReason"
+        },
+        "since": {
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$",
+          "type": "string"
+        },
+        "until": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "available",
+        "since",
+        "reason",
+        "until",
+        "evidence"
+      ],
+      "title": "Unavailable",
+      "type": "object"
+    },
+    "VerificationRecord": {
+      "additionalProperties": false,
+      "properties": {
+        "command": {
+          "type": "string"
+        },
+        "result": {
+          "type": "string"
+        },
+        "scope": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "command",
+        "result",
+        "scope"
+      ],
+      "title": "VerificationRecord",
+      "type": "object"
+    },
+    "WithdrawnResolutionRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "evidence": {
+          "type": "string"
+        },
+        "kind": {
+          "const": "withdrawn",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "evidence"
+      ],
+      "title": "WithdrawnResolutionRequest",
+      "type": "object"
+    }
+  },
+  "$id": "https://weave.sokrates.is/schemas/review-contract.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "The Weave review contract (review-state-machine v0.2 \u00a72). Validate one shape by compiling {\"$ref\": \"<$id>#/$defs/<Name>\"}.",
+  "properties": {
+    "action": {
+      "$ref": "#/$defs/Action"
+    },
+    "answer_submission": {
+      "$ref": "#/$defs/AnswerSubmission"
+    },
+    "availability": {
+      "$ref": "#/$defs/Availability"
+    },
+    "batch": {
+      "$ref": "#/$defs/Batch"
+    },
+    "command": {
+      "$ref": "#/$defs/Command"
+    },
+    "consequence": {
+      "$ref": "#/$defs/Consequence"
+    },
+    "effect": {
+      "$ref": "#/$defs/Effect"
+    },
+    "external_result": {
+      "$ref": "#/$defs/ExternalResult"
+    },
+    "finding_source": {
+      "$ref": "#/$defs/FindingSource"
+    },
+    "finding_status": {
+      "$ref": "#/$defs/FindingStatus"
+    },
+    "hold": {
+      "$ref": "#/$defs/Hold"
+    },
+    "hold_spec": {
+      "$ref": "#/$defs/HoldSpec"
+    },
+    "lifecycle": {
+      "$ref": "#/$defs/Lifecycle"
+    },
+    "normalized_result": {
+      "$ref": "#/$defs/NormalizedResult"
+    },
+    "policy": {
+      "$ref": "#/$defs/Policy"
+    },
+    "principal": {
+      "$ref": "#/$defs/Principal"
+    },
+    "readiness": {
+      "$ref": "#/$defs/Readiness"
+    },
+    "reason": {
+      "$ref": "#/$defs/Reason"
+    },
+    "receipt": {
+      "$ref": "#/$defs/Receipt"
+    },
+    "receipt_outcome": {
+      "$ref": "#/$defs/ReceiptOutcome"
+    },
+    "refusal": {
+      "$ref": "#/$defs/Refusal"
+    },
+    "refusal_code": {
+      "$ref": "#/$defs/RefusalCode"
+    },
+    "requirement": {
+      "$ref": "#/$defs/Requirement"
+    },
+    "resolution_request": {
+      "$ref": "#/$defs/ResolutionRequest"
+    },
+    "review": {
+      "$ref": "#/$defs/Review"
+    },
+    "review_key": {
+      "$ref": "#/$defs/ReviewKey"
+    },
+    "review_state": {
+      "$ref": "#/$defs/ReviewState"
+    },
+    "reviewkit_report": {
+      "$ref": "#/$defs/ReviewReport"
+    },
+    "reviewkit_resolution": {
+      "$ref": "#/$defs/ReviewResolution"
+    },
+    "subject": {
+      "$ref": "#/$defs/Subject"
+    },
+    "subject_author": {
+      "$ref": "#/$defs/SubjectAuthor"
+    },
+    "testimony": {
+      "$ref": "#/$defs/Testimony"
+    },
+    "transport_ref": {
+      "$ref": "#/$defs/TransportRef"
+    }
+  },
+  "title": "ReviewContract",
+  "type": "object"
+}

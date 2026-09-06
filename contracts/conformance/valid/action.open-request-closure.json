@@ -1,0 +1,16 @@
+{
+  "instance": {
+    "assignee": "ariadne",
+    "kind": "OpenRequest",
+    "mode": "closure",
+    "names": [
+      "fnd_01",
+      "fnd_02"
+    ],
+    "reason": "burn landed",
+    "request_kind": "review",
+    "required": true,
+    "subject_key": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:main"
+  },
+  "model": "action"
+}

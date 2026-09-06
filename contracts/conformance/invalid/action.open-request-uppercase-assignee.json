@@ -1,0 +1,20 @@
+{
+  "expect": {
+    "code": "malformed",
+    "why": "an actor id is a lowercase token"
+  },
+  "instance": {
+    "assignee": "Ariadne",
+    "kind": "OpenRequest",
+    "mode": "closure",
+    "names": [
+      "fnd_01",
+      "fnd_02"
+    ],
+    "reason": "burn landed",
+    "request_kind": "review",
+    "required": true,
+    "subject_key": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:main"
+  },
+  "model": "action"
+}

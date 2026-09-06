@@ -1,0 +1,12 @@
+{
+  "expect": {
+    "code": "malformed",
+    "why": "a grant is at least one round"
+  },
+  "instance": {
+    "kind": "GrantRounds",
+    "n": 0,
+    "reason": "one more burn"
+  },
+  "model": "action"
+}

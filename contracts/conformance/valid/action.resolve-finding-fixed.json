@@ -1,0 +1,14 @@
+{
+  "instance": {
+    "finding_id": "fnd_01",
+    "kind": "ResolveFinding",
+    "resolution": {
+      "commits": [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      ],
+      "evidence": "replay consults durable evidence first",
+      "kind": "fixed"
+    }
+  },
+  "model": "action"
+}

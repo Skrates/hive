@@ -1,0 +1,15 @@
+{
+  "expect": {
+    "code": "malformed",
+    "why": "resolution kinds are closed (\u00a7F3)"
+  },
+  "instance": {
+    "finding_id": "fnd_01",
+    "kind": "ResolveFinding",
+    "resolution": {
+      "evidence": "meh",
+      "kind": "ignored"
+    }
+  },
+  "model": "action"
+}
