@@ -8,7 +8,7 @@
   "workspace": "work-ariadne",
   "edgeWorkspaces": [{ "edgeId": "cx53", "cwd": "/home/hive/work-ariadne", "worktree": null }],
   "wakePolicy": "spawn",
-  "permissionProfile": "workspace-write",
+  "permissionProfile": "danger-full-access",
   "accountProfile": "/home/hive/.hive/profiles/ariadne",
   "leaseTtlMs": 60000,
   "deliveryTtlMs": 86400000,
