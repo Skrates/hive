@@ -8,7 +8,7 @@ import type { Delivery, Subscription } from "../domain.js";
 import { prepareSocketPath } from "../local/uds.js";
 import type { LiveIngress } from "./live-registry.js";
 import { delimiter, dirname } from "node:path";
-import { ingressInboxDirectory, ClaudeProvider, claudePromptSlotArgs, codexPermissionArgs, CodexProvider, composeChildEnv, GrokProvider, grokPermissionArgs, prependPathEntry, ProviderPreDispatchError, requireAccountProfile, resolveEdgeSocketPath } from "./providers.js";
+import { ingressInboxDirectory, ClaudeProvider, claudePromptSlotArgs, codexPermissionArgs, codexSpawnArgs, CodexProvider, composeChildEnv, GrokProvider, grokPermissionArgs, prependPathEntry, ProviderPreDispatchError, requireAccountProfile, resolveEdgeSocketPath } from "./providers.js";
 import { drainInbox } from "../channel/claude-hook.js";
 
 function subscription(overrides: Partial<Subscription> = {}): Subscription {
@@ -437,4 +437,12 @@ test("a structured Desktop account rejection remains a deterministic pre-dispatc
     (error: unknown) => error instanceof ProviderPreDispatchError
       && error.code === "account_profile_mismatch",
   );
+});
+
+test("codex spawn skips the git-repo check: the edge's cwd is a root of checkouts, not a checkout", () => {
+  const socketPath = "/tmp/hive-edge.sock";
+  const args = codexSpawnArgs("/home/hive/work-ariadne", "workspace-write", socketPath);
+  assert.deepEqual(args.slice(0, 5), ["exec", "--cd", "/home/hive/work-ariadne", "--skip-git-repo-check", "--json"]);
+  assert.deepEqual(args.slice(5, -1), codexPermissionArgs("workspace-write", socketPath));
+  assert.equal(args.at(-1), "-");
 });

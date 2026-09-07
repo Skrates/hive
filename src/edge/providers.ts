@@ -141,7 +141,7 @@ export class CodexProvider implements ProviderAdapter {
   spawn(subscription: Subscription, cwd: string, framed: string, context: HeadlessDispatch): Promise<ProviderDispatch> {
     return runHeadless(
       "codex",
-      ["exec", "--cd", cwd, "--json", ...codexPermissionArgs(subscription.permissionProfile), "-"],
+      codexSpawnArgs(cwd, subscription.permissionProfile),
       cwd,
       framed,
       { CODEX_HOME: requireAccountProfile(subscription) },
@@ -471,6 +471,16 @@ function assistantMessageText(message: unknown): string | null {
  * The pinned CODEX_HOME must use permission profiles rather than the legacy
  * `sandbox_mode` setting; Codex intentionally does not compose the two models.
  */
+/**
+ * The edge chooses the turn's cwd (a subscription's workspace root or a
+ * per-turn slot), and that root is a directory of checkouts, not a checkout:
+ * `codex exec` refuses such a cwd unless told to skip its git-repo check.
+ * Ariadne's cx53 seat failed every spawn on that refusal (2026-09-06).
+ */
+export function codexSpawnArgs(cwd: string, profile: string, edgeSocketPath = resolveEdgeSocketPath()): string[] {
+  return ["exec", "--cd", cwd, "--skip-git-repo-check", "--json", ...codexPermissionArgs(profile, edgeSocketPath), "-"];
+}
+
 export function codexPermissionArgs(
   profile: string,
   edgeSocketPath = resolveEdgeSocketPath(),
