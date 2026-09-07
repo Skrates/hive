@@ -8,7 +8,7 @@ import type { Delivery, Subscription } from "../domain.js";
 import { prepareSocketPath } from "../local/uds.js";
 import type { LiveIngress } from "./live-registry.js";
 import { delimiter, dirname } from "node:path";
-import { ingressInboxDirectory, ClaudeProvider, claudePromptSlotArgs, CODEX_NETWORK_DOMAINS, codexPermissionArgs, codexSpawnArgs, CodexProvider, composeChildEnv, GrokProvider, grokPermissionArgs, prependPathEntry, ProviderPreDispatchError, requireAccountProfile, resolveEdgeSocketPath } from "./providers.js";
+import { ingressInboxDirectory, ClaudeProvider, claudePromptSlotArgs, CODEX_NETWORK_DOMAINS, codexPermissionArgs, codexSpawnArgs, codexResumeTurn, codexSpawnTurn, CodexProvider, composeChildEnv, GrokProvider, grokPermissionArgs, prependPathEntry, ProviderPreDispatchError, requireAccountProfile, resolveEdgeSocketPath } from "./providers.js";
 import { drainInbox } from "../channel/claude-hook.js";
 
 function subscription(overrides: Partial<Subscription> = {}): Subscription {
@@ -463,6 +463,49 @@ test("KRA-1414: a codex spawn's effort override is clamped by the pinned CODEX_H
     assert.deepEqual(
       codexSpawnArgs("/w", "workspace-write", null, home, socketPath),
       codexSpawnArgs("/w", "workspace-write", null, null, socketPath),
+    );
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("KRA-1414: both codex turn routes clamp against the same pinned home the child runs under", () => {
+  const socketPath = "/tmp/hive-edge.sock";
+  const home = mkdtempSync(join(tmpdir(), "hive-codex-home-"));
+  try {
+    writeFileSync(join(home, "config.toml"), 'model = "gpt-5.5"\nmodel_reasoning_effort = "medium"\n');
+    const pinned = subscription({ accountProfile: home, sessionId: "thread-1" });
+    const routes = [
+      ["resume", (effort: "ultra" | null) => codexResumeTurn(pinned, effort)],
+      ["spawn", (effort: "ultra" | null) => codexSpawnTurn(pinned, "/work/taxis", effort, socketPath)],
+    ] as const;
+    // The clamp is armed on BOTH routes, from the home the turn actually runs
+    // under — a route that derived its argv without it would silently degrade
+    // every overlay to the unknown-model floor.
+    for (const [name, turnOf] of routes) {
+      const turn = turnOf("ultra");
+      assert.equal(turn.codexHome, home, name);
+      assert.ok(turn.args.includes("model_reasoning_effort=xhigh"), name);
+    }
+    // Same request, a model that speaks the whole grammar: verbatim on both.
+    writeFileSync(join(home, "config.toml"), 'model = "gpt-6-astra"\n');
+    for (const [name, turnOf] of routes) {
+      assert.ok(turnOf("ultra").args.includes("model_reasoning_effort=ultra"), name);
+    }
+    // The routes are still the two different invocations they always were.
+    assert.deepEqual(codexResumeTurn(pinned, null).args.slice(0, 5), ["exec", "resume", "thread-1", "-", "--json"]);
+    assert.deepEqual(codexSpawnTurn(pinned, "/work/taxis", null, socketPath).args.slice(0, 5),
+      ["exec", "--cd", "/work/taxis", "--skip-git-repo-check", "--json"]);
+    // R-5: a missing pinned profile is a hard pre-dispatch failure on either route.
+    const unpinned = subscription({ accountProfile: "/nonexistent/profile" });
+    const missingProfile = (error: unknown) =>
+      error instanceof ProviderPreDispatchError && error.code === "account_profile_missing";
+    assert.throws(() => codexResumeTurn(unpinned, "ultra"), missingProfile);
+    assert.throws(() => codexSpawnTurn(unpinned, "/work/taxis", "ultra", socketPath), missingProfile);
+    // A resume with no session is refused before the profile is even read.
+    assert.throws(
+      () => codexResumeTurn(subscription({ accountProfile: home, sessionId: null }), null),
+      (error: unknown) => error instanceof Error && error.message === "resume target missing",
     );
   } finally {
     rmSync(home, { recursive: true, force: true });

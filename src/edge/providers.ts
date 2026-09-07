@@ -134,29 +134,53 @@ export class CodexProvider implements ProviderAdapter {
   }
 
   resume(subscription: Subscription, cwd: string, framed: string, context: HeadlessDispatch): Promise<ProviderDispatch> {
-    if (!subscription.sessionId) throw new Error("resume target missing");
-    const codexHome = requireAccountProfile(subscription);
-    return runHeadless(
-      "codex",
-      ["exec", "resume", subscription.sessionId, "-", "--json", ...codexEffortArgs(context.effort, codexHome), ...codexPermissionArgs(subscription.permissionProfile)],
-      cwd,
-      framed,
-      { CODEX_HOME: codexHome },
-      context,
-    );
+    const turn = codexResumeTurn(subscription, context.effort);
+    return runHeadless("codex", turn.args, cwd, framed, { CODEX_HOME: turn.codexHome }, context);
   }
 
   spawn(subscription: Subscription, cwd: string, framed: string, context: HeadlessDispatch): Promise<ProviderDispatch> {
-    const codexHome = requireAccountProfile(subscription);
-    return runHeadless(
-      "codex",
-      codexSpawnArgs(cwd, subscription.permissionProfile, context.effort, codexHome),
-      cwd,
-      framed,
-      { CODEX_HOME: codexHome },
-      context,
-    );
+    const turn = codexSpawnTurn(subscription, cwd, context.effort);
+    return runHeadless("codex", turn.args, cwd, framed, { CODEX_HOME: turn.codexHome }, context);
   }
+}
+
+/**
+ * One Codex headless turn: its argv and the pinned home it runs under, derived
+ * TOGETHER from the subscription.
+ *
+ * KRA-1414: the effort clamp needs the same `CODEX_HOME` the child gets, and
+ * two adapter methods each threading it by hand is two chances to arm the clamp
+ * on one route and leave it off the other — a slip that degrades every overlay
+ * on that route to the unknown-model floor while every test still passes. There
+ * is no home parameter to forget here; the caller names the subscription, which
+ * it must name anyway.
+ *
+ * The two routes are two functions rather than one with a route argument, and
+ * their signatures differ (only a spawn needs a cwd), so calling the wrong one
+ * does not type-check — the route cannot be swapped by a slip that a test would
+ * have to catch after the fact.
+ */
+export function codexResumeTurn(
+  subscription: Subscription,
+  effort: WakeEffort | null,
+): { args: string[]; codexHome: string } {
+  if (!subscription.sessionId) throw new Error("resume target missing");
+  const codexHome = requireAccountProfile(subscription);
+  return {
+    args: ["exec", "resume", subscription.sessionId, "-", "--json", ...codexEffortArgs(effort, codexHome), ...codexPermissionArgs(subscription.permissionProfile)],
+    codexHome,
+  };
+}
+
+/** @see codexResumeTurn — the spawn half; its cwd is the turn's slot directory. */
+export function codexSpawnTurn(
+  subscription: Subscription,
+  cwd: string,
+  effort: WakeEffort | null,
+  edgeSocketPath = resolveEdgeSocketPath(),
+): { args: string[]; codexHome: string } {
+  const codexHome = requireAccountProfile(subscription);
+  return { args: codexSpawnArgs(cwd, subscription.permissionProfile, effort, codexHome, edgeSocketPath), codexHome };
 }
 
 /**
