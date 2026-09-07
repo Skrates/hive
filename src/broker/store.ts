@@ -1355,12 +1355,22 @@ export class BrokerStore {
    * in ONE transaction: a broker crash between them could otherwise leave a
    * delivery whose thread never shows it was delivered.
    */
-  markDispatched(deliveryId: number, edgeId: string, generation: number): Delivery {
+  /**
+   * KRA-1414: `notices` are dispatch-time dispositions the requester must be
+   * able to read — today, an `Effort:` overlay the route could not honour.
+   * They are rendered into THIS post rather than the delivery's terminal one
+   * because the dispatched notice is the only thread-visible event every route
+   * reaches: a live Claude turn closes through `recordOutcome` from the agent,
+   * where the edge that took the decision is no longer present. Being in the
+   * same transaction as the status transition makes them as durable as the
+   * transition itself.
+   */
+  markDispatched(deliveryId: number, edgeId: string, generation: number, notices: Reason[] = []): Delivery {
     return this.db.transaction(() => {
       const delivery = this.transition(deliveryId, edgeId, generation, "dispatching", "dispatched");
       this.enqueueOutbox(
         delivery,
-        `→ delivered to ${delivery.actor} (delivery ${delivery.id}, attempt ${delivery.attempts}/${delivery.subscription.maxAttempts})`,
+        dispatchedNotice(delivery, notices),
         REACTION_DISPATCHED,
       );
       return delivery;
@@ -1659,6 +1669,11 @@ function seatWakeRender(from: string, target: string, deliveryId: number, text: 
 /** The commons render of a system-origin review wake: the review machine addressed a seat. */
 function systemWakeRender(target: string, deliveryId: number, text: string): string {
   return `🐝 review wake ${SYSTEM_WAKE_SENDER} → ${target} (delivery ${deliveryId})\n\n${text}`;
+}
+
+function dispatchedNotice(delivery: Delivery, notices: Reason[]): string {
+  const head = `→ delivered to ${delivery.actor} (delivery ${delivery.id}, attempt ${delivery.attempts}/${delivery.subscription.maxAttempts})`;
+  return [head, ...notices.map((notice) => `⚠ ${notice.code} — ${notice.detail}`)].join("\n");
 }
 
 function outcomePost(delivery: Delivery, text: string): string {

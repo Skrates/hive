@@ -57,6 +57,13 @@ export const ReasonSchema = z.object({
 export type Reason = z.infer<typeof ReasonSchema>;
 
 /**
+ * KRA-1414: dispatch-time dispositions the broker renders into a delivery's
+ * thread-visible status — a request the route could not honour, published
+ * where the requester reads rather than on the edge's stderr.
+ */
+export const DispatchNoticesSchema = z.array(ReasonSchema).default([]);
+
+/**
  * KRA-1364: the placeholder an `edgeWorkspaces[].cwd` carries when the actor
  * runs more than one turn at once. Slot `n` runs in the entry's `cwd` with
  * every `{slot}` replaced by `n`, so two concurrent turns of one actor on one

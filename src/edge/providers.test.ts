@@ -441,10 +441,32 @@ test("a structured Desktop account rejection remains a deterministic pre-dispatc
 
 test("codex spawn skips the git-repo check: the edge's cwd is a root of checkouts, not a checkout", () => {
   const socketPath = "/tmp/hive-edge.sock";
-  const args = codexSpawnArgs("/home/hive/work-ariadne", "workspace-write", null, socketPath);
+  const args = codexSpawnArgs("/home/hive/work-ariadne", "workspace-write", null, null, socketPath);
   assert.deepEqual(args.slice(0, 5), ["exec", "--cd", "/home/hive/work-ariadne", "--skip-git-repo-check", "--json"]);
   assert.deepEqual(args.slice(5, -1), codexPermissionArgs("workspace-write", socketPath));
   assert.equal(args.at(-1), "-");
+});
+
+test("KRA-1414: a codex spawn's effort override is clamped by the pinned CODEX_HOME's model", () => {
+  const socketPath = "/tmp/hive-edge.sock";
+  const home = mkdtempSync(join(tmpdir(), "hive-codex-home-"));
+  try {
+    writeFileSync(join(home, "config.toml"), 'model = "gpt-5.5"\nmodel_reasoning_effort = "medium"\n');
+    // gpt-5.5's ladder stops at xhigh; ultra would be rejected at provider start.
+    assert.ok(codexSpawnArgs("/w", "workspace-write", "ultra", home, socketPath)
+      .includes("model_reasoning_effort=xhigh"));
+    // The same request against a model that speaks the whole grammar is verbatim.
+    writeFileSync(join(home, "config.toml"), 'model = "gpt-6-astra"\n');
+    assert.ok(codexSpawnArgs("/w", "workspace-write", "ultra", home, socketPath)
+      .includes("model_reasoning_effort=ultra"));
+    // No overlay: the invocation is byte-identical to the pre-overlay one.
+    assert.deepEqual(
+      codexSpawnArgs("/w", "workspace-write", null, home, socketPath),
+      codexSpawnArgs("/w", "workspace-write", null, null, socketPath),
+    );
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test("codex seats may reach GitHub and the hive socket, nothing else", () => {

@@ -11,7 +11,11 @@ invariants.
 - Trust is sender identity: the broker's admission policy is a closed trust set; a trust-set
   message is delivered as an instruction, framed imperatively. Anyone else is dropped with a
   thread notice. Hive never inspects, gates, or grades content — the authority ceiling is the
-  receiving agent's own harness configuration.
+  receiving agent's own harness configuration. The one thing the edge reads out of a message
+  is the ENVELOPE grammar it is addressed by — `WAKE: <actor>` selects the recipient, a bare
+  `Effort: <tier>` line sets that turn's reasoning depth — which is routing and dispatch shape,
+  never a judgement about the payload: no `Effort:` line can widen what the turn may do, and
+  the ceiling stays exactly where R-2 puts it.
 - Workstation edges connect outward and expose no inbound network port. The machine-local plane is
   owner-only Unix domain sockets; filesystem ownership is the local authentication.
 - Delivery is at-least-once with a single fenced claimant; exactly-once is not claimed and not

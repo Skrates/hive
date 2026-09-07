@@ -126,6 +126,8 @@ class FakeBroker {
   readonly releases: ReleaseRecord[] = [];
   readonly replies: Array<{ deliveryId: number; text: string }> = [];
   readonly outcomes: Array<{ deliveryId: number; text: string }> = [];
+  /** KRA-1414: the dispatch-time dispositions each markDispatched carried. */
+  readonly dispatchNotices: Array<{ deliveryId: number; notices: readonly Reason[] }> = [];
   markCount = 0;
 
   constructor(private readonly queue: Delivery[]) {}
@@ -147,8 +149,9 @@ class FakeBroker {
 
   async accept(value: Delivery): Promise<Delivery> { return { ...value, status: "accepted_local" }; }
   async beginDispatch(value: Delivery): Promise<Delivery> { return { ...value, status: "dispatching" }; }
-  async markDispatched(value: Delivery): Promise<Delivery> {
+  async markDispatched(value: Delivery, notices: readonly Reason[] = []): Promise<Delivery> {
     this.markCount += 1;
+    this.dispatchNotices.push({ deliveryId: value.id, notices });
     return { ...value, status: "dispatched" };
   }
   async renew(value: Delivery): Promise<Delivery> { return value; }
@@ -1086,22 +1089,20 @@ test("a live delivery that carries an Effort overlay publishes that it did not a
     runtimeAttestation: { ok: false, absence: "attestation_unreported" },
   }, 60_000);
   const edge = new EdgeService(asBrokerClient(broker), store, live, [adapter]);
-  const logged: unknown[][] = [];
-  const original = console.error;
-  console.error = (...args: unknown[]) => {
-    logged.push(args);
-  };
-  try {
-    assert.equal(await edge.processOne(), true);
-    assert.equal(await edge.processOne(), true);
-  } finally {
-    console.error = original;
-  }
+  assert.equal(await edge.processOne(), true);
+  assert.equal(await edge.processOne(), true);
   assert.deepEqual(adapter.liveDeliveries, [4, 5]);
   assert.equal(adapter.efforts.length, 0);
-  const unused = logged.filter((args) => args[0] === "hive edge effort overlay unused");
+  // KRA-1414: the refusal rides the delivery's own status transition into the
+  // requester's thread. The plain follow-up carries nothing, so an unconditional
+  // notice would fail here.
+  assert.deepEqual(broker.dispatchNotices.map((entry) => entry.deliveryId), [4, 5]);
+  assert.deepEqual(broker.dispatchNotices[1]?.notices, []);
+  const unused = broker.dispatchNotices[0]?.notices ?? [];
   assert.equal(unused.length, 1);
-  assert.deepEqual(unused[0], ["hive edge effort overlay unused", 4, "max", "live_session_fixed_at_spawn"]);
+  assert.equal(unused[0]?.code, "effort_overlay_unused");
+  assert.match(unused[0]?.detail ?? "", /live_session_fixed_at_spawn/);
+  assert.match(unused[0]?.detail ?? "", /max/);
   store.close();
 });
 
@@ -1116,23 +1117,17 @@ test("a conflicting Effort overlay on a headless delivery publishes that it did 
   const store = new EdgeStore(":memory:");
   const adapter = new StubAdapter();
   const edge = new EdgeService(asBrokerClient(broker), store, new LiveIngressRegistry(), [adapter]);
-  const logged: unknown[][] = [];
-  const original = console.error;
-  console.error = (...args: unknown[]) => {
-    logged.push(args);
-  };
-  try {
-    assert.equal(await edge.processOne(), true);
-    assert.equal(await edge.processOne(), true);
-  } finally {
-    console.error = original;
-  }
+  assert.equal(await edge.processOne(), true);
+  assert.equal(await edge.processOne(), true);
   // Fail-closed: neither tier is applied. The plain follow-up stays silent,
-  // so one exact unused line is unreachable without the conflict diagnostic.
+  // so one exact notice is unreachable without the conflict disposition.
   assert.deepEqual(adapter.efforts, [null, null]);
-  const unused = logged.filter((args) => args[0] === "hive edge effort overlay unused");
+  assert.deepEqual(broker.dispatchNotices.map((entry) => entry.deliveryId), [6, 7]);
+  assert.deepEqual(broker.dispatchNotices[1]?.notices, []);
+  const unused = broker.dispatchNotices[0]?.notices ?? [];
   assert.equal(unused.length, 1);
-  assert.deepEqual(unused[0], ["hive edge effort overlay unused", 6, "low,max", "conflict"]);
+  assert.equal(unused[0]?.code, "effort_overlay_unused");
+  assert.match(unused[0]?.detail ?? "", /conflict:low,max/);
   store.close();
 });
 
@@ -1158,21 +1153,13 @@ test("a live delivery with a conflicting Effort overlay publishes the conflict, 
     runtimeAttestation: { ok: false, absence: "attestation_unreported" },
   }, 60_000);
   const edge = new EdgeService(asBrokerClient(broker), store, live, [adapter]);
-  const logged: unknown[][] = [];
-  const original = console.error;
-  console.error = (...args: unknown[]) => {
-    logged.push(args);
-  };
-  try {
-    assert.equal(await edge.processOne(), true);
-  } finally {
-    console.error = original;
-  }
+  assert.equal(await edge.processOne(), true);
   assert.deepEqual(adapter.liveDeliveries, [8]);
   assert.equal(adapter.efforts.length, 0);
-  const unused = logged.filter((args) => args[0] === "hive edge effort overlay unused");
+  const unused = broker.dispatchNotices[0]?.notices ?? [];
   assert.equal(unused.length, 1);
-  assert.deepEqual(unused[0], ["hive edge effort overlay unused", 8, "low,max", "conflict"]);
+  assert.match(unused[0]?.detail ?? "", /conflict:low,max/);
+  assert.doesNotMatch(unused[0]?.detail ?? "", /live_session_fixed_at_spawn/);
   store.close();
 });
 

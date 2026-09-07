@@ -134,8 +134,8 @@ export class BrokerService {
    * ADR-0003 R-6: the thread shows delivery. The dispatched transition and the
    * sender-visible delivery receipt commit in one store transaction.
    */
-  markDispatched(deliveryId: number, edgeId: string, generation: number): Delivery {
-    return this.store.markDispatched(deliveryId, edgeId, generation);
+  markDispatched(deliveryId: number, edgeId: string, generation: number, notices: Reason[] = []): Delivery {
+    return this.store.markDispatched(deliveryId, edgeId, generation, notices);
   }
 
   renew(deliveryId: number, edgeId: string, generation: number): Delivery {

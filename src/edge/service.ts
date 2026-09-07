@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { busySlotKey, frameWakeInstruction, workspaceCwd, type BusySlot, type Delivery, type Provider, type Reason, type ReplaySnapshot } from "../domain.js";
-import { parseDeliveryEffort } from "./effort.js";
+import { disposeDeliveryEffort, parseDeliveryEffort, type WakeEffort } from "./effort.js";
 import { BrokerClient } from "./broker-client.js";
 import { LiveIngressRegistry, type LiveIngress } from "./live-registry.js";
 import {
@@ -244,9 +244,18 @@ export class EdgeService {
       current = asClaimed(await this.broker.beginDispatch(current));
       this.store.setStatus(current.id, generation, "dispatching");
 
+      // KRA-1414: the overlay is disposed once, against the route this turn
+      // actually took. A tier the route cannot honour is not a diagnostic —
+      // it rides the dispatched transition below into the thread the requester
+      // is reading, because edge stderr lives on a machine they cannot see and
+      // the outcome reports success either way.
+      // Parsed from `current`, the freshest ledger view of the delivery, so a
+      // message coalesced into it after the claim is still part of the request.
+      const overlay = disposeDeliveryEffort(parseDeliveryEffort(current), live !== null);
+
       const dispatch = await this.withLeaseHeartbeat(
         current,
-        () => this.dispatch(current, replay, live, generation, slot, async () => {
+        () => this.dispatch(current, replay, live, generation, slot, overlay.effort, async () => {
           providerStarted = true;
           // The last uncovered cell of {live, headless} × {claim, provider-start}:
           // a headless child reads its profile when it spawns, which is several
@@ -267,7 +276,7 @@ export class EdgeService {
           }
         }),
       );
-      current = asClaimed(await this.broker.markDispatched(current));
+      current = asClaimed(await this.broker.markDispatched(current, overlay.unused ? [overlay.unused] : []));
       this.store.setStatus(current.id, generation, "dispatched", dispatch.receipt);
       if (dispatch.processed) {
         // A completed provider turn (headless, or a completion-tracked Codex
@@ -419,6 +428,10 @@ export class EdgeService {
     live: LiveIngress | null,
     generation: number,
     slot: number,
+    // KRA-1414: the route-aware fold of the delivery's `Effort:` overlay, taken
+    // once in dispatchClaimed so the tier handed to the provider and the notice
+    // published to the requester cannot disagree about the route.
+    effort: WakeEffort | null,
     // Awaited: the headless branch re-reads the profile attestation here, and
     // that read is now off the event loop. The rebind must land before the
     // provider starts, so the start waits for it.
@@ -429,35 +442,6 @@ export class EdgeService {
     if (!adapter) throw new PreDispatchError("provider_adapter_missing");
     adapter.preflight?.(subscription);
 
-    // Overlay is computed for every route, including live. A live session's
-    // effort was fixed at its own spawn, so the flag cannot apply there —
-    // but a requested overlay that we cannot honour must not vanish silently.
-    // The honourable tier is the one named member; every other non-none
-    // parse result is a request we refuse and publish.
-    const parsed = parseDeliveryEffort(delivery);
-    const effort = parsed.kind === "tier" ? parsed.tier : null;
-    switch (parsed.kind) {
-      case "none":
-        break;
-      case "tier":
-        if (live) {
-          console.error(
-            "hive edge effort overlay unused",
-            delivery.id,
-            parsed.tier,
-            "live_session_fixed_at_spawn",
-          );
-        }
-        break;
-      case "conflict":
-        console.error(
-          "hive edge effort overlay unused",
-          delivery.id,
-          parsed.tiers.join(","),
-          "conflict",
-        );
-        break;
-    }
     if (live) {
       await onProviderStart();
       // Codex live delivery waits for the exact app-server turn and lets the
