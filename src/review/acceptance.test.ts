@@ -14,13 +14,16 @@ import { readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { BrokerService, housekeepingTick, type SlackTransport } from "../broker/service.js";
 import { BrokerStore } from "../broker/store.js";
+import type { ReplaySnapshot, SubscriptionInput } from "../domain.js";
 import type { Clock } from "../time.js";
 import type {
   Action,
   AppliedOutcome,
   ExternalResult,
   Finding,
+  FindingsExternalResult,
   ObservePRAction,
   Policy,
   Principal,
@@ -32,10 +35,12 @@ import type {
   ReviewState,
 } from "./contract.js";
 import { validateReview, validateReviewState } from "./contract.js";
-import { issueCommentRecord, type GitHubChangedFile, type GitHubPort, type GitHubPullRequest, type GitHubRecord, type GitHubReaction } from "./github/port.js";
+import { classifyCodexRecord } from "./github/classify.js";
+import { issueCommentRecord, reviewCommentRecord, reviewRecord, type GitHubChangedFile, type GitHubPort, type GitHubPullRequest, type GitHubReaction, type GitHubRecord } from "./github/port.js";
 import { ReconcileScheduler, reconcile } from "./github/reconcile.js";
 import { handleWebhook } from "./github/webhook.js";
 import { ReviewPublisher, type ReviewGitHubPort, type SystemWakePort } from "./publisher.js";
+import { threadState } from "./render.js";
 import { decide, fold, read } from "./reducer.js";
 import { ReviewStore } from "./store.js";
 
@@ -94,6 +99,33 @@ class FakeClock implements Clock {
 
 function codexFixture(name: string): GitHubRecord {
   return issueCommentRecord(JSON.parse(readFileSync(join(FIXTURES, `${name}.json`), "utf8")) as Record<string, unknown>);
+}
+
+/** Any captured source-record fixture, read by the reader its `-<kind>-` segment names. */
+function codexRecord(name: string): GitHubRecord {
+  const raw = JSON.parse(readFileSync(join(FIXTURES, `${name}.json`), "utf8")) as Record<string, unknown>;
+  switch (name.split("-").at(-2)) {
+    case "review": return reviewRecord(raw);
+    case "review_comment": return reviewCommentRecord(raw);
+    default: return issueCommentRecord(raw);
+  }
+}
+
+/** The one classification, as the reconciler runs it: the record's own `ExternalResult`. */
+function classified(name: string, o: { repository: string; head: string; members?: GitHubRecord[] }): FindingsExternalResult {
+  const result = classifyCodexRecord(codexRecord(name), {
+    headSha: o.head,
+    heads: [o.head],
+    repository: o.repository,
+    members: o.members ?? [],
+    reviews: [],
+    reviewComments: [],
+    prReactions: [],
+  });
+  assert.equal(result.classification, "findings", result.detail);
+  assert.ok(result.external !== undefined);
+  assert.equal(result.external.verdict, "findings");
+  return result.external as FindingsExternalResult;
 }
 
 interface ObserveOverrides {
@@ -203,7 +235,7 @@ function external(o: Partial<ExternalResult> & { comments?: Array<{ id: number; 
       source: "codex",
       reviewed_head: H1,
       verdict: comments === undefined || comments.length === 0 ? "clean" : "findings",
-      findings: (comments ?? []).map((c) => ({ source_comment_id: c.id, path: "src/x.py", line: 12, priority: "P1", title: c.title ?? `Codex ${c.id}`, body: "…" })),
+      findings: (comments ?? []).map((c) => ({ container_kind: "review_comment" as const, container_id: c.id, locator: 0, path: "src/x.py", line: 12, priority: "P1" as const, title: c.title ?? `Codex ${c.id}`, body: "…" })),
       source_record: { kind: "review", id: 5001, version: T0 },
       submitted_at: T0,
       ...rest,
@@ -234,6 +266,13 @@ class FakeSlack implements SystemWakePort {
   }
 }
 
+/** A promise that rejects when `signal` aborts, as an aborted request does. */
+function aborted(signal: AbortSignal): Promise<never> {
+  return new Promise<never>((_resolve, reject) => {
+    signal.addEventListener("abort", () => { reject(new Error("aborted")); }, { once: true });
+  });
+}
+
 /** The projection sink. `boardGate`, when set, holds the worker inside the board render (§11.5's delayed worker). */
 class FakeGitHub implements ReviewGitHubPort {
   checks: Array<{ headSha: string; conclusion: "success" | "failure"; title: string }> = [];
@@ -244,12 +283,31 @@ class FakeGitHub implements ReviewGitHubPort {
   threads: Array<{ commentId: number; op: "resolve" | "unresolve" }> = [];
   comments: string[] = [];
   boardGate: { reached: () => void; proceed: Promise<void> } | null = null;
-  async createOrUpdateCheckRun(input: { headSha: string; existingId: number | null; conclusion: "success" | "failure"; title: string }): Promise<{ checkRunId: number }> {
+  /** A port that refuses every call (bundle-1 #9: GitHub down). */
+  down: Error | null = null;
+  /** A port that accepts every call and never answers (bundle-1 #9: GitHub hung). */
+  hang: Promise<never> | null = null;
+  async createOrUpdateCheckRun(input: { headSha: string; existingId: number | null; conclusion: "success" | "failure"; title: string }, signal: AbortSignal): Promise<{ checkRunId: number }> {
+    await this.reachable(signal);
     this.checks.push({ headSha: input.headSha, conclusion: input.conclusion, title: input.title });
     this.checkEdits.push(input.existingId);
     return { checkRunId: input.existingId ?? this.checks.length };
   }
-  async createOrUpdateBoardComment(input: { existingId: number | null; body: string }): Promise<{ commentId: number }> {
+  /**
+   * Whatever this port is doing to the caller — throwing, hanging, or answering. A hung call
+   * ends when the dispatch's signal aborts it, as a real request does: nothing it carried
+   * reaches the sink afterwards.
+   */
+  private async reachable(signal: AbortSignal): Promise<void> {
+    if (this.down !== null) throw this.down;
+    if (this.hang !== null) {
+      await Promise.race([this.hang, aborted(signal)]);
+    }
+    if (signal.aborted) throw new Error("aborted");
+  }
+
+  async createOrUpdateBoardComment(input: { existingId: number | null; body: string }, signal: AbortSignal): Promise<{ commentId: number }> {
+    await this.reachable(signal);
     const gate = this.boardGate;
     if (gate !== null) {
       this.boardGate = null;
@@ -260,9 +318,10 @@ class FakeGitHub implements ReviewGitHubPort {
     this.boardEdits.push(input.existingId);
     return { commentId: input.existingId ?? 500 };
   }
-  async resolveThread(input: { commentId: number }): Promise<void> { this.threads.push({ commentId: input.commentId, op: "resolve" }); }
-  async unresolveThread(input: { commentId: number }): Promise<void> { this.threads.push({ commentId: input.commentId, op: "unresolve" }); }
-  async postComment(input: { body: string }): Promise<{ commentId: number; summonLogin: string }> {
+  async resolveThread(input: { commentId: number }, signal: AbortSignal): Promise<void> { await this.reachable(signal); this.threads.push({ commentId: input.commentId, op: "resolve" }); }
+  async unresolveThread(input: { commentId: number }, signal: AbortSignal): Promise<void> { await this.reachable(signal); this.threads.push({ commentId: input.commentId, op: "unresolve" }); }
+  async postComment(input: { body: string }, signal: AbortSignal): Promise<{ commentId: number; summonLogin: string }> {
+    await this.reachable(signal);
     this.comments.push(input.body);
     return { commentId: 700 + this.comments.length, summonLogin: "RationallyPrime" };
   }
@@ -428,7 +487,12 @@ test("M0 slice: an adapter observation and a Codex clean answer reach the Slack 
   // Without GitHub (M0) the check refresh has no sink and the summons waits; nothing is lost.
   const rows = core.effectRows();
   assert.ok(rows.some((r) => r.target.startsWith("check:") && r.status === "obsolete"));
-  assert.ok(rows.filter((r) => r.target.startsWith("board:")).every((r) => r.status === "sent" || r.status === "obsolete"));
+  // §8.1: the board's two sinks are two rows — the Slack line is sent, the GitHub comment
+  // has no port in M0 and is retired, neither waiting on the other.
+  const slackBoard = rows.filter((r) => r.target.startsWith("board:slack:"));
+  assert.ok(slackBoard.every((r) => r.status === "sent" || r.status === "obsolete"), "sent, or coalesced into the one that was");
+  assert.equal(slackBoard.filter((r) => r.status === "sent").length, 1);
+  assert.ok(rows.filter((r) => r.target.startsWith("board:github:")).every((r) => r.status === "obsolete"));
   core.close();
 });
 
@@ -675,7 +739,7 @@ test("§11.6 Exhaustion predicate becomes true → another answer at the same su
   const rows = core.effectRows().filter((r) => exhausted.effects.includes(r.effect_id));
   const deliveries = rows.filter((r) => r.target.startsWith("delivery:"));
   assert.deepEqual(deliveries.map((r) => r.target).sort(), [`delivery:talos:${retro.id}`, `delivery:theoros:${retro.id}`].sort(), "one author delivery, one retrospective request delivery");
-  assert.deepEqual(rows.filter((r) => r.kind === "refresh").map((r) => r.target), [`board:${review.id}`, `check:Owner/repo:${H1}`], "one gate projection (the board and check refresh from current state)");
+  assert.deepEqual(rows.filter((r) => r.kind === "refresh").map((r) => r.target), [`board:github:${review.id}`, `board:slack:${review.id}`, `check:Owner/repo:${H1}`], "one gate projection (the board sinks and the check refresh from current state)");
 
   // Another answer at the same subject while the episode is open: the predicate holds again and emits nothing new.
   core.applied({ kind: "OpenRequest", request_kind: "review", mode: "appeal", assignee: "ariadne", subject_key: key, required: false, names: [], reason: "one more look" }, OPERATOR);
@@ -962,6 +1026,324 @@ test("§6.C6 through the reconciler: a verbatim template copy is exempt in the R
   core.close();
 });
 
+// ---------------------------------------------------------------------------------------
+// §3.5 / §8.1 — source *container* vs source *item*: one comment, many findings
+// ---------------------------------------------------------------------------------------
+
+/** The head `sokrates-issue_comment-5420521329`'s own permalinks pin (V-6 capture). */
+const INLINE_HEAD = "b21a0e215207df98c7761e8e27d9f4b4af553c72";
+/** The head the `hive-review-5125461304` envelope was submitted at (V-6 capture). */
+const ENVELOPE_HEAD = "9ae793d86be8a73a29717e55cb978ee120e72ad9";
+
+test("§3.5 five inline findings in one issue comment are five findings, and §8.1 refreshes no thread", () => {
+  const core = new Core();
+  core.applied(observe({ head: INLINE_HEAD }), ADAPTER, { actId: "obs:inline" });
+  assert.equal(core.pending("codex").length, 1, "the initial round routes to codex (§D2)");
+
+  const external = classified("sokrates-issue_comment-5420521329", { repository: "Skrates/sokrates", head: INLINE_HEAD });
+  assert.equal(external.findings.length, 5, "the wild's comment carries five findings");
+  const applied = core.applied({ kind: "AdmitExternalResult", result: external }, ADAPTER, { actId: "src:issue_comment:5420521329:v1" });
+
+  // Every finding is retained: one container, five distinct locators, five distinct Hive ids.
+  const findings = core.review().findings;
+  assert.equal(findings.length, 5, "admission keeps all five; a shared comment id is not a duplicate");
+  assert.equal(new Set(findings.map((f) => f.id)).size, 5, "each finding has its own immutable id");
+  const sources = findings.map((f) => {
+    assert.ok("comment_id" in f.source);
+    return f.source;
+  });
+  assert.deepEqual(sources.map((s) => s.comment_id), Array<number>(5).fill(5420521329), "one container");
+  assert.deepEqual(sources.map((s) => s.container_kind), Array<string>(5).fill("issue_comment"));
+  assert.equal(new Set(sources.map((s) => s.locator)).size, 5, "distinct source-local locators");
+  assert.equal(core.state().blocking_findings.length, 5, "all five are read back as blocking (P1/P1/P2/P2/P2)");
+  assert.deepEqual(core.pending("codex"), [], "the five-finding result answers the pending codex request (§E4)");
+
+  // §8.1: an issue comment has no GitHub review thread, so the batch names no `thread:` target.
+  const rows = new Map(core.effectRows().map((r) => [r.effect_id, r.target]));
+  const emitted = applied.effects.map((id) => rows.get(id) ?? id);
+  assert.ok(emitted.length > 0);
+  assert.ok(!emitted.some((t) => t.startsWith("thread:")), `an issue-comment container is never a thread target: ${emitted.join(" ")}`);
+  core.close();
+});
+
+test("§8.1 a review envelope's member comments are thread containers: one refresh each, resolved only when every finding in the container is closed", () => {
+  const core = new Core();
+  core.applied(observe({ head: ENVELOPE_HEAD }), ADAPTER, { actId: "obs:envelope" });
+
+  const members = [codexRecord("hive-review_comment-3944094503"), codexRecord("hive-review_comment-3944094508")];
+  const envelope = classified("hive-review-5125461304", { repository: "Skrates/hive", head: ENVELOPE_HEAD, members });
+  assert.deepEqual(
+    envelope.findings.map((f) => [f.container_kind, f.container_id, f.locator]),
+    [["review_comment", 3944094503, 0], ["review_comment", 3944094508, 0]],
+    "each member comment is its own container",
+  );
+  core.applied({ kind: "AdmitExternalResult", result: envelope }, ADAPTER, { actId: "src:review:5125461304:v1" });
+
+  // A second finding in the *first* member's container — the case `threadState` must not decide
+  // off the first match. The connector writes one finding per member comment; the state machine
+  // must still be right when a container carries two.
+  const second: FindingsExternalResult = {
+    ...envelope,
+    findings: [{ ...envelope.findings[0], locator: 1, title: "A second finding in the same member comment" }],
+    source_record: { ...envelope.source_record, version: "2026-09-06T13:00:00Z" },
+  };
+  core.applied({ kind: "AdmitExternalResult", result: second }, ADAPTER, { actId: "src:review:5125461304:v2" });
+
+  const byContainer = (commentId: number) =>
+    core.review().findings.filter((f) => "comment_id" in f.source && f.source.comment_id === commentId);
+  assert.equal(byContainer(3944094503).length, 2, "two findings share the first member's container");
+  assert.equal(byContainer(3944094508).length, 1);
+
+  const close = (findingId: string, actId: string) =>
+    core.applied({ kind: "ResolveFinding", finding_id: findingId, resolution: { kind: "fixed", evidence: "repaired", commits: [H2] } }, seat("talos"), { actId });
+  const targetsOf = (effects: string[]): string[] => {
+    const rows = new Map(core.effectRows().map((r) => [r.effect_id, r.target]));
+    return effects.map((id) => rows.get(id) ?? id);
+  };
+
+  // Closing the first of the container's two findings changes the *finding*, not the container:
+  // its sibling is still open, so the thread stays un-resolved and there is nothing to refresh.
+  // The container's aggregate state is the trigger, not any one finding's status.
+  const first = byContainer(3944094503)[0];
+  assert.ok(first !== undefined);
+  const firstClose = close(first.id, "01JCLOSE1");
+  assert.deepEqual(targetsOf(firstClose.effects).filter((t) => t.startsWith("thread:")), [], "the container's state did not change");
+  assert.equal(threadState(core.review(), 3944094503), "unresolve", "one finding still open keeps the whole container un-resolved");
+
+  const remaining = byContainer(3944094503).find((f) => f.status.open);
+  assert.ok(remaining !== undefined);
+  const secondClose = close(remaining.id, "01JCLOSE2");
+  assert.deepEqual(targetsOf(secondClose.effects).filter((t) => t.startsWith("thread:")), ["thread:3944094503"]);
+  assert.equal(threadState(core.review(), 3944094503), "resolve", "every finding in the container is closed");
+  assert.equal(threadState(core.review(), 3944094508), "unresolve", "the other container is untouched");
+
+  // The other member container refreshes on its own status change, and the publisher resolves
+  // exactly the two threads the containers stand for.
+  const other = byContainer(3944094508)[0];
+  assert.ok(other !== undefined);
+  const otherClose = close(other.id, "01JCLOSE3");
+  assert.deepEqual(targetsOf(otherClose.effects).filter((t) => t.startsWith("thread:")), ["thread:3944094508"]);
+  core.close();
+});
+
+test("§8.1 admitting a new open finding into a resolved container un-resolves its thread", () => {
+  const core = new Core();
+  core.applied(observe({ head: ENVELOPE_HEAD }), ADAPTER, { actId: "obs:readmit" });
+
+  const members = [codexRecord("hive-review_comment-3944094503")];
+  const envelope = classified("hive-review-5125461304", { repository: "Skrates/hive", head: ENVELOPE_HEAD, members });
+  core.applied({ kind: "AdmitExternalResult", result: envelope }, ADAPTER, { actId: "src:review:5125461304:v1" });
+
+  const targetsOf = (effects: string[]): string[] => {
+    const rows = new Map(core.effectRows().map((r) => [r.effect_id, r.target]));
+    return effects.map((id) => rows.get(id) ?? id);
+  };
+
+  const only = core.review().findings[0];
+  assert.ok(only !== undefined);
+  const closed = core.applied(
+    { kind: "ResolveFinding", finding_id: only.id, resolution: { kind: "fixed", evidence: "repaired", commits: [H2] } },
+    seat("talos"),
+    { actId: "01JREADMIT1" },
+  );
+  assert.deepEqual(targetsOf(closed.effects).filter((t) => t.startsWith("thread:")), ["thread:3944094503"]);
+  assert.equal(threadState(core.review(), 3944094503), "resolve", "the container's only finding is closed");
+
+  // A later run finds a second problem in the same review comment. Nothing about the existing
+  // finding changes, so a refresh keyed on a finding's status change emits nothing and the
+  // thread stays resolved over an open blocking finding. The container's aggregate flipped.
+  const again: FindingsExternalResult = {
+    ...envelope,
+    findings: [{ ...envelope.findings[0], locator: 1, title: "A second problem in the same review comment" }],
+    source_record: { ...envelope.source_record, version: "2026-09-06T14:00:00Z" },
+  };
+  const readmitted = core.applied({ kind: "AdmitExternalResult", result: again }, ADAPTER, { actId: "src:review:5125461304:v2" });
+  assert.deepEqual(targetsOf(readmitted.effects).filter((t) => t.startsWith("thread:")), ["thread:3944094503"], "the container is un-resolved");
+  assert.equal(threadState(core.review(), 3944094503), "unresolve", "an open finding in the container keeps its thread open");
+  core.close();
+});
+
+// ---------------------------------------------------------------------------------------
+// Bundle-1 #9: GitHub availability is not a prerequisite for Hive delivery
+// ---------------------------------------------------------------------------------------
+
+/** A live subscription, so a system wake to this seat is routable (R-3). */
+function seatSubscription(actor: string): SubscriptionInput {
+  return {
+    actor, provider: "codex", providerSurface: "app-server", providerVersion: "0.144.0",
+    sessionId: null, homeEdge: "mac", workspace: "hive",
+    edgeWorkspaces: [{ edgeId: "mac", cwd: "/work/hive", worktree: null }],
+    wakePolicy: "spawn", permissionProfile: "read-only", accountProfile: "/home/user/.codex-hive",
+    leaseTtlMs: 1_000, deliveryTtlMs: 60_000, homeGraceMs: 2_000, spawnRateLimit: 1,
+    maxAttempts: 3, turnSlots: 1, expiresAt: null,
+  };
+}
+
+/**
+ * The composed sinks: the real broker database as the Slack sink (as `bootReviewRuntime` wires
+ * it), the real `BrokerService` outbox over a Slack transport the test drives, and a GitHub
+ * port the test can take down or hang.
+ */
+function sinks(options: { publisherTimeoutMs?: number } = {}) {
+  const clock = new FakeClock(new Date(T0));
+  const broker = new BrokerStore(":memory:", clock);
+  const store = new ReviewStore(broker.db, { decide, fold, read, clock });
+  store.putPolicy(KEY.repository_id, POLICY);
+  const github = new FakeGitHub();
+  const publisher = options.publisherTimeoutMs === undefined
+    ? new ReviewPublisher(store, { github, slack: broker }, clock)
+    : new ReviewPublisher(store, { github, slack: broker }, clock, options.publisherTimeoutMs);
+  const posts: Array<{ channelId: string; threadTs: string | null; text: string }> = [];
+  const slack: SlackTransport = {
+    async replay(): Promise<ReplaySnapshot> {
+      return { channelId: "C0123ABCD", threadTs: "1700.1", fetchedAt: T0, cursor: null, messages: [] };
+    },
+    async reply(channelId: string, threadTs: string, text: string): Promise<string> {
+      posts.push({ channelId, threadTs, text });
+      return `1700.${posts.length}`;
+    },
+    async react(): Promise<void> {},
+  };
+  const service = new BrokerService(broker, slack);
+  const acts = { n: 0 };
+  const act = (action: Action, principal: Principal): Receipt => {
+    acts.n += 1;
+    const fenced = principal.kind === "seat" || principal.kind === "operator";
+    return store.apply(KEY, {
+      actId: principal.kind === "adapter" ? `obs:run${acts.n}` : `01J${String(acts.n).padStart(3, "0")}`,
+      principal, expectedRevision: fenced ? store.get(KEY)?.revision ?? 0 : null, action, display: DISPLAY,
+    });
+  };
+  const rows = (): Array<{ target: string; status: string }> =>
+    broker.db.prepare("SELECT target, status FROM review_effects ORDER BY rowid").all() as Array<{ target: string; status: string }>;
+  /** Silence the publisher's own failure log for as long as the job under test runs. */
+  const quiet = async <T>(run: () => Promise<T>): Promise<T> => {
+    const original = console.error;
+    console.error = () => {};
+    try {
+      return await run();
+    } finally {
+      console.error = original;
+    }
+  };
+  return { clock, broker, store, github, publisher, service, posts, act, rows, quiet };
+}
+
+// A publication pass is single-flight, so a GitHub port that never answers used to hold the
+// whole tick — and the outbox drained only after it. Every Hive wake on the bus, review or not,
+// waited on GitHub.
+test("bundle-1 #9: a hung GitHub port delays no Hive wake and no Slack board line", async () => {
+  // A short dispatch timeout so the hung port's rows fail inside the test rather than at the
+  // production bound; the point under test is what happens while it is still hung.
+  const { broker, github, publisher, service, posts, act, rows, quiet } = sinks({ publisherTimeoutMs: 50 });
+  broker.enqueueThreadNotice("C9", "900.1", "an unrelated Hive wake");
+  github.hang = new Promise<never>(() => {});
+  act(observe(), ADAPTER);
+
+  const tick = quiet(() => housekeepingTick({
+    sweep: () => broker.requeueExpiredLeases(),
+    publish: () => publisher.drainOnce(),
+    drainOutbox: () => service.drainOutbox(),
+    log: () => {},
+  }));
+  // The publication pass is still inside the hung GitHub call …
+  await new Promise((resolve) => setImmediate(resolve));
+  // … and the unrelated wake, plus the Review's own Slack board line, have gone out.
+  assert.deepEqual(posts.map((p) => p.text), ["an unrelated Hive wake", posts[1]?.text ?? ""]);
+  assert.match(posts[1]?.text ?? "", /Owner\/repo#7/u);
+  const board = rows().filter((r) => r.target.startsWith("board:"));
+  assert.deepEqual(board.filter((r) => r.target.startsWith("board:slack:")).map((r) => r.status), ["sent"]);
+  assert.ok(board.filter((r) => r.target.startsWith("board:github:")).every((r) => r.status === "pending" || r.status === "claimed"),
+    "the GitHub sink has published nothing — its row waits on its own port, alone");
+  assert.equal(github.boards.length, 0);
+
+  // F4 (Codex 3945383523): a Slack row queued *after* the hung pass began — too late to be in
+  // its listing — still leaves on the next tick. One global publication fence would have made it
+  // wait for every remaining GitHub row to answer or time out; the fences are per sink.
+  act({ kind: "GrantRounds", n: 1, reason: "queued while GitHub hangs" }, OPERATOR);
+  const nextTick = quiet(() => housekeepingTick({
+    sweep: () => broker.requeueExpiredLeases(),
+    publish: () => publisher.drainOnce(),
+    drainOutbox: () => service.drainOutbox(),
+    log: () => {},
+  }));
+  await new Promise((resolve) => setImmediate(resolve));
+  await service.drainOutbox();
+  assert.deepEqual(rows().filter((r) => r.target.startsWith("board:slack:")).map((r) => r.status), ["sent", "sent"],
+    "both Slack rows are out, the second queued after the GitHub pass hung");
+  assert.equal(posts.length, 3, "and the second board line reached Slack while GitHub is still hanging");
+  assert.equal(github.boards.length, 0, "GitHub has still published nothing");
+
+  await tick;
+  await nextTick;
+  broker.close();
+});
+
+// The Slack board line is what opens the Review's thread, and every delivery threads under it.
+test("bundle-1 #9: with GitHub down the Slack thread still opens and a seat delivery threads under it", async () => {
+  const { broker, store, github, publisher, service, posts, act, rows, quiet } = sinks();
+  broker.createEdge("mac");
+  broker.upsertSubscription(seatSubscription("talos"));
+  github.down = new Error("github is down");
+  act(observe(), ADAPTER);
+
+  await quiet(() => publisher.drainOnce());
+  await service.drainOutbox();
+  assert.equal(posts.length, 1, "the board line left, GitHub notwithstanding");
+  assert.ok(!posts[0]?.threadTs, "§8.1: the first line is the thread's top-level post");
+  assert.deepEqual(rows().filter((r) => r.target.startsWith("board:github:")).map((r) => r.status), ["pending"], "failed and behind backoff, alone");
+
+  // A delivery queued after the outbox has posted that line threads under it.
+  act({ kind: "OpenRequest", request_kind: "review", mode: "appeal", assignee: "talos", subject_key: `${H1}:main`, required: false, names: [], reason: "burn" }, OPERATOR);
+  await quiet(() => publisher.drainOnce());
+  await service.drainOutbox();
+  assert.equal(store.read(KEY)?.projection_handles.slack_thread_ts, "1700.1", "the thread ts was learned from the outbox, not from GitHub");
+  const transport = store.get(KEY)?.requests.find((r) => r.assignee === "talos")?.transport ?? [];
+  const ref = transport.find((t) => "delivery_id" in t);
+  assert.ok(ref !== undefined && "delivery_id" in ref, "the delivery was minted");
+  assert.equal(broker.getDelivery(ref.delivery_id).event.threadTs, "1700.1", "threaded under the Slack board parent, never under GitHub");
+  broker.close();
+});
+
+// Refresh-from-current: the GitHub sink catches up from the state as it is now, coalesced into
+// one call, and the check row was never part of the board's trouble.
+test("bundle-1 #9: when GitHub recovers the board comment catches up from the current state", async () => {
+  const { clock, broker, github, publisher, act, rows, quiet } = sinks();
+  github.down = new Error("github is down");
+  act(observe(), ADAPTER);
+  await quiet(() => publisher.drainOnce());
+  assert.equal(github.boards.length, 0);
+  assert.equal(github.checks.length, 0, "the check row is a GitHub row too, and failed on its own");
+
+  // Two more acts while GitHub is down: two more board:github rows, one per batch.
+  act({ kind: "GrantRounds", n: 1, reason: "one more" }, OPERATOR);
+  act({ kind: "Hold", hold: { kind: "operator", reason: "wait", release_on: "explicit", blocks: { readiness: true, summons: false } } }, OPERATOR);
+  github.down = null;
+  clock.advance(10 * MINUTE);
+  await publisher.drainOnce();
+
+  assert.equal(github.boards.length, 1, "one comment, rendered from the state now — the earlier rows coalesced");
+  assert.match(github.boards[0] ?? "", /hold: operator/u);
+  assert.deepEqual(github.checks.map((c) => [c.conclusion, c.title]), [["failure", "hold: operator"]], "the check caught up on its own row");
+  const github_rows = rows().filter((r) => r.target.startsWith("board:github:"));
+  assert.equal(github_rows.filter((r) => r.status === "sent").length, 1);
+  assert.ok(github_rows.every((r) => r.status === "sent" || r.status === "obsolete" || r.status === "pending"));
+  broker.close();
+});
+
+// The publisher's own guard against a port that never answers: the pass is sequential and
+// single-flight, so an await that never returns would wedge publication for the process's life.
+test("bundle-1 #9: a GitHub call that never answers fails its row on the dispatch timeout", async () => {
+  const { broker, github, publisher, act, rows, quiet } = sinks({ publisherTimeoutMs: 20 });
+  github.hang = new Promise<never>(() => {});
+  act(observe(), ADAPTER);
+  await quiet(() => publisher.drainOnce());
+  assert.deepEqual(rows().filter((r) => r.target.startsWith("board:slack:")).map((r) => r.status), ["sent"], "the Slack sink never waited on the hung port");
+  const stuck = rows().filter((r) => r.target.startsWith("board:github:") || r.target.startsWith("check:") || r.target.startsWith("summon:"));
+  assert.ok(stuck.every((r) => r.status === "pending"), "timed out, attempts spent, behind backoff — not claimed forever");
+  broker.close();
+});
+
 test("quiet sweep observations age out without republishing; source activity remains visible", async () => {
   const core = new Core();
   core.applied(observe(), ADAPTER);
@@ -977,9 +1359,9 @@ test("quiet sweep observations age out without republishing; source activity rem
   core.store.sourceRecords.upsert({ recordKey: "issue_comment:123", version: core.clock.now().toISOString(), reviewId: core.review().id, authorLogin: CODEX_LOGIN, body: { text: "new unknown record" } });
   core.store.sourceRecords.setClassification("issue_comment:123", core.clock.now().toISOString(), "unknown");
   assert.deepEqual(core.store.active(core.clock.now().toISOString()), [KEY], "a new source record is real activity");
-  assert.equal(core.effectRows().length, before + 1, "unknown records queue their own board refresh");
+  assert.equal(core.effectRows().length, before + 2, "unknown records queue their own board refresh, one row per sink (§8.1)");
   core.store.sourceRecords.setClassification("issue_comment:123", core.clock.now().toISOString(), "unknown");
-  assert.equal(core.effectRows().length, before + 1, "resampling the same classification adds nothing");
+  assert.equal(core.effectRows().length, before + 2, "resampling the same classification adds nothing");
   core.close();
 });
 

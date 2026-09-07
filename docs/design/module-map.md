@@ -47,9 +47,10 @@ export type Validated<T> = { ok: true; value: T } | { ok: false; code: "malforme
   `ep_`, `eff_`; `batch_id = "bat_" + actId`; `review_id = "rev_" + actId` of the opening act. Ids may
   contain colons (adapter act ids are `obs:<run>` / `src:<record_key>:<version>`); the §8.1 target
   grammar tolerates that.
-- **Effect target grammar (§8.1)** — `check:<owner/repo>:<head_sha>` · `board:<review_id>` ·
-  `thread:<comment_id>` · `delivery:<actor>:<request_id>` · `summon:<request_id>` ·
-  `announce:<review_id>`. `kind` is `refresh` for check/board/thread and `actionable` for
+- **Effect target grammar (§8.1)** — `check:<owner/repo>:<head_sha>` ·
+  `board:<github|slack>:<review_id>` · `thread:<comment_id>` · `delivery:<actor>:<request_id>` ·
+  `summon:<request_id>` · `announce:<review_id>`. A target names one publication sink; the board's
+  two sinks are two targets. `kind` is `refresh` for check/board/thread and `actionable` for
   delivery/summon/announce. `payload` is `null` for refreshes (a refresh re-renders from `read()`);
   actionable payloads are §4 of this map.
 - **Refusal** (what `decide` returns; the store wraps it into a `Receipt`):
@@ -108,17 +109,24 @@ uses, so the auto-request, a reassignment and the exhaustion episode honour it t
 decision time, D4 reassignment with `supersedes`, D6 stall housekeeping (runs inside every `ObservePR`
 — the §7 sweep is the cadence, §A4 forbids a separate command — measuring `stall_window_s` from the last
 transport the reducer queued, recording `request_retransported` up to `transport_bound`, then
-`request_unanswerable` + `Hold(unanswerable, blocks summons)`; paused transport never stalls; an answer
-arriving anyway releases the hold as the system), D8 `mergeable_observed`
+`request_transport_exhausted` + `Hold(transport_exhausted, blocks summons)` — neither discharges the
+obligation, the request stays pending; paused transport never stalls; an answer arriving anyway releases
+the hold as the system), D9 the one outstanding-obligation predicate (`isOutstanding`, used by
+readiness, housekeeping, answer matching and restoration), D10 `restoreObligations` (the one
+invariant-restoration point, called from `observe`, `release`, `grantRounds`, `cancelRequest`,
+`setAvailability` and `adoptPolicy`; holds withhold transport, never creation; an operator's
+`cancellation` at the current subject is not resurrected), D8 `mergeable_observed`
 + transport withheld (effects not emitted while `mergeable === false`; emitted on flip to `true`),
 E1–E7, F1–F5, G1–G5, H readiness, I `AdoptPolicy`. Cross-item and process rules listed in the
 contract module's docstring (`weave_reviewkit/contract.py`) are refused `malformed` here — the store
 already ran Ajv, so `decide` may assume shape. `decide` on `state === null` admits only
 `ObservePR` from an adapter/system principal; everything else is `no_such_target`.
 
-Effects `decide` emits (ids `eff_<actId>_<n>`): on every applied batch one `refresh` for
-`board:<review_id>` and one for `check:<display-repo>:<head_sha>`; `thread:<comment_id>` refresh
-when a finding with a comment source changes status; `delivery:<assignee>:<request_id>` on
+Effects `decide` emits (ids `eff_<actId>_<n>`): on every applied batch one `refresh` per board sink
+(`board:github:<review_id>`, `board:slack:<review_id>`) and one for `check:<display-repo>:<head_sha>`;
+`thread:<comment_id>` refresh when a finding whose source container is a `review_comment` changes
+status (the target is the container, not the finding; an `issue_comment` container has no review
+thread); `delivery:<assignee>:<request_id>` on
 `request_opened` to a seat; `summon:<request_id>` on `request_opened` to `codex`;
 `announce:<review_id>` on `lifecycle_changed → merged`. G4's episode emits exactly one
 `delivery:<author>:<request_id>` (author seat) plus the retrospective request's own delivery.
@@ -180,6 +188,9 @@ export class ReviewStore {
   /** §5.B3 truth: fold over review_batches in revision order; never calls decide, never emits. */
   replay(key: ReviewKey): Review;
   batches(key: ReviewKey): Batch[];
+  /** effects.pendingByTarget(now, sink, limit?) selects the due rows of one sink (§8.1 per-sink passes);
+   *  the sink is derived from the target with parseTarget/sinkOf, and an unparseable target is offered
+   *  to every pass so the defect is failed visibly. */
   /** Reviews with a pending request or activity in the last 24 h (§7 bounded reconcile). */
   active(since: string): ReviewKey[];
 
@@ -247,6 +258,10 @@ DDL: §9.3 verbatim, plus `CREATE INDEX IF NOT EXISTS reviews_display_idx ON rev
 tables `review_projection_handles(review_id, handle, key, value, recorded_at)` and
 `review_transport(effect_id PK, review_id, request_id, ref_json, recorded_at)`.
 
+Generation (§9.3): `REVIEW_STORE_GENERATION` + the `review_store_generation` singleton — construction stamps an
+empty store and throws `LegacyReviewStoreError` over reviews of another generation; `resetReviewStore` (behind
+`hive review reset-store`) drops every review table, keeps `review_policies` and `operators`, and re-stamps.
+
 ## 4. `src/review/effects.ts`, `render.ts`, `publisher.ts` — owner: **effects builder**
 
 The only builder who edits `src/broker/store.ts` (to add `SystemWakePort`).
@@ -272,15 +287,20 @@ export interface AnnouncePayload { review_id: string; text: string }
 export function checkRun(state: ReviewState): { name: "weave/review"; conclusion: "success" | "failure"; title: string; summary: string };
 export function boardComment(state: ReviewState, unknownRecords?: readonly UnknownSourceRecord[]): string;   // §7 step 3: unreadable Codex records, ahead of the findings
 export function slackBoardLine(state: ReviewState, unknownRecords?: readonly UnknownSourceRecord[]): string;
+// One op per `review_comment` *container* whose all-findings state flipped (§8.1): resolve once
+// every finding in it is closed, unresolve as soon as any is open or contested. An `issue_comment`
+// container has no review thread and yields none.
 export function threadOps(before: Review | null, after: Review): Array<{ comment_id: number; op: "resolve" | "unresolve" }>;
 
 // publisher.ts
+/** Every method takes the dispatch's AbortSignal and carries it onto the wire: the publisher's
+ *  timeout aborts the call, so a call it gave up on cannot land after the retry (§8.1). */
 export interface ReviewGitHubPort {
-  createOrUpdateCheckRun(input: { repositoryId: number; headSha: string; existingId: number | null; name: string; conclusion: "success" | "failure"; title: string; summary: string }): Promise<{ checkRunId: number }>;
-  createOrUpdateBoardComment(input: { repositoryId: number; prNumber: number; existingId: number | null; body: string }): Promise<{ commentId: number }>;
-  resolveThread(input: { repositoryId: number; commentId: number }): Promise<void>;
-  unresolveThread(input: { repositoryId: number; commentId: number }): Promise<void>;
-  postComment(input: { repositoryId: number; prNumber: number; body: string }): Promise<{ commentId: number }>;   // summons
+  createOrUpdateCheckRun(input: { repositoryId: number; headSha: string; existingId: number | null; name: string; conclusion: "success" | "failure"; title: string; summary: string }, signal: AbortSignal): Promise<{ checkRunId: number }>;
+  createOrUpdateBoardComment(input: { repositoryId: number; prNumber: number; existingId: number | null; body: string }, signal: AbortSignal): Promise<{ commentId: number }>;
+  resolveThread(input: { repositoryId: number; commentId: number }, signal: AbortSignal): Promise<void>;
+  unresolveThread(input: { repositoryId: number; commentId: number }, signal: AbortSignal): Promise<void>;
+  postComment(input: { repositoryId: number; prNumber: number; body: string }, signal: AbortSignal): Promise<{ commentId: number }>;   // summons
 }
 
 /** Implemented on BrokerStore by the effects builder: system-origin Hive deliveries (§8.1 Slack). */
@@ -295,8 +315,11 @@ export interface PublisherStore { … }
 
 export class ReviewPublisher {
   constructor(store: PublisherStore, ports: { github: ReviewGitHubPort | null; slack: SystemWakePort }, clock: Clock);
-  /** One pass: claim pending effects by target, render refreshes from read(), check actionable applicability (§D7), dispatch, mark. Returns effects handled. */
+  /** One pass per sink (§8.1), each single-flight on its own: claim pending effects by target, render
+   *  refreshes from read(), check actionable applicability (§D7), dispatch, mark. Returns effects handled. */
   drainOnce(): Promise<number>;
+  /** Join every sink's in-flight pass before the broker closes its database. */
+  stop(): Promise<void>;
 }
 ```
 
@@ -445,9 +468,11 @@ builder's `deviations` output and the integrator amends this map; do not work ar
 `new ReviewStore(broker.db, { decide, fold, read, clock })`, the `ReviewPublisher` over `{ github, slack: broker }`
 (`BrokerStore` is the `SystemWakePort`), and, when the GitHub App is configured, the `AppGitHubPort`, the webhook
 handler bound to the secret, and the `ReconcileScheduler`; it returns the `ReviewHttpDeps` the `broker` command
-hands to `BrokerHttpServer`. The publisher drains on the broker's 5-second housekeeping tick ahead of the outbox
-drain (its Slack deliveries land in that outbox); `review.start()` arms the scheduler after Slack is up and
-`review.stop()` joins the shutdown.
+hands to `BrokerHttpServer`. The broker's 5-second housekeeping tick is `housekeepingTick` in
+`src/broker/service.ts`: it runs the sweep, one publication pass, and the outbox drain independently — no job
+waits on another, so GitHub availability is never a prerequisite for Hive delivery (§8.1). The publisher's Slack
+deliveries land in that outbox and go out on the tick that finds them. `review.start()` arms the scheduler after
+Slack is up and `review.stop()` joins the shutdown.
 
 Env (broker): `HIVE_GITHUB_WEBHOOK_SECRET_FILE`, `HIVE_GITHUB_APP_ID`, `HIVE_GITHUB_APP_KEY_FILE` — secrets are
 owner-only (0600) files read by `src/review/secret-file.ts`, never bare values; all three or none. With none set

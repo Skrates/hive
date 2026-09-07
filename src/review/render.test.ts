@@ -174,13 +174,15 @@ test("slack board line is one line naming the review, head, readiness, rounds an
   assert.match(slackBoardLine(state()), /^skrates\/hive#7 @ aaaaaaa · ready at aaaaaaa · rounds 0\/7 · blocking 0$/);
 });
 
-// §8.1 (ruled): closed ⇒ resolve, contested or re-opened ⇒ unresolve, comment-sourced only.
+// §8.1 (ruled): a container's thread resolves once every finding in it is closed, and
+// un-resolves as soon as any is open or contested; only a `review_comment` container has one.
 test("thread ops: resolve on close, unresolve on contest or re-open, nothing for reviewkit sources", () => {
-  const open = finding({ id: "fnd_1", source: { record_kind: "review_comment", comment_id: 9001 } });
-  const closed = finding({ id: "fnd_1", source: { record_kind: "review_comment", comment_id: 9001 }, status: { open: false, resolution: fixedClaim() } });
+  const at = (locator: number) => ({ container_kind: "review_comment" as const, comment_id: 9001, locator });
+  const open = finding({ id: "fnd_1", source: at(0) });
+  const closed = finding({ id: "fnd_1", source: at(0), status: { open: false, resolution: fixedClaim() } });
   const contested = finding({
     id: "fnd_1",
-    source: { record_kind: "review_comment", comment_id: 9001 },
+    source: at(0),
     status: { open: true, contested: { by: "codex", at: AT, prior: fixedClaim() } },
   });
   const kitOpen = finding({ id: "fnd_k", source: { fingerprint: "fp", semantic_key: "sk" } });
@@ -199,8 +201,45 @@ test("thread ops: resolve on close, unresolve on contest or re-open, nothing for
   assert.equal(threadState(review({ findings: [closed] }), 9001), "resolve");
   assert.equal(threadState(review({ findings: [contested] }), 9001), "unresolve");
   assert.equal(threadState(review({ findings: [kitClosed] }), 9001), null);
-  const issue = finding({ source: { record_kind: "issue_comment", comment_id: 9001 } });
+  const issue = finding({ source: { container_kind: "issue_comment", comment_id: 9001, locator: 0 } });
   assert.equal(threadState(review({ findings: [issue, closed] }), 9001), "resolve", "issue and review comments have separate numeric id namespaces");
+});
+
+// §8.1 (ruled): the container is the thread, not the finding — one `review_comment` can carry
+// more than one finding, and an `issue_comment` container carries no thread at all.
+test("a container's thread follows all of its findings, and an issue-comment container has none", () => {
+  const reviewComment = (locator: number, closedAt: boolean) =>
+    finding({
+      id: `fnd_${locator}`,
+      source: { container_kind: "review_comment", comment_id: 9001, locator },
+      ...(closedAt ? { status: { open: false, resolution: fixedClaim() } as const } : {}),
+    });
+  const bothOpen = review({ findings: [reviewComment(0, false), reviewComment(1, false)] });
+  const oneClosed = review({ findings: [reviewComment(0, true), reviewComment(1, false)] });
+  const bothClosed = review({ findings: [reviewComment(0, true), reviewComment(1, true)] });
+
+  // All-findings rule: one open finding keeps the whole container un-resolved.
+  assert.equal(threadState(bothOpen, 9001), "unresolve");
+  assert.equal(threadState(oneClosed, 9001), "unresolve", "the first finding closing is not the container closing");
+  assert.equal(threadState(bothClosed, 9001), "resolve");
+
+  // One op per container, on the container's flip — never one per finding.
+  assert.deepEqual(threadOps(bothOpen, oneClosed), []);
+  assert.deepEqual(threadOps(oneClosed, bothClosed), [{ comment_id: 9001, op: "resolve" }]);
+  assert.deepEqual(threadOps(bothClosed, oneClosed), [{ comment_id: 9001, op: "unresolve" }]);
+  assert.deepEqual(threadOps(bothOpen, bothClosed), [{ comment_id: 9001, op: "resolve" }], "two findings, one resolve");
+
+  // An issue comment carries many findings and no review thread: it is never a thread target.
+  const inline = (locator: number) =>
+    finding({
+      id: `fnd_i${locator}`,
+      source: { container_kind: "issue_comment", comment_id: 5420521329, locator },
+      status: { open: false, resolution: fixedClaim() },
+    });
+  const inlineOpen = review({ findings: [finding({ id: "fnd_i0", source: { container_kind: "issue_comment", comment_id: 5420521329, locator: 0 } })] });
+  const inlineClosed = review({ findings: [inline(0)] });
+  assert.deepEqual(threadOps(inlineOpen, inlineClosed), []);
+  assert.equal(threadState(inlineClosed, 5420521329), null);
 });
 
 // §7 step 3: `unknown` is surfaced on the board, never promoted — ahead of the findings, with a link.

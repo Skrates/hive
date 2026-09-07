@@ -133,13 +133,18 @@ interface ExternalResult {
   submitted_at: string;
 }
 interface ExternalFinding {
-  source_comment_id: number; path: string; line: number | null;
+  container_kind: "review" | "review_comment" | "issue_comment";   // the record it was read out of
+  container_id: number; locator: number;         // container + zero-based block ordinal within it
+  path: string; line: number | null;
   priority: "P0" | "P1" | "P2" | "P3" | "unknown";   // badge-less ⇒ unknown, admitted, visible, blocking (§6.F5)
   title: string; body: string;
 }
 ```
 
-No fingerprint, falsifier or evidence is invented for Codex. Provenance is the comment.
+No fingerprint, falsifier or evidence is invented for Codex. Provenance is the container record.
+A container is **not** an identity: one issue comment routinely carries several inline findings, so
+what identifies a finding at its source is `(container_kind, container_id, locator)` — distinct
+across a result, and each finding still gets its own Hive id (§3.5).
 
 ---
 
@@ -217,7 +222,9 @@ interface Request {
   subject_key: string;
   required: boolean;                              // counts toward readiness (§6.H)
   names: string[];                                // finding ids this request must answer (closure/appeal)
-  status: "pending" | "answered" | "cancelled" | "unanswerable";
+  status: "pending" | "answered" | "cancelled";  // the OBLIGATION's status (§6.D9), never its transport's
+  transport_exhausted: boolean;                   // §6.D6: the bound is spent — a fact about reach
+  cancellation: null | { by: Principal; at: string; reason: string };   // §6.D9 evidence
   opened_by: Principal; opened_at: string; reason: string;
   supersedes: string | null;                      // reassignment (§6.D4)
   transport: TransportRef[];                      // references only: {delivery_id} | {summon_comment_id}; Hive owns attempts
@@ -239,7 +246,9 @@ interface AdmittedFinding {
   id: string;                                     // immutable, minted at admission
   review_id: ReviewId; subject_key: string;       // where it was raised
   raised_by: ActorId | "codex"; answer_id: string | null;   // null for unsolicited external evidence
-  source: { fingerprint: string; semantic_key: string } | { record_kind: "review_comment" | "issue_comment"; comment_id: number };   // native identity, retained
+  source: { fingerprint: string; semantic_key: string }
+        | { container_kind: "review_comment" | "issue_comment"; comment_id: number; locator: number };
+                                                  // native identity, retained: source container + item
   priority: "P0" | "P1" | "P2" | "P3" | "unknown";
   reviewer_disposition: "must-fix" | "owner-decision" | "follow-up" | "noise" | null;   // reviewkit only
   title: string; path: string; line: number | null;
@@ -257,7 +266,7 @@ interface Resolution {
   confirmed_by: string | null;                    // answer id of the closure that confirmed a fix, if any
 }
 interface Hold {
-  id: string; kind: "human_gate" | "owner_decision" | "exhaustion" | "unanswerable" | "operator" | "stack";
+  id: string; kind: "human_gate" | "owner_decision" | "exhaustion" | "transport_exhausted" | "operator" | "stack";
   by: Principal; at: string; reason: string;
   release_on: "explicit" | "subject_change";      // subject_change only where the change invalidates the reason
   blocks: { readiness: true; summons: boolean };
@@ -330,8 +339,8 @@ Thirteen verbs, closed. **Authorization is this table and nothing else** — no 
 | `ClassifyFinding` | ✓ (raiser) | ✓ | – | – |
 | `Hold` human_gate / stack | ✓ | ✓ | – | – |
 | `Hold` operator | – | ✓ | – | – |
-| `Hold` exhaustion / unanswerable / owner_decision | – | – | – | ✓ |
-| `Release` | ✓ (its own holds) | ✓ | – | ✓ (subject_change, unanswerable answered) |
+| `Hold` exhaustion / transport_exhausted / owner_decision | – | – | – | ✓ |
+| `Release` | ✓ (its own holds) | ✓ | – | ✓ (subject_change, transport_exhausted answered) |
 | `GrantRounds`, `AdoptPolicy` | – | ✓ | – | – |
 
 **Receipt:**
@@ -426,16 +435,36 @@ type RefusalCode = "stale_revision" | "unauthorized" | "lifecycle" | "unknown_su
   decision, recorded as a system consequence), or an operator `SetReviewerAvailability(true)`.
 - **D4** Unavailability while a request to that reviewer is pending **reassigns explicitly**: the pending
   request is cancelled (`reviewer_unavailable`) and a new request to the substitute is opened with
-  `supersedes` set — one consequence, recorded, once.
+  `supersedes` set — one consequence, recorded, once. **The obligation is preserved, never
+  substituted.** Where the substitute already holds a pending request at that `(subject_key, kind)` —
+  D1 leaves room for only one — the reassignment does not silently adopt it: it records
+  `request_obligation_merged`, which carries the **union** of the two obligations and names what it
+  superseded. (ruled 2026-09-06, Codex 3945383525/3945383505/3945383529) The union is exact:
+  `required` is the OR of the two, so two optional obligations merge into an optional one and the
+  merge never invents a requirement neither side had; `names` is the union of the named findings; and
+  `mode` is one whose **complete answer satisfies every obligation folded in** — `appeal` survives only
+  when both sides were appeals (an appeal satisfies no requirement, §H, so it can never absorb one),
+  otherwise the merged request names findings ⇒ `closure` and names none ⇒ `initial`. A merge that
+  **expanded** the obligation (required raised, names added, mode changed) queues one fresh transport
+  (§D5): the payload already delivered describes the request as it was, and the assignee is otherwise
+  never told what the request now carries.
 - **D5** Transport is Hive's: opening a request queues one effect — a Hive delivery to a seat assignee
   (the broker mints a `system`-origin event; the delivery ledger owns attempts, redelivery and failure) or a
   summon comment for `codex`. The request stores **references** (`delivery_id` / `summon_comment_id`),
   never its own retry ledger.
 - **D6** Stall handling is housekeeping over pending requests: after the policy's stall window with no
   answer, one more transport effect is queued (a summon for Codex, a redelivery for a seat), bounded by
-  policy; when the bound is spent the request becomes `unanswerable` and the system places
-  `Hold(unanswerable, blocks summons)`. `Release` is the operator's, or the system's when an answer
-  arrives anyway.
+  policy; when the bound is spent the request is marked `transport_exhausted` and the system places
+  `Hold(transport_exhausted, blocks summons)`. **Both are facts about transport; neither discharges the
+  obligation** — the request stays `pending`, keeps blocking readiness (§H), and is still what a late
+  answer discharges. `Release` is the operator's, or the system's when an answer arrives anyway;
+  releasing that hold lifts the readiness block the hold itself imposed and nothing more.
+  (ruled 2026-09-06, Codex 3945383519) Exhaustion is undone only by a named act. Retracting the late
+  answer that discharged an exhausted request reopens an obligation housekeeping will never push
+  again — it skips an exhausted request — so `RetractAnswer` records
+  `request_transport_rearmed {request_id, reason}` for each request it reopens that is exhausted: the
+  flag is cleared, the re-transport ledger emptied, and one transport queued. Nothing else clears the
+  flag; releasing the `transport_exhausted` hold still does not (§D6 above).
 - **D7** A summon effect checks applicability at dispatch: the request must still be pending at the
   current subject, else the effect is marked `obsolete` and not sent.
 - **D8** (ruled 2026-09-06: F-12 → (a)) Conflict-aware summons. `ObservePR` carries GitHub's `mergeable`
@@ -445,6 +474,24 @@ type RefusalCode = "stale_revision" | "unauthorized" | "lifecycle" | "unknown_su
   emitted whether or not a request is pending; `null` (not yet computed) never withholds. When `mergeable`
   flips to `true` transport resumes. No round is charged for a head nobody reviewed. This is KRA-1362's
   fork 1(a) plus fork 2(b) — the cheap detection the ticket verified, sited where the summons are.
+- **D9** (ruled 2026-09-06, bundle-1 #4/#5) **An obligation is separate from its assignment and its
+  transport.** One predicate names the outstanding ones: a request is outstanding while its `status` is
+  `pending` — that is, until an `Answer` (§E1) or an explicit `CancelRequest` discharges it. Exhausted
+  transport, a withholding hold, a conflict, a closed PR and an unavailable assignee are all transport
+  or assignment facts and change nothing about it. Readiness (§H), stall housekeeping, `Answer` and
+  `AdmitExternalResult` matching, and the restoration below all ask this one predicate.
+- **D10** (ruled 2026-09-06, bundle-1 #5) **Holds withhold transport, never creation.** The reducer has
+  one invariant-restoration function: *the current subject has the required work it must have* — the
+  §C2/§C4 initial request per policy and routing when the subject is open, non-draft, non-exempt,
+  unsatisfied by a standing complete answer, and carrying no outstanding obligation. It runs from every
+  act that can change those inputs: `ObservePR` (subject change, draft flip, lifecycle), `Release`,
+  `GrantRounds`, `CancelRequest`, `SetReviewerAvailability` and `AdoptPolicy`. It is idempotent, so a
+  release, a grant or a reopen queues no second transport — the withheld row resumes at dispatch (§8.1).
+  It never resurrects what the operator ended: a `cancelled` required review request at the **current**
+  subject whose `cancellation.by` is the operator is that decision, and it stands until the subject
+  changes (`CancelRequest` is the operator's alone, §4, so no other principal's cancellation can be
+  mistaken for it; the system's own `subject_changed` and `reviewer_unavailable` cancellations are
+  bookkeeping, and the latter carries the obligation on by D4).
 
 ### E. Answers — explicit completion
 
@@ -459,7 +506,13 @@ type RefusalCode = "stale_revision" | "unauthorized" | "lifecycle" | "unknown_su
   that the questions were answered; the reviewer decides the answers.
 - **E4** An `AdmitExternalResult` answers the pending Codex request at that subject **that existed at
   admission time**; otherwise it is unsolicited evidence: findings are admitted, nothing is answered, and
-  no request opened later is answered by it.
+  no request opened later is answered by it. (ruled 2026-09-07, bundle-1 #6) A request whose `names` is
+  non-empty is **not** such a request. The external arm carries no `FindingAnswer` — its `answers` is
+  always `[]`, because a Codex comment says nothing per named finding — so by E3 it can address none of
+  them, and answering it would mark a closure discharged with none of its findings confirmed. The request
+  stays outstanding and the result is unsolicited evidence at the subject. A named closure reaches a Codex
+  request by a §D4 merge or an operator `OpenRequest`; the loop's own closure rounds sit at a new subject,
+  where §C2 has already cancelled the old request.
 - **E5** Answers at one subject accumulate; a later clean answer withdraws nothing (F-7 ruled: union).
 - **E6** `completion: incomplete` (or external `incomplete`) does not satisfy the requirement, charges
   nothing, and leaves the request pending with the attempt recorded.
@@ -470,6 +523,15 @@ type RefusalCode = "stale_revision" | "unauthorized" | "lifecycle" | "unknown_su
 ### F. Findings — identity, resolution, classification
 
 - **F1** Every admitted finding gets an immutable id and keeps its native source identity (§3.5).
+  Source identity is a **container** (the GitHub record it was read out of, by kind and id) plus a
+  source-local **locator** (its zero-based block ordinal within that record). Findings sharing a
+  container are not duplicates; admission refuses only a repeated `(container, locator)`.
+  (ruled 2026-09-07, bundle-1 #6) That identity holds across admissions, not only within one result:
+  §7 step 3 re-admits a source record at every new `updated_at`, so editing a Codex comment presents the
+  findings it already carries again. The admitted finding **is** that finding — a second id for one
+  observation would double every open finding and re-block a resolved one — so a locator already present
+  in the Review is not re-admitted, and the record is not rewritten from the edit (§F4). The answer the
+  result discharges still names it, so the report records what the reviewer said and not only what was new.
   Fingerprints, semantic keys and normalized titles populate `correlation_hints` — evidence shown to
   reviewers, never authority to move a resolution.
 - **F2** `ResolveFinding(same_as: F-old)` links explicitly. If `F-old` is resolved, the link marks it
@@ -502,8 +564,9 @@ type RefusalCode = "stale_revision" | "unauthorized" | "lifecycle" | "unknown_su
   behaviour preserved.
 - **G3** Holds: closed kinds (§3.5). Any active hold ⇒ not ready. `blocks.summons` pauses transport for
   requests. `release_on: subject_change` is permitted only for `human_gate` and `stack`, whose reason a
-  new subject can invalidate; `exhaustion`, `owner_decision`, `unanswerable` and `operator` release only
-  explicitly (F-8 ruled).
+  new subject can invalidate; `exhaustion`, `owner_decision`, `transport_exhausted` and `operator` release only
+  explicitly (F-8 ruled). A hold pauses transport; it never suppresses the creation of required work
+  (§D10).
 - **G4** Exhaustion is an **episode**: when, after admitting an answer, `blocking_findings ≠ ∅ ∧
   rounds_consumed ≥ rounds_max + granted` and no episode is open, the reducer opens one — one
   `Hold(exhaustion)`, one gate projection, one delivery to the author seat, one retrospective request to
@@ -519,11 +582,15 @@ type RefusalCode = "stale_revision" | "unauthorized" | "lifecycle" | "unknown_su
 ready ⇔ lifecycle = open ∧ ¬draft
       ∧ ∄ active hold
       ∧ requirement(current subject) ∈ { satisfied, exempt }
-      ∧ ∄ request with required = true ∧ status = pending at the current subject
+      ∧ ∄ *outstanding* required request at the current subject (§D9: `status = pending`,
+        whatever its transport says)
       ∧ ∄ blocking finding
 ```
 `requirement.satisfied` ⇔ ∃ standing, complete `Answer` to a review request (`initial` or `closure`) at
 the current subject. Unsolicited evidence satisfies nothing. Readiness speaks for the review limb only.
+An obligation that was never answered keeps `required_request_pending` in the reasons even after every
+hold over it is released: releasing a hold is not a discharge (§D9, and the explicit-discharge doctrine
+this design opens with).
 
 ### I. Policy versions
 
@@ -571,14 +638,46 @@ reads the policy by the Review's version; the batch records it (§B3).
 
 ### 8.1 Effects and publication
 
-- Every effect row has its own `effect_id`, a `target` (`check:<repo>:<head>`, `board:<review>`,
-  `thread:<comment_id>`, `delivery:<actor>:<request>`, `summon:<request>`, `announce:<review>`,
-  `notice:<actor>:<subject_key>`) and a kind: **refresh** (check, board, thread) or **actionable**
-  (delivery, summon, announce, notice).
+- Every effect row has its own `effect_id`, a `target` (`check:<repo>:<head>`,
+  `board:<sink>:<review>`, `thread:<comment_id>`, `delivery:<actor>:<request>`, `summon:<request>`,
+  `announce:<review>`, `notice:<actor>:<subject_key>`) and a kind: **refresh** (check, board, thread)
+  or **actionable** (delivery, summon, announce, notice).
+- **A target names exactly one sink.** The board projection has two — the GitHub comment and the
+  Slack line — so it has two targets (`board:github:<review>`, `board:slack:<review>`), and one
+  sink's failure, backoff, or absence never gates the other. Every other target already named one
+  sink: check, thread and summon are GitHub; delivery, notice and announce are Slack. Every applied
+  batch emits both board rows; the publisher retires the row of a sink this broker does not have
+  (the GitHub comment in M0), and fails the row of a sink the policy should have named but did not.
+  **Each sink publishes on its own pass.** `drainOnce` starts one pass per sink, each with its own
+  single-flight fence, so a tick joins only the pass of a sink that is already busy and a row queued
+  for the idle sink leaves at once; per-target serialization is unchanged, and the board row leads
+  its sink's pass because it opens the Review's Slack thread. One global pass would have made Slack
+  delivery wait out the GitHub work already listed — up to the row limit times the dispatch timeout —
+  which is the coupling this section forbids. The pending-row query selects by sink; a target that
+  does not parse names no sink, so it is offered to every pass and the claim decides which one fails
+  it. A GitHub call that has not answered within the dispatch timeout fails its row rather than
+  holding its pass, and **the timeout aborts the call**: every `ReviewGitHubPort` method takes the
+  dispatch's `AbortSignal` and carries it onto the wire (the installation-token fetch included), so a
+  call the pass has given up on cannot land after the retry that replaced it and overwrite a newer
+  render or create a second board comment. No path is exempt; nothing stays claimed on a timeout.
+- **Publication is not broker housekeeping.** The broker's periodic tick runs the outbox drain and
+  a publication pass independently, neither awaiting the other, each single-flight: a GitHub port
+  that is slow, hung, or down delays no Hive delivery. The publisher's Slack rows land in that same
+  outbox and go out on the tick that finds them.
 - A `notice` is a standing message to an actor about a subject, named by the subject rather than by a
   request. It is **not request transport**: the §D8 pause never withholds it (it is what explains the
   pause), and it goes obsolete only when the Review has left the subject it names. Its payload is
   exactly `actor`, `text`, and `dedupe_key`; the subject is carried by the target.
+- `thread:<comment_id>` names the **container**, and only a `review_comment` container has a GitHub
+  review thread: a finding whose container is an `issue_comment` never queues a `thread:` effect. The
+  thread renders from every finding in that container — resolved once all of them are closed,
+  un-resolved as soon as any is open or contested — never from the first one found.
+  (ruled 2026-09-06, Codex 3945383536) The **container's** aggregate state across the batch is what
+  queues the refresh, not any one finding's status change: a batch is compared container-by-container,
+  before against after, **admissions included**. Admitting a new open finding into a container whose
+  thread is resolved changes no existing finding, and a per-finding trigger left that thread resolved
+  over an open blocking finding. Symmetrically, closing one of two open findings in a container changes
+  the container not at all and queues nothing.
 - A refresh job means "re-render this target from `read()` now"; per-target publication is serialized and
   pending refreshes for the same target coalesce into the newest. A delayed worker can never publish an
   older verdict because it never carries one.
@@ -620,7 +719,7 @@ The broker gains a Logfire token (tier-2, dev box) and exports spans through the
 (`sokrates`, service `review`): `review.ingress` (accepted / hmac_rejected / malformed), `review.reconcile`
 (records imported, admissions, duration, GitHub rate state), `review.admit` (code, refusal reason),
 `review.publish` (target, outcome, GitHub status), `review.housekeeping` (stalls, reassignments,
-unanswerable), `review.outbox` (stuck rows, retries). Dashboards and the baseline's SQL rewrite are
+transport exhaustion), `review.outbox` (stuck rows, retries). Dashboards and the baseline's SQL rewrite are
 deferred; visibility of the machinery is not.
 
 ---
@@ -645,6 +744,7 @@ hive review grant-rounds <owner/repo>#<n> <k> --reason <t>
 hive review rule         <owner/repo>#<n> <finding-id> --resolution <t>           # owner_decision
 hive review availability <owner/repo>#<n> <reviewer> --available|--unavailable --reason <t>
 hive review adopt-policy <owner/repo>#<n> <version>
+hive review reset-store  <db-path> --confirm <db-path>   # drops every review table; §9.3 generation refusal
 ```
 Writes need delivery or session custody and `--expect`; reads need the edge socket. Argument schemas are
 generated from the contract (§2.1).
@@ -687,8 +787,20 @@ CREATE TABLE source_records (record_key TEXT NOT NULL, version TEXT NOT NULL, re
 CREATE TABLE review_policies (repository_id INTEGER NOT NULL, version INTEGER NOT NULL, policy_json TEXT NOT NULL,
   created_at TEXT NOT NULL, PRIMARY KEY(repository_id, version));
 CREATE TABLE operators (operator_id TEXT PRIMARY KEY, token_hash TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE review_store_generation (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), generation INTEGER NOT NULL);
 ```
 `state_json` is a cache; `review_batches` is the truth; the replay test proves it.
+
+**Generation.** The review tables carry their own generation stamp — `REVIEW_STORE_GENERATION` in
+`src/review/store.ts`, currently **2** — and it is bumped on every change to the persisted shape of
+`state_json`, of a batch's `consequences_json`, or of an effect `target`. It is deliberately not the
+broker's `user_version`, which is the Hive ledger's own generation (ADR-0003 R-8): a review-shape
+change must not refuse deliveries, subscriptions and the outbox. Opening the store over reviews
+stamped below the running build's generation — or unstamped with rows, which is generation 1 —
+is a `LegacyReviewStoreError` and a boot failure, never a degraded adapter; a stamp above it is
+refused too, because a newer binary wrote those rows. There is no migration path and no code that
+reads an old shape: the operator runs `hive review reset-store` (§9.1) and reconcile rebuilds every
+enrolled PR from GitHub, losing revision history and projection handles.
 
 ---
 

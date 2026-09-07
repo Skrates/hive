@@ -35,6 +35,7 @@ import type {
   TransportRef,
 } from "./contract.js";
 import { validateAction } from "./contract.js";
+import { BOARD_SINKS, parseTarget, sinkOf, type EffectSink } from "./effects.js";
 import type { DecideContext, ReviewIdentity, decide as reducerDecide, fold as reducerFold, read as reducerRead } from "./reducer.js";
 
 interface Row { [key: string]: unknown }
@@ -134,6 +135,103 @@ export class ReviewStoreError extends Error {
   }
 }
 
+/**
+ * The generation of the persisted review shapes this build understands (§9.3).
+ *
+ * Generation 1 is what the parent commit wrote: requests with `status: "unanswerable"`, the
+ * retired `request_unanswerable` consequence and hold kind, and bare `board:<review>` effect
+ * targets. It never stamped, so an unstamped store that holds any review row *is* generation 1
+ * — that is the whole of this build's knowledge of it. Nothing here reads or rewrites an old
+ * shape (there is no migration path); the store refuses to open instead, and the operator
+ * resets it with `hive review reset-store` and lets reconcile rebuild every Review from GitHub.
+ *
+ * **Bump this on every change to the persisted shape** of `state_json`, of a batch's
+ * `consequences_json`, or of an effect `target` — the three things replay and publication read
+ * back. A pure DDL addition that leaves those shapes alone does not need a bump.
+ */
+export const REVIEW_STORE_GENERATION = 2;
+
+/**
+ * The review tables `reset-store` drops: everything derived from admitted acts, plus the
+ * generation stamp itself. `review_policies` and `operators` are deliberately absent — a
+ * policy version and an operator's token hash are configuration and custody, not review state,
+ * and nothing in them carries a request, a consequence or an effect target.
+ */
+export const REVIEW_STATE_TABLES = [
+  "reviews",
+  "review_batches",
+  "review_attempts",
+  "review_effects",
+  "github_inbox",
+  "source_records",
+  "review_projection_handles",
+  "review_transport",
+  "review_store_generation",
+] as const;
+
+/** The three tables whose rows are written by an admitted act; any row in them means "in use". */
+const REVIEW_ROW_TABLES = ["reviews", "review_batches", "review_effects"] as const;
+
+/**
+ * Persisted reviews this build must not read (§9.3). The broker's `LegacyDatabaseError` refuses
+ * a pre-v0.5 Hive ledger; this refuses a stale *review* generation inside a current ledger, so
+ * the operator resets the review tables alone instead of the whole broker database.
+ */
+export class LegacyReviewStoreError extends ReviewStoreError {
+  constructor(message: string, readonly stored: number | null, readonly required: number) {
+    super(message);
+    this.name = "LegacyReviewStoreError";
+  }
+}
+
+/** `:memory:` and an anonymous handle have no path to name; say so rather than print an empty one. */
+function databasePath(db: Database.Database): string {
+  const name = db.name;
+  return name === "" || name === ":memory:" ? "this broker database" : name;
+}
+
+function resetProcedure(path: string): string {
+  return "there is no migration path for persisted reviews (§9.3): stop the broker, run "
+    + `\`hive review reset-store ${path} --confirm ${path}\` with the operator credential, start the broker, `
+    + "then `hive review reconcile <owner/repo>#<n>` for every enrolled PR (or wait for the sweep) — "
+    + "reconcile rebuilds each Review from GitHub, but revision history and projection handles are lost "
+    + "and the next reconcile re-creates the board comment and the check runs";
+}
+
+/**
+ * `operator_id` for a live token, else null; the digest comparison is constant-time (§5.A2).
+ * Standalone so custody can be proven against a store {@link ReviewStore} refuses to open —
+ * `reset-store` is exactly that case; {@link ReviewStore.operators}`.verify` delegates here.
+ */
+export function verifyOperatorToken(db: Database.Database, token: string): string | null {
+  const presented = Buffer.from(hashToken(token), "hex");
+  const rows = db.prepare("SELECT operator_id, token_hash FROM operators ORDER BY operator_id").all() as Row[];
+  let found: string | null = null;
+  for (const row of rows) {
+    const stored = Buffer.from(String(row.token_hash), "hex");
+    if (stored.length === presented.length && timingSafeEqual(stored, presented)) found = String(row.operator_id);
+  }
+  return found;
+}
+
+/**
+ * Drops every review-state table in one transaction and stamps the running generation, leaving
+ * `review_policies` and `operators` untouched. Standalone — a {@link ReviewStore} cannot be
+ * constructed over the store this is meant to clear.
+ */
+export function resetReviewStore(db: Database.Database): void {
+  db.transaction(() => {
+    for (const table of REVIEW_STATE_TABLES) db.exec(`DROP TABLE IF EXISTS ${table}`);
+    db.exec(`
+      CREATE TABLE review_store_generation (
+        singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+        generation INTEGER NOT NULL
+      );
+      INSERT INTO review_store_generation (singleton, generation) VALUES (1, ${REVIEW_STORE_GENERATION});
+    `);
+  })();
+}
+
 function isRefusal(result: Batch | Refusal): result is Refusal {
   return (result as Refusal).refused === true;
 }
@@ -156,6 +254,18 @@ function effectFromRow(row: Row): EffectRow {
     sentAt: row.sent_at === null ? null : String(row.sent_at),
     obsoleteAt: row.obsolete_at === null ? null : String(row.obsolete_at),
   };
+}
+
+/**
+ * Does this target dispatch through `sink`? A target that does not parse belongs to no sink and
+ * is offered to every pass, so the defect is failed visibly rather than listed by nobody.
+ */
+function inSink(target: string, sink: EffectSink): boolean {
+  try {
+    return sinkOf(parseTarget(target)) === sink;
+  } catch {
+    return true;
+  }
 }
 
 function inboxFromRow(row: Row): InboxDelivery {
@@ -199,6 +309,8 @@ export class ReviewStore {
 
   constructor(private readonly db: Database.Database, private readonly deps: ReviewStoreDeps) {
     this.migrate();
+    // §9.3: persisted reviews written under an older shape are refused, never read.
+    this.assertStoreGeneration();
     // The broker owns one ReviewStore. A prior process may have died after claiming
     // but before recording the remote outcome: retry with the ordinary backoff.
     const interrupted = this.db.prepare("SELECT effect_id, attempts FROM review_effects WHERE status = 'claimed'").all() as Row[];
@@ -234,6 +346,11 @@ export class ReviewStore {
         created_at TEXT NOT NULL, PRIMARY KEY(repository_id, version));
       CREATE TABLE IF NOT EXISTS operators (operator_id TEXT PRIMARY KEY, token_hash TEXT NOT NULL, created_at TEXT NOT NULL);
 
+      CREATE TABLE IF NOT EXISTS review_store_generation (
+        singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+        generation INTEGER NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS review_projection_handles (review_id TEXT NOT NULL, handle TEXT NOT NULL, key TEXT NOT NULL,
         value TEXT NOT NULL, recorded_at TEXT NOT NULL, PRIMARY KEY(review_id, handle, key));
       CREATE TABLE IF NOT EXISTS review_transport (effect_id TEXT PRIMARY KEY, review_id TEXT NOT NULL, request_id TEXT NOT NULL,
@@ -245,6 +362,46 @@ export class ReviewStore {
       CREATE INDEX IF NOT EXISTS github_inbox_unreconciled_idx ON github_inbox(reconciled_run) WHERE reconciled_run IS NULL;
       CREATE INDEX IF NOT EXISTS source_records_review_idx ON source_records(review_id, admitted_act_id);
     `);
+  }
+
+  /**
+   * §9.3: refuse to open persisted reviews this build cannot read.
+   *
+   * The stamp is the review tables' own generation, never the broker's `user_version` — that
+   * one is the Hive ledger's generation, and refusing on it would refuse deliveries,
+   * subscriptions and the outbox over a review-shape change. An unstamped store that holds
+   * review rows is generation 1 (the parent commit never stamped); an empty store is stamped
+   * and opened; a stamp above this build's means a newer binary wrote these rows.
+   */
+  private assertStoreGeneration(): void {
+    const path = databasePath(this.db);
+    const stampRow = this.db.prepare("SELECT generation FROM review_store_generation WHERE singleton = 1").get() as Row | undefined;
+    const stored = stampRow === undefined ? null : Number(stampRow.generation);
+    if (stored !== null && stored > REVIEW_STORE_GENERATION) {
+      throw new LegacyReviewStoreError(
+        `the review tables in ${path} are stamped generation ${stored}, but this build reads generation `
+        + `${REVIEW_STORE_GENERATION}: a newer Hive wrote them. Run that build, or ${resetProcedure(path)}`,
+        stored,
+        REVIEW_STORE_GENERATION,
+      );
+    }
+    const hasRows = REVIEW_ROW_TABLES.some(
+      (table) => this.db.prepare(`SELECT 1 FROM ${table} LIMIT 1`).get() !== undefined,
+    );
+    if (!hasRows) {
+      this.db.prepare("INSERT OR REPLACE INTO review_store_generation (singleton, generation) VALUES (1, ?)")
+        .run(REVIEW_STORE_GENERATION);
+      return;
+    }
+    if (stored === null || stored < REVIEW_STORE_GENERATION) {
+      throw new LegacyReviewStoreError(
+        `the review tables in ${path} hold reviews written at generation ${stored ?? 1}`
+        + `${stored === null ? " (unstamped)" : ""}, but this build reads generation ${REVIEW_STORE_GENERATION} — `
+        + `${resetProcedure(path)}`,
+        stored,
+        REVIEW_STORE_GENERATION,
+      );
+    }
   }
 
   // ---------------------------------------------------------------------------------------
@@ -605,11 +762,23 @@ export class ReviewStore {
 
   readonly effects = {
     /**
-     * One row per target: the newest pending refresh (a refresh re-renders from `read()`, so
-     * only the latest matters) or the oldest pending actionable (dispatched in order). A row
-     * whose `next_attempt_at` is in the future is not yet due.
+     * The due rows of one sink, one row per target: the newest pending refresh (a refresh
+     * re-renders from `read()`, so only the latest matters) or the oldest pending actionable
+     * (dispatched in order). A row whose `next_attempt_at` is in the future is not yet due.
+     *
+     * §8.1: each sink publishes on its own pass, so the selection is by sink. The row grammar is
+     * unchanged — a target already names its sink — and the filter runs in memory over the
+     * listing rather than in SQL, because the mapping from target to sink is `parseTarget` +
+     * `sinkOf` (`effects.ts`) and a LIKE-per-target-kind predicate would be a second copy of it,
+     * free to drift. The query already reads every due row before deduplicating by target, so
+     * filtering here costs nothing extra; `limit` is applied after it, which is what keeps one
+     * sink's backlog from crowding the other out of its own pass.
+     *
+     * A target that does not parse names no sink. Such a row is a defect that must stay visible,
+     * so it is returned to every sink; the publisher's exclusive claim decides which pass fails
+     * it, and it touches no port on the way.
      */
-    pendingByTarget: (now: string, limit = 100): EffectRow[] => {
+    pendingByTarget: (now: string, sink: EffectSink, limit = 100): EffectRow[] => {
       const rows = this.db.prepare(`
         SELECT * FROM review_effects
         WHERE status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
@@ -618,6 +787,7 @@ export class ReviewStore {
       const byTarget = new Map<string, EffectRow>();
       for (const row of rows) {
         const effect = effectFromRow(row);
+        if (!inSink(effect.target, sink)) continue;
         if (effect.kind === "refresh" || !byTarget.has(effect.target)) byTarget.set(effect.target, effect);
       }
       return [...byTarget.values()].slice(0, limit);
@@ -812,9 +982,13 @@ export class ReviewStore {
         this.updateSourceRecord(recordKey, version, "UPDATE source_records SET classification = ? WHERE record_key = ? AND version = ?", classification);
         if (classification === "unknown" || row.classification === "unknown") {
           const reviewId = String(row.review_id);
-          this.db.prepare(`INSERT OR IGNORE INTO review_effects(effect_id, review_id, revision, kind, target, payload_json, status)
-            SELECT ?, review_id, revision, 'refresh', ?, NULL, 'pending' FROM reviews WHERE review_id = ?`)
-            .run(`source:${recordKey}:${version}:${classification}`, `board:${reviewId}`, reviewId);
+          // §8.1: the board is one row per sink, so a classification change refreshes each of
+          // them on its own row — the same shape the reducer emits, and for the same reason.
+          const queue = this.db.prepare(`INSERT OR IGNORE INTO review_effects(effect_id, review_id, revision, kind, target, payload_json, status)
+            SELECT ?, review_id, revision, 'refresh', ?, NULL, 'pending' FROM reviews WHERE review_id = ?`);
+          for (const sink of BOARD_SINKS) {
+            queue.run(`source:${recordKey}:${version}:${classification}:${sink}`, `board:${sink}:${reviewId}`, reviewId);
+          }
         }
       })();
     },
@@ -840,15 +1014,6 @@ export class ReviewStore {
     },
 
     /** `operator_id` for a live token, else null; the digest comparison is constant-time. */
-    verify: (token: string): string | null => {
-      const presented = Buffer.from(hashToken(token), "hex");
-      const rows = this.db.prepare("SELECT operator_id, token_hash FROM operators ORDER BY operator_id").all() as Row[];
-      let found: string | null = null;
-      for (const row of rows) {
-        const stored = Buffer.from(String(row.token_hash), "hex");
-        if (stored.length === presented.length && timingSafeEqual(stored, presented)) found = String(row.operator_id);
-      }
-      return found;
-    },
+    verify: (token: string): string | null => verifyOperatorToken(this.db, token),
   };
 }

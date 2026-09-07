@@ -317,7 +317,7 @@ test("§7 step 3: a findings review is one AdmitExternalResult carrying its memb
   assert.ok(action !== undefined && action.kind === "AdmitExternalResult");
   assert.equal(action.result.verdict, "findings");
   assert.equal(action.result.reviewed_head, H1);
-  assert.deepEqual(action.result.findings.map((f) => [f.source_comment_id, f.priority]), [[3944094503, "P1"], [3944094508, "P2"]]);
+  assert.deepEqual(action.result.findings.map((f) => [f.container_kind, f.container_id, f.locator, f.priority]), [["review_comment", 3944094503, 0, "P1"], ["review_comment", 3944094508, 0, "P2"]]);
   for (const member of members) {
     const row = store.records.get(`review_comment:${member.id}@${member.version}`);
     assert.equal(row?.admittedActId, envelopeAct);

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { Policy, ReviewState, TransportRef } from "./contract.js";
+import { parseTarget, sinkOf, type EffectSink } from "./effects.js";
 import type { Clock } from "../time.js";
 import { AT, finding, fixedClaim, hold, policy, request, SHA_A, SHA_B, state } from "./fixtures.js";
 import {
@@ -94,9 +95,9 @@ class FakeReviewStore implements PublisherStore {
     return found;
   }
   readonly effects = {
-    pendingByTarget: (now: string): PublishableEffect[] => {
+    pendingByTarget: (now: string, sink: EffectSink): PublishableEffect[] => {
       const byTarget = new Map<string, Row>();
-      const eligible = this.rows.filter((r) => r.status === "pending" && (r.nextAttemptAt === null || r.nextAttemptAt <= now));
+      const eligible = this.rows.filter((r) => r.status === "pending" && (r.nextAttemptAt === null || r.nextAttemptAt <= now) && inSink(r.target, sink));
       for (const row of eligible) {
         const current = byTarget.get(row.target);
         if (current === undefined) { byTarget.set(row.target, row); continue; }
@@ -132,6 +133,15 @@ class FakeReviewStore implements PublisherStore {
   };
 }
 
+/** As the real store selects: by sink, with a target that does not parse offered to every pass. */
+function inSink(target: string, sink: EffectSink): boolean {
+  try {
+    return sinkOf(parseTarget(target)) === sink;
+  } catch {
+    return true;
+  }
+}
+
 class FakeSlack implements SystemWakePort {
   wakes: Array<{ actor: string; channelId: string; threadTs: string | null; text: string; dedupeKey: string }> = [];
   lines: Array<{ channelId: string; threadTs: string | null; text: string }> = [];
@@ -161,18 +171,31 @@ class FakeGitHub implements ReviewGitHubPort {
   gate: Promise<void> | null = null;
   /** A port whose responses carry no id (the App port's `?? 0` fallback). */
   noIds = false;
-  async createOrUpdateCheckRun(input: { headSha: string; existingId: number | null; conclusion: "success" | "failure"; title: string }): Promise<{ checkRunId: number }> {
+  /** As a real request does: once the dispatch's signal fires, the call does nothing on the wire. */
+  private refuseIfAborted(signal: AbortSignal): void {
+    if (signal.aborted) throw new Error("aborted");
+  }
+  async createOrUpdateCheckRun(input: { headSha: string; existingId: number | null; conclusion: "success" | "failure"; title: string }, signal: AbortSignal): Promise<{ checkRunId: number }> {
     if (this.gate !== null) await this.gate;
+    this.refuseIfAborted(signal);
     this.checks.push({ headSha: input.headSha, conclusion: input.conclusion, title: input.title, existingId: input.existingId });
     return { checkRunId: this.noIds ? 0 : input.existingId ?? this.checks.length };
   }
-  async createOrUpdateBoardComment(input: { existingId: number | null; body: string }): Promise<{ commentId: number }> {
+  async createOrUpdateBoardComment(input: { existingId: number | null; body: string }, signal: AbortSignal): Promise<{ commentId: number }> {
+    this.refuseIfAborted(signal);
     this.boards.push({ body: input.body, existingId: input.existingId });
     return { commentId: this.noIds ? 0 : input.existingId ?? 500 };
   }
-  async resolveThread(input: { commentId: number }): Promise<void> { this.threads.push({ commentId: input.commentId, op: "resolve" }); }
-  async unresolveThread(input: { commentId: number }): Promise<void> { this.threads.push({ commentId: input.commentId, op: "unresolve" }); }
-  async postComment(input: { body: string }): Promise<{ commentId: number; summonLogin: string }> {
+  async resolveThread(input: { commentId: number }, signal: AbortSignal): Promise<void> {
+    this.refuseIfAborted(signal);
+    this.threads.push({ commentId: input.commentId, op: "resolve" });
+  }
+  async unresolveThread(input: { commentId: number }, signal: AbortSignal): Promise<void> {
+    this.refuseIfAborted(signal);
+    this.threads.push({ commentId: input.commentId, op: "unresolve" });
+  }
+  async postComment(input: { body: string }, signal: AbortSignal): Promise<{ commentId: number; summonLogin: string }> {
+    this.refuseIfAborted(signal);
     this.comments.push(input.body);
     return { commentId: 700 + this.comments.length, summonLogin: "RationallyPrime" };
   }
@@ -191,6 +214,8 @@ function fixture(options: { github?: boolean; threadReady?: boolean } = {}) {
 }
 
 const CHECK = `check:skrates/hive:${SHA_A}`;
+const BOARD_GITHUB = "board:github:rev_obs:run_1";
+const BOARD_SLACK = "board:slack:rev_obs:run_1";
 
 // §11 #5, publisher half: "ready refresh queued → Hold → delayed worker runs the earlier job":
 // the check publishes failure(hold) because a refresh never carries a verdict — it renders
@@ -226,27 +251,70 @@ test("the earlier job, if it is the one a worker picks up, still renders from re
   assert.deepEqual(github!.checks.map((c) => c.title), ["hold: human_gate"]);
 });
 
-test("refreshes are serialized per target: one row per target per pass, and passes never overlap", async () => {
-  const { store, github, publisher } = fixture({ github: true });
+// §8.1: a sink's passes never overlap — a second drain joins the running one rather than
+// dispatching its rows a second time — but the *other* sink's pass starts regardless.
+test("refreshes are serialized per target: a concurrent drain joins the running GitHub pass while a Slack row queued meanwhile still goes out", async () => {
+  const { store, slack, github, publisher } = fixture({ github: true });
   store.add({ effect_id: "eff_a_1", kind: "refresh", target: CHECK });
-  store.add({ effect_id: "eff_a_2", kind: "refresh", target: "board:rev_obs:run_1" });
+  store.add({ effect_id: "eff_a_2", kind: "refresh", target: BOARD_GITHUB });
   let release!: () => void;
   github!.gate = new Promise<void>((resolve) => { release = resolve; });
 
   const first = publisher.drainOnce();
+  // Its Slack pass found nothing and is over; its GitHub pass sits inside the gated call.
+  await new Promise((resolve) => setImmediate(resolve));
+  // Queued after that pass listed its rows …
+  store.add({ effect_id: "eff_slack", kind: "refresh", target: BOARD_SLACK });
   const second = publisher.drainOnce();
-  assert.equal(first, second, "a concurrent drain joins the in-flight pass");
+  await new Promise((resolve) => setImmediate(resolve));
+  // … and dispatched on its own sink's pass, with the GitHub pass still hung.
+  assert.deepEqual(slack.lines.length, 1, "the Slack row did not wait on GitHub");
+  assert.equal(store.row("eff_slack").status, "sent");
+  assert.equal(github!.checks.length, 0, "the GitHub pass is still inside its call");
+
   release();
   assert.equal(await first, 2);
-  assert.equal(github!.checks.length, 1);
+  assert.equal(await second, 3, "the joined GitHub pass plus the Slack row");
+  assert.equal(github!.checks.length, 1, "each GitHub row dispatched once, not once per drain");
   assert.equal(github!.boards.length, 1);
-  // The pass is over; a new one finds nothing pending.
+  // The passes are over; a new drain finds nothing pending.
   assert.equal(await publisher.drainOnce(), 0);
+});
+
+// F2 (Codex 3945383516): the time-box aborts the call, so a port that answers late answers into
+// nothing — no handle recorded, no second board comment on the retry.
+test("a GitHub call that outlives its dispatch timeout is aborted and records nothing when it finally answers", async () => {
+  const store = new FakeReviewStore();
+  const slack = new FakeSlack();
+  const github = new FakeGitHub();
+  const clock = new FakeClock();
+  store.policies.set("42:1", policy());
+  store.put(state());
+  const publisher = new ReviewPublisher(store, { github, slack }, clock, 5);
+  let release!: () => void;
+  github.gate = new Promise<void>((resolve) => { release = resolve; });
+  store.add({ effect_id: "eff_late", kind: "refresh", target: CHECK });
+
+  const quiet = console.error;
+  console.error = () => {};
+  try {
+    assert.equal(await publisher.drainOnce(), 0, "the row was failed on the timeout, not sent");
+  } finally {
+    console.error = quiet;
+  }
+  assert.equal(store.row("eff_late").status, "pending");
+  assert.equal(store.row("eff_late").attempts, 1);
+
+  // The port answers only now — after the abort — and its call reaches no sink.
+  release();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(github.checks, [], "the aborted call published nothing");
+  assert.deepEqual(store.handles, [], "and recorded no handle a retry would have to reconcile with");
 });
 
 test("board refresh in M0 (github: null) posts the Slack board line to the policy channel", async () => {
   const { store, slack, publisher } = fixture({ threadReady: false });
-  store.add({ effect_id: "eff_1", kind: "refresh", target: "board:rev_obs:run_1" });
+  store.add({ effect_id: "eff_1", kind: "refresh", target: BOARD_SLACK });
   assert.equal(await publisher.drainOnce(), 1);
   assert.equal(slack.lines.length, 1);
   assert.equal(slack.lines[0]!.channelId, "C0123ABCD");
@@ -258,8 +326,9 @@ test("board refresh in M0 (github: null) posts the Slack board line to the polic
 test("board refresh with a GitHub port edits the board comment in place and still posts the Slack line", async () => {
   const { store, slack, github, publisher } = fixture({ github: true, threadReady: false });
   store.put(state({ projection_handles: { board_comment_id: 314, check_run_ids: {}, slack_thread_ts: "1700.5" } }));
-  store.add({ effect_id: "eff_1", kind: "refresh", target: "board:rev_obs:run_1" });
-  await publisher.drainOnce();
+  store.add({ effect_id: "eff_1", kind: "refresh", target: BOARD_GITHUB });
+  store.add({ effect_id: "eff_2", kind: "refresh", target: BOARD_SLACK });
+  assert.equal(await publisher.drainOnce(), 2);
   assert.equal(github!.boards[0]!.existingId, 314);
   assert.match(github!.boards[0]!.body, /^## Review skrates\/hive#7/);
   assert.equal(slack.lines[0]!.threadTs, "1700.5");
@@ -280,8 +349,8 @@ test("thread refresh resolves a closed comment-sourced finding and unresolves a 
   const { store, github, publisher } = fixture({ github: true });
   store.put(state({
     findings: [
-      finding({ id: "fnd_1", source: { record_kind: "review_comment", comment_id: 9001 }, status: { open: false, resolution: fixedClaim() } }),
-      finding({ id: "fnd_2", source: { record_kind: "review_comment", comment_id: 9002 }, status: { open: true, contested: { by: "codex", at: AT, prior: fixedClaim() } } }),
+      finding({ id: "fnd_1", source: { container_kind: "review_comment", comment_id: 9001, locator: 0 }, status: { open: false, resolution: fixedClaim() } }),
+      finding({ id: "fnd_2", source: { container_kind: "review_comment", comment_id: 9002, locator: 0 }, status: { open: true, contested: { by: "codex", at: AT, prior: fixedClaim() } } }),
     ],
   }));
   store.add({ effect_id: "eff_1", kind: "refresh", target: "thread:9001" });
@@ -484,8 +553,8 @@ test("announce posts on merged and is obsolete otherwise", async () => {
 
 test("a row already claimed elsewhere is skipped, and a row whose Review is gone is obsolete", async () => {
   const { store, publisher } = fixture();
-  store.add({ effect_id: "eff_1", kind: "refresh", target: "board:rev_obs:run_1", status: "claimed" });
-  store.add({ effect_id: "eff_2", kind: "refresh", target: "board:rev_gone", reviewId: "rev_gone" });
+  store.add({ effect_id: "eff_1", kind: "refresh", target: BOARD_SLACK, status: "claimed" });
+  store.add({ effect_id: "eff_2", kind: "refresh", target: "board:slack:rev_gone", reviewId: "rev_gone" });
   assert.equal(await publisher.drainOnce(), 1);
   assert.equal(store.row("eff_1").status, "claimed");
   assert.equal(store.row("eff_2").status, "obsolete");
@@ -495,11 +564,11 @@ test("a row already claimed elsewhere is skipped, and a row whose Review is gone
 // port answers is recorded, and the next refresh carries it as existingId (POST once, PATCH after).
 test("the board comment is created once: the first refresh POSTs, records the id, and the next refresh PATCHes with it", async () => {
   const { store, github, publisher } = fixture({ github: true });
-  store.add({ effect_id: "eff_1", kind: "refresh", target: "board:rev_obs:run_1" });
+  store.add({ effect_id: "eff_1", kind: "refresh", target: BOARD_GITHUB });
   assert.equal(await publisher.drainOnce(), 1);
   assert.deepEqual(github!.boards.map((b) => b.existingId), [null]);
   assert.deepEqual(store.handles.filter((h) => h.handle === "board_comment_id"), [{ reviewId: "rev_obs:run_1", handle: "board_comment_id", key: "", value: 500 }]);
-  store.add({ effect_id: "eff_2", kind: "refresh", target: "board:rev_obs:run_1" });
+  store.add({ effect_id: "eff_2", kind: "refresh", target: BOARD_GITHUB });
   assert.equal(await publisher.drainOnce(), 1);
   assert.deepEqual(github!.boards.map((b) => b.existingId), [null, 500]);
   assert.equal(store.handles.filter((h) => h.handle === "board_comment_id").length, 1, "recorded once, not per refresh");
@@ -524,18 +593,18 @@ test("check-run ids are recorded per head: POST once, PATCH after, and a new hea
 test("the Slack thread: the first board line opens it; once the outbox has posted it, later lines and deliveries thread under it", async () => {
   const { store, slack, publisher } = fixture({ threadReady: false });
   store.put(state({ requests: [request({ id: "req_2", assignee: "talos" })] }));
-  store.add({ effect_id: "eff_1", kind: "refresh", target: "board:rev_obs:run_1" });
+  store.add({ effect_id: "eff_1", kind: "refresh", target: BOARD_SLACK });
   await publisher.drainOnce();
   assert.equal(slack.lines[0]!.threadTs, null, "the first line is the thread's top-level post");
   assert.equal(store.projections.slackBoardOutboxId("rev_obs:run_1", "C0123ABCD"), 1);
   // The outbox has not drained yet: the next line still posts at the top level rather than waiting or vanishing.
-  store.add({ effect_id: "eff_2", kind: "refresh", target: "board:rev_obs:run_1" });
+  store.add({ effect_id: "eff_2", kind: "refresh", target: BOARD_SLACK });
   await publisher.drainOnce();
   assert.equal(slack.lines[1]!.threadTs, null);
   assert.equal(store.projections.slackBoardOutboxId("rev_obs:run_1", "C0123ABCD"), 1, "the first row stays the thread opener");
   // Drained: the ts is learned, recorded once, and everything after threads under it.
   slack.posted.set(1, "1700.1");
-  store.add({ effect_id: "eff_3", kind: "refresh", target: "board:rev_obs:run_1" });
+  store.add({ effect_id: "eff_3", kind: "refresh", target: BOARD_SLACK });
   store.add({ effect_id: "eff_4", kind: "actionable", target: "delivery:talos:req_2", payload: { actor: "talos", request_id: "req_2", text: "please burn", dedupe_key: "eff_4" } });
   assert.equal(await publisher.drainOnce(), 2);
   assert.equal(slack.lines[2]!.threadTs, "1700.1");
@@ -566,7 +635,7 @@ test("a dispatched delivery records {delivery_id} and a summon records {summon_c
 test("a port that answers without an id fails the row visibly instead of recording nothing", async () => {
   const { store, github, publisher } = fixture({ github: true, threadReady: false });
   github!.noIds = true;
-  store.add({ effect_id: "eff_1", kind: "refresh", target: "board:rev_obs:run_1" });
+  store.add({ effect_id: "eff_1", kind: "refresh", target: BOARD_GITHUB });
   const quiet = console.error;
   console.error = () => {};
   try {
@@ -589,8 +658,9 @@ test("Codex records the classifier could not read reach the board comment and th
     htmlUrl: "https://github.com/skrates/hive/pull/7#issuecomment-5550157393",
     excerpt: "### Summary",
   }]);
-  store.add({ effect_id: "eff_1", kind: "refresh", target: "board:rev_obs:run_1" });
-  await publisher.drainOnce();
+  store.add({ effect_id: "eff_1", kind: "refresh", target: BOARD_GITHUB });
+  store.add({ effect_id: "eff_2", kind: "refresh", target: BOARD_SLACK });
+  assert.equal(await publisher.drainOnce(), 2);
   assert.match(github!.boards[0]!.body, /could not read[\s\S]*\[issue_comment:5550157393\]\(https:\/\/github\.com\/skrates\/hive\/pull\/7#issuecomment-5550157393\) by chatgpt-codex-connector\[bot\][^\n]*### Summary/u);
   assert.match(slack.lines[0]!.text, /unreadable codex records 1 \(issue_comment:5550157393\)/u);
 });
@@ -620,7 +690,7 @@ test("missing publication destinations leave board and announcement effects fail
   store.policies.set("42:1", policy({ slack: null }));
   const current = state({ lifecycle: "merged" });
   store.put(current);
-  store.add({ effect_id: "board-no-sink", reviewId: current.id, kind: "refresh", target: `board:${current.id}` });
+  store.add({ effect_id: "board-no-sink", reviewId: current.id, kind: "refresh", target: `board:slack:${current.id}` });
   store.add({ effect_id: "announce-no-sink", reviewId: current.id, kind: "actionable", target: `announce:${current.id}`, payload: { review_id: "rev_obs:run_1", text: "merged" } });
   assert.equal(await publisher.drainOnce(), 0);
   for (const id of ["board-no-sink", "announce-no-sink"]) {
@@ -635,8 +705,8 @@ test("an uncertain summon retry carries the same request and effect identity wit
   store.put(state({ requests: [request({ id: "req_1" })] }));
   const post = github!.postComment.bind(github);
   let loseResponse = true;
-  github!.postComment = async input => {
-    const result = await post(input);
+  github!.postComment = async (input, signal) => {
+    const result = await post(input, signal);
     if (loseResponse) { loseResponse = false; throw new Error("response lost after GitHub accepted POST"); }
     return result;
   };
@@ -656,7 +726,7 @@ test("a rerouted wake waits for the replacement channel's board parent without s
   store.policies.set("42:2", { ...policy(), version: 2, slack: { channel_id: "C_NEW" } });
   store.put(state({ policy_version: 2, requests: [request({ id: "req_new", assignee: "ariadne" })] }));
   store.add({ effect_id: "eff_wake", kind: "actionable", target: "delivery:ariadne:req_new", payload: { actor: "ariadne", request_id: "req_new", text: "review", dedupe_key: "eff_wake" } });
-  store.add({ effect_id: "eff_board", kind: "refresh", target: "board:rev_obs:run_1" });
+  store.add({ effect_id: "eff_board", kind: "refresh", target: BOARD_SLACK });
   await publisher.drainOnce();
   assert.equal(slack.lines.length, 1);
   assert.equal(slack.lines[0]!.channelId, "C_NEW");

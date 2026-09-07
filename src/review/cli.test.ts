@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import Database from "better-sqlite3";
 import { Command } from "commander";
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -6,6 +7,8 @@ import { join } from "node:path";
 import test from "node:test";
 import type { Receipt, ReviewState } from "./contract.js";
 import { registerReviewCommands, resolveCustody, type ReviewActBody, type ReviewTransport } from "./cli.js";
+import { REVIEW_STORE_GENERATION, ReviewStore, type ReviewStoreDeps } from "./store.js";
+import { policy as POLICY_FIXTURE } from "./fixtures.js";
 import { ULID_PATTERN } from "./ulid.js";
 
 const STATE = { revision: 4, subject: { key: `${"a".repeat(40)}:main` } } as unknown as ReviewState;
@@ -226,4 +229,104 @@ test("read and reconcile need only the edge socket; --as-operator reads through 
   await runOperator("read", "42:7", "--as-operator", "--json");
   assert.equal(calls[2]!.via, "operatorRead");
   assert.equal(calls[2]!.token, "fake-operator-token-for-tests");
+});
+
+// §9.3: the operator's answer to a LegacyReviewStoreError. Custody is the operator credential;
+// the drop takes the review tables and leaves policy and operator custody standing.
+function legacyStore(t: test.TestContext): { path: string; db: Database.Database; operatorToken: string } {
+  const root = mkdtempSync(join(tmpdir(), "hive-review-reset-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const path = join(root, "broker.sqlite");
+  const db = new Database(path);
+  const store = new ReviewStore(db, {
+    decide: (() => { throw new Error("not used"); }) as unknown as ReviewStoreDeps["decide"],
+    fold: (() => { throw new Error("not used"); }) as unknown as ReviewStoreDeps["fold"],
+    read: (() => { throw new Error("not used"); }) as unknown as ReviewStoreDeps["read"],
+    clock: { now: () => new Date("2026-09-06T00:00:00.000Z") },
+  });
+  const operatorToken = store.operators.create("hakon");
+  store.putPolicy(42, POLICY_FIXTURE());
+  // Generation-1 rows, written directly: nothing in this build produces these shapes.
+  db.exec(`
+    DELETE FROM review_store_generation;
+    INSERT INTO reviews (review_id, repository_id, pr_number, display, revision, policy_version, state_json, updated_at)
+      VALUES ('rev_legacy', 42, 7, 'Owner/repo#7', 1, 1, '{"requests":[{"id":"req_1","status":"unanswerable"}]}', '2026-09-05T00:00:00.000Z');
+    INSERT INTO review_effects (effect_id, review_id, revision, kind, target, payload_json, status, attempts)
+      VALUES ('eff_legacy', 'rev_legacy', 1, 'refresh', 'board:rev_legacy', NULL, 'pending', 0);
+  `);
+  db.close();
+  return { path, db, operatorToken };
+}
+
+function operatorTokenFile(t: test.TestContext, token: string): string {
+  const root = mkdtempSync(join(tmpdir(), "hive-review-reset-token-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const file = join(root, "operator.token");
+  writeFileSync(file, `${token}\n`);
+  chmodSync(file, 0o600);
+  return file;
+}
+
+test("§9.3 reset-store drops the review tables, keeps policies and operators, stamps, and the store boots again", async (t) => {
+  const { path, operatorToken } = legacyStore(t);
+  const { transport, calls } = fakeTransport();
+  const env = { HIVE_OPERATOR_TOKEN_FILE: operatorTokenFile(t, operatorToken) };
+  const { run } = cli(env, transport);
+  const printed = (await run("reset-store", path, "--confirm", path, "--as-operator")).join("");
+  assert.match(printed, /review tables dropped/u);
+  assert.match(printed, /review_policies and operators are untouched/u);
+  assert.match(printed, /hive review reconcile/u);
+  assert.match(printed, /orphan/u, "the operator is told the old board comments are orphaned");
+  assert.deepEqual(calls, [], "nothing left the machine: the broker it would talk to is stopped");
+
+  const db = new Database(path);
+  assert.equal((db.prepare("SELECT count(*) AS n FROM review_policies").get() as { n: number }).n, 1, "policy rows are configuration, not review state");
+  assert.equal((db.prepare("SELECT operator_id FROM operators").get() as { operator_id: string }).operator_id, "hakon", "operator custody survives");
+  const tables = (db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>).map((row) => row.name);
+  for (const dropped of ["reviews", "review_batches", "review_attempts", "review_effects", "github_inbox", "source_records", "review_projection_handles", "review_transport"]) {
+    assert.ok(!tables.includes(dropped), `${dropped} dropped`);
+  }
+  assert.deepEqual(db.prepare("SELECT generation FROM review_store_generation").all(), [{ generation: REVIEW_STORE_GENERATION }]);
+  // The refusal is lifted: a store opens over the reset database.
+  const deps = {
+    decide: (() => { throw new Error("not used"); }) as unknown as ReviewStoreDeps["decide"],
+    fold: (() => { throw new Error("not used"); }) as unknown as ReviewStoreDeps["fold"],
+    read: (() => { throw new Error("not used"); }) as unknown as ReviewStoreDeps["read"],
+    clock: { now: () => new Date("2026-09-06T00:00:00.000Z") },
+  };
+  assert.doesNotThrow(() => new ReviewStore(db, deps));
+  db.close();
+});
+
+test("§9.3 reset-store refuses without a matching --confirm, without --as-operator, and on an unknown operator token, and changes nothing", async (t) => {
+  const { path, operatorToken } = legacyStore(t);
+  const { transport } = fakeTransport();
+  const file = operatorTokenFile(t, operatorToken);
+  const rows = () => {
+    const db = new Database(path);
+    const state = {
+      reviews: (db.prepare("SELECT count(*) AS n FROM reviews").get() as { n: number }).n,
+      effects: (db.prepare("SELECT count(*) AS n FROM review_effects").get() as { n: number }).n,
+      stamped: (db.prepare("SELECT count(*) AS n FROM review_store_generation").get() as { n: number }).n,
+    };
+    db.close();
+    return state;
+  };
+  const before = rows();
+
+  await assert.rejects(
+    cli({ HIVE_OPERATOR_TOKEN_FILE: file }, transport).run("reset-store", path, "--confirm", `${path}.typo`, "--as-operator"),
+    (error: Error) => error.message.includes("refusing reset-store") && error.message.includes("nothing was touched"),
+  );
+  await assert.rejects(
+    cli({ HIVE_OPERATOR_TOKEN_FILE: file }, transport).run("reset-store", path, "--confirm", path),
+    (error: Error) => error.message.includes("operator act"),
+  );
+  await assert.rejects(
+    cli({ HIVE_OPERATOR_TOKEN_FILE: operatorTokenFile(t, "not-a-live-operator-token") }, transport)
+      .run("reset-store", path, "--confirm", path, "--as-operator"),
+    (error: Error) => error.message.includes("not a live credential"),
+  );
+  assert.deepEqual(rows(), before, "every refusal left the store exactly as it was");
+  assert.deepEqual(before, { reviews: 1, effects: 1, stamped: 0 });
 });

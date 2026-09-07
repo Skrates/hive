@@ -1,0 +1,18 @@
+{
+  "expect": {
+    "code": "malformed",
+    "why": "a merge names what it absorbed; `supersedes` is required so an obligation can never be folded in anonymously (§6.D4)"
+  },
+  "instance": {
+    "kind": "request_obligation_merged",
+    "mode": "closure",
+    "names": [
+      "fnd_1"
+    ],
+    "reason": "reviewer_unavailable: codex → talos",
+    "request_id": "req_1",
+    "required": true,
+    "supersedes": null
+  },
+  "model": "consequence"
+}

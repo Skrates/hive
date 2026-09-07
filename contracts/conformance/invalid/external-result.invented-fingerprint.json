@@ -7,11 +7,13 @@
     "findings": [
       {
         "body": "The loop skips the last record.",
+        "container_id": 9001,
+        "container_kind": "review_comment",
         "fingerprint": "ifp-sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
         "line": 12,
+        "locator": 0,
         "path": "src/x.py",
         "priority": "P1",
-        "source_comment_id": 9001,
         "title": "Off-by-one in replay window"
       }
     ],

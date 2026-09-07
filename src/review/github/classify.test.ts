@@ -168,6 +168,18 @@ for (const [name, expected] of Object.entries(EXPECTED)) {
         assert.ok(first !== undefined);
         assert.equal(first.path, expected.first?.path);
         assert.equal(first.line, expected.first?.line);
+        // §3.5: the container is the record a finding was read out of — the member comment for
+        // an envelope, the record itself otherwise — and the locator separates findings that
+        // share one. `(container, locator)` is distinct even where the container is not.
+        const containers = new Set(result.external.findings.map((f) => `${f.container_kind}:${f.container_id}`));
+        const located = result.external.findings.map((f) => `${f.container_kind}:${f.container_id}#${f.locator}`);
+        assert.equal(new Set(located).size, located.length, `distinct source locators: ${located.join(" ")}`);
+        if (record(name).kind === "review") {
+          assert.deepEqual([...containers], (expected.context?.members ?? []).map((m) => `review_comment:${m.id}`));
+          assert.deepEqual(result.external.findings.map((f) => f.locator), result.external.findings.map(() => 0), "one finding per member comment");
+        } else {
+          assert.deepEqual([...containers], [`${record(name).kind}:${record(name).id}`], "the record itself is the container");
+        }
         for (const finding of result.external.findings) {
           assert.ok(finding.title.length > 0 && !finding.title.includes("<sub>") && !finding.title.includes("Badge"), `title is prose: ${finding.title}`);
           assert.ok(!finding.body.includes("Useful? React"), "the connector's reaction footer is not finding body");
@@ -220,6 +232,26 @@ test("§6.F5: a badge-less finding is priority unknown — admitted, visible, bl
   assert.equal(result.external?.findings[0]?.priority, "unknown");
   assert.equal(result.external?.findings[0]?.title, "Add Codex to cx53's service PATH");
   assert.equal(result.external?.findings[0]?.body, "body");
+});
+
+test("§3.5 the connector's nested badge tags leave nothing on the title", () => {
+  // The producer writes `**<sub><sub>![P1 Badge](…)</sub></sub>  Title**`. A non-greedy
+  // `<sub>.*?</sub>` matches the inner pair and leaves the outer `</sub>` on the front of every
+  // title — every finding admitted from Skrates/hive#71 carried one. The exact fixture bytes:
+  const nested = record("sokrates-issue_comment-5420521329");
+  assert.ok(nested.body.includes("**<sub><sub>![P1 Badge]"), "the fixture carries the nested markup");
+  const result = classifyCodexRecord(nested, { ...baseContext, repository: "Skrates/sokrates", heads: [head("f8b5e0e")] });
+  assert.equal(result.classification, "findings");
+  assert.deepEqual(result.external?.findings.map((f) => f.title), [
+    "Expand the CRM URL before submitting the config",
+    "Transfer the Postmark spec with the source config",
+    "Relocate the Twenty SDL before deleting it",
+    "Retire the active Meridian runbooks with the deleted driver",
+    "Update the canonical inventory for the relocated fixtures",
+  ]);
+  // A single-`<sub>` wrapper and a bare title are unchanged by the same rule.
+  const single = { ...record("hive-review_comment-3944094503"), body: "**<sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub>  Add Codex to cx53's service PATH**\n\nbody" };
+  assert.equal(classifyCodexRecord(single, baseContext).external?.findings[0]?.title, "Add Codex to cx53's service PATH");
 });
 
 test("a reply inside a review thread is not a finding", () => {

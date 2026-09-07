@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import Database from "better-sqlite3";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import type { Clock } from "../time.js";
 import type {
@@ -18,7 +21,9 @@ import type {
 } from "./contract.js";
 import { validateBatch, validateReceipt, validateReview, validateReviewState } from "./contract.js";
 import {
+  LegacyReviewStoreError,
   REVIEW_EFFECT_MAX_ATTEMPTS,
+  REVIEW_STORE_GENERATION,
   ReviewStore,
   ReviewStoreError,
   type ApplyInput,
@@ -108,7 +113,7 @@ function fakeReducer(): ReviewStoreDeps & { calls: { decide: DecideContext[]; re
         ...base,
         consequences: changed ? [{ kind: "subject_changed", previous_key: state?.subject.key ?? null, subject: action.subject }] : [],
         effects: [
-          { effect_id: `eff_${ctx.actId}_1`, kind: "refresh", target: `board:${reviewId}`, payload: null },
+          { effect_id: `eff_${ctx.actId}_1`, kind: "refresh", target: `board:slack:${reviewId}`, payload: null },
           { effect_id: `eff_${ctx.actId}_2`, kind: "refresh", target: `check:${ctx.identity?.display.split("#")[0]}:${action.subject.head_sha}`, payload: null },
           ...(changed
             ? [{ effect_id: `eff_${ctx.actId}_3`, kind: "actionable" as const, target: `summon:req_${ctx.actId}_1`, payload: { text: "@codex review" } }]
@@ -120,7 +125,7 @@ function fakeReducer(): ReviewStoreDeps & { calls: { decide: DecideContext[]; re
       return {
         ...base,
         consequences: [{ kind: "rounds_granted", n: action.n, reason: action.reason }],
-        effects: [{ effect_id: `eff_${ctx.actId}_1`, kind: "refresh", target: `board:${reviewId}`, payload: null }],
+        effects: [{ effect_id: `eff_${ctx.actId}_1`, kind: "refresh", target: `board:slack:${reviewId}`, payload: null }],
       };
     }
     return { refused: true, code: "unauthorized", detail: `fake reducer does not model ${action.kind}` };
@@ -191,6 +196,14 @@ function setup(): { db: Database.Database; store: ReviewStore; reducer: ReturnTy
   return { db, store, reducer };
 }
 
+/**
+ * Every due row, whatever its sink. `pendingByTarget` selects one sink's rows (§8.1: each sink
+ * publishes on its own pass); assertions about the queue as a whole ask both.
+ */
+function pendingEverySink(store: ReviewStore, now: string): ReturnType<ReviewStore["effects"]["pendingByTarget"]> {
+  return [...store.effects.pendingByTarget(now, "slack"), ...store.effects.pendingByTarget(now, "github")];
+}
+
 function open(store: ReviewStore, actId = "obs:run_1", headSha = SHA_A): ReturnType<ReviewStore["apply"]> {
   return store.apply(KEY, { actId, principal: ADAPTER, expectedRevision: null, action: observe(headSha), display: DISPLAY });
 }
@@ -218,7 +231,7 @@ test("migrate creates the §9.3 tables and indexes idempotently", () => {
   new ReviewStore(db, reducer);
   const tables = (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all() as Array<{ name: string }>)
     .map((row) => row.name);
-  for (const name of ["reviews", "review_batches", "review_attempts", "review_effects", "github_inbox", "source_records", "review_policies", "operators", "review_projection_handles", "review_transport"]) {
+  for (const name of ["reviews", "review_batches", "review_attempts", "review_effects", "github_inbox", "source_records", "review_policies", "operators", "review_projection_handles", "review_transport", "review_store_generation"]) {
     assert.ok(tables.includes(name), `table ${name}`);
   }
   assert.ok(tables.includes("deliveries"), "an existing broker table is untouched");
@@ -462,25 +475,41 @@ test("effects: pendingByTarget never returns two rows for one target; claim is e
   store.apply(KEY, { actId: "01J_G1", principal: OPERATOR, expectedRevision: 1, action: grant(1) });
   store.apply(KEY, { actId: "01J_G2", principal: OPERATOR, expectedRevision: 2, action: grant(1) });
   const now = reducer.clock.now().toISOString();
-  const pending = store.effects.pendingByTarget(now);
+  const pending = pendingEverySink(store, now);
   const targets = pending.map((effect) => effect.target);
   assert.equal(new Set(targets).size, targets.length, "one row per target");
-  const board = pending.find((effect) => effect.target === "board:rev_obs:run_1");
+  const board = pending.find((effect) => effect.target === "board:slack:rev_obs:run_1");
   assert.equal(board?.effect_id, "eff_01J_G2_1", "the newest pending refresh for the board");
   assert.equal(board?.revision, 3);
   const summon = pending.find((effect) => effect.target === "summon:req_obs:run_1_1");
   assert.equal(summon?.effect_id, "eff_obs:run_1_3");
   assert.deepEqual(summon?.payload, { text: "@codex review" });
   assert.equal(summon?.status, "pending");
-  assert.equal(store.effects.pendingByTarget(now, 1).length, 1);
+  assert.equal(store.effects.pendingByTarget(now, "slack", 1).length, 1, "the limit is per sink");
 
   const claimed = store.effects.claim("eff_01J_G2_1");
   assert.equal(claimed?.status, "claimed");
   assert.equal(store.effects.claim("eff_01J_G2_1"), null, "a second claim loses");
   assert.equal(store.effects.claim("eff_nope"), null);
-  assert.ok(!store.effects.pendingByTarget(now).some((effect) => effect.effect_id === "eff_01J_G2_1"));
+  assert.ok(!pendingEverySink(store, now).some((effect) => effect.effect_id === "eff_01J_G2_1"));
   // With the newest claimed, the older board refreshes are still pending and the next-newest surfaces.
-  assert.equal(store.effects.pendingByTarget(now).find((effect) => effect.target === "board:rev_obs:run_1")?.effect_id, "eff_01J_G1_1");
+  assert.equal(pendingEverySink(store, now).find((effect) => effect.target === "board:slack:rev_obs:run_1")?.effect_id, "eff_01J_G1_1");
+});
+
+// §8.1: each sink publishes on its own pass, so the queue is selected by sink.
+test("effects: pendingByTarget selects one sink's rows, and the limit is that sink's", () => {
+  const { store, reducer } = setup();
+  open(store);
+  const now = reducer.clock.now().toISOString();
+  const slack = store.effects.pendingByTarget(now, "slack").map((effect) => effect.target);
+  const github = store.effects.pendingByTarget(now, "github").map((effect) => effect.target);
+  assert.ok(slack.length > 0 && github.length > 0, "the fixture queues both sinks");
+  assert.ok(slack.every((target) => target.startsWith("board:slack:")), `slack pass: ${slack.join()}`);
+  assert.ok(github.every((target) => target.startsWith("board:github:") || target.startsWith("check:") || target.startsWith("summon:")), `github pass: ${github.join()}`);
+  assert.equal(slack.filter((target) => github.includes(target)).length, 0, "no row is in both passes");
+  // A GitHub backlog cannot crowd the Slack sink out of its own pass: the limit is per sink.
+  assert.equal(store.effects.pendingByTarget(now, "slack", 1).length, 1);
+  assert.equal(store.effects.pendingByTarget(now, "github", 1).length, 1);
 });
 
 test("effects: markSent / markObsolete / markFailed with backoff and a terminal bound", () => {
@@ -503,13 +532,13 @@ test("effects: markSent / markObsolete / markFailed with backoff and a terminal 
   store.effects.markFailed("eff_obs:run_1_2", later);
   const failedOnce = db.prepare("SELECT status, attempts, next_attempt_at FROM review_effects WHERE effect_id = ?").get("eff_obs:run_1_2") as { status: string; attempts: number; next_attempt_at: string };
   assert.deepEqual(failedOnce, { status: "pending", attempts: 1, next_attempt_at: later });
-  assert.equal(store.effects.pendingByTarget(now).length, 0, "not due yet");
-  assert.equal(store.effects.pendingByTarget(later).length, 1, "due at next_attempt_at");
+  assert.equal(pendingEverySink(store, now).length, 0, "not due yet");
+  assert.equal(pendingEverySink(store, later).length, 1, "due at next_attempt_at");
 
   for (let attempt = 1; attempt < REVIEW_EFFECT_MAX_ATTEMPTS; attempt += 1) store.effects.markFailed("eff_obs:run_1_2", later);
   const exhausted = db.prepare("SELECT status, attempts, next_attempt_at FROM review_effects WHERE effect_id = ?").get("eff_obs:run_1_2") as { status: string; attempts: number; next_attempt_at: string | null };
   assert.deepEqual(exhausted, { status: "failed", attempts: REVIEW_EFFECT_MAX_ATTEMPTS, next_attempt_at: null });
-  assert.equal(store.effects.pendingByTarget(later).length, 0);
+  assert.equal(pendingEverySink(store, later).length, 0);
   assert.throws(() => store.effects.markSent("eff_nope"), ReviewStoreError);
   assert.throws(() => store.effects.markFailed("eff_nope", later), ReviewStoreError);
 });
@@ -521,14 +550,14 @@ test("effects: coalesceRefresh keeps only the newest pending refresh per target"
   store.apply(KEY, { actId: "01J_G1", principal: OPERATOR, expectedRevision: 1, action: grant(1) });
   store.apply(KEY, { actId: "01J_G2", principal: OPERATOR, expectedRevision: 2, action: grant(1) });
   store.effects.claim("eff_01J_G1_1");
-  assert.equal(store.effects.coalesceRefresh("board:rev_obs:run_1"), 1, "only pending rows are coalesced");
-  const rows = db.prepare("SELECT effect_id, status FROM review_effects WHERE target = ? ORDER BY rowid").all("board:rev_obs:run_1") as Array<{ effect_id: string; status: string }>;
+  assert.equal(store.effects.coalesceRefresh("board:slack:rev_obs:run_1"), 1, "only pending rows are coalesced");
+  const rows = db.prepare("SELECT effect_id, status FROM review_effects WHERE target = ? ORDER BY rowid").all("board:slack:rev_obs:run_1") as Array<{ effect_id: string; status: string }>;
   assert.deepEqual(rows, [
     { effect_id: "eff_obs:run_1_1", status: "obsolete" },
     { effect_id: "eff_01J_G1_1", status: "claimed" },
     { effect_id: "eff_01J_G2_1", status: "pending" },
   ]);
-  assert.equal(store.effects.coalesceRefresh("board:rev_obs:run_1"), 0);
+  assert.equal(store.effects.coalesceRefresh("board:slack:rev_obs:run_1"), 0);
   assert.equal(store.effects.coalesceRefresh("summon:req_obs:run_1_1"), 0, "actionable rows never coalesce");
   assert.equal(db.prepare("SELECT status FROM review_effects WHERE effect_id = ?").pluck().get("eff_obs:run_1_3"), "pending");
 });
@@ -613,7 +642,7 @@ test("active(since) lists Reviews with a pending request or recent activity", ()
   state.requests.push({
     id: "req_1", kind: "review", mode: "initial", assignee: "codex", subject_key: state.subject.key, required: true, names: [],
     status: "pending", opened_by: { kind: "system", caused_by: "obs:run_1" }, opened_at: "2026-09-06T12:00:00.000Z", reason: "routing_by_round.first",
-    supersedes: null, transport: [], retransports: [], answered_by: null,
+    supersedes: null, transport: [], retransports: [], transport_exhausted: false, cancellation: null, answered_by: null,
   });
   db.prepare("UPDATE reviews SET state_json = ? WHERE review_id = ?").run(JSON.stringify(state), state.id);
   assert.deepEqual(store.active("2026-09-06T12:00:30.000Z"), [quiet, KEY]);
@@ -704,6 +733,96 @@ test("startup retries an interrupted claimed effect after backoff", () => {
   assert.equal(recovered.status, "pending");
   assert.equal(recovered.attempts, 1);
   assert.ok(recovered.next_attempt_at > reducer.clock.now().toISOString());
-  assert.ok(reopened.effects.pendingByTarget(recovered.next_attempt_at).some(row => row.effect_id === id));
+  assert.ok(pendingEverySink(reopened, recovered.next_attempt_at).some(row => row.effect_id === id));
+  db.close();
+});
+
+// ---------------------------------------------------------------------------------------
+// §9.3 store generation: persisted reviews written under an older shape are refused, never read.
+
+/** The {@link LegacyReviewStoreError} `body` threw, so its generations can be read back. */
+function legacyRefusal(body: () => unknown): LegacyReviewStoreError {
+  try {
+    body();
+  } catch (error) {
+    assert.ok(error instanceof LegacyReviewStoreError, `expected LegacyReviewStoreError, got ${String(error)}`);
+    return error;
+  }
+  assert.fail("expected a LegacyReviewStoreError");
+}
+
+/**
+ * A generation-1 store: what the parent commit wrote — a request `status: "unanswerable"` with
+ * no `transport_exhausted`/`cancellation`, a `request_unanswerable` consequence, and a bare
+ * `board:<review>` effect target — and no stamp, because generation 1 never stamped one. The
+ * rows are written directly: no code here may read or produce these shapes.
+ */
+function generationOneRows(db: Database.Database): void {
+  db.exec("DELETE FROM review_store_generation");
+  const legacyState = JSON.stringify({
+    id: "rev_legacy", key: KEY, display: DISPLAY, revision: 1,
+    requests: [{ id: "req_1", status: "unanswerable", assignee: "ariadne" }],
+    holds: [{ id: "hold_1", kind: "request_unanswerable", reason: "codex is out" }],
+  });
+  db.prepare(`INSERT INTO reviews (review_id, repository_id, pr_number, display, revision, policy_version, state_json, updated_at)
+    VALUES ('rev_legacy', ?, ?, ?, 1, 1, ?, '2026-09-05T00:00:00.000Z')`).run(KEY.repository_id, KEY.pr_number, DISPLAY, legacyState);
+  db.prepare(`INSERT INTO review_batches (review_id, revision, batch_id, act_id, command_json, consequences_json, policy_version, admitted_at)
+    VALUES ('rev_legacy', 1, 'bat_legacy', 'act_legacy', '{}', ?, 1, '2026-09-05T00:00:00.000Z')`)
+    .run(JSON.stringify([{ kind: "request_unanswerable", request_id: "req_1" }]));
+  db.prepare(`INSERT INTO review_effects (effect_id, review_id, revision, kind, target, payload_json, status, attempts)
+    VALUES ('eff_legacy', 'rev_legacy', 1, 'refresh', 'board:rev_legacy', NULL, 'pending', 0)`).run();
+}
+
+test("§9.3: a generation-1 store (unstamped, with reviews) refuses to open, naming the path and both generations", () => {
+  const root = mkdtempSync(join(tmpdir(), "hive-review-generation-"));
+  const path = join(root, "broker.sqlite");
+  try {
+    const db = new Database(path);
+    new ReviewStore(db, fakeReducer());
+    generationOneRows(db);
+    const error = legacyRefusal(() => new ReviewStore(db, fakeReducer()));
+    assert.equal(error.stored, null);
+    assert.equal(error.required, REVIEW_STORE_GENERATION);
+    assert.ok(error.message.includes(path), "the message names the database path");
+    assert.match(error.message, /generation 1/u);
+    assert.match(error.message, new RegExp(`generation ${REVIEW_STORE_GENERATION}`, "u"));
+    assert.match(error.message, /hive review reset-store/u, "the message carries the reset procedure");
+    assert.ok(error instanceof ReviewStoreError, "it extends the store's own refusal");
+    // The refusal never touched the rows it refuses to read.
+    assert.equal(count(db, "SELECT count(*) AS n FROM reviews"), 1);
+    assert.equal(count(db, "SELECT count(*) AS n FROM review_store_generation"), 0);
+    db.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("§9.3: an empty store stamps the current generation and opens", () => {
+  const db = new Database(":memory:");
+  const store = new ReviewStore(db, fakeReducer());
+  assert.deepEqual(db.prepare("SELECT singleton, generation FROM review_store_generation").all(), [{ singleton: 1, generation: REVIEW_STORE_GENERATION }]);
+  store.putPolicy(KEY.repository_id, policy(1));
+  assert.ok("applied" in open(store).outcome, "a stamped, empty store admits acts");
+  db.close();
+});
+
+test("§9.3: a store at the current generation opens again and replays its batches", () => {
+  const { db, store, reducer } = setup();
+  open(store);
+  const cached = store.get(KEY);
+  const reopened = new ReviewStore(db, reducer);
+  assert.deepEqual(reopened.replay(KEY), cached, "the batch log still folds to the cached state");
+  assert.deepEqual(db.prepare("SELECT generation FROM review_store_generation").all(), [{ generation: REVIEW_STORE_GENERATION }]);
+  db.close();
+});
+
+test("§9.3: a stamp above this build's generation refuses — a newer binary wrote these reviews", () => {
+  const { db, store, reducer } = setup();
+  open(store);
+  db.prepare("UPDATE review_store_generation SET generation = ?").run(REVIEW_STORE_GENERATION + 1);
+  const error = legacyRefusal(() => new ReviewStore(db, reducer));
+  assert.equal(error.stored, REVIEW_STORE_GENERATION + 1);
+  assert.equal(error.required, REVIEW_STORE_GENERATION);
+  assert.match(error.message, /newer Hive wrote them/u);
   db.close();
 });

@@ -1,0 +1,8 @@
+{
+  "instance": {
+    "comment_id": 9001,
+    "container_kind": "issue_comment",
+    "locator": 1
+  },
+  "model": "finding_source"
+}

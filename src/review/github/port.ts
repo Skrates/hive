@@ -131,9 +131,15 @@ export function issueCommentRecord(row: Record<string, unknown>): GitHubRecord {
 // App implementation
 // ---------------------------------------------------------------------------------------
 
-/** The slice of `fetch` this port uses; a test fakes it without undici's `Response`. */
+/**
+ * The slice of `fetch` this port uses; a test fakes it without undici's `Response`.
+ *
+ * `signal` is always passed — `null` on the read paths, an `AbortSignal` on every projection
+ * write, where the publisher's dispatch time-box aborts the call it has given up on so it
+ * cannot land after the retry that replaced it (§8.1).
+ */
 export interface FetchLike {
-  (url: string, init: { method: string; headers: Record<string, string>; body?: string }): Promise<{
+  (url: string, init: { method: string; headers: Record<string, string>; body?: string; signal: AbortSignal | null }): Promise<{
     status: number;
     headers: { get(name: string): string | null };
     text(): Promise<string>;
@@ -211,11 +217,12 @@ export class AppGitHubPort implements GitHubPort {
     return this.jwt.value;
   }
 
-  private async appRequest(method: string, path: string, body?: unknown): Promise<{ status: number; json: unknown; link: string | null }> {
+  private async appRequest(method: string, path: string, signal: AbortSignal | null, body?: unknown): Promise<{ status: number; json: unknown; link: string | null }> {
     const url = path.startsWith("http") ? path : `${this.baseUrl}${path}`;
     const response = await this.fetch(url, {
       method,
       headers: this.headers(`Bearer ${this.appJwt()}`),
+      signal,
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     });
     const text = await response.text();
@@ -235,17 +242,17 @@ export class AppGitHubPort implements GitHubPort {
   }
 
   /** Repository id → installation + full name, discovered once through the App's installations. */
-  private async home(repositoryId: number): Promise<RepositoryHome> {
+  private async home(repositoryId: number, signal: AbortSignal | null): Promise<RepositoryHome> {
     const cached = this.homes.get(repositoryId);
     if (cached !== undefined) return cached;
     const homes = new Map<number, RepositoryHome>();
-    const installations = await this.appRequest("GET", "/app/installations?per_page=100");
+    const installations = await this.appRequest("GET", "/app/installations?per_page=100", signal);
     for (const installation of Array.isArray(installations.json) ? installations.json : []) {
       const installationId = isRecord(installation) ? num(installation.id) : null;
       if (installationId === null) continue;
-      const token = await this.installationToken(installationId);
+      const token = await this.installationToken(installationId, signal);
       for (let page = 1; ; page += 1) {
-        const listing = await this.tokenRequest(token, "GET", `/installation/repositories?per_page=100&page=${page}`);
+        const listing = await this.tokenRequest(token, "GET", `/installation/repositories?per_page=100&page=${page}`, { signal });
         const repositories = isRecord(listing.json) && Array.isArray(listing.json.repositories) ? listing.json.repositories : [];
         for (const repository of repositories) {
           if (!isRecord(repository)) continue;
@@ -261,11 +268,12 @@ export class AppGitHubPort implements GitHubPort {
     return found;
   }
 
-  private async installationToken(installationId: number): Promise<string> {
+  private async installationToken(installationId: number, signal: AbortSignal | null): Promise<string> {
     const now = this.options.clock.now().getTime();
     const cached = this.tokens.get(installationId);
     if (cached !== undefined && cached.expiresAt - TOKEN_REFRESH_MARGIN_MS > now) return cached.token;
-    const minted = await this.appRequest("POST", `/app/installations/${installationId}/access_tokens`);
+    // The token fetch is on the dispatch's path, so it carries the dispatch's signal too.
+    const minted = await this.appRequest("POST", `/app/installations/${installationId}/access_tokens`, signal);
     const token = isRecord(minted.json) ? str(minted.json.token) : "";
     const expiresAt = isRecord(minted.json) ? Date.parse(str(minted.json.expires_at)) : Number.NaN;
     if (token === "") throw new GitHubApiError(500, `/app/installations/${installationId}/access_tokens`, "no token in response");
@@ -278,12 +286,13 @@ export class AppGitHubPort implements GitHubPort {
     token: string,
     method: string,
     path: string,
-    options: { body?: unknown; etag?: string } = {},
+    options: { signal: AbortSignal | null; body?: unknown; etag?: string },
   ): Promise<{ status: number; json: unknown; etag: string | null }> {
     const url = path.startsWith("http") ? path : `${this.baseUrl}${path}`;
     const response = await this.fetch(url, {
       method,
       headers: this.headers(`Bearer ${token}`, options.etag === undefined ? {} : { "if-none-match": options.etag }),
+      signal: options.signal,
       ...(options.body === undefined ? {} : { body: JSON.stringify(options.body) }),
     });
     const text = await response.text();
@@ -297,10 +306,10 @@ export class AppGitHubPort implements GitHubPort {
     repositoryId: number,
     method: string,
     path: string,
-    options: { body?: unknown; etag?: string } = {},
+    options: { signal: AbortSignal | null; body?: unknown; etag?: string },
   ): Promise<{ status: number; json: unknown; etag: string | null }> {
-    const home = await this.home(repositoryId);
-    const token = await this.installationToken(home.installationId);
+    const home = await this.home(repositoryId, options.signal);
+    const token = await this.installationToken(home.installationId, options.signal);
     return this.tokenRequest(token, method, `/repos/${home.fullName}${path}`, options);
   }
 
@@ -308,17 +317,17 @@ export class AppGitHubPort implements GitHubPort {
     const separator = path.includes("?") ? "&" : "?";
     const items: unknown[] = [];
     for (let page = 1; ; page += 1) {
-      const result = await this.repoRequest(repositoryId, "GET", `${path}${separator}per_page=100&page=${page}`);
+      const result = await this.repoRequest(repositoryId, "GET", `${path}${separator}per_page=100&page=${page}`, { signal: null });
       const batch = Array.isArray(result.json) ? result.json : [];
       items.push(...batch);
       if (batch.length < 100) return items;
     }
   }
 
-  private async graphql(repositoryId: number, query: string, variables: Record<string, unknown>): Promise<unknown> {
-    const home = await this.home(repositoryId);
-    const token = await this.installationToken(home.installationId);
-    const result = await this.tokenRequest(token, "POST", "/graphql", { body: { query, variables } });
+  private async graphql(repositoryId: number, query: string, variables: Record<string, unknown>, signal: AbortSignal | null): Promise<unknown> {
+    const home = await this.home(repositoryId, signal);
+    const token = await this.installationToken(home.installationId, signal);
+    const result = await this.tokenRequest(token, "POST", "/graphql", { signal, body: { query, variables } });
     if (isRecord(result.json) && Array.isArray(result.json.errors) && result.json.errors.length > 0) {
       throw new GitHubApiError(200, "/graphql", JSON.stringify(result.json.errors).slice(0, 200));
     }
@@ -328,7 +337,7 @@ export class AppGitHubPort implements GitHubPort {
   // --- reads (GitHubPort) -----------------------------------------------------------------
 
   async getPullRequest(repositoryId: number, prNumber: number, etag?: string): Promise<GitHubPullRequest | "not_modified"> {
-    const result = await this.repoRequest(repositoryId, "GET", `/pulls/${prNumber}`, etag === undefined ? {} : { etag });
+    const result = await this.repoRequest(repositoryId, "GET", `/pulls/${prNumber}`, etag === undefined ? { signal: null } : { signal: null, etag });
     if (result.status === 304) return "not_modified";
     const pr = result.json;
     if (!isRecord(pr)) throw new GitHubApiError(500, `/pulls/${prNumber}`, "no pull request object");
@@ -359,7 +368,7 @@ export class AppGitHubPort implements GitHubPort {
   }
 
   private async mergeBase(repositoryId: number, baseSha: string, headSha: string): Promise<string> {
-    const result = await this.repoRequest(repositoryId, "GET", `/compare/${baseSha}...${headSha}`);
+    const result = await this.repoRequest(repositoryId, "GET", `/compare/${baseSha}...${headSha}`, { signal: null });
     const mergeBase = isRecord(result.json) && isRecord(result.json.merge_base_commit) ? str(result.json.merge_base_commit.sha) : "";
     return mergeBase === "" ? baseSha : mergeBase;
   }
@@ -391,7 +400,7 @@ export class AppGitHubPort implements GitHubPort {
 
   async getBlobSha(repositoryId: number, ref: string, path: string): Promise<string | null> {
     try {
-      const result = await this.repoRequest(repositoryId, "GET", `/contents/${path.split("/").map(encodeURIComponent).join("/")}?ref=${encodeURIComponent(ref)}`);
+      const result = await this.repoRequest(repositoryId, "GET", `/contents/${path.split("/").map(encodeURIComponent).join("/")}?ref=${encodeURIComponent(ref)}`, { signal: null });
       return isRecord(result.json) && typeof result.json.sha === "string" ? result.json.sha : null;
     } catch (error) {
       if (error instanceof GitHubApiError && error.status === 404) return null;
@@ -406,7 +415,7 @@ export class AppGitHubPort implements GitHubPort {
     const failed: Array<{ id: number; guid: string }> = [];
     let next: string | null = "/app/hook/deliveries?per_page=100";
     while (next !== null) {
-      const page: { json: unknown; link: string | null } = await this.appRequest("GET", next);
+      const page: { json: unknown; link: string | null } = await this.appRequest("GET", next, null);
       const rows = Array.isArray(page.json) ? page.json : [];
       let olderThanWindow = false;
       for (const row of rows) {
@@ -428,7 +437,7 @@ export class AppGitHubPort implements GitHubPort {
   }
 
   async redeliver(id: number): Promise<void> {
-    await this.appRequest("POST", `/app/hook/deliveries/${id}/attempts`);
+    await this.appRequest("POST", `/app/hook/deliveries/${id}/attempts`, null);
   }
 
   // --- projections (module map §4 `ReviewGitHubPort`, implemented on the same identity) ---
@@ -441,7 +450,7 @@ export class AppGitHubPort implements GitHubPort {
     conclusion: "success" | "failure";
     title: string;
     summary: string;
-  }): Promise<{ checkRunId: number }> {
+  }, signal: AbortSignal): Promise<{ checkRunId: number }> {
     const body = {
       name: input.name,
       head_sha: input.headSha,
@@ -450,23 +459,23 @@ export class AppGitHubPort implements GitHubPort {
       output: { title: input.title, summary: input.summary },
     };
     const result = input.existingId === null
-      ? await this.repoRequest(input.repositoryId, "POST", "/check-runs", { body })
-      : await this.repoRequest(input.repositoryId, "PATCH", `/check-runs/${input.existingId}`, { body });
+      ? await this.repoRequest(input.repositoryId, "POST", "/check-runs", { signal, body })
+      : await this.repoRequest(input.repositoryId, "PATCH", `/check-runs/${input.existingId}`, { signal, body });
     const checkRunId = isRecord(result.json) ? num(result.json.id) : null;
     if (checkRunId === null || checkRunId < 1) throw new GitHubApiError(500, "check run", "response has no positive id");
     return { checkRunId };
   }
 
-  async createOrUpdateBoardComment(input: { repositoryId: number; prNumber: number; existingId: number | null; body: string }): Promise<{ commentId: number }> {
+  async createOrUpdateBoardComment(input: { repositoryId: number; prNumber: number; existingId: number | null; body: string }, signal: AbortSignal): Promise<{ commentId: number }> {
     const result = input.existingId === null
-      ? await this.repoRequest(input.repositoryId, "POST", `/issues/${input.prNumber}/comments`, { body: { body: input.body } })
-      : await this.repoRequest(input.repositoryId, "PATCH", `/issues/comments/${input.existingId}`, { body: { body: input.body } });
+      ? await this.repoRequest(input.repositoryId, "POST", `/issues/${input.prNumber}/comments`, { signal, body: { body: input.body } })
+      : await this.repoRequest(input.repositoryId, "PATCH", `/issues/comments/${input.existingId}`, { signal, body: { body: input.body } });
     return { commentId: (isRecord(result.json) ? num(result.json.id) : null) ?? input.existingId ?? 0 };
   }
 
-  async postComment(input: { repositoryId: number; prNumber: number; body: string }): Promise<{ commentId: number; summonLogin: string }> {
-    const home = await this.home(input.repositoryId);
-    const result = await this.tokenRequest(this.options.summonToken, "POST", `/repos/${home.fullName}/issues/${input.prNumber}/comments`, { body: { body: input.body } });
+  async postComment(input: { repositoryId: number; prNumber: number; body: string }, signal: AbortSignal): Promise<{ commentId: number; summonLogin: string }> {
+    const home = await this.home(input.repositoryId, signal);
+    const result = await this.tokenRequest(this.options.summonToken, "POST", `/repos/${home.fullName}/issues/${input.prNumber}/comments`, { signal, body: { body: input.body } });
     const row = isRecord(result.json) ? result.json : {};
     const commentId = num(row.id);
     const summonLogin = isRecord(row.user) ? str(row.user.login) : "";
@@ -476,21 +485,21 @@ export class AppGitHubPort implements GitHubPort {
     return { commentId, summonLogin };
   }
 
-  async resolveThread(input: { repositoryId: number; commentId: number }): Promise<void> {
-    const threadId = await this.threadIdForComment(input.repositoryId, input.commentId);
-    await this.graphql(input.repositoryId, "mutation($id: ID!) { resolveReviewThread(input: {threadId: $id}) { thread { id } } }", { id: threadId });
+  async resolveThread(input: { repositoryId: number; commentId: number }, signal: AbortSignal): Promise<void> {
+    const threadId = await this.threadIdForComment(input.repositoryId, input.commentId, signal);
+    await this.graphql(input.repositoryId, "mutation($id: ID!) { resolveReviewThread(input: {threadId: $id}) { thread { id } } }", { id: threadId }, signal);
   }
 
-  async unresolveThread(input: { repositoryId: number; commentId: number }): Promise<void> {
-    const threadId = await this.threadIdForComment(input.repositoryId, input.commentId);
-    await this.graphql(input.repositoryId, "mutation($id: ID!) { unresolveReviewThread(input: {threadId: $id}) { thread { id } } }", { id: threadId });
+  async unresolveThread(input: { repositoryId: number; commentId: number }, signal: AbortSignal): Promise<void> {
+    const threadId = await this.threadIdForComment(input.repositoryId, input.commentId, signal);
+    await this.graphql(input.repositoryId, "mutation($id: ID!) { unresolveReviewThread(input: {threadId: $id}) { thread { id } } }", { id: threadId }, signal);
   }
 
   /** A review comment's thread node id: REST for the comment's PR, GraphQL to find the thread holding it. */
-  private async threadIdForComment(repositoryId: number, commentId: number): Promise<string> {
-    const home = await this.home(repositoryId);
+  private async threadIdForComment(repositoryId: number, commentId: number, signal: AbortSignal): Promise<string> {
+    const home = await this.home(repositoryId, signal);
     const [owner, name] = home.fullName.split("/");
-    const comment = await this.repoRequest(repositoryId, "GET", `/pulls/comments/${commentId}`);
+    const comment = await this.repoRequest(repositoryId, "GET", `/pulls/comments/${commentId}`, { signal });
     const prNumber = Number.parseInt(str(isRecord(comment.json) ? comment.json.pull_request_url : "").split("/").pop() ?? "", 10);
     if (Number.isNaN(prNumber)) throw new GitHubApiError(404, `/pulls/comments/${commentId}`, "comment names no pull request");
     const query = `query($owner: String!, $name: String!, $number: Int!, $after: String) {
@@ -499,7 +508,7 @@ export class AppGitHubPort implements GitHubPort {
           nodes { id comments(first: 100) { nodes { databaseId } } } } } } }`;
     let after: string | null = null;
     for (;;) {
-      const data = await this.graphql(repositoryId, query, { owner, name, number: prNumber, after });
+      const data = await this.graphql(repositoryId, query, { owner, name, number: prNumber, after }, signal);
       const threads = isRecord(data) && isRecord(data.repository) && isRecord(data.repository.pullRequest) && isRecord(data.repository.pullRequest.reviewThreads)
         ? data.repository.pullRequest.reviewThreads
         : null;

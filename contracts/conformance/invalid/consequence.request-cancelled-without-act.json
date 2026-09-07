@@ -1,0 +1,12 @@
+{
+  "expect": {
+    "code": "malformed",
+    "why": "a cancellation is a named act: `by` and `at` are required, because the reducer reads them as the operator's decision (\u00a76.D9)"
+  },
+  "instance": {
+    "kind": "request_cancelled",
+    "reason": "the author is rewriting the change",
+    "request_id": "req_obs:run_01J_1"
+  },
+  "model": "consequence"
+}

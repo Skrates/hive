@@ -1,13 +1,13 @@
 {
   "expect": {
     "code": "malformed",
-    "why": "act ids must contain no whitespace"
+    "why": "a board effect names its sink: board:github:<review> or board:slack:<review>, never board:<review> (§8.1)"
   },
   "instance": {
     "admitted_at": "2026-09-06T12:00:00.000Z",
     "batch_id": "bat_01J_1",
     "command": {
-      "act_id": "act\n",
+      "act_id": "obs:run_01J",
       "action": {
         "draft": false,
         "exemption": null,
@@ -98,23 +98,9 @@
     "effects": [
       {
         "effect_id": "eff_obs:run_01J_1",
-        "kind": "actionable",
-        "payload": null,
-        "target": "summon:req_obs:run_01J_1"
-      },
-      {
-        "effect_id": "eff_obs:run_01J_2",
         "kind": "refresh",
         "payload": null,
-        "target": "check:Owner/repo:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-      },
-      {
-        "effect_id": "eff_obs:run_01J_3",
-        "kind": "refresh",
-        "payload": {
-          "note": "opened"
-        },
-        "target": "board:github:rev_01J"
+        "target": "board:rev_01J"
       }
     ],
     "policy_version": 1,
