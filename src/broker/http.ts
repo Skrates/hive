@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { URL } from "node:url";
-import { canonicalActor, DeliveryResultInputSchema, ReasonSchema, SeatWakeMintSchema, SubscriptionInputSchema, BusySlotFormatError, parseBusySlots, type BusySlot } from "../domain.js";
+import { canonicalActor, DeliveryResultInputSchema, DispatchNoticesSchema, ReasonSchema, SeatWakeMintSchema, SubscriptionInputSchema, BusySlotFormatError, parseBusySlots, type BusySlot } from "../domain.js";
 import { routeReview, type ReviewHttpDeps } from "../review/http.js";
 import { BrokerService } from "./service.js";
 import { InvalidTransitionError, SeatWakeRefusedError, StaleLeaseError, TurnSlotReductionError } from "./store.js";
@@ -137,7 +137,13 @@ export class BrokerHttpServer {
       switch (transition[2]) {
         case "accept": return json(response, 200, this.broker.accept(deliveryId, edgeId, generation));
         case "dispatch": return json(response, 200, this.broker.beginDispatch(deliveryId, edgeId, generation));
-        case "dispatched": return json(response, 200, this.broker.markDispatched(deliveryId, edgeId, generation));
+        case "dispatched": {
+          // KRA-1414: dispatch-time dispositions the requester must see. Absent
+          // is the ordinary case and parses to the empty list, so an edge that
+          // predates the field still transitions.
+          const notices = DispatchNoticesSchema.parse(body.notices);
+          return json(response, 200, this.broker.markDispatched(deliveryId, edgeId, generation, notices));
+        }
         case "renew": return json(response, 200, this.broker.renew(deliveryId, edgeId, generation));
         case "reserve-spawn": return json(response, 200, { reserved: this.broker.reserveSpawn(deliveryId, edgeId, generation) });
         case "release": {

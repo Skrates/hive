@@ -53,8 +53,9 @@ export class BrokerClient {
     return this.transition(delivery, "dispatch");
   }
 
-  markDispatched(delivery: Delivery): Promise<Delivery> {
-    return this.transition(delivery, "dispatched");
+  /** KRA-1414: `notices` ride the dispatched transition into the thread-visible delivery status. */
+  markDispatched(delivery: Delivery, notices: readonly Reason[] = []): Promise<Delivery> {
+    return this.transition(delivery, "dispatched", { notices });
   }
 
   renew(delivery: Delivery): Promise<Delivery> {
@@ -180,10 +181,10 @@ export class BrokerClient {
     return this.json(response);
   }
 
-  private async transition(delivery: Delivery, action: string): Promise<Delivery> {
+  private async transition(delivery: Delivery, action: string, extra: Record<string, unknown> = {}): Promise<Delivery> {
     const response = await this.request(`/v1/deliveries/${delivery.id}/${action}`, {
       method: "POST",
-      body: JSON.stringify({ generation: requiredGeneration(delivery) }),
+      body: JSON.stringify({ ...extra, generation: requiredGeneration(delivery) }),
     });
     return this.json<Delivery>(response);
   }

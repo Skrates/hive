@@ -653,6 +653,45 @@ test("lifecycle reactions ride the outbox: eyes on dispatched, check on outcome,
   store.close();
 });
 
+test("KRA-1414 falsifier: a dispatch notice reaches the requester's thread and leaves the outcome alone", () => {
+  const { store } = fixture();
+  store.ingestEvent(event());
+  const claimed = store.claimNext("mac", 0)!;
+  store.transition(claimed.id, "mac", 1, "claimed", "accepted_local");
+  store.transition(claimed.id, "mac", 1, "accepted_local", "dispatching");
+  store.markDispatched(claimed.id, "mac", 1, [{
+    code: "effort_overlay_unused",
+    detail: "live_session_fixed_at_spawn — Effort: max did not apply; this session's effort was fixed when it started",
+  }]);
+  store.finish(claimed.id, "mac", 1, "processed", [], "done: shipped it");
+
+  const outbox = store.listUnsentOutbox();
+  const dispatched = outbox.find((entry) => /delivered to ariadne/.test(entry.text))!;
+  // The status line the thread already carried is intact; the notice is a line
+  // under it, naming the reason the requested effort never applied.
+  assert.match(dispatched.text, /^→ delivered to ariadne \(delivery \d+, attempt \d+\/\d+\)$/m);
+  assert.match(dispatched.text, /effort_overlay_unused — live_session_fixed_at_spawn/);
+  assert.match(dispatched.text, /Effort: max did not apply/);
+  assert.equal(dispatched.reaction, "eyes");
+  // The agent's outcome post is untouched — a disposition is not an outcome.
+  const outcome = outbox.find((entry) => /done: shipped it/.test(entry.text))!;
+  assert.doesNotMatch(outcome.text, /effort_overlay_unused/);
+  store.close();
+});
+
+test("a dispatch with no notices posts exactly the status line it always posted", () => {
+  const { store } = fixture();
+  store.ingestEvent(event());
+  const claimed = store.claimNext("mac", 0)!;
+  store.transition(claimed.id, "mac", 1, "claimed", "accepted_local");
+  store.transition(claimed.id, "mac", 1, "accepted_local", "dispatching");
+  store.markDispatched(claimed.id, "mac", 1);
+  const dispatched = store.listUnsentOutbox().find((entry) => /delivered to ariadne/.test(entry.text))!;
+  assert.equal(dispatched.text, `→ delivered to ariadne (delivery ${claimed.id}, attempt 1/${claimed.subscription.maxAttempts})`);
+  assert.ok(!dispatched.text.includes("\n"));
+  store.close();
+});
+
 test("a coalesced delivery stamps every wake message it absorbed, not only the primary", () => {
   const { store } = fixture();
   store.ingestEvent(event());

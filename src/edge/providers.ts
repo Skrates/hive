@@ -1,10 +1,10 @@
 import { spawn } from "node:child_process";
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { canonicalActor, type Delivery, type Provider, type Subscription } from "../domain.js";
 import { UdsHttpError, udsRequestJson } from "../local/uds.js";
-import { clampEffortToMax, clampEffortToXhigh, type WakeEffort } from "./effort.js";
+import { clampEffortToCodexModel, clampEffortToMax, clampEffortToXhigh, type WakeEffort } from "./effort.js";
 import type { LiveIngress } from "./live-registry.js";
 
 const MAX_CODEX_LIVE_RECEIPT_CHARS = 4_000;
@@ -135,23 +135,25 @@ export class CodexProvider implements ProviderAdapter {
 
   resume(subscription: Subscription, cwd: string, framed: string, context: HeadlessDispatch): Promise<ProviderDispatch> {
     if (!subscription.sessionId) throw new Error("resume target missing");
+    const codexHome = requireAccountProfile(subscription);
     return runHeadless(
       "codex",
-      ["exec", "resume", subscription.sessionId, "-", "--json", ...codexEffortArgs(context.effort), ...codexPermissionArgs(subscription.permissionProfile)],
+      ["exec", "resume", subscription.sessionId, "-", "--json", ...codexEffortArgs(context.effort, codexHome), ...codexPermissionArgs(subscription.permissionProfile)],
       cwd,
       framed,
-      { CODEX_HOME: requireAccountProfile(subscription) },
+      { CODEX_HOME: codexHome },
       context,
     );
   }
 
   spawn(subscription: Subscription, cwd: string, framed: string, context: HeadlessDispatch): Promise<ProviderDispatch> {
+    const codexHome = requireAccountProfile(subscription);
     return runHeadless(
       "codex",
-      codexSpawnArgs(cwd, subscription.permissionProfile, context.effort),
+      codexSpawnArgs(cwd, subscription.permissionProfile, context.effort, codexHome),
       cwd,
       framed,
-      { CODEX_HOME: requireAccountProfile(subscription) },
+      { CODEX_HOME: codexHome },
       context,
     );
   }
@@ -161,13 +163,81 @@ export class CodexProvider implements ProviderAdapter {
  * Codex has no dedicated effort flag; `-c` overrides the config key for this
  * invocation only. The value is passed unquoted — the child receives the
  * argument verbatim with no shell in between, and Codex's TOML-ish parser
- * treats a bare word as a string. Its ladder IS the whole wake grammar —
- * `max` attested by a live config.toml running exactly that, `ultra` its
- * swarm rung above — so the tier passes verbatim, no mapping.
+ * treats a bare word as a string.
+ *
+ * KRA-1414: the wake grammar is the UNION of the provider ladders, but Codex's
+ * own ladder is per-model — `gpt-5.5` stops at `xhigh`, `gpt-5.6-luna` at
+ * `max`, only the `gpt-6`-class slugs speak the whole grammar. An unsupported
+ * value is rejected at provider start, which is deterministic, so the delivery
+ * would retry that same rejection to exhaustion. The tier is therefore clamped
+ * to the ladder of the model this seat's pinned `CODEX_HOME` actually runs.
+ *
+ * The no-overlay path is byte-identical to before and reads no file at all:
+ * a null tier returns before the config is opened.
  */
-export function codexEffortArgs(effort: WakeEffort | null): string[] {
+export function codexEffortArgs(effort: WakeEffort | null, codexHome: string | null): string[] {
   if (effort === null) return [];
-  return ["-c", `model_reasoning_effort=${effort}`];
+  const model = codexHome === null ? null : readCodexPinnedModel(codexHome);
+  return ["-c", `model_reasoning_effort=${clampEffortToCodexModel(effort, model)}`];
+}
+
+/** A bare `key = "value"` assignment; a dotted or non-string key is deliberately not matched. */
+const TOML_STRING_ASSIGNMENT = /^([A-Za-z0-9_-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')\s*(?:#.*)?$/;
+const TOML_TABLE_HEADER = /^\[([^\]]+)\]/;
+
+/**
+ * The model slug a `codex exec` under this `CODEX_HOME` will run, or null when
+ * the config does not say or cannot be read. Codex is invoked with no
+ * `--profile`, so the effective model is the root-table `model` — unless the
+ * root selects a default profile with `profile = "<name>"`, in which case
+ * `[profiles.<name>].model` wins and the root `model` is its fallback.
+ *
+ * This reads the two keys it needs rather than parsing TOML: a scan that only
+ * ever recognises fewer keys than a real parser can return null, and null is
+ * the safe answer ({@link CODEX_UNKNOWN_MODEL_CEILING}). Matching `model`
+ * exactly is why the regex anchors the whole key — `model_reasoning_effort`
+ * sits on the very next line of Ariadne's live config.
+ */
+export function readCodexPinnedModel(codexHome: string): string | null {
+  let text: string;
+  try {
+    text = readFileSync(join(codexHome, "config.toml"), "utf8");
+  } catch {
+    return null;
+  }
+  let table = "";
+  let rootModel: string | null = null;
+  let rootProfile: string | null = null;
+  const profileModels = new Map<string, string>();
+  for (const raw of text.split("\n")) {
+    const line = raw.trim();
+    const header = TOML_TABLE_HEADER.exec(line);
+    if (header?.[1] !== undefined) {
+      table = header[1].trim();
+      continue;
+    }
+    const assignment = TOML_STRING_ASSIGNMENT.exec(line);
+    const key = assignment?.[1];
+    const value = assignment?.[2] ?? assignment?.[3];
+    if (key === undefined || value === undefined) continue;
+    if (table === "") {
+      if (key === "model") rootModel = value;
+      else if (key === "profile") rootProfile = value;
+      continue;
+    }
+    const profile = profileTableName(table);
+    if (profile !== null && key === "model") profileModels.set(profile, value);
+  }
+  if (rootProfile !== null) return profileModels.get(rootProfile) ?? rootModel;
+  return rootModel;
+}
+
+/** `profiles.foo` and `profiles."foo.bar"` name profile `foo` / `foo.bar`; anything else is not a profile table. */
+function profileTableName(table: string): string | null {
+  if (!table.startsWith("profiles.")) return null;
+  const name = table.slice("profiles.".length).trim();
+  const quoted = /^"([^"]*)"$|^'([^']*)'$/.exec(name);
+  return (quoted?.[1] ?? quoted?.[2] ?? name) || null;
 }
 
 function surfaceErrorCode(body: string): string | null {
@@ -521,9 +591,10 @@ export function codexSpawnArgs(
   cwd: string,
   profile: string,
   effort: WakeEffort | null = null,
+  codexHome: string | null = null,
   edgeSocketPath = resolveEdgeSocketPath(),
 ): string[] {
-  return ["exec", "--cd", cwd, "--skip-git-repo-check", "--json", ...codexEffortArgs(effort), ...codexPermissionArgs(profile, edgeSocketPath), "-"];
+  return ["exec", "--cd", cwd, "--skip-git-repo-check", "--json", ...codexEffortArgs(effort, codexHome), ...codexPermissionArgs(profile, edgeSocketPath), "-"];
 }
 
 export function codexPermissionArgs(
