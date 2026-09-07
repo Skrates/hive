@@ -8,7 +8,7 @@ import type { Delivery, Subscription } from "../domain.js";
 import { prepareSocketPath } from "../local/uds.js";
 import type { LiveIngress } from "./live-registry.js";
 import { delimiter, dirname } from "node:path";
-import { ingressInboxDirectory, ClaudeProvider, claudePromptSlotArgs, codexPermissionArgs, codexSpawnArgs, CodexProvider, composeChildEnv, GrokProvider, grokPermissionArgs, prependPathEntry, ProviderPreDispatchError, requireAccountProfile, resolveEdgeSocketPath } from "./providers.js";
+import { ingressInboxDirectory, ClaudeProvider, claudePromptSlotArgs, CODEX_NETWORK_DOMAINS, codexPermissionArgs, codexSpawnArgs, CodexProvider, composeChildEnv, GrokProvider, grokPermissionArgs, prependPathEntry, ProviderPreDispatchError, requireAccountProfile, resolveEdgeSocketPath } from "./providers.js";
 import { drainInbox } from "../channel/claude-hook.js";
 
 function subscription(overrides: Partial<Subscription> = {}): Subscription {
@@ -205,7 +205,7 @@ test("Codex permission arguments grant only the Hive edge socket on spawn and re
     "-c", "features.network_proxy=true",
     "-c", 'permissions.hive-read-only.extends=":read-only"',
     "-c", "permissions.hive-read-only.network.enabled=true",
-    "-c", 'permissions.hive-read-only.network.domains={"hive.invalid"="allow"}',
+    "-c", `permissions.hive-read-only.network.domains=${CODEX_NETWORK_DOMAINS}`,
     "-c", 'permissions.hive-read-only.network.unix_sockets={"/tmp/hive edge.sock"="allow"}',
     "-c", 'default_permissions="hive-read-only"',
   ]);
@@ -213,7 +213,7 @@ test("Codex permission arguments grant only the Hive edge socket on spawn and re
     "-c", "features.network_proxy=true",
     "-c", 'permissions.hive-workspace.extends=":workspace"',
     "-c", "permissions.hive-workspace.network.enabled=true",
-    "-c", 'permissions.hive-workspace.network.domains={"hive.invalid"="allow"}',
+    "-c", `permissions.hive-workspace.network.domains=${CODEX_NETWORK_DOMAINS}`,
     "-c", 'permissions.hive-workspace.network.unix_sockets={"/tmp/hive edge.sock"="allow"}',
     "-c", 'default_permissions="hive-workspace"',
   ]);
@@ -445,4 +445,13 @@ test("codex spawn skips the git-repo check: the edge's cwd is a root of checkout
   assert.deepEqual(args.slice(0, 5), ["exec", "--cd", "/home/hive/work-ariadne", "--skip-git-repo-check", "--json"]);
   assert.deepEqual(args.slice(5, -1), codexPermissionArgs("workspace-write", socketPath));
   assert.equal(args.at(-1), "-");
+});
+
+test("codex seats may reach GitHub and the hive socket, nothing else", () => {
+  const domains = codexPermissionArgs("workspace-write", "/tmp/hive-edge.sock").find((arg) => arg.includes("network.domains="));
+  assert.ok(domains);
+  for (const host of ["hive.invalid", "github.com", "api.github.com", "codeload.github.com", "objects.githubusercontent.com"]) {
+    assert.ok(domains.includes(`"${host}"="allow"`), host);
+  }
+  assert.ok(!domains.includes("deny"));
 });
