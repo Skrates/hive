@@ -491,8 +491,18 @@ function applyConsequence(review: Review, c: Consequence): void {
       return;
     }
     case "request_transport_rearmed": {
-      // §D6: exhaustion undone by a named act — the request is reachable again and housekeeping
-      // measures its window from the transport this consequence's act queues.
+      // §D6: exhaustion undone by a named act — the request is reachable again, with the whole
+      // transport bound in front of it.
+      //
+      // The ledger §D6 empties is also the only thing `housekeepStalls` measures its stall
+      // window from (the last `retransports` entry, else `opened_at`), so emptying it drops it
+      // to `opened_at` — necessarily long past by the time a request has been exhausted,
+      // answered late and retracted. The act queues one transport now, and housekeeping's very
+      // next pass finds the window already elapsed and queues a second. A duplicate is
+      // self-identifying (dedupe key + attempt) and no obligation is lost, so this is a wasted
+      // push, not a defect in the fold. Charging that push to the ledger would restore the
+      // window and cost the rearm a bound §D6 deliberately gave back — the consequence carries
+      // no timestamp to separate the two, so the choice belongs to §D6, not to this switch.
       const request = must(review.requests.find((r) => r.id === c.request_id), `request ${c.request_id}`);
       request.transport_exhausted = false;
       request.retransports = [];
