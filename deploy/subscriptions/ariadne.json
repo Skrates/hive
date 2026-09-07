@@ -6,7 +6,7 @@
   "sessionId": null,
   "homeEdge": "cx53",
   "workspace": "work-ariadne",
-  "edgeWorkspaces": [{ "edgeId": "cx53", "cwd": "/home/hive/work-ariadne", "worktree": null }],
+  "edgeWorkspaces": [{ "edgeId": "cx53", "cwd": "/home/hive/work-ariadne/slot-{slot}", "worktree": null }],
   "wakePolicy": "spawn",
   "permissionProfile": "danger-full-access",
   "accountProfile": "/home/hive/.hive/profiles/ariadne",
@@ -15,5 +15,6 @@
   "homeGraceMs": 30000,
   "spawnRateLimit": 2,
   "maxAttempts": 5,
+  "turnSlots": 2,
   "expiresAt": null
 }
