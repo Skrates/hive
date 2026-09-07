@@ -83,7 +83,7 @@ test("prependPathEntry puts the runtime dir first and never duplicates it", () =
 
 test("composeChildEnv prepends the running runtime's directory to the child PATH", () => {
   const runtimeDir = dirname(process.execPath);
-  const env = composeChildEnv({ CLAUDE_CONFIG_DIR: "/profiles/ariadne" }, { deliveryId: 512, token: "turn-token" });
+  const env = composeChildEnv({ CLAUDE_CONFIG_DIR: "/profiles/ariadne" }, { deliveryId: 512, token: "turn-token", effort: null });
   assert.ok(env.PATH, "composed env carries a PATH");
   assert.ok(env.PATH!.startsWith(`${runtimeDir}${delimiter}`) || env.PATH === runtimeDir, "PATH starts with the runtime dir");
   // The pinned profile env is preserved alongside the PATH fix.
@@ -100,7 +100,7 @@ test("a headless child carries its delivery id, and never the actor's live-ingre
     if (previous === undefined) delete process.env.HIVE_ACTOR;
     else process.env.HIVE_ACTOR = previous;
   });
-  const env = composeChildEnv({ CLAUDE_CONFIG_DIR: "/profiles/gnomon" }, { deliveryId: 512, token: "turn-token" });
+  const env = composeChildEnv({ CLAUDE_CONFIG_DIR: "/profiles/gnomon" }, { deliveryId: 512, token: "turn-token", effort: null });
 
   // KRA-1097: `hive wake` reads this to name the minting seat's delivery, so a
   // completing seat can address a peer without re-typing an id it was handed.
@@ -136,13 +136,13 @@ test("composeChildEnv exports the owner-local edge socket, not the child's pinne
     else process.env.HIVE_HOME = previousHome;
   });
 
-  const env = composeChildEnv({ HOME: "/profiles/grok-seat" }, { deliveryId: 7, token: "turn-token" });
+  const env = composeChildEnv({ HOME: "/profiles/grok-seat" }, { deliveryId: 7, token: "turn-token", effort: null });
   assert.equal(env.HOME, "/profiles/grok-seat");
   assert.equal(env.HIVE_EDGE_SOCKET, join(homedir(), ".hive", "edge.sock"));
   assert.notEqual(env.HIVE_EDGE_SOCKET, join("/profiles/grok-seat", ".hive", "edge.sock"));
 
   process.env.HIVE_EDGE_SOCKET = "/run/hive/edge.sock";
-  const pinned = composeChildEnv({ HOME: "/profiles/grok-seat" }, { deliveryId: 7, token: "turn-token" });
+  const pinned = composeChildEnv({ HOME: "/profiles/grok-seat" }, { deliveryId: 7, token: "turn-token", effort: null });
   assert.equal(pinned.HIVE_EDGE_SOCKET, "/run/hive/edge.sock");
 });
 
@@ -194,7 +194,7 @@ test("Grok Build live delivery terminalizes loudly; resume without a session id 
   const grok = new GrokProvider();
   await assert.rejects(grok.deliverLive(), /no live-ingress surface/);
   await assert.rejects(
-    async () => grok.resume(subscription({ provider: "grok", sessionId: null }), "/tmp", "framed", { deliveryId: 512, token: "turn-token" }),
+    async () => grok.resume(subscription({ provider: "grok", sessionId: null }), "/tmp", "framed", { deliveryId: 512, token: "turn-token", effort: null }),
     /resume target missing/,
   );
 });
@@ -235,7 +235,7 @@ test("Codex socket grant and child env share resolveEdgeSocketPath, including HI
   const expected = resolveEdgeSocketPath();
   assert.equal(expected, join("/var/lib/hive", "edge.sock"));
   assert.notEqual(expected, join(homedir(), ".hive", "edge.sock"));
-  assert.equal(composeChildEnv({}, { deliveryId: 1, token: "turn-token" }).HIVE_EDGE_SOCKET, expected);
+  assert.equal(composeChildEnv({}, { deliveryId: 1, token: "turn-token", effort: null }).HIVE_EDGE_SOCKET, expected);
 
   const grant = codexPermissionArgs("read-only").find((arg) => arg.includes("unix_sockets="));
   assert.ok(grant?.includes(JSON.stringify(expected)), grant);
@@ -441,7 +441,7 @@ test("a structured Desktop account rejection remains a deterministic pre-dispatc
 
 test("codex spawn skips the git-repo check: the edge's cwd is a root of checkouts, not a checkout", () => {
   const socketPath = "/tmp/hive-edge.sock";
-  const args = codexSpawnArgs("/home/hive/work-ariadne", "workspace-write", socketPath);
+  const args = codexSpawnArgs("/home/hive/work-ariadne", "workspace-write", null, socketPath);
   assert.deepEqual(args.slice(0, 5), ["exec", "--cd", "/home/hive/work-ariadne", "--skip-git-repo-check", "--json"]);
   assert.deepEqual(args.slice(5, -1), codexPermissionArgs("workspace-write", socketPath));
   assert.equal(args.at(-1), "-");
