@@ -20,9 +20,11 @@ import type {
   AnswerAction,
   Availability,
   Batch,
+  CommentFindingSource,
   Consequence,
   Effect,
   ExhaustionEpisode,
+  ExternalFinding,
   FindingAnswer,
   FindingAnswerKind,
   Hold,
@@ -1196,6 +1198,17 @@ function admitFinding(tx: Transaction, finding: Omit<AdmittedFinding, "id" | "re
   return admitted;
 }
 
+/**
+ * §F1: an external finding's identity — the GitHub record it was read out of, by kind and id,
+ * plus its source-local block ordinal. `CommentFindingSource` spells the container id
+ * `comment_id`; the wire shape spells it `container_id`. One reading, so the within-result check
+ * and the already-admitted check cannot drift apart.
+ */
+function sourceLocator(source: CommentFindingSource | ExternalFinding): string {
+  const container = "comment_id" in source ? source.comment_id : source.container_id;
+  return `${source.container_kind}:${container}#${source.locator}`;
+}
+
 // ---------------------------------------------------------------------------------------------
 // AdmitExternalResult (§E4, §E6, §D3)
 // ---------------------------------------------------------------------------------------------
@@ -1208,7 +1221,7 @@ function admitExternal(tx: Transaction, action: Extract<Action, { kind: "AdmitEx
   if (subject === undefined) return refuse("unknown_subject", `head ${result.reviewed_head} was never observed on ${review.display}`);
   // §2.3/§3.5: the container is not the identity — one issue comment routinely carries several
   // inline findings — so it is (container kind, container id, locator) that must be distinct.
-  const locators = result.findings.map((f) => `${f.container_kind}:${f.container_id}#${f.locator}`);
+  const locators = result.findings.map(sourceLocator);
   if (new Set(locators).size !== locators.length) {
     return refuse("malformed", "external findings must carry distinct source locators within their container");
   }
@@ -1219,12 +1232,30 @@ function admitExternal(tx: Transaction, action: Extract<Action, { kind: "AdmitEx
   // §E4: only a Codex request outstanding at that subject *now* is answered; otherwise
   // unsolicited evidence. §D6: a request whose transport the system gave up on is outstanding
   // like any other — the late answer discharges it, and its hold is released with it.
+  // §E3: a request whose `names` is non-empty is answered only by a report that addresses every
+  // named finding, and the external arm carries no `FindingAnswer` at all — its `answers` is
+  // always `[]`, because a Codex comment says nothing per named finding. Such a request is
+  // therefore not one this result can discharge: it stays outstanding, exactly as if no request
+  // were pending, and this result is unsolicited evidence at the subject. Answering it here
+  // would mark a closure discharged with none of its findings confirmed and could make the
+  // Review ready on findings that were only claimed fixed. (A named closure reaches Codex by
+  // §D4 merge or an operator `OpenRequest`; the loop's own closure rounds are at a new subject,
+  // where the old request is already cancelled by §C2.)
   const pending = review.requests.find(
-    (r) => isOutstanding(r) && r.kind === "review" && r.assignee === "codex" && r.subject_key === subject.key,
+    (r) => isOutstanding(r) && r.kind === "review" && r.assignee === "codex" && r.subject_key === subject.key && r.names.length === 0,
   );
   const answerId = pending === undefined ? null : tx.mint("ans");
-  const findings = result.findings.map((f) =>
-    admitFinding(tx, {
+  // §F1: `(container kind, container id, locator)` *is* the finding's identity, and §7 step 3
+  // re-admits a source record at every new `updated_at` — so editing a Codex comment presents
+  // the findings it already carries a second time. The admitted finding is that finding: minting
+  // a second id for one observation would double every open finding and re-block one already
+  // resolved. The report still names it, so the answer records what Codex said and not only what
+  // was new. The edited text is not re-read into the record: §F1 findings are immutable, and §F4
+  // keeps a re-observation from moving a resolution.
+  const findings = result.findings.map((f) => {
+    const known = review.findings.find((a) => "comment_id" in a.source && sourceLocator(a.source) === sourceLocator(f));
+    if (known !== undefined) return known;
+    return admitFinding(tx, {
       subject_key: subject.key,
       raised_by: "codex",
       answer_id: answerId,
@@ -1234,8 +1265,8 @@ function admitExternal(tx: Transaction, action: Extract<Action, { kind: "AdmitEx
       title: f.title,
       path: f.path,
       line: f.line,
-    }),
-  );
+    });
+  });
   if (pending === undefined || answerId === null) return null;
 
   const completion = result.verdict === "incomplete" ? "incomplete" : "complete";

@@ -506,7 +506,13 @@ type RefusalCode = "stale_revision" | "unauthorized" | "lifecycle" | "unknown_su
   that the questions were answered; the reviewer decides the answers.
 - **E4** An `AdmitExternalResult` answers the pending Codex request at that subject **that existed at
   admission time**; otherwise it is unsolicited evidence: findings are admitted, nothing is answered, and
-  no request opened later is answered by it.
+  no request opened later is answered by it. (ruled 2026-09-07, bundle-1 #6) A request whose `names` is
+  non-empty is **not** such a request. The external arm carries no `FindingAnswer` — its `answers` is
+  always `[]`, because a Codex comment says nothing per named finding — so by E3 it can address none of
+  them, and answering it would mark a closure discharged with none of its findings confirmed. The request
+  stays outstanding and the result is unsolicited evidence at the subject. A named closure reaches a Codex
+  request by a §D4 merge or an operator `OpenRequest`; the loop's own closure rounds sit at a new subject,
+  where §C2 has already cancelled the old request.
 - **E5** Answers at one subject accumulate; a later clean answer withdraws nothing (F-7 ruled: union).
 - **E6** `completion: incomplete` (or external `incomplete`) does not satisfy the requirement, charges
   nothing, and leaves the request pending with the attempt recorded.
@@ -520,6 +526,12 @@ type RefusalCode = "stale_revision" | "unauthorized" | "lifecycle" | "unknown_su
   Source identity is a **container** (the GitHub record it was read out of, by kind and id) plus a
   source-local **locator** (its zero-based block ordinal within that record). Findings sharing a
   container are not duplicates; admission refuses only a repeated `(container, locator)`.
+  (ruled 2026-09-07, bundle-1 #6) That identity holds across admissions, not only within one result:
+  §7 step 3 re-admits a source record at every new `updated_at`, so editing a Codex comment presents the
+  findings it already carries again. The admitted finding **is** that finding — a second id for one
+  observation would double every open finding and re-block a resolved one — so a locator already present
+  in the Review is not re-admitted, and the record is not rewritten from the edit (§F4). The answer the
+  result discharges still names it, so the report records what the reviewer said and not only what was new.
   Fingerprints, semantic keys and normalized titles populate `correlation_hints` — evidence shown to
   reviewers, never authority to move a resolution.
 - **F2** `ResolveFinding(same_as: F-old)` links explicitly. If `F-old` is resolved, the link marks it

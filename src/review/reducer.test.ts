@@ -1313,6 +1313,88 @@ test("§E4 an external result answers the Codex request pending at that subject 
   assert.equal(old.state.findings[1]?.answer_id, null);
 });
 
+test("§F1 a source record re-admitted at a newer version re-presents the findings it already carries: the admitted finding is that finding, and the answer still records it", () => {
+  // §7 step 3 admits a Codex record once per `updated_at`, so an edited comment arrives again
+  // carrying the same containers and locators. The first admission answers the pending request.
+  const review = opened();
+  const first = apply(review, external({ comments: [{ id: 9001 }, { id: 9002 }] }), ADAPTER, { actId: "src:review:5001:v1" }).state;
+  assert.equal(first.findings.length, 2);
+  const [f1, f2] = first.findings;
+  assert.ok(f1 && f2);
+
+  // The burn closes the first one. A resolved finding is exactly what a second admission must
+  // not resurrect: re-admitting it would mint a fresh open id for the same observation.
+  const fixed = apply(first, { kind: "ResolveFinding", finding_id: f1.id, resolution: { kind: "fixed", evidence: "repaired", commits: [H2] } }, seat("talos")).state;
+  assert.equal(fixed.findings[0]?.status.open, false);
+
+  // A new required codex request at the same subject — §D1 leaves room for it because the first
+  // is answered — is what the edited record will be measured against.
+  const reopened = apply(fixed, { kind: "OpenRequest", request_kind: "review", mode: "initial", assignee: "codex", subject_key: fixed.subject.key, required: true, names: [], reason: "re-review" }, OPERATOR).state;
+  const second = pending(reopened, "codex")[0];
+  assert.ok(second);
+
+  // The edit re-presents both findings and adds a third block to the first container.
+  const edited = external({
+    verdict: "findings",
+    source_record: { kind: "review", id: 5001, version: T1 },
+    findings: [
+      { container_kind: "review_comment", container_id: 9001, locator: 0, path: "src/x.py", line: 12, priority: "P1", title: "Codex 9001 (typo fixed)", body: "…" },
+      { container_kind: "review_comment", container_id: 9002, locator: 0, path: "src/x.py", line: 12, priority: "P1", title: "Codex 9002", body: "…" },
+      { container_kind: "review_comment", container_id: 9001, locator: 1, path: "src/x.py", line: 30, priority: "P1", title: "A third block in the first container", body: "…" },
+    ],
+  });
+  const again = apply(reopened, edited, ADAPTER, { actId: "src:review:5001:v2" });
+
+  // One new finding, not three: `(container kind, container id, locator)` is the identity (§F1).
+  assert.deepEqual(kinds(again.batch), ["finding_admitted", "answer_admitted", "request_answered"], "only the new locator is admitted; the record is not a second round, so no charge");
+  assert.equal(again.state.findings.length, 3);
+  assert.deepEqual(again.state.findings.slice(0, 2).map((f) => f.id), [f1.id, f2.id], "the admitted findings keep their ids");
+  assert.equal(again.state.findings[0]?.status.open, false, "the resolved finding is not re-raised");
+  assert.equal(again.state.findings[0]?.title, "Codex 9001", "§F1/§F4: the record is immutable; a re-observation never rewrites it");
+
+  // The answer records what Codex said — all three — so a re-admission of an all-known report
+  // can never read as a clean verdict.
+  const answer = again.state.answers.find((a) => a.request_id === second.id);
+  assert.ok(answer && "verdict" in answer.normalized);
+  assert.deepEqual(answer.normalized.findings.map((f) => f.id), [f1.id, f2.id, again.state.findings[2]?.id]);
+  assert.equal(answer.normalized.verdict, "findings", "the open findings it re-presents are still blocking");
+  assert.deepEqual(state(again.state).blocking_findings.map((f) => f.id), [f2.id, again.state.findings[2]?.id]);
+});
+
+test("§E3 an external result never discharges a request that names findings: it addresses none of them, so the obligation stands", () => {
+  // The substitute for a seat is codex here, which is how a named closure reaches a Codex
+  // request at all (§D4); an operator `OpenRequest` is the other way.
+  const P: Policy = { ...POLICY, routing_by_round: { first: "codex", later: "codex" } };
+  const review = opened({}, P);
+  const reviewed = apply(review, external({ comments: [{ id: 9001 }] }), ADAPTER, { policy: P }).state;
+  const F1 = reviewed.findings[0];
+  assert.ok(F1);
+
+  // codex holds an ordinary review request; ariadne holds the required closure naming F1.
+  const withCodex = apply(reviewed, { kind: "OpenRequest", request_kind: "review", mode: "initial", assignee: "codex", subject_key: reviewed.subject.key, required: true, names: [], reason: "re-review" }, OPERATOR, { policy: P }).state;
+  const codexReq = pending(withCodex, "codex")[0];
+  assert.ok(codexReq);
+  const withClosure = apply(withCodex, { kind: "OpenRequest", request_kind: "review", mode: "closure", assignee: "ariadne", subject_key: reviewed.subject.key, required: true, names: [F1.id], reason: "burn landed" }, OPERATOR, { policy: P }).state;
+
+  // ariadne goes unavailable: §D4 folds the closure's names and mode into the codex request.
+  const down = apply(withClosure, { kind: "SetReviewerAvailability", reviewer: "ariadne", available: false, reason: "quota", until: null, evidence: "429" }, OPERATOR, { policy: P }).state;
+  const merged = down.requests.find((r) => r.id === codexReq.id);
+  assert.ok(merged);
+  assert.deepEqual({ names: merged.names, mode: merged.mode, status: merged.status }, { names: [F1.id], mode: "closure", status: "pending" });
+
+  // An ordinary complete Codex result carries no per-finding resolutions (`answers: []`), so it
+  // addresses none of the names. It is unsolicited evidence: findings admitted, nothing answered.
+  const after = apply(down, external({ comments: [{ id: 9002 }], source_record: { kind: "review", id: 5002, version: T1 } }), ADAPTER, { policy: P });
+  assert.deepEqual(kinds(after.batch), ["finding_admitted"], "no answer_admitted, no request_answered");
+  assert.equal(after.state.requests.find((r) => r.id === codexReq.id)?.status, "pending");
+  assert.equal(after.state.findings[1]?.answer_id, null);
+  assert.equal(F1.id, after.state.findings[0]?.id);
+  // The obligation is visible: the review is not ready on a closure nobody confirmed.
+  const s = state(after.state, P);
+  assert.equal(s.readiness.ready, false);
+  assert.ok((s.readiness.ready ? [] : s.readiness.reasons).some((r) => typeof r === "object" && "required_request_pending" in r && r.required_request_pending.includes(codexReq.id)));
+});
+
 test("§E5 answers at one subject accumulate: a later clean answer withdraws nothing", () => {
   const review = opened();
   const first = apply(review, external({ comments: [{ id: 9001 }] }), ADAPTER).state;
