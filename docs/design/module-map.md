@@ -258,6 +258,10 @@ DDL: §9.3 verbatim, plus `CREATE INDEX IF NOT EXISTS reviews_display_idx ON rev
 tables `review_projection_handles(review_id, handle, key, value, recorded_at)` and
 `review_transport(effect_id PK, review_id, request_id, ref_json, recorded_at)`.
 
+Generation (§9.3): `REVIEW_STORE_GENERATION` + the `review_store_generation` singleton — construction stamps an
+empty store and throws `LegacyReviewStoreError` over reviews of another generation; `resetReviewStore` (behind
+`hive review reset-store`) drops every review table, keeps `review_policies` and `operators`, and re-stamps.
+
 ## 4. `src/review/effects.ts`, `render.ts`, `publisher.ts` — owner: **effects builder**
 
 The only builder who edits `src/broker/store.ts` (to add `SystemWakePort`).

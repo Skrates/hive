@@ -732,6 +732,7 @@ hive review grant-rounds <owner/repo>#<n> <k> --reason <t>
 hive review rule         <owner/repo>#<n> <finding-id> --resolution <t>           # owner_decision
 hive review availability <owner/repo>#<n> <reviewer> --available|--unavailable --reason <t>
 hive review adopt-policy <owner/repo>#<n> <version>
+hive review reset-store  <db-path> --confirm <db-path>   # drops every review table; §9.3 generation refusal
 ```
 Writes need delivery or session custody and `--expect`; reads need the edge socket. Argument schemas are
 generated from the contract (§2.1).
@@ -774,8 +775,20 @@ CREATE TABLE source_records (record_key TEXT NOT NULL, version TEXT NOT NULL, re
 CREATE TABLE review_policies (repository_id INTEGER NOT NULL, version INTEGER NOT NULL, policy_json TEXT NOT NULL,
   created_at TEXT NOT NULL, PRIMARY KEY(repository_id, version));
 CREATE TABLE operators (operator_id TEXT PRIMARY KEY, token_hash TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE review_store_generation (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), generation INTEGER NOT NULL);
 ```
 `state_json` is a cache; `review_batches` is the truth; the replay test proves it.
+
+**Generation.** The review tables carry their own generation stamp — `REVIEW_STORE_GENERATION` in
+`src/review/store.ts`, currently **2** — and it is bumped on every change to the persisted shape of
+`state_json`, of a batch's `consequences_json`, or of an effect `target`. It is deliberately not the
+broker's `user_version`, which is the Hive ledger's own generation (ADR-0003 R-8): a review-shape
+change must not refuse deliveries, subscriptions and the outbox. Opening the store over reviews
+stamped below the running build's generation — or unstamped with rows, which is generation 1 —
+is a `LegacyReviewStoreError` and a boot failure, never a degraded adapter; a stamp above it is
+refused too, because a newer binary wrote those rows. There is no migration path and no code that
+reads an old shape: the operator runs `hive review reset-store` (§9.1) and reconcile rebuilds every
+enrolled PR from GitHub, losing revision history and projection handles.
 
 ---
 

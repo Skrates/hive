@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import Database from "better-sqlite3";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import type { Clock } from "../time.js";
 import type {
@@ -18,7 +21,9 @@ import type {
 } from "./contract.js";
 import { validateBatch, validateReceipt, validateReview, validateReviewState } from "./contract.js";
 import {
+  LegacyReviewStoreError,
   REVIEW_EFFECT_MAX_ATTEMPTS,
+  REVIEW_STORE_GENERATION,
   ReviewStore,
   ReviewStoreError,
   type ApplyInput,
@@ -226,7 +231,7 @@ test("migrate creates the §9.3 tables and indexes idempotently", () => {
   new ReviewStore(db, reducer);
   const tables = (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all() as Array<{ name: string }>)
     .map((row) => row.name);
-  for (const name of ["reviews", "review_batches", "review_attempts", "review_effects", "github_inbox", "source_records", "review_policies", "operators", "review_projection_handles", "review_transport"]) {
+  for (const name of ["reviews", "review_batches", "review_attempts", "review_effects", "github_inbox", "source_records", "review_policies", "operators", "review_projection_handles", "review_transport", "review_store_generation"]) {
     assert.ok(tables.includes(name), `table ${name}`);
   }
   assert.ok(tables.includes("deliveries"), "an existing broker table is untouched");
@@ -729,5 +734,95 @@ test("startup retries an interrupted claimed effect after backoff", () => {
   assert.equal(recovered.attempts, 1);
   assert.ok(recovered.next_attempt_at > reducer.clock.now().toISOString());
   assert.ok(pendingEverySink(reopened, recovered.next_attempt_at).some(row => row.effect_id === id));
+  db.close();
+});
+
+// ---------------------------------------------------------------------------------------
+// §9.3 store generation: persisted reviews written under an older shape are refused, never read.
+
+/** The {@link LegacyReviewStoreError} `body` threw, so its generations can be read back. */
+function legacyRefusal(body: () => unknown): LegacyReviewStoreError {
+  try {
+    body();
+  } catch (error) {
+    assert.ok(error instanceof LegacyReviewStoreError, `expected LegacyReviewStoreError, got ${String(error)}`);
+    return error;
+  }
+  assert.fail("expected a LegacyReviewStoreError");
+}
+
+/**
+ * A generation-1 store: what the parent commit wrote — a request `status: "unanswerable"` with
+ * no `transport_exhausted`/`cancellation`, a `request_unanswerable` consequence, and a bare
+ * `board:<review>` effect target — and no stamp, because generation 1 never stamped one. The
+ * rows are written directly: no code here may read or produce these shapes.
+ */
+function generationOneRows(db: Database.Database): void {
+  db.exec("DELETE FROM review_store_generation");
+  const legacyState = JSON.stringify({
+    id: "rev_legacy", key: KEY, display: DISPLAY, revision: 1,
+    requests: [{ id: "req_1", status: "unanswerable", assignee: "ariadne" }],
+    holds: [{ id: "hold_1", kind: "request_unanswerable", reason: "codex is out" }],
+  });
+  db.prepare(`INSERT INTO reviews (review_id, repository_id, pr_number, display, revision, policy_version, state_json, updated_at)
+    VALUES ('rev_legacy', ?, ?, ?, 1, 1, ?, '2026-09-05T00:00:00.000Z')`).run(KEY.repository_id, KEY.pr_number, DISPLAY, legacyState);
+  db.prepare(`INSERT INTO review_batches (review_id, revision, batch_id, act_id, command_json, consequences_json, policy_version, admitted_at)
+    VALUES ('rev_legacy', 1, 'bat_legacy', 'act_legacy', '{}', ?, 1, '2026-09-05T00:00:00.000Z')`)
+    .run(JSON.stringify([{ kind: "request_unanswerable", request_id: "req_1" }]));
+  db.prepare(`INSERT INTO review_effects (effect_id, review_id, revision, kind, target, payload_json, status, attempts)
+    VALUES ('eff_legacy', 'rev_legacy', 1, 'refresh', 'board:rev_legacy', NULL, 'pending', 0)`).run();
+}
+
+test("§9.3: a generation-1 store (unstamped, with reviews) refuses to open, naming the path and both generations", () => {
+  const root = mkdtempSync(join(tmpdir(), "hive-review-generation-"));
+  const path = join(root, "broker.sqlite");
+  try {
+    const db = new Database(path);
+    new ReviewStore(db, fakeReducer());
+    generationOneRows(db);
+    const error = legacyRefusal(() => new ReviewStore(db, fakeReducer()));
+    assert.equal(error.stored, null);
+    assert.equal(error.required, REVIEW_STORE_GENERATION);
+    assert.ok(error.message.includes(path), "the message names the database path");
+    assert.match(error.message, /generation 1/u);
+    assert.match(error.message, new RegExp(`generation ${REVIEW_STORE_GENERATION}`, "u"));
+    assert.match(error.message, /hive review reset-store/u, "the message carries the reset procedure");
+    assert.ok(error instanceof ReviewStoreError, "it extends the store's own refusal");
+    // The refusal never touched the rows it refuses to read.
+    assert.equal(count(db, "SELECT count(*) AS n FROM reviews"), 1);
+    assert.equal(count(db, "SELECT count(*) AS n FROM review_store_generation"), 0);
+    db.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("§9.3: an empty store stamps the current generation and opens", () => {
+  const db = new Database(":memory:");
+  const store = new ReviewStore(db, fakeReducer());
+  assert.deepEqual(db.prepare("SELECT singleton, generation FROM review_store_generation").all(), [{ singleton: 1, generation: REVIEW_STORE_GENERATION }]);
+  store.putPolicy(KEY.repository_id, policy(1));
+  assert.ok("applied" in open(store).outcome, "a stamped, empty store admits acts");
+  db.close();
+});
+
+test("§9.3: a store at the current generation opens again and replays its batches", () => {
+  const { db, store, reducer } = setup();
+  open(store);
+  const cached = store.get(KEY);
+  const reopened = new ReviewStore(db, reducer);
+  assert.deepEqual(reopened.replay(KEY), cached, "the batch log still folds to the cached state");
+  assert.deepEqual(db.prepare("SELECT generation FROM review_store_generation").all(), [{ generation: REVIEW_STORE_GENERATION }]);
+  db.close();
+});
+
+test("§9.3: a stamp above this build's generation refuses — a newer binary wrote these reviews", () => {
+  const { db, store, reducer } = setup();
+  open(store);
+  db.prepare("UPDATE review_store_generation SET generation = ?").run(REVIEW_STORE_GENERATION + 1);
+  const error = legacyRefusal(() => new ReviewStore(db, reducer));
+  assert.equal(error.stored, REVIEW_STORE_GENERATION + 1);
+  assert.equal(error.required, REVIEW_STORE_GENERATION);
+  assert.match(error.message, /newer Hive wrote them/u);
   db.close();
 });

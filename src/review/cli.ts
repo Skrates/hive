@@ -1,3 +1,4 @@
+import Database from "better-sqlite3";
 import type { Command } from "commander";
 import { readFileSync } from "node:fs";
 import { resolveEdgeSocketPath } from "../edge/providers.js";
@@ -13,6 +14,7 @@ import {
 } from "./contract.js";
 import { parseReviewKey } from "./key.js";
 import { readOwnerOnlyFile, SecretFileError } from "./secret-file.js";
+import { resetReviewStore, verifyOperatorToken, REVIEW_STATE_TABLES, REVIEW_STORE_GENERATION } from "./store.js";
 import { ulid } from "./ulid.js";
 
 /**
@@ -371,6 +373,55 @@ export function registerReviewCommands(
     .description("[operator] adopt a newer policy version for this review (§6.I)")
     .action((key: string, version: string, options: WriteOptions) =>
       write(key, options, () => ({ kind: "AdoptPolicy", version: Number(version) }), true));
+
+  /**
+   * §9.3: the operator's answer to a `LegacyReviewStoreError`. Unlike every other verb this one
+   * opens the database file directly instead of going through the edge or the broker — the
+   * broker whose HTTP surface would carry the request is precisely the process that refused to
+   * boot, so there is nothing to send to. Custody is not weakened by that: `--as-operator` is
+   * required, the token comes from the owner-only `HIVE_OPERATOR_TOKEN_FILE` and never from an
+   * agent's environment (§5.A2), and it is verified against an `operators` row *in the database
+   * being reset* — the one table, with `review_policies`, the reset leaves standing.
+   */
+  review.command("reset-store")
+    .argument("<db-path>", "the broker database whose review tables to drop")
+    .requiredOption("--confirm <db-path>", "repeat <db-path> exactly; every review is dropped and cannot be recovered")
+    .option("--as-operator", "required: this is an operator act")
+    .description("[operator] drop every review table and stamp the current store generation (§9.3)")
+    .action((dbPath: string, options: { confirm: string; asOperator?: boolean }) => {
+      if (options.asOperator !== true) {
+        throw new ReviewCliError("this is an operator act (§4); pass --as-operator with HIVE_OPERATOR_TOKEN_FILE");
+      }
+      if (options.confirm !== dbPath) {
+        throw new ReviewCliError(
+          `refusing reset-store: --confirm names ${options.confirm}, the store to reset is ${dbPath}; `
+          + "repeat the path exactly — nothing was touched",
+        );
+      }
+      const custody = resolveCustody(env, true);
+      let db: Database.Database;
+      try {
+        db = new Database(dbPath, { fileMustExist: true });
+      } catch (error) {
+        throw new ReviewCliError(`refusing reset-store: cannot open ${dbPath} (${error instanceof Error ? error.message : String(error)})`);
+      }
+      try {
+        if (verifyOperatorToken(db, custody.token) === null) {
+          throw new ReviewCliError(`refusing reset-store: the operator token is not a live credential in ${dbPath}; nothing was touched`);
+        }
+        resetReviewStore(db);
+      } finally {
+        db.close();
+      }
+      out(
+        `review tables dropped in ${dbPath} and stamped generation ${REVIEW_STORE_GENERATION}: `
+        + `${REVIEW_STATE_TABLES.join(", ")}. review_policies and operators are untouched. `
+        + "Revision history and projection handles are gone; start the broker and run "
+        + "`hive review reconcile <owner/repo>#<n>` for every enrolled PR (or wait for the sweep) — "
+        + "reconcile rebuilds each Review from GitHub and re-creates the board comment and check runs, "
+        + "so any board comment already on a PR is now an orphan.",
+      );
+    });
 
   // Admin (HIVE_ADMIN_TOKEN): policy rows and operator credentials.
   review.command("put-review-policy")

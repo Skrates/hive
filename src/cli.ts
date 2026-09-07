@@ -10,7 +10,7 @@ import { BrokerHttpServer } from "./broker/http.js";
 import { SlackLinkProbe } from "./broker/probe.js";
 import { BrokerService, housekeepingTick } from "./broker/service.js";
 import { SlackCanaryPoster, SlackSocketIngress, SlackWebTransport } from "./broker/slack.js";
-import { BrokerStore } from "./broker/store.js";
+import { BrokerStore, LegacyDatabaseError } from "./broker/store.js";
 import { SlackDeafnessWatchdog } from "./broker/watchdog.js";
 import { SubscriptionInputSchema, type Delivery, type SeatWakeReceipt } from "./domain.js";
 import { ensureEdgeStateDirs } from "./edge/bootstrap.js";
@@ -33,7 +33,8 @@ import {
 import type { BindingStatus } from "./codex/live.js";
 import { installCodexSkill } from "./codex/skill-install.js";
 import { registerReviewCommands } from "./review/cli.js";
-import { bootReviewRuntime } from "./review/runtime.js";
+import { bootReviewRuntime, type ReviewRuntime } from "./review/runtime.js";
+import { LegacyReviewStoreError } from "./review/store.js";
 import { systemClock } from "./time.js";
 
 const program = new Command().name("hive").description("Hive broker/edge wake router");
@@ -45,19 +46,33 @@ program.command("broker")
   .action(async () => {
     const config = BrokerConfig.parse(process.env);
     const policy = AdmissionPolicySchema.parse(JSON.parse(config.HIVE_ADMISSION_POLICY));
-    const store = new BrokerStore(config.HIVE_BROKER_DB);
+    // Two generations are asserted here, and a stale one is a boot failure, never a degraded
+    // broker: `LegacyDatabaseError` for the Hive ledger (ADR-0003 R-8), `LegacyReviewStoreError`
+    // for the persisted reviews (design §9.3). Each names its own reset procedure; the review one
+    // is `hive review reset-store`, which leaves the ledger alone.
+    let store: BrokerStore;
+    let review: ReviewRuntime;
+    try {
+      store = new BrokerStore(config.HIVE_BROKER_DB);
+      // The review state machine lives in the broker's own database (module map §8): the
+      // store, the publisher, and — once the App's owner-only secret files exist — the
+      // webhook ingress and the reconcile scheduler.
+      review = bootReviewRuntime({
+        broker: store,
+        clock: systemClock,
+        adminToken: config.HIVE_ADMIN_TOKEN,
+        env: config,
+        failureChannelId: policy.channelIds.values().next().value,
+        log: (line) => console.error(line),
+      });
+    } catch (error) {
+      if (error instanceof LegacyDatabaseError || error instanceof LegacyReviewStoreError) {
+        console.error(`[boot] refusing to start: ${error.message}`);
+        process.exit(1);
+      }
+      throw error;
+    }
     const broker = new BrokerService(store, new SlackWebTransport(config.HIVE_SLACK_BOT_TOKEN));
-    // The review state machine lives in the broker's own database (module map §8): the
-    // store, the publisher, and — once the App's owner-only secret files exist — the
-    // webhook ingress and the reconcile scheduler.
-    const review = bootReviewRuntime({
-      broker: store,
-      clock: systemClock,
-      adminToken: config.HIVE_ADMIN_TOKEN,
-      env: config,
-      failureChannelId: policy.channelIds.values().next().value,
-      log: (line) => console.error(line),
-    });
     const http = new BrokerHttpServer(broker, {
       host: config.HIVE_BROKER_HOST,
       port: config.HIVE_BROKER_PORT,
