@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { busySlotKey, frameWakeInstruction, workspaceCwd, type BusySlot, type Delivery, type Provider, type Reason, type ReplaySnapshot } from "../domain.js";
+import { parseDeliveryEffort } from "./effort.js";
 import { BrokerClient } from "./broker-client.js";
 import { LiveIngressRegistry, type LiveIngress } from "./live-registry.js";
 import {
@@ -428,6 +429,35 @@ export class EdgeService {
     if (!adapter) throw new PreDispatchError("provider_adapter_missing");
     adapter.preflight?.(subscription);
 
+    // Overlay is computed for every route, including live. A live session's
+    // effort was fixed at its own spawn, so the flag cannot apply there —
+    // but a requested overlay that we cannot honour must not vanish silently.
+    // The honourable tier is the one named member; every other non-none
+    // parse result is a request we refuse and publish.
+    const parsed = parseDeliveryEffort(delivery);
+    const effort = parsed.kind === "tier" ? parsed.tier : null;
+    switch (parsed.kind) {
+      case "none":
+        break;
+      case "tier":
+        if (live) {
+          console.error(
+            "hive edge effort overlay unused",
+            delivery.id,
+            parsed.tier,
+            "live_session_fixed_at_spawn",
+          );
+        }
+        break;
+      case "conflict":
+        console.error(
+          "hive edge effort overlay unused",
+          delivery.id,
+          parsed.tiers.join(","),
+          "conflict",
+        );
+        break;
+    }
     if (live) {
       await onProviderStart();
       // Codex live delivery waits for the exact app-server turn and lets the
@@ -450,7 +480,7 @@ export class EdgeService {
     // delivery the edge no longer holds.
     const token = randomUUID();
     this.dispatchTokens.set(token, { deliveryId: delivery.id, generation });
-    const context = { deliveryId: delivery.id, token };
+    const context = { deliveryId: delivery.id, token, effort };
     try {
       if (subscription.sessionId && this.broker.edgeId === subscription.homeEdge) {
         await onProviderStart();

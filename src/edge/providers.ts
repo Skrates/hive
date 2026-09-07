@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { canonicalActor, type Delivery, type Provider, type Subscription } from "../domain.js";
 import { UdsHttpError, udsRequestJson } from "../local/uds.js";
+import { clampEffortToMax, clampEffortToXhigh, type WakeEffort } from "./effort.js";
 import type { LiveIngress } from "./live-registry.js";
 
 const MAX_CODEX_LIVE_RECEIPT_CHARS = 4_000;
@@ -70,11 +71,17 @@ export interface HeadlessDispatch {
    * could name too.
    */
   token: string;
+  /** The delivery's `Effort:` overlay, or null when the wake carried none. */
+  effort: WakeEffort | null;
 }
 
 export interface ProviderAdapter {
   provider: Provider;
   preflight?(subscription: Subscription): void;
+  /**
+   * Live delivery reaches a session that is already running — its effort was
+   * fixed at ITS spawn, so the overlay does not apply here by construction.
+   */
   deliverLive(ingress: LiveIngress, delivery: Delivery, framed: string): Promise<ProviderDispatch>;
   resume(subscription: Subscription, cwd: string, framed: string, context: HeadlessDispatch): Promise<ProviderDispatch>;
   spawn(subscription: Subscription, cwd: string, framed: string, context: HeadlessDispatch): Promise<ProviderDispatch>;
@@ -130,7 +137,7 @@ export class CodexProvider implements ProviderAdapter {
     if (!subscription.sessionId) throw new Error("resume target missing");
     return runHeadless(
       "codex",
-      ["exec", "resume", subscription.sessionId, "-", "--json", ...codexPermissionArgs(subscription.permissionProfile)],
+      ["exec", "resume", subscription.sessionId, "-", "--json", ...codexEffortArgs(context.effort), ...codexPermissionArgs(subscription.permissionProfile)],
       cwd,
       framed,
       { CODEX_HOME: requireAccountProfile(subscription) },
@@ -141,13 +148,26 @@ export class CodexProvider implements ProviderAdapter {
   spawn(subscription: Subscription, cwd: string, framed: string, context: HeadlessDispatch): Promise<ProviderDispatch> {
     return runHeadless(
       "codex",
-      codexSpawnArgs(cwd, subscription.permissionProfile),
+      codexSpawnArgs(cwd, subscription.permissionProfile, context.effort),
       cwd,
       framed,
       { CODEX_HOME: requireAccountProfile(subscription) },
       context,
     );
   }
+}
+
+/**
+ * Codex has no dedicated effort flag; `-c` overrides the config key for this
+ * invocation only. The value is passed unquoted — the child receives the
+ * argument verbatim with no shell in between, and Codex's TOML-ish parser
+ * treats a bare word as a string. Its ladder IS the whole wake grammar —
+ * `max` attested by a live config.toml running exactly that, `ultra` its
+ * swarm rung above — so the tier passes verbatim, no mapping.
+ */
+export function codexEffortArgs(effort: WakeEffort | null): string[] {
+  if (effort === null) return [];
+  return ["-c", `model_reasoning_effort=${effort}`];
 }
 
 function surfaceErrorCode(body: string): string | null {
@@ -191,7 +211,7 @@ export class GrokProvider implements ProviderAdapter {
     if (!subscription.sessionId) throw new Error("resume target missing");
     return runHeadless(
       process.env.HIVE_GROK_COMMAND ?? "grok",
-      ["-r", subscription.sessionId, "--output-format", "streaming-messages-json", ...grokPermissionArgs(subscription.permissionProfile), "-p", framed],
+      ["-r", subscription.sessionId, "--output-format", "streaming-messages-json", ...grokEffortArgs(context.effort), ...grokPermissionArgs(subscription.permissionProfile), "-p", framed],
       cwd,
       null,
       { HOME: requireAccountProfile(subscription) },
@@ -202,13 +222,23 @@ export class GrokProvider implements ProviderAdapter {
   spawn(subscription: Subscription, cwd: string, framed: string, context: HeadlessDispatch): Promise<ProviderDispatch> {
     return runHeadless(
       process.env.HIVE_GROK_COMMAND ?? "grok",
-      ["--output-format", "streaming-messages-json", ...grokPermissionArgs(subscription.permissionProfile), "-p", framed],
+      ["--output-format", "streaming-messages-json", ...grokEffortArgs(context.effort), ...grokPermissionArgs(subscription.permissionProfile), "-p", framed],
       cwd,
       null,
       { HOME: requireAccountProfile(subscription) },
       context,
     );
   }
+}
+
+/**
+ * Grok validates at CLI parse against `low|medium|high|xhigh` (grok 1.0.4);
+ * an unclamped `max` would burn the whole wake on an argument error — the
+ * exact failure class of the `-p`-must-come-last scar above.
+ */
+export function grokEffortArgs(effort: WakeEffort | null): string[] {
+  if (effort === null) return [];
+  return ["--reasoning-effort", clampEffortToXhigh(effort)];
 }
 
 export interface ClaudeInboxConfig {
@@ -268,7 +298,7 @@ export class ClaudeProvider implements ProviderAdapter {
     const profile = requireAccountProfile(subscription);
     return runHeadless(
       process.env.HIVE_CLAUDE_COMMAND ?? "claude",
-      ["-p", "--resume", subscription.sessionId, "--output-format", "stream-json", "--verbose", ...claudePermissionArgs(subscription.permissionProfile), ...claudePromptSlotArgs(profile), framed],
+      ["-p", "--resume", subscription.sessionId, "--output-format", "stream-json", "--verbose", ...claudeEffortArgs(context.effort), ...claudePermissionArgs(subscription.permissionProfile), ...claudePromptSlotArgs(profile), framed],
       cwd,
       null,
       { CLAUDE_CONFIG_DIR: profile },
@@ -280,13 +310,23 @@ export class ClaudeProvider implements ProviderAdapter {
     const profile = requireAccountProfile(subscription);
     return runHeadless(
       process.env.HIVE_CLAUDE_COMMAND ?? "claude",
-      ["-p", "--output-format", "stream-json", "--verbose", ...claudePermissionArgs(subscription.permissionProfile), ...claudePromptSlotArgs(profile), framed],
+      ["-p", "--output-format", "stream-json", "--verbose", ...claudeEffortArgs(context.effort), ...claudePermissionArgs(subscription.permissionProfile), ...claudePromptSlotArgs(profile), framed],
       cwd,
       null,
       { CLAUDE_CONFIG_DIR: profile },
       context,
     );
   }
+}
+
+/**
+ * Claude's `--effort` ladder is `low..max`; Codex's swarm rung `ultra` clamps
+ * to `max` here. The flag outranks the profile's `settings.json` effortLevel
+ * for this session only.
+ */
+export function claudeEffortArgs(effort: WakeEffort | null): string[] {
+  if (effort === null) return [];
+  return ["--effort", clampEffortToMax(effort)];
 }
 
 /**
@@ -477,8 +517,13 @@ function assistantMessageText(message: unknown): string | null {
  * `codex exec` refuses such a cwd unless told to skip its git-repo check.
  * Ariadne's cx53 seat failed every spawn on that refusal (2026-09-06).
  */
-export function codexSpawnArgs(cwd: string, profile: string, edgeSocketPath = resolveEdgeSocketPath()): string[] {
-  return ["exec", "--cd", cwd, "--skip-git-repo-check", "--json", ...codexPermissionArgs(profile, edgeSocketPath), "-"];
+export function codexSpawnArgs(
+  cwd: string,
+  profile: string,
+  effort: WakeEffort | null = null,
+  edgeSocketPath = resolveEdgeSocketPath(),
+): string[] {
+  return ["exec", "--cd", cwd, "--skip-git-repo-check", "--json", ...codexEffortArgs(effort), ...codexPermissionArgs(profile, edgeSocketPath), "-"];
 }
 
 export function codexPermissionArgs(
