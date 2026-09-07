@@ -493,13 +493,23 @@ export function codexPermissionArgs(
   }
 }
 
+/**
+ * Egress a Codex seat may reach besides the edge socket. GitHub is the seat's
+ * work surface — `git fetch`/`push` (github.com, codeload), `gh` (api.github.com)
+ * and release/LFS objects — and without it a seat can read a PR but never
+ * rebase, burn or open one (Ariadne's acceptance turn, 2026-09-07). Everything
+ * else stays denied; this is an allowlist, not a proxy policy.
+ */
+export const CODEX_NETWORK_DOMAINS =
+  '{"hive.invalid"="allow","github.com"="allow","api.github.com"="allow","codeload.github.com"="allow","objects.githubusercontent.com"="allow"}';
+
 function codexSocketPermissionProfile(name: string, parent: ":read-only" | ":workspace", edgeSocketPath: string): string[] {
   const socketKey = JSON.stringify(edgeSocketPath);
   return [
     "-c", "features.network_proxy=true",
     "-c", `permissions.${name}.extends=${JSON.stringify(parent)}`,
     "-c", `permissions.${name}.network.enabled=true`,
-    "-c", `permissions.${name}.network.domains={"hive.invalid"="allow"}`,
+    "-c", `permissions.${name}.network.domains=${CODEX_NETWORK_DOMAINS}`,
     "-c", `permissions.${name}.network.unix_sockets={${socketKey}="allow"}`,
     "-c", `default_permissions=${JSON.stringify(name)}`,
   ];
