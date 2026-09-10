@@ -3,9 +3,11 @@ import test from "node:test";
 import { mkdtempSync, writeFileSync, chmodSync, rmSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { age, renderCanvas, type CanvasSnapshot } from "./canvas.js";
+import { age, collectCanvas, renderCanvas, type CanvasSnapshot } from "./canvas.js";
 import { probeProfile, treeDigest } from "./profile-probe.js";
 import { ProfileReport } from "./report.js";
+import { execFileSync } from "node:child_process";
+import Database from "better-sqlite3";
 
 const now = "2026-09-05T15:00:00.000Z";
 function snapshot(): CanvasSnapshot {
@@ -140,4 +142,75 @@ test("skill drift includes added files and executable changes; profile schema re
   chmodSync(join(root, "skill/SKILL.md"), 0o755);
   assert.notEqual(treeDigest(join(root, "skill")), original);
   assert.equal(ProfileReport.safeParse({ token: "must never reach the canvas" }).success, false);
+});
+
+
+test("unverified hashes and unknown plugin versions are not drift or absence", async () => {
+  const s = snapshot();
+  const p = { ...await probeProfile("one", "/missing-health-test-profile", "claude"),
+    edgeId: "edge", accountProfile: "/profiles/one", observedAt: now };
+  p.inventory = { state: "observed", observedAt: now };
+  p.skills = { unknown: "unverified", changed: "b".repeat(64) };
+  p.plugins = [{ name: "versionless", installed: null, intended: null, state: "version_unverified" }];
+  s.seats[0]!.subscription = { edge: "edge", lastSeen: now, expiresAt: null, sessionId: null };
+  s.seats[0]!.intendedSkills = { unknown: "a".repeat(64), changed: "a".repeat(64) };
+  s.seats[0]!.intendedPlugins = ["versionless"]; s.probes = [p];
+  const output = renderCanvas(s);
+  assert.match(output, /1 skills differ from intended/);
+  assert.match(output, /1 skills could not be checked/);
+  assert.doesNotMatch(output, /2 skills differ|plugins need checking/);
+  p.plugins[0]!.state = "version_differs"; p.plugins[0]!.intended = "1.0";
+  assert.doesNotMatch(renderCanvas(s), /plugins need checking/);
+});
+
+test("the native probe keeps a present versionless plugin unverified", async t => {
+  const root = mkdtempSync(join(tmpdir(), "hive-versionless-"));
+  const old = process.env.HIVE_CLAUDE_COMMAND;
+  t.after(() => { if (old === undefined) delete process.env.HIVE_CLAUDE_COMMAND; else process.env.HIVE_CLAUDE_COMMAND = old; rmSync(root, {recursive:true,force:true}); });
+  const cli = join(root, "claude");
+  writeFileSync(join(root, "settings.json"), JSON.stringify({enabledPlugins:{"example@market":true}}));
+  mkdirSync(join(root, "plugins/marketplaces/market/.claude-plugin"), {recursive:true});
+  writeFileSync(join(root, "plugins/marketplaces/market/.claude-plugin/marketplace.json"), JSON.stringify({plugins:[{name:"example",version:"1.0"}]}));
+  writeFileSync(cli, `#!/usr/bin/env node\nconsole.log(process.argv[2]==='plugin' ? JSON.stringify([{id:'example@market',scope:'user',enabled:true,installPath:${JSON.stringify(root)}}]) : JSON.stringify({loggedIn:true}));\n`, {mode:0o700});
+  process.env.HIVE_CLAUDE_COMMAND = cli;
+  const report = await probeProfile("one", root, "claude");
+  assert.equal(report.plugins[0]?.state, "version_unverified");
+  assert.equal(report.plugins[0]?.installed, null);
+});
+
+test("collection retains exact persisted evidence and chooses the last changed delivery", async t => {
+  const root = mkdtempSync(join(tmpdir(), "hive-canvas-collect-"));
+  const token = process.env.HIVE_USAGE_READ_TOKEN; delete process.env.HIVE_USAGE_READ_TOKEN;
+  t.after(() => { if (token !== undefined) process.env.HIVE_USAGE_READ_TOKEN = token; rmSync(root,{recursive:true,force:true}); });
+  const doctrine = join(root,"doctrine");
+  for (const dir of ["seats", "templates/claude", "skills"]) mkdirSync(join(doctrine,dir),{recursive:true});
+  writeFileSync(join(doctrine,"seats/registry.json"),JSON.stringify({one:{provider:"claude",machine:"edge",profile_dir:"/profiles/one",skills:[]}}));
+  writeFileSync(join(doctrine,"templates/claude/settings.json"),JSON.stringify({enabledPlugins:{}}));
+  execFileSync("git",["init","-q",doctrine]);
+  execFileSync("git",["-C",doctrine,"add","."]);
+  execFileSync("git",["-C",doctrine,"-c","user.name=Test","-c","user.email=test@example.invalid","commit","-qm","fixture"]);
+  const dbPath = join(root,"broker.sqlite"); const db = new Database(dbPath);
+  t.after(() => db.close());
+  db.exec(`CREATE TABLE subscriptions(actor TEXT,provider TEXT,account_profile TEXT,home_edge TEXT,session_id TEXT,expires_at TEXT);
+    CREATE TABLE edges(edge_id TEXT,last_seen_at TEXT);
+    CREATE TABLE deliveries(delivery_id INTEGER,actor TEXT,status TEXT,updated_at TEXT);
+    CREATE TABLE profile_health(actor TEXT,edge_id TEXT,report_json TEXT);`);
+  const time = new Date().toISOString();
+  const report = await probeProfile("one","/profiles/one","claude");
+  report.observedAt=time;report.auth={state:"local_login_present",observedAt:time};report.inventory={state:"observed",observedAt:time};
+  db.prepare("INSERT INTO subscriptions VALUES ('one','claude','/profiles/one','edge',NULL,NULL)").run();
+  db.prepare("INSERT INTO edges VALUES ('edge',?)").run(time);
+  db.prepare("INSERT INTO deliveries VALUES (1,'one','failed',?), (2,'one','processed',?)").run(time,"2026-01-01T00:00:00.000Z");
+  db.prepare("INSERT INTO profile_health VALUES ('one','edge',?)").run(JSON.stringify(report));
+  const config = {doctrineRoot:doctrine,brokerDb:dbPath,usageUrl:"https://example.invalid",archiveUrl:"https://example.test/archive",
+    usageBindings:[{actor:"one",edgeId:"edge",profileId:"collector-one"}],
+    probes:[{actor:"one",edgeId:"wrong-edge",command:[process.execPath,"-e",`process.stdout.write(${JSON.stringify(JSON.stringify(report))})`]}]};
+  const s = await collectCanvas(config);
+  assert.equal(s.probes.length,2);
+  assert.equal(s.seats[0]?.delivery?.id,1);
+  assert.match(renderCanvas(s),/last delivery failed/);
+  assert.doesNotMatch(renderCanvas(s),/maintenance not observed/);
+  db.exec("DELETE FROM subscriptions"); config.probes[0]!.edgeId="edge";
+  const unenrolled = await collectCanvas(config);
+  assert.doesNotMatch(renderCanvas(unenrolled),/maintenance not observed/);
 });

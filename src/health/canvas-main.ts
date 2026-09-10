@@ -1,5 +1,5 @@
 /** Broker-host-only timer entrypoint. Collection never opens a provider turn or repairs a login. */
-import { readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, readFileSync, writeFileSync } from "node:fs";
 import { WebClient } from "@slack/web-api";
 import { execFileSync } from "node:child_process";
 import { CanvasConfig, collectCanvas, renderCanvas } from "./canvas.js";
@@ -22,6 +22,8 @@ async function main(): Promise<void> {
   const markdown = renderCanvas(snapshot, status);
   writeFileSync(outputPath, markdown, { mode: 0o600 });
   writeFileSync(`${outputPath}.json`, JSON.stringify(snapshot, null, 2) + "\n", { mode: 0o600 });
+  chmodSync(outputPath, 0o600);
+  chmodSync(`${outputPath}.json`, 0o600);
   if (mode === "publish") {
     if (!config.canvasId || !process.env.HIVE_SLACK_BOT_TOKEN) throw new Error("canvas ID and broker Slack token required");
     const slack = new WebClient(process.env.HIVE_SLACK_BOT_TOKEN, { retryConfig: { retries: 0 }, timeout: 20_000 });

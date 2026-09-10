@@ -85,7 +85,7 @@ export async function collectCanvas(config: CanvasConfig): Promise<CanvasSnapsho
         }
         seat.profile = row.account_profile;
         seat.subscription = { edge: row.home_edge, lastSeen: row.last_seen_at, expiresAt: row.expires_at, sessionId: row.session_id };
-        const d = db.prepare("SELECT delivery_id,status,updated_at FROM deliveries WHERE actor=? ORDER BY delivery_id DESC LIMIT 1").get(row.actor) as any;
+        const d = db.prepare("SELECT delivery_id,status,updated_at FROM deliveries WHERE actor=? ORDER BY updated_at DESC, delivery_id DESC LIMIT 1").get(row.actor) as any;
         if (d) seat.delivery = { id: d.delivery_id, status: d.status, at: d.updated_at, sessionId: null };
       }
       if (db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='profile_health'").get()) {
@@ -122,7 +122,6 @@ export async function collectCanvas(config: CanvasConfig): Promise<CanvasSnapsho
       try {
         const data = ProfileReport.parse(await commandJson(probe.command));
         if (data.actor !== probe.actor) throw new Error("probe actor mismatch");
-        snapshot.probes = snapshot.probes.filter(p => p.actor !== probe.actor);
         snapshot.probes.push({ ...data, edgeId: probe.edgeId });
       } catch { snapshot.failedProbes.push(probe.actor); }
     }),
@@ -199,8 +198,9 @@ export function renderCanvas(s: CanvasSnapshot, refreshStatus = "Snapshot only")
     if (edgeState === "stale" || expired) add(`Hive edge ${edgeState}`, name);
     if (seat?.delivery && ["failed", "undeliverable"].includes(seat.delivery.status)) add(`last delivery ${seat.delivery.status}`, name);
 
-    const p = seat ? s.probes.find(p => p.actor === seat.actor && p.provider === seat.provider &&
-      p.edgeId === seat.subscription?.edge && !seat.profile.startsWith("~/") && p.accountProfile === seat.profile) : undefined;
+    const p = seat ? s.probes.filter(p => p.actor === seat.actor && p.provider === seat.provider &&
+      p.edgeId === (seat.subscription?.edge ?? seat.machine) && !seat.profile.startsWith("~/") && p.accountProfile === seat.profile)
+      .sort((a, b) => Date.parse(b.observedAt) - Date.parse(a.observedAt))[0] : undefined;
     // Stale maintenance is one actionable gap, not a list of old auth/plugin
     // failures presented as current. Quota and edge freshness are independent.
     if (!p || stale(p.observedAt, s.generatedAt)) {
@@ -225,12 +225,15 @@ export function renderCanvas(s: CanvasSnapshot, refreshStatus = "Snapshot only")
       const intended = seat?.intendedSkills;
       if (intended) {
         const missing = Object.keys(intended).filter(n => !(n in p.skills));
-        const changed = Object.keys(intended).filter(n => n in p.skills && p.skills[n] !== intended[n]);
+        const unverified = Object.keys(intended).filter(n => p.skills[n] === "unverified");
+        const changed = Object.keys(intended).filter(n => n in p.skills && p.skills[n] !== "unverified" && p.skills[n] !== intended[n]);
         if (missing.length) add(`${missing.length} skills missing`, name);
         if (changed.length) add(`${changed.length} skills differ from intended`, name);
+        if (unverified.length) add(`${unverified.length} skills could not be checked`, name);
       }
-      const badPlugins = new Set(p.plugins.filter(i => ["missing", "missing_files", "disabled_but_intended", "version_differs"].includes(i.state)).map(i => i.name));
-      for (const plugin of seat?.intendedPlugins ?? []) if (!p.plugins.some(i => i.name === plugin && i.installed !== null)) badPlugins.add(plugin);
+      const badPlugins = new Set(p.plugins.filter(i => ["missing", "missing_files", "disabled_but_intended"].includes(i.state) ||
+        (i.state === "version_differs" && i.installed !== null && i.intended !== null)).map(i => i.name));
+      for (const plugin of seat?.intendedPlugins ?? []) if (!p.plugins.some(i => i.name === plugin)) badPlugins.add(plugin);
       if (badPlugins.size) add(`${badPlugins.size} plugins need checking`, name);
     }
   }

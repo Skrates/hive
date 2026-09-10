@@ -84,6 +84,7 @@ export async function probeProfile(actor: string, root: string, provider: Profil
       result.plugins.push({ name, installed: version, intended,
         state: expected[name] === true && !entry ? "missing" : entry && !existsSync(entry.installPath) ? "missing_files"
           : entry?.enabled === false ? "disabled_but_intended"
+          : version === null ? "version_unverified"
           : intended && version !== intended ? "version_differs" : intended ? "matches_cached_catalog" : "version_unverified" });
     }
     // Codex cache directories prove disk presence only, never which version a session loaded.
