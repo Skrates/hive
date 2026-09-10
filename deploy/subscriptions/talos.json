@@ -15,6 +15,6 @@
   "homeGraceMs": 30000,
   "spawnRateLimit": 2,
   "maxAttempts": 5,
-  "turnSlots": 2,
+  "turnSlots": 4,
   "expiresAt": null
 }
