@@ -1,0 +1,8 @@
+{
+  "instance": {
+    "hold_id": "hold_01",
+    "kind": "Release",
+    "reason": "gate passed"
+  },
+  "model": "action"
+}

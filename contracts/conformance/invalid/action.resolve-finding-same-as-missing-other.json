@@ -1,0 +1,15 @@
+{
+  "expect": {
+    "code": "malformed",
+    "why": "same_as names the other finding (\u00a7F2)"
+  },
+  "instance": {
+    "finding_id": "fnd_03",
+    "kind": "ResolveFinding",
+    "resolution": {
+      "evidence": "dup",
+      "kind": "same_as"
+    }
+  },
+  "model": "action"
+}

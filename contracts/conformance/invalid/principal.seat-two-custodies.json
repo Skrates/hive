@@ -1,0 +1,15 @@
+{
+  "expect": {
+    "code": "malformed",
+    "why": "custody is delivery or session, not both (\u00a73.2)"
+  },
+  "instance": {
+    "actor": "gnomon",
+    "custody": {
+      "delivery_id": 1,
+      "session_id": "s"
+    },
+    "kind": "seat"
+  },
+  "model": "principal"
+}

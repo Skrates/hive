@@ -1,0 +1,19 @@
+{
+  "expect": {
+    "code": "malformed",
+    "why": "every hold blocks readiness (\u00a7G3)"
+  },
+  "instance": {
+    "hold": {
+      "blocks": {
+        "readiness": false,
+        "summons": false
+      },
+      "kind": "stack",
+      "reason": "stacked",
+      "release_on": "explicit"
+    },
+    "kind": "Hold"
+  },
+  "model": "action"
+}

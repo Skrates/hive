@@ -1,0 +1,8 @@
+{
+  "instance": {
+    "kind": "CancelRequest",
+    "reason": "subject_changed",
+    "request_id": "req_01"
+  },
+  "model": "action"
+}

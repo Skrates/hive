@@ -1,0 +1,8 @@
+{
+  "instance": {
+    "answer_id": "ans_01",
+    "kind": "RetractAnswer",
+    "reason": "wrong head"
+  },
+  "model": "action"
+}

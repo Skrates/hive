@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { busySlotKey, frameWakeInstruction, workspaceCwd, type BusySlot, type Delivery, type Provider, type Reason, type ReplaySnapshot } from "../domain.js";
+import { disposeDeliveryEffort, parseDeliveryEffort, type WakeEffort } from "./effort.js";
 import { BrokerClient } from "./broker-client.js";
 import { LiveIngressRegistry, type LiveIngress } from "./live-registry.js";
 import {
@@ -243,9 +244,18 @@ export class EdgeService {
       current = asClaimed(await this.broker.beginDispatch(current));
       this.store.setStatus(current.id, generation, "dispatching");
 
+      // KRA-1414: the overlay is disposed once, against the route this turn
+      // actually took. A tier the route cannot honour is not a diagnostic —
+      // it rides the dispatched transition below into the thread the requester
+      // is reading, because edge stderr lives on a machine they cannot see and
+      // the outcome reports success either way.
+      // Parsed from `current`, the freshest ledger view of the delivery, so a
+      // message coalesced into it after the claim is still part of the request.
+      const overlay = disposeDeliveryEffort(parseDeliveryEffort(current), live !== null);
+
       const dispatch = await this.withLeaseHeartbeat(
         current,
-        () => this.dispatch(current, replay, live, generation, slot, async () => {
+        () => this.dispatch(current, replay, live, generation, slot, overlay.effort, async () => {
           providerStarted = true;
           // The last uncovered cell of {live, headless} × {claim, provider-start}:
           // a headless child reads its profile when it spawns, which is several
@@ -266,7 +276,7 @@ export class EdgeService {
           }
         }),
       );
-      current = asClaimed(await this.broker.markDispatched(current));
+      current = asClaimed(await this.broker.markDispatched(current, overlay.unused ? [overlay.unused] : []));
       this.store.setStatus(current.id, generation, "dispatched", dispatch.receipt);
       if (dispatch.processed) {
         // A completed provider turn (headless, or a completion-tracked Codex
@@ -418,6 +428,10 @@ export class EdgeService {
     live: LiveIngress | null,
     generation: number,
     slot: number,
+    // KRA-1414: the route-aware fold of the delivery's `Effort:` overlay, taken
+    // once in dispatchClaimed so the tier handed to the provider and the notice
+    // published to the requester cannot disagree about the route.
+    effort: WakeEffort | null,
     // Awaited: the headless branch re-reads the profile attestation here, and
     // that read is now off the event loop. The rebind must land before the
     // provider starts, so the start waits for it.
@@ -450,7 +464,7 @@ export class EdgeService {
     // delivery the edge no longer holds.
     const token = randomUUID();
     this.dispatchTokens.set(token, { deliveryId: delivery.id, generation });
-    const context = { deliveryId: delivery.id, token };
+    const context = { deliveryId: delivery.id, token, effort };
     try {
       if (subscription.sessionId && this.broker.edgeId === subscription.homeEdge) {
         await onProviderStart();

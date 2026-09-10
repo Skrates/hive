@@ -1,0 +1,12 @@
+{
+  "instance": {
+    "finding_id": "fnd_02",
+    "kind": "ResolveFinding",
+    "resolution": {
+      "evidence": "out of scope for this PR",
+      "kind": "follow_up",
+      "ticket": "KRA-1400"
+    }
+  },
+  "model": "action"
+}

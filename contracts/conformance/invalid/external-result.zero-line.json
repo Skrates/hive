@@ -1,0 +1,29 @@
+{
+  "expect": {
+    "code": "malformed",
+    "why": "external-result.zero-line"
+  },
+  "instance": {
+    "findings": [
+      {
+        "body": "The loop skips the last record.",
+        "line": 0,
+        "path": "src/x.py",
+        "priority": "P1",
+        "source_comment_id": 9001,
+        "title": "Off-by-one in replay window"
+      }
+    ],
+    "reviewed_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "schema_version": "1",
+    "source": "codex",
+    "source_record": {
+      "id": 5001,
+      "kind": "review",
+      "version": "2026-09-06T11:59:00Z"
+    },
+    "submitted_at": "2026-09-06T12:00:00.000Z",
+    "verdict": "findings"
+  },
+  "model": "external_result"
+}

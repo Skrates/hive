@@ -8,7 +8,7 @@ import type { Delivery, Subscription } from "../domain.js";
 import { prepareSocketPath } from "../local/uds.js";
 import type { LiveIngress } from "./live-registry.js";
 import { delimiter, dirname } from "node:path";
-import { ingressInboxDirectory, ClaudeProvider, claudePromptSlotArgs, codexPermissionArgs, CodexProvider, composeChildEnv, GrokProvider, grokPermissionArgs, prependPathEntry, ProviderPreDispatchError, requireAccountProfile, resolveEdgeSocketPath } from "./providers.js";
+import { ingressInboxDirectory, ClaudeProvider, claudePromptSlotArgs, CODEX_NETWORK_DOMAINS, codexPermissionArgs, codexSpawnArgs, codexResumeTurn, codexSpawnTurn, CodexProvider, composeChildEnv, GrokProvider, grokPermissionArgs, prependPathEntry, ProviderPreDispatchError, requireAccountProfile, resolveEdgeSocketPath } from "./providers.js";
 import { drainInbox } from "../channel/claude-hook.js";
 
 function subscription(overrides: Partial<Subscription> = {}): Subscription {
@@ -83,7 +83,7 @@ test("prependPathEntry puts the runtime dir first and never duplicates it", () =
 
 test("composeChildEnv prepends the running runtime's directory to the child PATH", () => {
   const runtimeDir = dirname(process.execPath);
-  const env = composeChildEnv({ CLAUDE_CONFIG_DIR: "/profiles/ariadne" }, { deliveryId: 512, token: "turn-token" });
+  const env = composeChildEnv({ CLAUDE_CONFIG_DIR: "/profiles/ariadne" }, { deliveryId: 512, token: "turn-token", effort: null });
   assert.ok(env.PATH, "composed env carries a PATH");
   assert.ok(env.PATH!.startsWith(`${runtimeDir}${delimiter}`) || env.PATH === runtimeDir, "PATH starts with the runtime dir");
   // The pinned profile env is preserved alongside the PATH fix.
@@ -100,7 +100,7 @@ test("a headless child carries its delivery id, and never the actor's live-ingre
     if (previous === undefined) delete process.env.HIVE_ACTOR;
     else process.env.HIVE_ACTOR = previous;
   });
-  const env = composeChildEnv({ CLAUDE_CONFIG_DIR: "/profiles/gnomon" }, { deliveryId: 512, token: "turn-token" });
+  const env = composeChildEnv({ CLAUDE_CONFIG_DIR: "/profiles/gnomon" }, { deliveryId: 512, token: "turn-token", effort: null });
 
   // KRA-1097: `hive wake` reads this to name the minting seat's delivery, so a
   // completing seat can address a peer without re-typing an id it was handed.
@@ -136,13 +136,13 @@ test("composeChildEnv exports the owner-local edge socket, not the child's pinne
     else process.env.HIVE_HOME = previousHome;
   });
 
-  const env = composeChildEnv({ HOME: "/profiles/grok-seat" }, { deliveryId: 7, token: "turn-token" });
+  const env = composeChildEnv({ HOME: "/profiles/grok-seat" }, { deliveryId: 7, token: "turn-token", effort: null });
   assert.equal(env.HOME, "/profiles/grok-seat");
   assert.equal(env.HIVE_EDGE_SOCKET, join(homedir(), ".hive", "edge.sock"));
   assert.notEqual(env.HIVE_EDGE_SOCKET, join("/profiles/grok-seat", ".hive", "edge.sock"));
 
   process.env.HIVE_EDGE_SOCKET = "/run/hive/edge.sock";
-  const pinned = composeChildEnv({ HOME: "/profiles/grok-seat" }, { deliveryId: 7, token: "turn-token" });
+  const pinned = composeChildEnv({ HOME: "/profiles/grok-seat" }, { deliveryId: 7, token: "turn-token", effort: null });
   assert.equal(pinned.HIVE_EDGE_SOCKET, "/run/hive/edge.sock");
 });
 
@@ -194,7 +194,7 @@ test("Grok Build live delivery terminalizes loudly; resume without a session id 
   const grok = new GrokProvider();
   await assert.rejects(grok.deliverLive(), /no live-ingress surface/);
   await assert.rejects(
-    async () => grok.resume(subscription({ provider: "grok", sessionId: null }), "/tmp", "framed", { deliveryId: 512, token: "turn-token" }),
+    async () => grok.resume(subscription({ provider: "grok", sessionId: null }), "/tmp", "framed", { deliveryId: 512, token: "turn-token", effort: null }),
     /resume target missing/,
   );
 });
@@ -205,7 +205,7 @@ test("Codex permission arguments grant only the Hive edge socket on spawn and re
     "-c", "features.network_proxy=true",
     "-c", 'permissions.hive-read-only.extends=":read-only"',
     "-c", "permissions.hive-read-only.network.enabled=true",
-    "-c", 'permissions.hive-read-only.network.domains={"hive.invalid"="allow"}',
+    "-c", `permissions.hive-read-only.network.domains=${CODEX_NETWORK_DOMAINS}`,
     "-c", 'permissions.hive-read-only.network.unix_sockets={"/tmp/hive edge.sock"="allow"}',
     "-c", 'default_permissions="hive-read-only"',
   ]);
@@ -213,7 +213,7 @@ test("Codex permission arguments grant only the Hive edge socket on spawn and re
     "-c", "features.network_proxy=true",
     "-c", 'permissions.hive-workspace.extends=":workspace"',
     "-c", "permissions.hive-workspace.network.enabled=true",
-    "-c", 'permissions.hive-workspace.network.domains={"hive.invalid"="allow"}',
+    "-c", `permissions.hive-workspace.network.domains=${CODEX_NETWORK_DOMAINS}`,
     "-c", 'permissions.hive-workspace.network.unix_sockets={"/tmp/hive edge.sock"="allow"}',
     "-c", 'default_permissions="hive-workspace"',
   ]);
@@ -235,7 +235,7 @@ test("Codex socket grant and child env share resolveEdgeSocketPath, including HI
   const expected = resolveEdgeSocketPath();
   assert.equal(expected, join("/var/lib/hive", "edge.sock"));
   assert.notEqual(expected, join(homedir(), ".hive", "edge.sock"));
-  assert.equal(composeChildEnv({}, { deliveryId: 1, token: "turn-token" }).HIVE_EDGE_SOCKET, expected);
+  assert.equal(composeChildEnv({}, { deliveryId: 1, token: "turn-token", effort: null }).HIVE_EDGE_SOCKET, expected);
 
   const grant = codexPermissionArgs("read-only").find((arg) => arg.includes("unix_sockets="));
   assert.ok(grant?.includes(JSON.stringify(expected)), grant);
@@ -437,4 +437,86 @@ test("a structured Desktop account rejection remains a deterministic pre-dispatc
     (error: unknown) => error instanceof ProviderPreDispatchError
       && error.code === "account_profile_mismatch",
   );
+});
+
+test("codex spawn skips the git-repo check: the edge's cwd is a root of checkouts, not a checkout", () => {
+  const socketPath = "/tmp/hive-edge.sock";
+  const args = codexSpawnArgs("/home/hive/work-ariadne", "workspace-write", null, null, socketPath);
+  assert.deepEqual(args.slice(0, 5), ["exec", "--cd", "/home/hive/work-ariadne", "--skip-git-repo-check", "--json"]);
+  assert.deepEqual(args.slice(5, -1), codexPermissionArgs("workspace-write", socketPath));
+  assert.equal(args.at(-1), "-");
+});
+
+test("KRA-1414: a codex spawn's effort override is clamped by the pinned CODEX_HOME's model", () => {
+  const socketPath = "/tmp/hive-edge.sock";
+  const home = mkdtempSync(join(tmpdir(), "hive-codex-home-"));
+  try {
+    writeFileSync(join(home, "config.toml"), 'model = "gpt-5.5"\nmodel_reasoning_effort = "medium"\n');
+    // gpt-5.5's ladder stops at xhigh; ultra would be rejected at provider start.
+    assert.ok(codexSpawnArgs("/w", "workspace-write", "ultra", home, socketPath)
+      .includes("model_reasoning_effort=xhigh"));
+    // The same request against a model that speaks the whole grammar is verbatim.
+    writeFileSync(join(home, "config.toml"), 'model = "gpt-6-astra"\n');
+    assert.ok(codexSpawnArgs("/w", "workspace-write", "ultra", home, socketPath)
+      .includes("model_reasoning_effort=ultra"));
+    // No overlay: the invocation is byte-identical to the pre-overlay one.
+    assert.deepEqual(
+      codexSpawnArgs("/w", "workspace-write", null, home, socketPath),
+      codexSpawnArgs("/w", "workspace-write", null, null, socketPath),
+    );
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("KRA-1414: both codex turn routes clamp against the same pinned home the child runs under", () => {
+  const socketPath = "/tmp/hive-edge.sock";
+  const home = mkdtempSync(join(tmpdir(), "hive-codex-home-"));
+  try {
+    writeFileSync(join(home, "config.toml"), 'model = "gpt-5.5"\nmodel_reasoning_effort = "medium"\n');
+    const pinned = subscription({ accountProfile: home, sessionId: "thread-1" });
+    const routes = [
+      ["resume", (effort: "ultra" | null) => codexResumeTurn(pinned, effort)],
+      ["spawn", (effort: "ultra" | null) => codexSpawnTurn(pinned, "/work/taxis", effort, socketPath)],
+    ] as const;
+    // The clamp is armed on BOTH routes, from the home the turn actually runs
+    // under — a route that derived its argv without it would silently degrade
+    // every overlay to the unknown-model floor.
+    for (const [name, turnOf] of routes) {
+      const turn = turnOf("ultra");
+      assert.equal(turn.codexHome, home, name);
+      assert.ok(turn.args.includes("model_reasoning_effort=xhigh"), name);
+    }
+    // Same request, a model that speaks the whole grammar: verbatim on both.
+    writeFileSync(join(home, "config.toml"), 'model = "gpt-6-astra"\n');
+    for (const [name, turnOf] of routes) {
+      assert.ok(turnOf("ultra").args.includes("model_reasoning_effort=ultra"), name);
+    }
+    // The routes are still the two different invocations they always were.
+    assert.deepEqual(codexResumeTurn(pinned, null).args.slice(0, 5), ["exec", "resume", "thread-1", "-", "--json"]);
+    assert.deepEqual(codexSpawnTurn(pinned, "/work/taxis", null, socketPath).args.slice(0, 5),
+      ["exec", "--cd", "/work/taxis", "--skip-git-repo-check", "--json"]);
+    // R-5: a missing pinned profile is a hard pre-dispatch failure on either route.
+    const unpinned = subscription({ accountProfile: "/nonexistent/profile" });
+    const missingProfile = (error: unknown) =>
+      error instanceof ProviderPreDispatchError && error.code === "account_profile_missing";
+    assert.throws(() => codexResumeTurn(unpinned, "ultra"), missingProfile);
+    assert.throws(() => codexSpawnTurn(unpinned, "/work/taxis", "ultra", socketPath), missingProfile);
+    // A resume with no session is refused before the profile is even read.
+    assert.throws(
+      () => codexResumeTurn(subscription({ accountProfile: home, sessionId: null }), null),
+      (error: unknown) => error instanceof Error && error.message === "resume target missing",
+    );
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("codex seats may reach GitHub and the hive socket, nothing else", () => {
+  const domains = codexPermissionArgs("workspace-write", "/tmp/hive-edge.sock").find((arg) => arg.includes("network.domains="));
+  assert.ok(domains);
+  for (const host of ["hive.invalid", "github.com", "api.github.com", "codeload.github.com", "objects.githubusercontent.com"]) {
+    assert.ok(domains.includes(`"${host}"="allow"`), host);
+  }
+  assert.ok(!domains.includes("deny"));
 });

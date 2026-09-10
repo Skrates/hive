@@ -1,0 +1,13 @@
+{
+  "instance": {
+    "at": "2026-09-06T12:30:00.000Z",
+    "by": {
+      "id": "hakon",
+      "kind": "operator"
+    },
+    "kind": "request_cancelled",
+    "reason": "the author is rewriting the change",
+    "request_id": "req_obs:run_01J_1"
+  },
+  "model": "consequence"
+}

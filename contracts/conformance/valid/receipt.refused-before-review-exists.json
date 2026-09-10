@@ -1,0 +1,14 @@
+{
+  "instance": {
+    "act_id": "01J",
+    "outcome": {
+      "code": "unauthorized",
+      "current_revision": 0,
+      "detail": "seat may not ObservePR",
+      "refused": true,
+      "state": null
+    },
+    "review_id": null
+  },
+  "model": "receipt"
+}

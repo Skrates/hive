@@ -1,0 +1,11 @@
+{
+  "expect": {
+    "code": "malformed",
+    "why": "the verb set is closed: thirteen kinds (\u00a74)"
+  },
+  "instance": {
+    "kind": "Summon",
+    "request_id": "req_01"
+  },
+  "model": "action"
+}

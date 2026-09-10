@@ -1,0 +1,12 @@
+{
+  "instance": {
+    "kind": "request_obligation_merged",
+    "mode": "initial",
+    "names": [],
+    "reason": "reviewer_unavailable (quota): codex → talos",
+    "request_id": "req_obs:run_01K_1",
+    "required": false,
+    "supersedes": "req_obs:run_01J_1"
+  },
+  "model": "consequence"
+}

@@ -1,0 +1,41 @@
+{
+  "expect": {
+    "code": "malformed",
+    "why": "a container is a GitHub source record kind (\u00a77)"
+  },
+  "instance": {
+    "findings": [
+      {
+        "body": "The loop skips the last record.",
+        "container_id": 9001,
+        "container_kind": "discussion_comment",
+        "line": 12,
+        "locator": 0,
+        "path": "src/x.py",
+        "priority": "P1",
+        "title": "Off-by-one in replay window"
+      },
+      {
+        "body": "The retry path swallows the refusal.",
+        "container_id": 9001,
+        "container_kind": "issue_comment",
+        "line": 40,
+        "locator": 1,
+        "path": "src/y.py",
+        "priority": "P2",
+        "title": "Refusal is discarded on retry"
+      }
+    ],
+    "reviewed_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "schema_version": "1",
+    "source": "codex",
+    "source_record": {
+      "id": 9001,
+      "kind": "issue_comment",
+      "version": "2026-09-06T11:59:00Z"
+    },
+    "submitted_at": "2026-09-06T12:00:00.000Z",
+    "verdict": "findings"
+  },
+  "model": "external_result"
+}

@@ -1,0 +1,12 @@
+{
+  "expect": {
+    "code": "malformed",
+    "why": "classification assigns a known priority; unknown is the absence of one (\u00a7F5)"
+  },
+  "instance": {
+    "finding_id": "fnd_05",
+    "kind": "ClassifyFinding",
+    "priority": "unknown"
+  },
+  "model": "action"
+}

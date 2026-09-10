@@ -1,0 +1,69 @@
+{
+  "url": "https://api.github.com/repos/Skrates/sokrates/pulls/comments/3944637959",
+  "pull_request_review_id": 5126005604,
+  "id": 3944637959,
+  "node_id": "PRRC_kwDORtnEfM7rHmYH",
+  "diff_hunk": "@@ -1,35 +1,198 @@\n #!/usr/bin/env bash\n-# Reset the dev box's conversational ceremony state: agent wakes, pending\n-# proposals/approvals, dialogue + arc sessions, Sókrates arc correlations, and\n-# Sókrates-owned Projection-B consent pointers. Operational state only — no Form\n-# graph, lakehouse, or DBOS ledger. Used between live-fire ceremony runs (and\n-# between checkpoint-ladder rounds, demo/ladder/README.md) so a refire starts\n-# from clean dialogue state.\n+# Reset the dev box's conversational ceremony state for ONE firing: the Sókrates\n+# dialogue sessions on the ceremony's channel, the agent wakes addressed to that\n+# channel, the operator-relay arc correlations bound to it, and the Projection-B\n+# consent pointers of the runs under test. Operational state only — no Form\n+# graph, lakehouse, or DBOS ledger. Used between live-fire ceremony runs and\n+# checkpoint-ladder rounds (demo/ladder/README.md) so a refire starts from clean\n+# dialogue state WITHOUT destroying every other conversation on the shared box.\n+#\n+#   devbox-ceremony-reset.sh --channel <coord> [--run <uuid>]... [--dry-run]\n+#   devbox-ceremony-reset.sh --everything [--dry-run]\n+#\n+# <coord> is the session channel coordinate (nous.sessions.keys.derive_session_key):\n+#   slack:<team_id>:<channel_id> | teams:<tenant_id>:<conversation_id>\n+#   | whatsapp:<chat_id>:<sender_id> | email:<address>\n+# --run names a Projection-B run whose consent pointer belongs to the firing\n+# (pointers carry a run id, not a channel). --everything is the unscoped wipe;\n+# it refuses when sessions, wakes, or arc correlations exist on more than one\n+# channel, because then the box is hosting conversations that are not the\n+# firing under test. --dry-run prints the row counts each predicate would\n+# delete and deletes nothing.\n #\n # Every table is created lazily by its store's boot DDL, so on a fresh box some\n-# do not exist yet; each delete is guarded on to_regclass instead of failing.\n+# do not exist yet; each statement is guarded on to_regclass instead of failing.\n set -euo pipefail\n \n BOX=\"${SOKRATES_BOX:-hakon@192.168.1.238}\"\n+PSQL=\"docker exec -i timaeus-postgres psql -U sokrates -d sokrates -t -A -v ON_ERROR_STOP=1\"\n \n-TABLES=(\n-  nous_agent_wakes\n-  nous_pending_proposals\n-  nous_projection_b_pending_proposals\n-  nous_arc_pending_approvals\n-  sokrates_projection_b_consent_pointers\n-  sokrates_arc_correlations\n-  nous_sessions\n-  sokrates_sessions\n-)\n+usage() {\n+  sed -n '2,24p' \"$0\" | sed 's/^# \\{0,1\\}//' >&2\n+  exit 2\n+}\n \n-sql=\"\"\n-for t in \"${TABLES[@]}\"; do\n-  sql+=\"DO \\$\\$ BEGIN IF to_regclass('${t}') IS NOT NULL THEN DELETE FROM ${t}; END IF; END \\$\\$;\"$'\\n'\n+channel=\"\"\n+everything=0\n+dry_run=0\n+runs=()\n+while [ $# -gt 0 ]; do\n+  case \"$1\" in\n+    --channel) [ $# -ge 2 ] || usage; channel=\"$2\"; shift 2 ;;\n+    --run) [ $# -ge 2 ] || usage; runs+=(\"$2\"); shift 2 ;;\n+    --everything) everything=1; shift ;;\n+    --dry-run) dry_run=1; shift ;;\n+    -h|--help) usage ;;",
+  "path": "scripts/devbox-ceremony-reset.sh",
+  "commit_id": "721da3a66efce6dcb1be4a23e7d99221b2ab8bf4",
+  "original_commit_id": "721da3a66efce6dcb1be4a23e7d99221b2ab8bf4",
+  "user": {
+    "login": "chatgpt-codex-connector[bot]",
+    "id": 199175422,
+    "node_id": "BOT_kgDOC98s_g",
+    "avatar_url": "https://avatars.githubusercontent.com/in/1144995?v=4",
+    "gravatar_id": "",
+    "url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D",
+    "html_url": "https://github.com/apps/chatgpt-codex-connector",
+    "followers_url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D/followers",
+    "following_url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D/following{/other_user}",
+    "gists_url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D/gists{/gist_id}",
+    "starred_url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D/starred{/owner}{/repo}",
+    "subscriptions_url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D/subscriptions",
+    "organizations_url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D/orgs",
+    "repos_url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D/repos",
+    "events_url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D/events{/privacy}",
+    "received_events_url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D/received_events",
+    "type": "Bot",
+    "user_view_type": "public",
+    "site_admin": false
+  },
+  "body": "**<sub><sub>![P3 Badge](https://img.shields.io/badge/P3-lightgrey?style=flat)</sub></sub>  Return success for --help**\n\nWhen an operator or automation invokes `devbox-ceremony-reset.sh --help`, this branch calls `usage`, which always exits with status 2. The command prints valid help but reports an invalid invocation to shells and documentation tooling; let the help path exit 0 while retaining status 2 for argument errors.\n\nUseful? React with 👍 / 👎.",
+  "created_at": "2026-09-06T16:58:09Z",
+  "updated_at": "2026-09-06T16:58:09Z",
+  "html_url": "https://github.com/Skrates/sokrates/pull/1186#discussion_r3944637959",
+  "pull_request_url": "https://api.github.com/repos/Skrates/sokrates/pulls/1186",
+  "_links": {
+    "self": {
+      "href": "https://api.github.com/repos/Skrates/sokrates/pulls/comments/3944637959"
+    },
+    "html": {
+      "href": "https://github.com/Skrates/sokrates/pull/1186#discussion_r3944637959"
+    },
+    "pull_request": {
+      "href": "https://api.github.com/repos/Skrates/sokrates/pulls/1186"
+    }
+  },
+  "reactions": {
+    "url": "https://api.github.com/repos/Skrates/sokrates/pulls/comments/3944637959/reactions",
+    "total_count": 0,
+    "+1": 0,
+    "-1": 0,
+    "laugh": 0,
+    "hooray": 0,
+    "confused": 0,
+    "heart": 0,
+    "rocket": 0,
+    "eyes": 0
+  },
+  "start_line": null,
+  "original_start_line": null,
+  "start_side": null,
+  "line": null,
+  "original_line": 45,
+  "side": "RIGHT",
+  "author_association": "NONE",
+  "original_position": 65,
+  "position": 1,
+  "subject_type": "line"
+}

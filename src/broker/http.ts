@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { URL } from "node:url";
-import { canonicalActor, DeliveryResultInputSchema, ReasonSchema, SeatWakeMintSchema, SubscriptionInputSchema, BusySlotFormatError, parseBusySlots, type BusySlot } from "../domain.js";
+import { canonicalActor, DeliveryResultInputSchema, DispatchNoticesSchema, ReasonSchema, SeatWakeMintSchema, SubscriptionInputSchema, BusySlotFormatError, parseBusySlots, type BusySlot } from "../domain.js";
+import { routeReview, type ReviewHttpDeps } from "../review/http.js";
 import { BrokerService } from "./service.js";
 import { InvalidTransitionError, SeatWakeRefusedError, StaleLeaseError, TurnSlotReductionError } from "./store.js";
 import { ProfileReport } from "../health/report.js";
@@ -12,6 +13,11 @@ export interface BrokerHttpConfig {
   port: number;
   adminToken: string;
   healthCanvasConfigPath?: string;
+  /**
+   * The review surface (design §5, §9; `src/review/http.ts`). Null mounts none of
+   * it — the state a broker is in before the integrator wires a `ReviewStore`.
+   */
+  review: ReviewHttpDeps | null;
 }
 
 export class BrokerHttpServer {
@@ -62,6 +68,10 @@ export class BrokerHttpServer {
     if (request.method === "GET" && url.pathname === "/health") {
       return json(response, 200, { ok: true });
     }
+
+    // The review surface authenticates its own callers (edge, operator, admin,
+    // or the webhook's HMAC), so it is consulted before the edge gate below.
+    if (this.config.review && await routeReview(request, response, url, this.config.review)) return;
 
     if (url.pathname.startsWith("/v1/admin/")) {
       this.requireAdmin(request);
@@ -147,7 +157,13 @@ export class BrokerHttpServer {
       switch (transition[2]) {
         case "accept": return json(response, 200, this.broker.accept(deliveryId, edgeId, generation));
         case "dispatch": return json(response, 200, this.broker.beginDispatch(deliveryId, edgeId, generation));
-        case "dispatched": return json(response, 200, this.broker.markDispatched(deliveryId, edgeId, generation));
+        case "dispatched": {
+          // KRA-1414: dispatch-time dispositions the requester must see. Absent
+          // is the ordinary case and parses to the empty list, so an edge that
+          // predates the field still transitions.
+          const notices = DispatchNoticesSchema.parse(body.notices);
+          return json(response, 200, this.broker.markDispatched(deliveryId, edgeId, generation, notices));
+        }
         case "renew": return json(response, 200, this.broker.renew(deliveryId, edgeId, generation));
         case "reserve-spawn": return json(response, 200, { reserved: this.broker.reserveSpawn(deliveryId, edgeId, generation) });
         case "release": {

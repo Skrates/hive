@@ -1,0 +1,69 @@
+{
+  "url": "https://api.github.com/repos/RationallyPrime/weave-doctrine/pulls/comments/3944427867",
+  "pull_request_review_id": 5125806227,
+  "id": 3944427867,
+  "node_id": "PRRC_kwDOTt6bd87rGzFb",
+  "diff_hunk": "@@ -39,4 +48,4 @@ Description=weave-doctrine pull + just install for seat %i\n \n [Service]\n Type=oneshot\n-ExecStart=/bin/bash -lc 'set -euo pipefail; seat=%i; for p in \"$HOME/projects/weave-doctrine\" \"$HOME/work/weave-doctrine\" \"$HOME/work-theoros/weave-doctrine\"; do if [ -f \"$p/services/doctrine-sync/sync.sh\" ]; then exec bash \"$p/services/doctrine-sync/sync.sh\" \"$seat\"; fi; done; echo \"doctrine-sync@$seat: no weave-doctrine checkout in a registered workspace\" >&2; exit 1'\n+ExecStart=/bin/bash -lc 'set -euo pipefail; seat=%i; for p in \"$HOME/projects/weave-doctrine\" \"$HOME/work/weave-doctrine\" \"$HOME/work-theoros/weave-doctrine\" \"/home/hive/work-ariadne/weave-doctrine\"; do s=\"$p/services/doctrine-sync/sync.sh\"; [ -f \"$s\" ] || continue; rc=0; bash \"$s\" \"$seat\" || rc=$?; [ \"$rc\" = 3 ] || exit \"$rc\"; done; echo \"doctrine-sync@$seat: no weave-doctrine checkout in a registered workspace\" >&2; exit 1'",
+  "path": "services/doctrine-sync/doctrine-sync@.service",
+  "commit_id": "4624ddcf91a768907997c2435a5e6a228788099c",
+  "original_commit_id": "4624ddcf91a768907997c2435a5e6a228788099c",
+  "user": {
+    "login": "chatgpt-codex-connector[bot]",
+    "id": 199175422,
+    "node_id": "BOT_kgDOC98s_g",
+    "avatar_url": "https://avatars.githubusercontent.com/in/1144995?v=4",
+    "gravatar_id": "",
+    "url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D",
+    "html_url": "https://github.com/apps/chatgpt-codex-connector",
+    "followers_url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D/followers",
+    "following_url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D/following{/other_user}",
+    "gists_url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D/gists{/gist_id}",
+    "starred_url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D/starred{/owner}{/repo}",
+    "subscriptions_url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D/subscriptions",
+    "organizations_url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D/orgs",
+    "repos_url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D/repos",
+    "events_url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D/events{/privacy}",
+    "received_events_url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D/received_events",
+    "type": "Bot",
+    "user_view_type": "public",
+    "site_admin": false
+  },
+  "body": "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Select Ariadne's checkout before invoking stale scripts**\n\nFresh evidence in this fix is that the continue protocol depends on the candidate's own `sync.sh`: during the first rollout, `$HOME/work/weave-doctrine` can still be at the parent commit, whose script exits 1—not 3—when its old registry re-homes Ariadne to the obsolete path. Because this dispatcher exits on every code except 3, it still stops before `/home/hive/work-ariadne/weave-doctrine`; the new test misses this by copying the current script into its fake stale checkout. Prefer the requested seat's candidate first, or detect stale candidates without relying on code they do not yet contain.\n\nUseful? React with 👍 / 👎.",
+  "created_at": "2026-09-06T15:32:49Z",
+  "updated_at": "2026-09-06T15:32:49Z",
+  "html_url": "https://github.com/RationallyPrime/weave-doctrine/pull/218#discussion_r3944427867",
+  "pull_request_url": "https://api.github.com/repos/RationallyPrime/weave-doctrine/pulls/218",
+  "_links": {
+    "self": {
+      "href": "https://api.github.com/repos/RationallyPrime/weave-doctrine/pulls/comments/3944427867"
+    },
+    "html": {
+      "href": "https://github.com/RationallyPrime/weave-doctrine/pull/218#discussion_r3944427867"
+    },
+    "pull_request": {
+      "href": "https://api.github.com/repos/RationallyPrime/weave-doctrine/pulls/218"
+    }
+  },
+  "reactions": {
+    "url": "https://api.github.com/repos/RationallyPrime/weave-doctrine/pulls/comments/3944427867/reactions",
+    "total_count": 0,
+    "+1": 0,
+    "-1": 0,
+    "laugh": 0,
+    "hooray": 0,
+    "confused": 0,
+    "heart": 0,
+    "rocket": 0,
+    "eyes": 0
+  },
+  "start_line": null,
+  "original_start_line": null,
+  "start_side": null,
+  "line": 51,
+  "original_line": 51,
+  "side": "RIGHT",
+  "author_association": "NONE",
+  "original_position": 40,
+  "position": 40,
+  "subject_type": "line"
+}

@@ -1,0 +1,8 @@
+{
+  "instance": {
+    "kind": "request_transport_rearmed",
+    "reason": "answer ans_obs:run_01K_1 retracted; the exhausted request is outstanding again",
+    "request_id": "req_obs:run_01J_1"
+  },
+  "model": "consequence"
+}

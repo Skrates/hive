@@ -111,6 +111,22 @@ function mintCustodyDetail(source: Delivery, edgeId: string, generation: number)
     + `(the ledger holds ${source.leaseGeneration ?? "none"}); this dispatch's lease has moved on`;
 }
 
+/**
+ * Review design §8.1: a system-origin delivery to a seat. `dedupeKey` is the whole of the
+ * mint's identity — the review publisher derives it from the effect it is dispatching, so a
+ * redelivery of the same effect is a replay, never a second wake.
+ */
+export interface SystemWakeMint {
+  actor: string;
+  channelId: string;
+  threadTs: string | null;
+  text: string;
+  dedupeKey: string;
+}
+
+/** The sender id every system-origin review wake carries (`senderKind: "app"`). */
+export const SYSTEM_WAKE_SENDER = "hive-review";
+
 export interface OutboxEntry {
   outboxId: number;
   deliveryId: number | null;
@@ -453,7 +469,11 @@ export class BrokerStore {
     }
   }
 
-  /** Forward-only schema step: pre-reaction databases gain the two nullable columns in place. */
+  /**
+   * Forward-only schema step: pre-reaction databases gain the two nullable reaction columns in
+   * place, and every database gains `message_ts` — the Slack ts a row was posted as, which the
+   * review publisher reads to thread a Review's later lines under its first (design §8.1).
+   */
   private ensureOutboxReactionColumns(): void {
     const columns = (this.db.pragma("table_info(outbox)") as { name: string }[]).map((c) => c.name);
     if (!columns.includes("reaction")) {
@@ -461,6 +481,9 @@ export class BrokerStore {
     }
     if (!columns.includes("reaction_targets_json")) {
       this.db.exec("ALTER TABLE outbox ADD COLUMN reaction_targets_json TEXT");
+    }
+    if (!columns.includes("message_ts")) {
+      this.db.exec("ALTER TABLE outbox ADD COLUMN message_ts TEXT");
     }
     // The single-timestamp shape never shipped past this branch; no dual readers survive it.
     if (columns.includes("reaction_target_ts")) {
@@ -992,6 +1015,113 @@ export class BrokerStore {
     })();
   }
 
+  /**
+   * Review design §8.1 (Slack): a system-origin Hive delivery — the "small `ingestEvent`
+   * extension" that carries a review request (burn digest, clean wake, exhaustion gate,
+   * retrospective) to a seat.
+   *
+   * What it shares with every other wake, deliberately: the ordinary ledger row, the
+   * ordinary outbox render stamped `hive_*` on the way out (so Slack admission drops it and
+   * it can never be re-ingested), the ordinary R-3 backoff/failure and R-6 outcome
+   * semantics. What differs from {@link mintSeatWake}: there is no source delivery and no
+   * Slack sender — the sender is the review machine itself (`senderKind: "app"`,
+   * `senderId: "hive-review"`), and identity is the caller's `dedupeKey`
+   * (`eventId = "review:" + dedupeKey`) so an at-least-once publisher that re-mints after a
+   * lost response gets the original delivery back and posts nothing new.
+   *
+   * R-3: a wake that would reach no one throws `SeatWakeRefusedError("unroutable_actor")`
+   * — the publisher marks the effect failed and retries behind backoff; nothing is
+   * dead-lettered silently.
+   */
+  mintSystemWake(input: SystemWakeMint): { deliveryId: number } {
+    return this.db.transaction(() => {
+      if (input.threadTs !== null && !isSlackMessageTs(input.threadTs)) {
+        throw new SeatWakeRefusedError(
+          "invalid_thread",
+          `thread coordinate \`${input.threadTs}\` is not a Slack message timestamp`,
+        );
+      }
+      const target = canonicalActor(input.actor);
+      if (target === EVERYONE) {
+        throw new SeatWakeRefusedError(
+          "broadcast_forbidden",
+          "`everyone` is a human-only broadcast target; a review request names one seat",
+        );
+      }
+      const eventId = `review:${input.dedupeKey}`;
+      const replayed = this.deliveryIdForEvent(eventId);
+      if (replayed !== null) return { deliveryId: replayed };
+
+      const subscription = this.getSubscription(target);
+      if (!subscription || isExpired(subscription.expiresAt, this.clock.now())) {
+        throw new SeatWakeRefusedError(
+          "unroutable_actor",
+          `no live subscription for actor \`${target}\` — this review request would reach no one`,
+        );
+      }
+      const digest = createHash("sha256").update(input.dedupeKey).digest("hex").slice(0, 16);
+      const ingest = this.ingestEvent({
+        eventId,
+        workspaceId: this.workspaceIdForChannel(input.channelId),
+        channelId: input.channelId,
+        // The outbox column is NOT NULL; a top-level post (no thread yet) rides as the empty
+        // coordinate, which the Slack sender must translate to "no thread_ts".
+        threadTs: input.threadTs ?? "",
+        // No Slack message exists yet — the render is enqueued below (see isSlackMessageTs).
+        messageTs: `review:${digest}`,
+        senderId: SYSTEM_WAKE_SENDER,
+        senderKind: "app",
+        actor: target,
+        text: input.text,
+        raw: { type: "system_wake", source: "system", dedupeKey: input.dedupeKey },
+        receivedAt: iso(this.clock),
+      });
+      const deliveryId = ingest.deliveryId ?? this.deliveryIdForEvent(eventId);
+      if (deliveryId === null) {
+        // The subscription check above proved the actor routable; the ledger disagreeing with
+        // itself mid-transaction is rolled back whole — the event row included.
+        throw new SeatWakeRefusedError(
+          "unroutable_actor",
+          `system wake for \`${target}\` produced no delivery`,
+        );
+      }
+      if (ingest.created) {
+        this.enqueueOutbox(this.getDelivery(deliveryId), systemWakeRender(target, deliveryId, input.text));
+      }
+      return { deliveryId };
+    })();
+  }
+
+  /**
+   * Review design §8.1 / §10.3 M0: the Slack board line — a plain thread notice on the
+   * ordinary outbox. `threadTs: null` posts at the channel's top level (empty coordinate,
+   * see {@link mintSystemWake}).
+   */
+  postBoardLine(input: { channelId: string; threadTs: string | null; text: string }): { outboxId: number } {
+    const result = this.db.prepare(`
+      INSERT INTO outbox(delivery_id, channel_id, thread_ts, text, created_at)
+      VALUES (NULL, ?, ?, ?, ?)
+    `).run(input.channelId, input.threadTs ?? "", input.text, iso(this.clock));
+    return { outboxId: Number(result.lastInsertRowid) };
+  }
+
+  /**
+   * The Slack workspace a channel belongs to, as this broker has seen it. One broker serves
+   * one workspace (`SlackIngress` is constructed with a single id), so the most recent event
+   * in the channel — or, before any, in any channel — names it; a broker that has never seen
+   * Slack at all records `"system"`.
+   */
+  private workspaceIdForChannel(channelId: string): string {
+    const inChannel = this.db.prepare(
+      "SELECT workspace_id FROM slack_events WHERE channel_id=? ORDER BY received_at DESC LIMIT 1",
+    ).get(channelId) as Row | undefined;
+    if (inChannel) return String(inChannel.workspace_id);
+    const any = this.db.prepare(
+      "SELECT workspace_id FROM slack_events ORDER BY received_at DESC LIMIT 1",
+    ).get() as Row | undefined;
+    return any ? String(any.workspace_id) : "system";
+  }
+
   /** The delivery an event belongs to, whether it opened one or coalesced into one. */
   private deliveryIdForEvent(eventId: string): number | null {
     const row = this.db.prepare("SELECT delivery_id FROM delivery_events WHERE event_id=?")
@@ -1243,12 +1373,22 @@ export class BrokerStore {
    * in ONE transaction: a broker crash between them could otherwise leave a
    * delivery whose thread never shows it was delivered.
    */
-  markDispatched(deliveryId: number, edgeId: string, generation: number): Delivery {
+  /**
+   * KRA-1414: `notices` are dispatch-time dispositions the requester must be
+   * able to read — today, an `Effort:` overlay the route could not honour.
+   * They are rendered into THIS post rather than the delivery's terminal one
+   * because the dispatched notice is the only thread-visible event every route
+   * reaches: a live Claude turn closes through `recordOutcome` from the agent,
+   * where the edge that took the decision is no longer present. Being in the
+   * same transaction as the status transition makes them as durable as the
+   * transition itself.
+   */
+  markDispatched(deliveryId: number, edgeId: string, generation: number, notices: Reason[] = []): Delivery {
     return this.db.transaction(() => {
       const delivery = this.transition(deliveryId, edgeId, generation, "dispatching", "dispatched");
       this.enqueueOutbox(
         delivery,
-        `→ delivered to ${delivery.actor} (delivery ${delivery.id}, attempt ${delivery.attempts}/${delivery.subscription.maxAttempts})`,
+        dispatchedNotice(delivery, notices),
         REACTION_DISPATCHED,
       );
       return delivery;
@@ -1434,9 +1574,16 @@ export class BrokerStore {
     return rows.map(outboxFromRow);
   }
 
-  markOutboxSent(outboxId: number): void {
-    this.db.prepare("UPDATE outbox SET sent_at=?, attempts=attempts+1 WHERE outbox_id=?")
-      .run(iso(this.clock), outboxId);
+  /** `messageTs` is what Slack answered `chat.postMessage` with: the coordinate later posts thread under. */
+  markOutboxSent(outboxId: number, messageTs: string): void {
+    this.db.prepare("UPDATE outbox SET sent_at=?, message_ts=?, attempts=attempts+1 WHERE outbox_id=?")
+      .run(iso(this.clock), messageTs, outboxId);
+  }
+
+  /** The Slack ts an outbox row was posted as; null until it is sent (review publisher, `SystemWakePort`). */
+  outboxMessageTs(outboxId: number): string | null {
+    const row = this.db.prepare("SELECT message_ts FROM outbox WHERE outbox_id=?").get(outboxId) as Row | undefined;
+    return row === undefined || row.message_ts === null || row.message_ts === undefined ? null : String(row.message_ts);
   }
 
   markOutboxAttempt(outboxId: number): void {
@@ -1535,6 +1682,16 @@ export class BrokerStore {
  */
 function seatWakeRender(from: string, target: string, deliveryId: number, text: string): string {
   return `🐝 wake minted by ${from} → ${target} (delivery ${deliveryId})\n\n${text}`;
+}
+
+/** The commons render of a system-origin review wake: the review machine addressed a seat. */
+function systemWakeRender(target: string, deliveryId: number, text: string): string {
+  return `🐝 review wake ${SYSTEM_WAKE_SENDER} → ${target} (delivery ${deliveryId})\n\n${text}`;
+}
+
+function dispatchedNotice(delivery: Delivery, notices: Reason[]): string {
+  const head = `→ delivered to ${delivery.actor} (delivery ${delivery.id}, attempt ${delivery.attempts}/${delivery.subscription.maxAttempts})`;
+  return [head, ...notices.map((notice) => `⚠ ${notice.code} — ${notice.detail}`)].join("\n");
 }
 
 function outcomePost(delivery: Delivery, text: string): string {

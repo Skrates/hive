@@ -1,0 +1,12 @@
+{
+  "expect": {
+    "code": "malformed",
+    "why": "re-arming exhausted transport is a named act; an empty reason records nothing (§6.D6)"
+  },
+  "instance": {
+    "kind": "request_transport_rearmed",
+    "reason": "",
+    "request_id": "req_1"
+  },
+  "model": "consequence"
+}

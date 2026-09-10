@@ -1,0 +1,16 @@
+{
+  "expect": {
+    "code": "malformed",
+    "why": "a fixed claim names at least one commit (\u00a7F3)"
+  },
+  "instance": {
+    "finding_id": "fnd_01",
+    "kind": "ResolveFinding",
+    "resolution": {
+      "commits": [],
+      "evidence": "trust me",
+      "kind": "fixed"
+    }
+  },
+  "model": "action"
+}

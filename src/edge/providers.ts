@@ -1,9 +1,10 @@
 import { spawn } from "node:child_process";
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { canonicalActor, type Delivery, type Provider, type Subscription } from "../domain.js";
 import { UdsHttpError, udsRequestJson } from "../local/uds.js";
+import { clampEffortToCodexModel, clampEffortToMax, clampEffortToXhigh, type WakeEffort } from "./effort.js";
 import type { LiveIngress } from "./live-registry.js";
 
 const MAX_CODEX_LIVE_RECEIPT_CHARS = 4_000;
@@ -70,11 +71,17 @@ export interface HeadlessDispatch {
    * could name too.
    */
   token: string;
+  /** The delivery's `Effort:` overlay, or null when the wake carried none. */
+  effort: WakeEffort | null;
 }
 
 export interface ProviderAdapter {
   provider: Provider;
   preflight?(subscription: Subscription): void;
+  /**
+   * Live delivery reaches a session that is already running — its effort was
+   * fixed at ITS spawn, so the overlay does not apply here by construction.
+   */
   deliverLive(ingress: LiveIngress, delivery: Delivery, framed: string): Promise<ProviderDispatch>;
   resume(subscription: Subscription, cwd: string, framed: string, context: HeadlessDispatch): Promise<ProviderDispatch>;
   spawn(subscription: Subscription, cwd: string, framed: string, context: HeadlessDispatch): Promise<ProviderDispatch>;
@@ -127,27 +134,134 @@ export class CodexProvider implements ProviderAdapter {
   }
 
   resume(subscription: Subscription, cwd: string, framed: string, context: HeadlessDispatch): Promise<ProviderDispatch> {
-    if (!subscription.sessionId) throw new Error("resume target missing");
-    return runHeadless(
-      "codex",
-      ["exec", "resume", subscription.sessionId, "-", "--json", ...codexPermissionArgs(subscription.permissionProfile)],
-      cwd,
-      framed,
-      { CODEX_HOME: requireAccountProfile(subscription) },
-      context,
-    );
+    const turn = codexResumeTurn(subscription, context.effort);
+    return runHeadless("codex", turn.args, cwd, framed, { CODEX_HOME: turn.codexHome }, context);
   }
 
   spawn(subscription: Subscription, cwd: string, framed: string, context: HeadlessDispatch): Promise<ProviderDispatch> {
-    return runHeadless(
-      "codex",
-      ["exec", "--cd", cwd, "--json", ...codexPermissionArgs(subscription.permissionProfile), "-"],
-      cwd,
-      framed,
-      { CODEX_HOME: requireAccountProfile(subscription) },
-      context,
-    );
+    const turn = codexSpawnTurn(subscription, cwd, context.effort);
+    return runHeadless("codex", turn.args, cwd, framed, { CODEX_HOME: turn.codexHome }, context);
   }
+}
+
+/**
+ * One Codex headless turn: its argv and the pinned home it runs under, derived
+ * TOGETHER from the subscription.
+ *
+ * KRA-1414: the effort clamp needs the same `CODEX_HOME` the child gets, and
+ * two adapter methods each threading it by hand is two chances to arm the clamp
+ * on one route and leave it off the other — a slip that degrades every overlay
+ * on that route to the unknown-model floor while every test still passes. There
+ * is no home parameter to forget here; the caller names the subscription, which
+ * it must name anyway.
+ *
+ * The two routes are two functions rather than one with a route argument, and
+ * their signatures differ (only a spawn needs a cwd), so calling the wrong one
+ * does not type-check — the route cannot be swapped by a slip that a test would
+ * have to catch after the fact.
+ */
+export function codexResumeTurn(
+  subscription: Subscription,
+  effort: WakeEffort | null,
+): { args: string[]; codexHome: string } {
+  if (!subscription.sessionId) throw new Error("resume target missing");
+  const codexHome = requireAccountProfile(subscription);
+  return {
+    args: ["exec", "resume", subscription.sessionId, "-", "--json", ...codexEffortArgs(effort, codexHome), ...codexPermissionArgs(subscription.permissionProfile)],
+    codexHome,
+  };
+}
+
+/** @see codexResumeTurn — the spawn half; its cwd is the turn's slot directory. */
+export function codexSpawnTurn(
+  subscription: Subscription,
+  cwd: string,
+  effort: WakeEffort | null,
+  edgeSocketPath = resolveEdgeSocketPath(),
+): { args: string[]; codexHome: string } {
+  const codexHome = requireAccountProfile(subscription);
+  return { args: codexSpawnArgs(cwd, subscription.permissionProfile, effort, codexHome, edgeSocketPath), codexHome };
+}
+
+/**
+ * Codex has no dedicated effort flag; `-c` overrides the config key for this
+ * invocation only. The value is passed unquoted — the child receives the
+ * argument verbatim with no shell in between, and Codex's TOML-ish parser
+ * treats a bare word as a string.
+ *
+ * KRA-1414: the wake grammar is the UNION of the provider ladders, but Codex's
+ * own ladder is per-model — `gpt-5.5` stops at `xhigh`, `gpt-5.6-luna` at
+ * `max`, only the `gpt-6`-class slugs speak the whole grammar. An unsupported
+ * value is rejected at provider start, which is deterministic, so the delivery
+ * would retry that same rejection to exhaustion. The tier is therefore clamped
+ * to the ladder of the model this seat's pinned `CODEX_HOME` actually runs.
+ *
+ * The no-overlay path is byte-identical to before and reads no file at all:
+ * a null tier returns before the config is opened.
+ */
+export function codexEffortArgs(effort: WakeEffort | null, codexHome: string | null): string[] {
+  if (effort === null) return [];
+  const model = codexHome === null ? null : readCodexPinnedModel(codexHome);
+  return ["-c", `model_reasoning_effort=${clampEffortToCodexModel(effort, model)}`];
+}
+
+/** A bare `key = "value"` assignment; a dotted or non-string key is deliberately not matched. */
+const TOML_STRING_ASSIGNMENT = /^([A-Za-z0-9_-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')\s*(?:#.*)?$/;
+const TOML_TABLE_HEADER = /^\[([^\]]+)\]/;
+
+/**
+ * The model slug a `codex exec` under this `CODEX_HOME` will run, or null when
+ * the config does not say or cannot be read. Codex is invoked with no
+ * `--profile`, so the effective model is the root-table `model` — unless the
+ * root selects a default profile with `profile = "<name>"`, in which case
+ * `[profiles.<name>].model` wins and the root `model` is its fallback.
+ *
+ * This reads the two keys it needs rather than parsing TOML: a scan that only
+ * ever recognises fewer keys than a real parser can return null, and null is
+ * the safe answer ({@link CODEX_UNKNOWN_MODEL_CEILING}). Matching `model`
+ * exactly is why the regex anchors the whole key — `model_reasoning_effort`
+ * sits on the very next line of Ariadne's live config.
+ */
+export function readCodexPinnedModel(codexHome: string): string | null {
+  let text: string;
+  try {
+    text = readFileSync(join(codexHome, "config.toml"), "utf8");
+  } catch {
+    return null;
+  }
+  let table = "";
+  let rootModel: string | null = null;
+  let rootProfile: string | null = null;
+  const profileModels = new Map<string, string>();
+  for (const raw of text.split("\n")) {
+    const line = raw.trim();
+    const header = TOML_TABLE_HEADER.exec(line);
+    if (header?.[1] !== undefined) {
+      table = header[1].trim();
+      continue;
+    }
+    const assignment = TOML_STRING_ASSIGNMENT.exec(line);
+    const key = assignment?.[1];
+    const value = assignment?.[2] ?? assignment?.[3];
+    if (key === undefined || value === undefined) continue;
+    if (table === "") {
+      if (key === "model") rootModel = value;
+      else if (key === "profile") rootProfile = value;
+      continue;
+    }
+    const profile = profileTableName(table);
+    if (profile !== null && key === "model") profileModels.set(profile, value);
+  }
+  if (rootProfile !== null) return profileModels.get(rootProfile) ?? rootModel;
+  return rootModel;
+}
+
+/** `profiles.foo` and `profiles."foo.bar"` name profile `foo` / `foo.bar`; anything else is not a profile table. */
+function profileTableName(table: string): string | null {
+  if (!table.startsWith("profiles.")) return null;
+  const name = table.slice("profiles.".length).trim();
+  const quoted = /^"([^"]*)"$|^'([^']*)'$/.exec(name);
+  return (quoted?.[1] ?? quoted?.[2] ?? name) || null;
 }
 
 function surfaceErrorCode(body: string): string | null {
@@ -191,7 +305,7 @@ export class GrokProvider implements ProviderAdapter {
     if (!subscription.sessionId) throw new Error("resume target missing");
     return runHeadless(
       process.env.HIVE_GROK_COMMAND ?? "grok",
-      ["-r", subscription.sessionId, "--output-format", "streaming-messages-json", ...grokPermissionArgs(subscription.permissionProfile), "-p", framed],
+      ["-r", subscription.sessionId, "--output-format", "streaming-messages-json", ...grokEffortArgs(context.effort), ...grokPermissionArgs(subscription.permissionProfile), "-p", framed],
       cwd,
       null,
       { HOME: requireAccountProfile(subscription) },
@@ -202,13 +316,23 @@ export class GrokProvider implements ProviderAdapter {
   spawn(subscription: Subscription, cwd: string, framed: string, context: HeadlessDispatch): Promise<ProviderDispatch> {
     return runHeadless(
       process.env.HIVE_GROK_COMMAND ?? "grok",
-      ["--output-format", "streaming-messages-json", ...grokPermissionArgs(subscription.permissionProfile), "-p", framed],
+      ["--output-format", "streaming-messages-json", ...grokEffortArgs(context.effort), ...grokPermissionArgs(subscription.permissionProfile), "-p", framed],
       cwd,
       null,
       { HOME: requireAccountProfile(subscription) },
       context,
     );
   }
+}
+
+/**
+ * Grok validates at CLI parse against `low|medium|high|xhigh` (grok 1.0.4);
+ * an unclamped `max` would burn the whole wake on an argument error — the
+ * exact failure class of the `-p`-must-come-last scar above.
+ */
+export function grokEffortArgs(effort: WakeEffort | null): string[] {
+  if (effort === null) return [];
+  return ["--reasoning-effort", clampEffortToXhigh(effort)];
 }
 
 export interface ClaudeInboxConfig {
@@ -268,7 +392,7 @@ export class ClaudeProvider implements ProviderAdapter {
     const profile = requireAccountProfile(subscription);
     return runHeadless(
       process.env.HIVE_CLAUDE_COMMAND ?? "claude",
-      ["-p", "--resume", subscription.sessionId, "--output-format", "stream-json", "--verbose", ...claudePermissionArgs(subscription.permissionProfile), ...claudePromptSlotArgs(profile), framed],
+      ["-p", "--resume", subscription.sessionId, "--output-format", "stream-json", "--verbose", ...claudeEffortArgs(context.effort), ...claudePermissionArgs(subscription.permissionProfile), ...claudePromptSlotArgs(profile), framed],
       cwd,
       null,
       { CLAUDE_CONFIG_DIR: profile },
@@ -280,13 +404,23 @@ export class ClaudeProvider implements ProviderAdapter {
     const profile = requireAccountProfile(subscription);
     return runHeadless(
       process.env.HIVE_CLAUDE_COMMAND ?? "claude",
-      ["-p", "--output-format", "stream-json", "--verbose", ...claudePermissionArgs(subscription.permissionProfile), ...claudePromptSlotArgs(profile), framed],
+      ["-p", "--output-format", "stream-json", "--verbose", ...claudeEffortArgs(context.effort), ...claudePermissionArgs(subscription.permissionProfile), ...claudePromptSlotArgs(profile), framed],
       cwd,
       null,
       { CLAUDE_CONFIG_DIR: profile },
       context,
     );
   }
+}
+
+/**
+ * Claude's `--effort` ladder is `low..max`; Codex's swarm rung `ultra` clamps
+ * to `max` here. The flag outranks the profile's `settings.json` effortLevel
+ * for this session only.
+ */
+export function claudeEffortArgs(effort: WakeEffort | null): string[] {
+  if (effort === null) return [];
+  return ["--effort", clampEffortToMax(effort)];
 }
 
 /**
@@ -471,6 +605,22 @@ function assistantMessageText(message: unknown): string | null {
  * The pinned CODEX_HOME must use permission profiles rather than the legacy
  * `sandbox_mode` setting; Codex intentionally does not compose the two models.
  */
+/**
+ * The edge chooses the turn's cwd (a subscription's workspace root or a
+ * per-turn slot), and that root is a directory of checkouts, not a checkout:
+ * `codex exec` refuses such a cwd unless told to skip its git-repo check.
+ * Ariadne's cx53 seat failed every spawn on that refusal (2026-09-06).
+ */
+export function codexSpawnArgs(
+  cwd: string,
+  profile: string,
+  effort: WakeEffort | null = null,
+  codexHome: string | null = null,
+  edgeSocketPath = resolveEdgeSocketPath(),
+): string[] {
+  return ["exec", "--cd", cwd, "--skip-git-repo-check", "--json", ...codexEffortArgs(effort, codexHome), ...codexPermissionArgs(profile, edgeSocketPath), "-"];
+}
+
 export function codexPermissionArgs(
   profile: string,
   edgeSocketPath = resolveEdgeSocketPath(),
@@ -483,13 +633,23 @@ export function codexPermissionArgs(
   }
 }
 
+/**
+ * Egress a Codex seat may reach besides the edge socket. GitHub is the seat's
+ * work surface — `git fetch`/`push` (github.com, codeload), `gh` (api.github.com)
+ * and release/LFS objects — and without it a seat can read a PR but never
+ * rebase, burn or open one (Ariadne's acceptance turn, 2026-09-07). Everything
+ * else stays denied; this is an allowlist, not a proxy policy.
+ */
+export const CODEX_NETWORK_DOMAINS =
+  '{"hive.invalid"="allow","github.com"="allow","api.github.com"="allow","codeload.github.com"="allow","objects.githubusercontent.com"="allow"}';
+
 function codexSocketPermissionProfile(name: string, parent: ":read-only" | ":workspace", edgeSocketPath: string): string[] {
   const socketKey = JSON.stringify(edgeSocketPath);
   return [
     "-c", "features.network_proxy=true",
     "-c", `permissions.${name}.extends=${JSON.stringify(parent)}`,
     "-c", `permissions.${name}.network.enabled=true`,
-    "-c", `permissions.${name}.network.domains={"hive.invalid"="allow"}`,
+    "-c", `permissions.${name}.network.domains=${CODEX_NETWORK_DOMAINS}`,
     "-c", `permissions.${name}.network.unix_sockets={${socketKey}="allow"}`,
     "-c", `default_permissions=${JSON.stringify(name)}`,
   ];

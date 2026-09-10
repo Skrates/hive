@@ -1,4 +1,13 @@
-# Edge: macbook — seat ariadne (Codex, ChatGPT Max 20x; formerly `codex-1`)
+# Edge: macbook — recipe only, no seat (Codex, ChatGPT Max 20x)
+
+**Retired for dispatch, 2026-09-06.** `ariadne`'s home edge is `cx53`
+(`deploy/subscriptions/ariadne.json`, `deploy/machines/edge-cx53/README.md`); no subscription
+names edge `mac`, so this edge is not deployed and nothing here needs to run for the seat to be
+woken. The Mac body is interactive-only Codex Desktop, which Hive never dispatches. What follows
+is the recipe kept for two reasons: reprovisioning a Mac edge, and the one capability that could
+not follow her to Linux — mid-turn steering, whose Desktop IPC and app-server control sockets must
+both be on the same machine as the seat, so a cx53 seat has headless wakes only. Reviving this
+edge means adding a `mac` row back to the machine map and pointing a subscription at it.
 
 1. Build the checkout; install the launchd plists from `deploy/launchd/` (edit paths inside):
    `launchctl bootstrap gui/$UID deploy/launchd/is.sokrates.hive-edge.plist`.
@@ -18,12 +27,13 @@
    pinned dedicated/headless seat, while `HIVE_CODEX_DESKTOP_HOME` selects the running Desktop app's
    state database and owner-only IPC socket:
    `CODEX_HOME=/Users/hakon/.hive/profiles/ariadne HIVE_CODEX_DESKTOP_HOME=/Users/hakon/.codex HIVE_ACTOR=ariadne HIVE_SESSION_ID=<thread> hive-codex-live`.
-   The Desktop IPC and app-server control sockets must be on this machine — `ariadne` lives here
-   because neither socket can be remote. Without the live daemon, wakes use the subscription's
+   Neither socket can be remote, so this daemon only ever serves a seat whose subscription names
+   *this* machine as its edge — it is the reason a Mac edge would be revived, and the reason the
+   cx53 seat has headless wakes only. Without the live daemon, wakes use the subscription's
    normal headless policy under the same pinned `CODEX_HOME`.
-5. Subscription: `deploy/subscriptions/ariadne.json`.
-   Actor rename (codex-1 → ariadne): `put-subscription` only ever *upserts*, so applying
-   `ariadne.json` leaves the old `codex-1` row live and thread-bound. After seating `ariadne`
-   and letting `codex-1`'s deliveries terminalize, retire it: `hive delete-subscription codex-1`
-   (needs `HIVE_BROKER_URL` + `HIVE_ADMIN_TOKEN`). Retirement fails closed while any delivery
-   for the old actor is still non-terminal.
+5. Subscription: none. `deploy/subscriptions/ariadne.json` names edge `cx53`; a revived Mac edge
+   needs its own subscription (or that file edited back) before any wake reaches this box.
+   `put-subscription` only ever *upserts*, so re-pointing an actor never removes the row it
+   replaces — a retired actor is retired explicitly with `hive delete-subscription <actor>`
+   (needs `HIVE_BROKER_URL` + `HIVE_ADMIN_TOKEN`), which fails closed while any delivery for it
+   is still non-terminal.

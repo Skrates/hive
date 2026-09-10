@@ -1,0 +1,69 @@
+{
+  "url": "https://api.github.com/repos/Skrates/hive/pulls/comments/3944094508",
+  "pull_request_review_id": 5125461304,
+  "id": 3944094508,
+  "node_id": "PRRC_kwDOTWMgn87rFhss",
+  "diff_hunk": "@@ -4,12 +4,12 @@\n   \"providerSurface\": \"app-server\",\n   \"providerVersion\": \"0.x\",\n   \"sessionId\": null,\n-  \"homeEdge\": \"mac\",\n-  \"workspace\": \"projects\",\n-  \"edgeWorkspaces\": [{ \"edgeId\": \"mac\", \"cwd\": \"/Users/hakon/projects\", \"worktree\": null }],\n+  \"homeEdge\": \"cx53\",\n+  \"workspace\": \"work-ariadne\",\n+  \"edgeWorkspaces\": [{ \"edgeId\": \"cx53\", \"cwd\": \"/home/hive/work-ariadne\", \"worktree\": null }],",
+  "path": "deploy/subscriptions/ariadne.json",
+  "commit_id": "4df54b1c368a31d3f617c2f4c0672479724ccdad",
+  "original_commit_id": "9ae793d86be8a73a29717e55cb978ee120e72ad9",
+  "user": {
+    "login": "chatgpt-codex-connector[bot]",
+    "id": 199175422,
+    "node_id": "BOT_kgDOC98s_g",
+    "avatar_url": "https://avatars.githubusercontent.com/in/1144995?v=4",
+    "gravatar_id": "",
+    "url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D",
+    "html_url": "https://github.com/apps/chatgpt-codex-connector",
+    "followers_url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D/followers",
+    "following_url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D/following{/other_user}",
+    "gists_url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D/gists{/gist_id}",
+    "starred_url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D/starred{/owner}{/repo}",
+    "subscriptions_url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D/subscriptions",
+    "organizations_url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D/orgs",
+    "repos_url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D/repos",
+    "events_url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D/events{/privacy}",
+    "received_events_url": "https://api.github.com/users/chatgpt-codex-connector%5Bbot%5D/received_events",
+    "type": "Bot",
+    "user_view_type": "public",
+    "site_admin": false
+  },
+  "body": "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Update the machine map for Ariadne's move**\n\nWhen operators follow the checked-in deployment runbook, this new assignment conflicts with `deploy/machines/README.md`, which still lists Ariadne on `mac`, and with `deploy/machines/edge-macbook/README.md`, which still says she lives there and instructs running her live daemon. That leaves the declared ratified topology inconsistent with the subscription and can cause a reprovision or cutover to configure the wrong host; update the machine map and the mac/cx53 seat instructions alongside this change.\n\nUseful? React with 👍 / 👎.",
+  "created_at": "2026-09-06T13:35:24Z",
+  "updated_at": "2026-09-06T13:35:24Z",
+  "html_url": "https://github.com/Skrates/hive/pull/66#discussion_r3944094508",
+  "pull_request_url": "https://api.github.com/repos/Skrates/hive/pulls/66",
+  "_links": {
+    "self": {
+      "href": "https://api.github.com/repos/Skrates/hive/pulls/comments/3944094508"
+    },
+    "html": {
+      "href": "https://github.com/Skrates/hive/pull/66#discussion_r3944094508"
+    },
+    "pull_request": {
+      "href": "https://api.github.com/repos/Skrates/hive/pulls/66"
+    }
+  },
+  "reactions": {
+    "url": "https://api.github.com/repos/Skrates/hive/pulls/comments/3944094508/reactions",
+    "total_count": 0,
+    "+1": 0,
+    "-1": 0,
+    "laugh": 0,
+    "hooray": 0,
+    "confused": 0,
+    "heart": 0,
+    "rocket": 0,
+    "eyes": 0
+  },
+  "start_line": 7,
+  "original_start_line": 7,
+  "start_side": "RIGHT",
+  "line": 9,
+  "original_line": 9,
+  "side": "RIGHT",
+  "author_association": "NONE",
+  "original_position": 9,
+  "position": 9,
+  "subject_type": "line"
+}

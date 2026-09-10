@@ -134,8 +134,8 @@ export class BrokerService {
    * ADR-0003 R-6: the thread shows delivery. The dispatched transition and the
    * sender-visible delivery receipt commit in one store transaction.
    */
-  markDispatched(deliveryId: number, edgeId: string, generation: number): Delivery {
-    return this.store.markDispatched(deliveryId, edgeId, generation);
+  markDispatched(deliveryId: number, edgeId: string, generation: number, notices: Reason[] = []): Delivery {
+    return this.store.markDispatched(deliveryId, edgeId, generation, notices);
   }
 
   renew(deliveryId: number, edgeId: string, generation: number): Delivery {
@@ -197,7 +197,7 @@ export class BrokerService {
     let sent = 0;
     for (const entry of entries) {
       try {
-        await this.slack.reply(entry.channelId, entry.threadTs, entry.text, entry.deliveryId === null
+        const messageTs = await this.slack.reply(entry.channelId, entry.threadTs, entry.text, entry.deliveryId === null
           ? {}
           : { delivery_id: String(entry.deliveryId) });
         // Reactions are glanceable annotation, not part of the two-events
@@ -212,7 +212,7 @@ export class BrokerService {
             });
           }
         }
-        this.store.markOutboxSent(entry.outboxId);
+        this.store.markOutboxSent(entry.outboxId, messageTs);
         sent += 1;
       } catch {
         this.store.markOutboxAttempt(entry.outboxId);
@@ -224,4 +224,56 @@ export class BrokerService {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
+}
+
+/**
+ * The broker's periodic housekeeping, as one testable unit (module map §8). `publish` is the
+ * review publisher's pass; everything else is core broker work that has nothing to do with
+ * review.
+ */
+export interface HousekeepingTickDeps {
+  /** R-3: return expired leases so loss stays visible. */
+  sweep(): void;
+  /** §8.1: one review publication pass. */
+  publish(): Promise<unknown>;
+  /** R-6: deliver every unsent outbox row — every Hive wake, review or not. */
+  drainOutbox(): Promise<unknown>;
+  log(what: string, error: unknown): void;
+}
+
+/**
+ * Run the three jobs of one tick with no job waiting on another. Publication used to run
+ * first and the outbox drain only after it, which made GitHub availability a prerequisite for
+ * unrelated Hive delivery: a publisher pass held up by a slow or hung GitHub port delayed
+ * every wake in the outbox for as long as it was held. They are independent concerns, so they
+ * run independently, each with its own error handling; both are single-flight in their own
+ * right (`ReviewPublisher.drainOnce`, `BrokerService.drainOutbox`), so a tick arriving while
+ * either is still running joins that pass rather than racing it.
+ *
+ * The publisher's own Slack rows still land in this outbox and still go out through this
+ * drain — this tick's if they were minted before the drain listed the unsent rows, the next
+ * tick's (≤5s later) otherwise. No second timer: one tick, two independent jobs.
+ *
+ * The returned promise settles when both have; callers that only want the tick fired discard it.
+ */
+export function housekeepingTick(deps: HousekeepingTickDeps): Promise<void> {
+  try {
+    deps.sweep();
+  } catch (error) {
+    deps.log("hive broker sweep failed", error);
+  }
+  // Both are started here, synchronously, so neither is even scheduled behind the other.
+  const publication = launch(() => deps.publish(), "hive review publish failed", deps.log);
+  const outbox = launch(() => deps.drainOutbox(), "hive broker outbox drain failed", deps.log);
+  return Promise.all([publication, outbox]).then(() => undefined);
+}
+
+function launch(run: () => Promise<unknown>, what: string, log: (what: string, error: unknown) => void): Promise<void> {
+  try {
+    return run().then(() => undefined, (error: unknown) => log(what, error));
+  } catch (error) {
+    // A job that throws before it returns a promise is the same failure, reported the same way.
+    log(what, error);
+    return Promise.resolve();
+  }
 }

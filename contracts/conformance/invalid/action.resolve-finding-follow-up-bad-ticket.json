@@ -1,0 +1,16 @@
+{
+  "expect": {
+    "code": "malformed",
+    "why": "the ticket id is format-checked (\u00a7F3, F-9)"
+  },
+  "instance": {
+    "finding_id": "fnd_02",
+    "kind": "ResolveFinding",
+    "resolution": {
+      "evidence": "later",
+      "kind": "follow_up",
+      "ticket": "later-maybe"
+    }
+  },
+  "model": "action"
+}

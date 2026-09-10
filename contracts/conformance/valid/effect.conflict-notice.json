@@ -1,0 +1,13 @@
+{
+  "instance": {
+    "effect_id": "conflict-1",
+    "kind": "actionable",
+    "payload": {
+      "actor": "ariadne",
+      "dedupe_key": "conflict-1",
+      "text": "Resolve the conflict"
+    },
+    "target": "notice:ariadne:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:main"
+  },
+  "model": "effect"
+}

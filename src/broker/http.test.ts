@@ -17,7 +17,7 @@ test("stop() force-closes an in-flight long-poll instead of hanging on it", { ti
   t.after(() => store.close());
   const edgeToken = store.createEdge("edge-1");
   const broker = new BrokerService(store, slack);
-  const server = new BrokerHttpServer(broker, { host: "127.0.0.1", port: 0, adminToken: "x".repeat(32) });
+  const server = new BrokerHttpServer(broker, { host: "127.0.0.1", port: 0, adminToken: "x".repeat(32), review: null });
   const { port } = await server.start();
 
   // A real edge long-poll: with no delivery pending, the broker holds this GET
@@ -78,7 +78,7 @@ test("POST /v1/wakes mints a seat wake, and refuses one that cannot be delivered
   t.after(() => store.close());
   const edgeToken = store.createEdge("dev");
   const broker = new BrokerService(store, slack);
-  const server = new BrokerHttpServer(broker, { host: "127.0.0.1", port: 0, adminToken: "x".repeat(32) });
+  const server = new BrokerHttpServer(broker, { host: "127.0.0.1", port: 0, adminToken: "x".repeat(32), review: null });
   const { port } = await server.start();
   t.after(() => server.stop());
 
@@ -185,12 +185,116 @@ test("POST /v1/wakes mints a seat wake, and refuses one that cannot be delivered
   assert.equal(invalid.status, 400);
 });
 
+test("KRA-1414: the dispatched transition carries the edge's notices across the process boundary", async (t) => {
+  const store = new BrokerStore(":memory:");
+  t.after(() => store.close());
+  const edgeToken = store.createEdge("dev");
+  const broker = new BrokerService(store, slack);
+  const server = new BrokerHttpServer(broker, { host: "127.0.0.1", port: 0, adminToken: "x".repeat(32), review: null });
+  const { port } = await server.start();
+  t.after(() => server.stop());
+
+  store.upsertSubscription(SubscriptionInputSchema.parse({
+    actor: "ariadne",
+    provider: "codex",
+    providerSurface: "app-server",
+    providerVersion: "0.153.4",
+    sessionId: "thread-1",
+    homeEdge: "dev",
+    workspace: "taxis",
+    edgeWorkspaces: [{ edgeId: "dev", cwd: "/srv/taxis", worktree: null }],
+    wakePolicy: "spawn",
+    permissionProfile: "read-only",
+    accountProfile: "/home/user/.codex-hive",
+  }));
+  store.ingestEvent({
+    eventId: "Ev1",
+    workspaceId: "T1",
+    channelId: "C1",
+    threadTs: "100.1",
+    messageTs: "100.2",
+    senderId: "U1",
+    senderKind: "user",
+    actor: "ariadne",
+    text: "WAKE: ariadne\n\nEffort: max\ngo",
+    raw: {},
+    receivedAt: "2026-08-15T00:00:00.000Z",
+  });
+  const claimed = store.claimNext("dev", 0)!;
+  const generation = claimed.leaseGeneration!;
+  store.transition(claimed.id, "dev", generation, "claimed", "accepted_local");
+  store.transition(claimed.id, "dev", generation, "accepted_local", "dispatching");
+
+  const post = (path: string, body: unknown): Promise<{ status: number; body: string }> =>
+    new Promise((resolve, reject) => {
+      const payload = JSON.stringify(body);
+      const request = http.request({
+        host: "127.0.0.1",
+        port,
+        method: "POST",
+        path,
+        headers: {
+          "x-hive-edge": "dev",
+          authorization: `Bearer ${edgeToken}`,
+          "content-type": "application/json",
+          "content-length": Buffer.byteLength(payload),
+        },
+      }, (response) => {
+        const chunks: Buffer[] = [];
+        response.on("data", (chunk: Buffer) => chunks.push(chunk));
+        response.on("end", () => resolve({ status: response.statusCode ?? 0, body: Buffer.concat(chunks).toString("utf8") }));
+        response.on("error", reject);
+      });
+      request.on("error", reject);
+      request.end(payload);
+    });
+
+  const dispatched = await post(`/v1/deliveries/${claimed.id}/dispatched`, {
+    generation,
+    notices: [{ code: "effort_overlay_unused", detail: "live_session_fixed_at_spawn — Effort: max did not apply" }],
+  });
+  assert.equal(dispatched.status, 200);
+  const notice = store.listUnsentOutbox().find((entry) => /delivered to ariadne/.test(entry.text))!;
+  assert.match(notice.text, /effort_overlay_unused — live_session_fixed_at_spawn/);
+
+  // A malformed notice is a validation failure, not a silently dropped field.
+  store.ingestEvent({
+    eventId: "Ev2",
+    workspaceId: "T1",
+    channelId: "C1",
+    threadTs: "200.1",
+    messageTs: "200.2",
+    senderId: "U1",
+    senderKind: "user",
+    actor: "ariadne",
+    text: "WAKE: ariadne | again",
+    raw: {},
+    receivedAt: "2026-08-15T00:01:00.000Z",
+  });
+  const second = store.claimNext("dev", 0)!;
+  const secondGeneration = second.leaseGeneration!;
+  store.transition(second.id, "dev", secondGeneration, "claimed", "accepted_local");
+  store.transition(second.id, "dev", secondGeneration, "accepted_local", "dispatching");
+  const malformed = await post(`/v1/deliveries/${second.id}/dispatched`, {
+    generation: secondGeneration,
+    notices: [{ code: "effort_overlay_unused" }],
+  });
+  assert.equal(malformed.status, 400);
+  assert.equal(store.getDelivery(second.id).status, "dispatching");
+
+  // An omitted field is the ordinary case and still transitions.
+  const bare = await post(`/v1/deliveries/${second.id}/dispatched`, { generation: secondGeneration });
+  assert.equal(bare.status, 200);
+  const plain = store.listUnsentOutbox().find((entry) => entry.deliveryId === second.id && /delivered to ariadne/.test(entry.text))!;
+  assert.ok(!plain.text.includes("effort_overlay_unused"));
+});
+
 test("GET /v1/deliveries refuses a busy declaration that names no slot (KRA-1364)", async (t) => {
   const store = new BrokerStore(":memory:");
   t.after(() => store.close());
   const edgeToken = store.createEdge("dev");
   const broker = new BrokerService(store, slack);
-  const server = new BrokerHttpServer(broker, { host: "127.0.0.1", port: 0, adminToken: "x".repeat(32) });
+  const server = new BrokerHttpServer(broker, { host: "127.0.0.1", port: 0, adminToken: "x".repeat(32), review: null });
   const { port } = await server.start();
   t.after(() => server.stop());
 

@@ -1,0 +1,11 @@
+{
+  "expect": {
+    "code": "malformed",
+    "why": "policy versions are integers"
+  },
+  "instance": {
+    "kind": "AdoptPolicy",
+    "version": "2"
+  },
+  "model": "action"
+}

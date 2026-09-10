@@ -9,6 +9,15 @@ import type {
   SubscriptionInput,
 } from "../domain.js";
 import { formatBusySlots } from "../domain.js";
+import type { Action, Receipt, ReviewState } from "../review/contract.js";
+
+/** A seat's review act as the edge forwards it: custody resolved, actor never named (§5.A1). */
+export interface ReviewActForward {
+  act_id: string;
+  expected_revision: number;
+  action: Action;
+  custody: { delivery_id: number; generation: number };
+}
 
 /**
  * A non-2xx broker answer, carrying the status and raw body so a caller can
@@ -52,8 +61,9 @@ export class BrokerClient {
     return this.transition(delivery, "dispatch");
   }
 
-  markDispatched(delivery: Delivery): Promise<Delivery> {
-    return this.transition(delivery, "dispatched");
+  /** KRA-1414: `notices` ride the dispatched transition into the thread-visible delivery status. */
+  markDispatched(delivery: Delivery, notices: readonly Reason[] = []): Promise<Delivery> {
+    return this.transition(delivery, "dispatched", { notices });
   }
 
   renew(delivery: Delivery): Promise<Delivery> {
@@ -89,6 +99,35 @@ export class BrokerClient {
       body: JSON.stringify(input),
     });
     return this.json<SeatWakeReceipt>(response);
+  }
+
+  /** Design §9.1: a read needs only the edge socket, so it carries the edge credential alone. */
+  async reviewRead(key: string): Promise<ReviewState> {
+    const response = await this.request(`/v1/review/${encodeURIComponent(key)}`, { method: "GET" });
+    return this.json<ReviewState>(response);
+  }
+
+  /**
+   * §5.A1: forward a seat's review act under this edge's machine credential with
+   * the delivery custody the edge resolved from the turn's dispatch token. The
+   * broker fences that custody and reads the actor from its ledger. A refusal
+   * (409) is a Receipt like an applied act, not a transport failure, so both
+   * come back with their status for the CLI to render.
+   */
+  async reviewAct(key: string, input: ReviewActForward): Promise<{ status: 200 | 409; receipt: Receipt }> {
+    const response = await this.request(`/v1/review/${encodeURIComponent(key)}/acts`, {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
+    if (response.status === 200 || response.status === 409) {
+      return { status: response.status, receipt: await response.json() as Receipt };
+    }
+    throw new BrokerHttpError(response.status, await response.text());
+  }
+
+  async reviewReconcile(key: string): Promise<{ accepted: boolean }> {
+    const response = await this.request(`/v1/review/${encodeURIComponent(key)}/reconcile`, { method: "POST", body: "{}" });
+    return this.json<{ accepted: boolean }>(response);
   }
 
   async outcome(deliveryId: number, text: string): Promise<Delivery> {
@@ -150,10 +189,10 @@ export class BrokerClient {
     return this.json(response);
   }
 
-  private async transition(delivery: Delivery, action: string): Promise<Delivery> {
+  private async transition(delivery: Delivery, action: string, extra: Record<string, unknown> = {}): Promise<Delivery> {
     const response = await this.request(`/v1/deliveries/${delivery.id}/${action}`, {
       method: "POST",
-      body: JSON.stringify({ generation: requiredGeneration(delivery) }),
+      body: JSON.stringify({ ...extra, generation: requiredGeneration(delivery) }),
     });
     return this.json<Delivery>(response);
   }
