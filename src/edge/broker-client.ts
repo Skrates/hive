@@ -16,7 +16,7 @@ export interface ReviewActForward {
   act_id: string;
   expected_revision: number;
   action: Action;
-  custody: { delivery_id: number; generation: number };
+  custody: { delivery_id: number; generation: number } | { session_id: string; actor: string };
 }
 
 /**

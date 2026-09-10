@@ -97,7 +97,7 @@ program.command("broker")
     const housekeeping = setInterval(() => {
       void housekeepingTick({
         sweep: () => store.requeueExpiredLeases(),
-        publish: () => review.publisher.drainOnce(),
+        publish: () => review.housekeeping(),
         drainOutbox: () => broker.drainOutbox(),
         log: (what, error) => console.error(what, error instanceof Error ? error.message : String(error)),
       });
@@ -366,6 +366,8 @@ const BrokerConfig = z.object({
   HIVE_GITHUB_APP_ID: z.string().min(1).optional(),
   HIVE_GITHUB_APP_KEY_FILE: z.string().min(1).optional(),
   HIVE_GITHUB_SUMMON_TOKEN_FILE: z.string().min(1).optional(),
+  HIVE_REVIEW_LOGFIRE_TOKEN: z.string().min(1).optional(),
+  HIVE_REVIEW_LOGFIRE_REGION: z.enum(["us", "eu"]).optional(),
 });
 
 const EdgeConfig = z.object({

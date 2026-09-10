@@ -730,6 +730,7 @@ deferred; visibility of the machinery is not.
 
 ```
 hive review read      <owner/repo>#<n> [--json]
+hive review session   <session-id> --token-file <new-file>             # live, attested registration
 hive review reconcile <owner/repo>#<n>                                   # adapter wake, any seat
 hive review answer    <owner/repo>#<n> --request <id> --report <file> --expect <rev>
 hive review resolve   <owner/repo>#<n> <finding-id> fixed|refuted|withdrawn|product-gate|follow-up|same-as
@@ -748,6 +749,11 @@ hive review reset-store  <db-path> --confirm <db-path>   # drops every review ta
 ```
 Writes need delivery or session custody and `--expect`; reads need the edge socket. Argument schemas are
 generated from the contract (§2.1).
+
+Session registration issues a token only for one live, attested actor binding. `review session`
+writes that token to a new owner-only file; the caller sets `HIVE_SESSION_TOKEN_FILE` to its path.
+Expiry, deregistration, replacement, or ambiguous attestation revokes it. The same rule supports
+single-actor and shared edges; a missing or ambiguous binding reports an explicit deferral reason.
 
 ### 9.2 Policy (versioned rows; replaces the `REVIEW_*` variables and constants)
 
@@ -870,7 +876,10 @@ section. **Tickets, reconciled against Linear on 2026-09-06** (bodies read throu
 
 ---
 
-## 11. Acceptance — Hákon's sequences, run through the core's own runner (`bun test`)
+## 11. Acceptance — Hákon's sequences, run through the core's own runner (`bun run check`)
+
+The repository gate builds TypeScript and runs Node's test runner. Direct `bun test` cannot load
+the broker's `better-sqlite3` dependency (`ERR_DLOPEN_FAILED`, verified 2026-09-10).
 
 | # | Sequence | Required result |
 |---|---|---|
@@ -884,6 +893,11 @@ section. **Tickets, reconciled against Linear on 2026-09-06** (bodies read throu
 | 8 | Unsolicited Codex re-sample at H → request opened later at H | findings admitted; the later request stays pending |
 | 9 | `fixed` claim on F → new subject → Codex raises F′ → `same_as F` | F contested and open; F′ linked; board shows the prior claim |
 | 10 | Codex request pending → quota refusal → later Codex signal | one reassignment to the substitute with `supersedes`; availability clears on the later signal |
+| M2 stalls | periodic pass → stall window → re-transport → unavailable → reassigned → transport bound spent | one replacement preserves the obligation; exhaustion leaves it pending and held |
+| M2 retrospective | exhaustion → retrospective stalls → testimony naming deliverable → grant | retrospective retries under the hold, answers without a charge; grant closes the episode |
+| M2 custody | live attested session → token → write → expiry/deregister/ambiguity | actor is resolved by the edge; revoked tokens refuse; ambiguous registrations explicitly defer |
+| M2 operator | each operator verb under delivery/session custody; malformed arguments | no transport; arguments are validated against the vendored property schemas |
+| M2 spans | ingress → reconcile → admit → periodic housekeeping/outbox → publish | all six named spans, service `review`, process attributes without report bodies or credentials |
 
 ### Verification items (facts to establish, not forks)
 

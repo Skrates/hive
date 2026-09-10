@@ -211,12 +211,27 @@ test("POST acts: no credential ⇒ 401; delivery custody ⇒ the ledger's actor 
   const stolen = await act(body, { ...edgeHeaders, "x-hive-edge": "other", authorization: `Bearer ${otherToken}` });
   assert.equal(stolen.status, 401);
 
-  // Session custody is recognised only to be declared deferred (M2).
+  // Raw session credentials never cross to the broker: the edge must resolve them.
   const session = await act({ ...body, custody: { session_token: "s" } });
-  assert.equal(session.status, 401);
-  assert.match((session.json() as { detail: string }).detail, /M2/);
+  assert.equal(session.status, 400);
   assert.equal(fake.applied.length, 1);
   void edgeToken;
+});
+
+test("§3.2 broker accepts an edge-resolved session only for an actor assigned to that edge", async t => {
+  const { act, fake, edgeHeaders, broker } = await fixture(t);
+  const body = { act_id: "session-write", expected_revision: 3, action: CLASSIFY,
+    custody: { session_id: "interactive-1", actor: "ariadne" } };
+  const applied = await act(body);
+  assert.equal(applied.status, 200, applied.body);
+  assert.deepEqual(fake.applied[0]!.input.principal,
+    { kind: "seat", actor: "ariadne", custody: { session_id: "interactive-1" } });
+  const otherToken = broker.createEdge("other");
+  const foreign = await act(body, { ...edgeHeaders, "x-hive-edge": "other", authorization: `Bearer ${otherToken}` });
+  assert.equal(foreign.status, 401);
+  const mixed = await act({ ...body, custody: { ...body.custody, delivery_id: 1, generation: 1 } });
+  assert.equal(mixed.status, 400);
+  assert.equal(fake.applied.length, 1);
 });
 
 test("POST acts: an operator token names an operator principal; a wrong token is 401", async (t) => {

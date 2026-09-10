@@ -43,6 +43,9 @@ import { ReviewPublisher, type ReviewGitHubPort, type SystemWakePort } from "./p
 import { threadState } from "./render.js";
 import { decide, fold, read } from "./reducer.js";
 import { ReviewStore } from "./store.js";
+import { InMemorySpanExporter, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
+import { ReviewTelemetry } from "./telemetry.js";
+import { bootReviewRuntime } from "./runtime.js";
 
 // ---------------------------------------------------------------------------------------
 // Fixtures (contract-valid; the store runs Ajv on every act)
@@ -380,11 +383,13 @@ class Core {
   readonly publisher: ReviewPublisher;
   private acts = 0;
 
-  constructor(policy: Policy = POLICY, options: { github?: boolean } = {}) {
-    this.store = new ReviewStore(this.broker.db, { decide, fold, read, clock: this.clock });
+  constructor(policy: Policy = POLICY, options: { github?: boolean; telemetry?: ReviewTelemetry } = {}) {
+    this.store = new ReviewStore(this.broker.db, { decide, fold, read, clock: this.clock,
+      ...(options.telemetry ? { telemetry: options.telemetry } : {}),
+    });
     this.store.putPolicy(KEY.repository_id, policy);
     this.github = options.github === false ? null : new FakeGitHub();
-    this.publisher = new ReviewPublisher(this.store, { github: this.github, slack: this.slack }, this.clock);
+    this.publisher = new ReviewPublisher(this.store, { github: this.github, slack: this.slack }, this.clock, undefined, options.telemetry);
   }
 
   /** Seat/operator acts carry the current revision unless the test says otherwise (§B1). */
@@ -769,6 +774,86 @@ test("§11.6 Exhaustion predicate becomes true → another answer at the same su
   core.applied({ kind: "GrantRounds", n: 2, reason: "one more go" }, OPERATOR);
   assert.equal(core.review().episodes[0]?.closed?.by.kind, "operator");
   assert.notEqual(core.review().holds[0]?.released, null);
+  core.close();
+});
+
+test("§11.M2 retrospective transport stalls under exhaustion; testimony names the deliverable without charging a round", async () => {
+  const core = new Core(TIGHT_POLICY);
+  core.applied(observe(), ADAPTER);
+  const request = core.pending("ariadne")[0]!;
+  core.applied(answer(request.id, `${H1}:main`, report("ariadne", { findings: [rkFinding("F1")] })), seat("ariadne"));
+  const retro = core.pending("theoros").find(r => r.kind === "retrospective")!;
+  core.clock.advance(21 * MINUTE);
+  core.applied(observe(), ADAPTER);
+  assert.equal(core.review().requests.find(r => r.id === retro.id)!.retransports.length, 1,
+    "retrospective stall handling proceeds under the exhaustion hold");
+  const rounds = core.review().charges.length;
+  core.applied({ kind: "Answer", request_id: retro.id, subject_key: `${H1}:main`,
+    submission: { arm: "testimony", testimony: { cause: "contract gap", scars: ["scars/review.md"], deliverable: { comment_id: 123 } } },
+  }, seat("theoros"));
+  assert.equal(core.review().requests.find(r => r.id === retro.id)!.status, "answered");
+  assert.equal(core.review().charges.length, rounds);
+  assert.equal(core.review().episodes[0]!.closed, null, "testimony does not release the human gate");
+  core.applied({ kind: "GrantRounds", n: 1, reason: "repair approved" }, OPERATOR);
+  assert.notEqual(core.review().episodes[0]!.closed, null);
+  core.close();
+});
+
+test("§11.M2 periodic stalls re-transport, unavailability reassigns once, transport exhaustion keeps the obligation pending", async () => {
+  const core = new Core({ ...POLICY, transport_bound: 1 });
+  core.applied(observe(), ADAPTER);
+  const port = new FakeGitHubPort(H1);
+  const scheduler = new ReconcileScheduler({ store: core.store, github: port, clock: core.clock });
+  await scheduler.housekeeping();
+  const original = core.pending("codex")[0]!;
+  core.clock.advance(21 * MINUTE);
+  await scheduler.housekeeping();
+  assert.equal(core.review().requests.find(r => r.id === original.id)!.retransports.length, 1);
+  core.applied({ kind: "SetReviewerAvailability", reviewer: "codex", available: false,
+    reason: "quota", until: null, evidence: "quota refused" }, OPERATOR);
+  const replacement = core.pending("ariadne")[0]!;
+  assert.equal(replacement.supersedes, original.id);
+  core.clock.advance(21 * MINUTE);
+  await scheduler.housekeeping();
+  core.clock.advance(21 * MINUTE);
+  await scheduler.housekeeping();
+  assert.equal(core.pending("ariadne").length, 1);
+  assert.equal(core.pending("ariadne")[0]!.transport_exhausted, true);
+  assert.equal(core.state().readiness.ready, false);
+  const count = core.review().holds.length;
+  core.clock.advance(21 * MINUTE);
+  await scheduler.housekeeping();
+  assert.equal(core.review().holds.length, count, "one transport exhaustion hold");
+  await scheduler.stop();
+  core.close();
+});
+
+test("§11.M2 all six spans come from the composed process and omit credentials and report bodies", async () => {
+  const exporter = new InMemorySpanExporter();
+  const telemetry = new ReviewTelemetry([new SimpleSpanProcessor(exporter)]);
+  const core = new Core(POLICY, { telemetry });
+  const port = new FakeGitHubPort(H1);
+  const runtime = bootReviewRuntime({ broker: core.broker, clock: core.clock, adminToken: "fake-admin", env: {}, log: () => {}, telemetry });
+  const bad = handleWebhook(core.store, WEBHOOK_SECRET, { headers: {}, rawBody: Buffer.from("private-report-body") }, core.clock, telemetry);
+  assert.equal(bad.outcome, "hmac_rejected");
+  await reconcile({ store: core.store, github: port, clock: core.clock, telemetry }, KEY, "span-run");
+  core.refused({ kind: "GrantRounds", n: 1, reason: "private-report-body" }, seat("ariadne"));
+  await core.publisher.drainOnce();
+  await runtime.housekeeping();
+  const spans = exporter.getFinishedSpans();
+  assert.deepEqual([...new Set(spans.map(span => span.name))].sort(), [
+    "review.admit", "review.housekeeping", "review.ingress", "review.outbox", "review.publish", "review.reconcile",
+  ]);
+  assert.ok(spans.every(span => span.resource.attributes["service.name"] === "review"));
+  assert.equal(spans.find(span => span.name === "review.ingress")!.attributes.outcome, "hmac_rejected");
+  assert.equal(spans.find(span => span.name === "review.reconcile")!.attributes.admissions, 0,
+    "the observation has no source records to import");
+  assert.ok(spans.some(span => span.name === "review.admit" && span.attributes.code === "unauthorized"));
+  assert.ok(spans.some(span => span.name === "review.publish" && span.attributes.outcome === "sent"));
+  const attributes = JSON.stringify(spans.map(span => span.attributes));
+  assert.ok(!attributes.includes("private-report-body"));
+  assert.ok(!attributes.includes(WEBHOOK_SECRET));
+  await runtime.stop();
   core.close();
 });
 

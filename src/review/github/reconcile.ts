@@ -24,6 +24,7 @@ import { classifyCodexRecord } from "./classify.js";
 import type { GitHubChangedFile, GitHubPort, GitHubPullRequest, GitHubRecord, MeterPort } from "./port.js";
 import type { ApplyInput, InboxDelivery, SourceRecordInput, SourceRecordRow } from "../store.js";
 import { CODEX_LOGINS } from "../reducer.js";
+import { noReviewTelemetry, type ReviewTelemetry } from "../telemetry.js";
 
 // ---------------------------------------------------------------------------------------
 // The slice of `ReviewStore` (module map §3) a reconcile run touches. Structural so a test
@@ -54,6 +55,7 @@ export const SKILL_ROOTS: readonly string[] = ["skills/", ".agents/skills/", ".c
 export interface ExemptionEvidence { reason: "skill_only" | "exempt_paths" | "verbatim_copy"; evidence: string }
 
 export interface ReconcileDeps {
+  telemetry?: ReviewTelemetry;
   store: ReconcileStore;
   github: GitHubPort;
   clock: Clock;
@@ -185,6 +187,17 @@ function reviewIdOf(record: GitHubRecord): number | null {
 }
 
 export async function reconcile(deps: ReconcileDeps, key: ReviewKey, runId: string): Promise<ReconcileSummary> {
+  return (deps.telemetry ?? noReviewTelemetry).run("review.reconcile", {
+    repository_id: key.repository_id, pr_number: key.pr_number, run_id: runId,
+  }, async span => {
+    const summary = await reconcileRun(deps, key, runId);
+    span.setAttributes({ records_imported: summary.recordsImported, admissions: summary.admitted.length,
+      refusals: summary.refused.length, duration_ms: summary.durationMs });
+    return summary;
+  });
+}
+
+async function reconcileRun(deps: ReconcileDeps, key: ReviewKey, runId: string): Promise<ReconcileSummary> {
   const startedAt = deps.clock.now().getTime();
   const summary: ReconcileSummary = { runId, key, observed: false, recordsImported: 0, admitted: [], refused: [], exemption: null, durationMs: 0 };
   const finish = (): ReconcileSummary => {
@@ -319,8 +332,6 @@ export async function reconcile(deps: ReconcileDeps, key: ReviewKey, runId: stri
 export interface ReconcileSchedulerDeps extends ReconcileDeps {
   /** The bounded sweep period; design: five minutes. */
   intervalMs?: number;
-  /** How often the inbox is drained into wakes. */
-  inboxPollMs?: number;
   log?: (line: string) => void;
 }
 
@@ -337,8 +348,8 @@ interface Lane { running: Promise<void> | null; pending: boolean; after: Array<(
  */
 export class ReconcileScheduler {
   private readonly lanes = new Map<string, Lane>();
-  private timers: NodeJS.Timeout[] = [];
   private stopped = false;
+  private nextSweepAt = 0;
 
   constructor(private readonly deps: ReconcileSchedulerDeps) {}
 
@@ -425,6 +436,17 @@ export class ReconcileScheduler {
     for (const key of this.deps.store.active(since)) this.wake(key);
   }
 
+  /** One periodic pass; live ObservePR admissions own stalls (A4/D6), never a new system act. */
+  async housekeeping(): Promise<void> {
+    this.drainInbox();
+    const now = this.deps.clock.now().getTime();
+    if (now >= this.nextSweepAt) {
+      this.nextSweepAt = now + (this.deps.intervalMs ?? 5 * 60_000);
+      this.sweep();
+    }
+    await Promise.all([...this.lanes.values()].map(lane => lane.running ?? Promise.resolve()));
+  }
+
   /** §7 "Gaps": on start, ask the App for failed deliveries in the last 24 h and redeliver each. */
   async requestRedeliveries(): Promise<number> {
     const since = new Date(this.deps.clock.now().getTime() - DAY_MS).toISOString();
@@ -442,14 +464,8 @@ export class ReconcileScheduler {
 
   start(): void {
     this.stopped = false;
+    this.nextSweepAt = 0;
     void this.requestRedeliveries();
-    this.drainInbox();
-    this.sweep();
-    const poll = setInterval(() => this.drainInbox(), this.deps.inboxPollMs ?? 5_000);
-    const sweep = setInterval(() => this.sweep(), this.deps.intervalMs ?? 5 * 60_000);
-    poll.unref();
-    sweep.unref();
-    this.timers = [poll, sweep];
   }
 
   /** Resolves once every lane is idle, coalesced follow-ups included (a test and CLI convenience). */
@@ -461,11 +477,9 @@ export class ReconcileScheduler {
     }
   }
 
-  /** Stops the timers, lets in-flight runs finish, and drops coalesced follow-ups (the next start sweeps). */
+  /** Lets in-flight runs finish and drops coalesced follow-ups (the broker owns the tick). */
   async stop(): Promise<void> {
     this.stopped = true;
-    for (const timer of this.timers) clearInterval(timer);
-    this.timers = [];
     await Promise.all([...this.lanes.values()].map((lane) => lane.running ?? Promise.resolve()));
   }
 }
