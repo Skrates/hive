@@ -497,8 +497,10 @@ test("scheduler: start asks for failed deliveries in the last 24 h and redeliver
   const { store, github, deps } = setup(H2);
   github.failed = [{ id: 41, guid: "g41" }, { id: 42, guid: "g42" }];
   store.activeKeys = [KEY];
-  const scheduler = new ReconcileScheduler({ ...deps, log: () => undefined, intervalMs: 60_000, inboxPollMs: 60_000 });
+  const scheduler = new ReconcileScheduler({ ...deps, log: () => undefined, intervalMs: 60_000 });
   scheduler.start();
+  scheduler.housekeeping();
+  await scheduler.idle();
   await scheduler.stop();
   assert.deepEqual(github.redelivered, [41, 42]);
   assert.equal(observations(store).length, 1, "the start-up sweep reconciled the active Review");

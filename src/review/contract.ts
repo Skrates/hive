@@ -89,6 +89,15 @@ export function contractValidator<T>(definition: string): ContractValidator<T> {
   };
 }
 
+/** §2.1/§9.1: CLI argument validation uses the actual property schema, including references. */
+export function contractPropertyValidator(definition: string, property: string): ContractValidator<unknown> {
+  const schema = contractSchema.$defs[definition] as { properties?: Record<string, unknown> } | undefined;
+  if (!schema?.properties || !(property in schema.properties)) throw new Error(`review contract has no ${definition}.${property}`);
+  const validate = ajv.compile({ $ref: `${contractSchema.$id}#/$defs/${definition}/properties/${property}` });
+  return input => validate(input) ? { ok: true, value: input }
+    : { ok: false, code: "malformed", detail: `${definition}.${property}: ${describe(validate.errors)}` };
+}
+
 export const validateCommand = contractValidator<Command>("Command");
 export const validateAction = contractValidator<Action>("Action");
 export const validateBatch = contractValidator<Batch>("Batch");

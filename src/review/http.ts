@@ -152,6 +152,9 @@ export async function routeReview(
   if ("actor" in body || "principal" in body) {
     return json(response, 400, { error: "bad_request", detail: "the body never names the actor; custody names it (§5.A1)" });
   }
+  if (caller.kind === "operator" && "custody" in body) {
+    return json(response, 400, { error: "bad_request", detail: "an operator act cannot carry seat custody" });
+  }
   const actId = body.act_id;
   if (typeof actId !== "string" || actId.length === 0) return json(response, 400, { error: "bad_request", detail: "missing act_id" });
   const expectedRevision = body.expected_revision;
@@ -206,8 +209,8 @@ function authenticate(request: IncomingMessage, deps: ReviewHttpDeps): Caller {
  * §5.A1: delivery custody. The edge names the delivery it is running and the
  * lease generation it holds; the broker proves custody with the one primitive
  * every delivery act passes through (`assertLease`) and reads the actor from
- * that ledger row — the same derivation `mintSeatWake` uses. Session custody
- * is recognised only to be declared deferred (M2).
+ * that ledger row — the same derivation `mintSeatWake` uses. For session custody
+ * the authenticated edge resolves its live token and this boundary proves actor enrollment.
  */
 function seatPrincipal(
   custody: unknown,
@@ -218,8 +221,18 @@ function seatPrincipal(
     return { status: 400, error: "bad_request", detail: "missing custody" };
   }
   const record = custody as Record<string, unknown>;
-  if ("session_token" in record) {
-    return { status: 401, error: "unauthorized", detail: "session custody is deferred (M2); present delivery custody" };
+  if ("session_id" in record) {
+    // The authenticated edge resolved a live registration token. The broker also proves
+    // that this actor is assigned to that edge; an edge cannot speak for another's seat.
+    if (typeof record.session_id !== "string" || !record.session_id
+      || typeof record.actor !== "string" || "delivery_id" in record || "generation" in record) {
+      return { status: 400, error: "bad_request", detail: "session custody needs one session_id and its edge-resolved actor" };
+    }
+    const subscription = broker.getActiveSubscription(record.actor);
+    if (!subscription?.edgeWorkspaces.some(workspace => workspace.edgeId === edgeId)) {
+      return { status: 401, error: "unauthorized", detail: "session actor has no live subscription assigned to this edge" };
+    }
+    return { kind: "seat", actor: record.actor, custody: { session_id: record.session_id } };
   }
   const deliveryId = record.delivery_id;
   const generation = record.generation;

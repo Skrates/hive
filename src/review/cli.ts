@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
 import type { Command } from "commander";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { resolveEdgeSocketPath } from "../edge/providers.js";
 import { udsRequest, udsRequestJson } from "../local/uds.js";
 import {
@@ -16,6 +16,7 @@ import { parseReviewKey } from "./key.js";
 import { readOwnerOnlyFile, SecretFileError } from "./secret-file.js";
 import { resetReviewStore, verifyOperatorToken, REVIEW_STATE_TABLES, REVIEW_STORE_GENERATION } from "./store.js";
 import { ulid } from "./ulid.js";
+import { contractArgument, contractOption } from "./cli-arguments.js";
 
 /**
  * `hive review …` (design §9.1). Every write mints a client ULID as its `act_id`
@@ -36,9 +37,10 @@ export interface ReviewActAnswer {
   receipt: Receipt;
 }
 
-/** The two custodies a write can present; the edge or the broker turns each into a Principal. */
+/** The credentials a write can present; the edge or broker derives the Principal. */
 export type Custody =
   | { kind: "delivery"; token: string }
+  | { kind: "session"; token: string }
   | { kind: "operator"; token: string };
 
 /** How the commands reach the edge socket and the broker; injectable so a test needs neither. */
@@ -65,11 +67,11 @@ export class ReviewCliError extends Error {
  * `--as-operator` is refused outright while `HIVE_DELIVERY_TOKEN` or
  * `HIVE_SESSION_TOKEN` is in the environment — the human credential does not
  * run inside an agent's execution environment — and the token file must be
- * owner-only. Session custody (`HIVE_SESSION_TOKEN` alone) is recognised only
- * to say it is not implemented yet (M2).
+ * owner-only. Session credentials are resolved against the edge's live registry,
+ * so a cached token file is no authority after expiry or deregistration.
  */
 export function resolveCustody(env: NodeJS.ProcessEnv, asOperator: boolean): Custody {
-  const agentVariable = ["HIVE_DELIVERY_TOKEN", "HIVE_SESSION_TOKEN"].find((name) => env[name] !== undefined) ?? null;
+  const agentVariable = ["HIVE_DELIVERY_TOKEN", "HIVE_DELIVERY_ID", "HIVE_SESSION_TOKEN", "HIVE_SESSION_TOKEN_FILE", "HIVE_ACTOR"].find((name) => env[name] !== undefined) ?? null;
   if (asOperator) {
     if (agentVariable !== null) {
       throw new ReviewCliError(
@@ -90,10 +92,11 @@ export function resolveCustody(env: NodeJS.ProcessEnv, asOperator: boolean): Cus
   }
   if (env.HIVE_DELIVERY_TOKEN) return { kind: "delivery", token: env.HIVE_DELIVERY_TOKEN };
   if (env.HIVE_SESSION_TOKEN) {
-    throw new ReviewCliError("session custody (HIVE_SESSION_TOKEN) is not implemented yet (M2); this session can read but not write");
+    return { kind: "session", token: env.HIVE_SESSION_TOKEN };
   }
+  if (env.HIVE_SESSION_TOKEN_FILE) return { kind: "session", token: readOwnerOnlyFile(env.HIVE_SESSION_TOKEN_FILE) };
   throw new ReviewCliError(
-    "no custody: a write presents HIVE_DELIVERY_TOKEN (exported by the edge for a running turn) "
+    "no custody: a write presents HIVE_DELIVERY_TOKEN, HIVE_SESSION_TOKEN, HIVE_SESSION_TOKEN_FILE "
     + "or --as-operator with HIVE_OPERATOR_TOKEN_FILE",
   );
 }
@@ -115,9 +118,24 @@ export function registerReviewCommands(
   program: Command,
   transport: ReviewTransport = defaultReviewTransport(),
   env: NodeJS.ProcessEnv = process.env,
+  out: (text: string) => void = text => { process.stdout.write(`${text}\n`); },
 ): void {
   const review = program.command("review").description("act on a pull-request review (design §9.1)");
-  const out = (text: string): void => { process.stdout.write(`${text}\n`); };
+
+  review.command("session")
+    .argument("<session-id>", "the running session registered by the live surface")
+    .requiredOption("--token-file <file>", "new owner-only file for this session's credential")
+    .description("bind review writes to an attested live session (§3.2)")
+    .action(async (sessionId: string, options: { tokenFile: string }) => {
+      const answer = await udsRequest(resolveEdgeSocketPath(env), "POST", "/review/session", { session_id: sessionId });
+      const custody = JSON.parse(answer.body) as { available: boolean; token?: string; reason?: string };
+      if (answer.status !== 200 || !custody.available || !custody.token) {
+        throw new ReviewCliError(`session custody deferred: ${custody.reason ?? "edge_unavailable"}; no credential written`);
+      }
+      // Exclusive creation refuses overwriting another session's file or following a symlink.
+      writeFileSync(options.tokenFile, custody.token, { mode: 0o600, flag: "wx" });
+      out(`Session credential written to ${options.tokenFile}; set HIVE_SESSION_TOKEN_FILE to that path for review writes.`);
+    });
 
   const readState = async (key: string, asOperator: boolean): Promise<ReviewState> => {
     assertKey(key);
@@ -312,8 +330,8 @@ export function registerReviewCommands(
   // Operator credential only (§4, §5.A2): never inside an agent environment.
   review.command("grant-rounds")
     .argument("<key>")
-    .argument("<k>", "rounds to add")
-    .requiredOption("--reason <text>")
+    .addArgument(contractArgument("GrantRoundsAction", "n", "<k>"))
+    .addOption(contractOption("GrantRoundsAction", "reason", "--reason <text>"))
     .requiredOption("--expect <rev>")
     .option("--as-operator")
     .option("--json")
@@ -323,9 +341,9 @@ export function registerReviewCommands(
 
   review.command("rule")
     .argument("<key>")
-    .argument("<finding-id>")
-    .requiredOption("--resolution <text>", "the owner's decision")
-    .requiredOption("--evidence <text>")
+    .addArgument(contractArgument("ResolveFindingAction", "finding_id", "<finding-id>"))
+    .addOption(contractOption("OwnerDecisionResolutionRequest", "resolution_text", "--resolution <text>"))
+    .addOption(contractOption("OwnerDecisionResolutionRequest", "evidence", "--evidence <text>"))
     .requiredOption("--expect <rev>")
     .option("--as-operator")
     .option("--json")
@@ -339,12 +357,12 @@ export function registerReviewCommands(
 
   review.command("availability")
     .argument("<key>")
-    .argument("<reviewer>")
+    .addArgument(contractArgument("SetReviewerAvailabilityAction", "reviewer", "<reviewer>"))
     .option("--available")
     .option("--unavailable")
-    .option("--reason <reason>", "quota | connector | meter")
-    .option("--until <iso>", "when the condition clears (ISO-8601 UTC)")
-    .requiredOption("--evidence <text>")
+    .addOption(contractOption("SetReviewerAvailabilityAction", "reason", "--reason <reason>"))
+    .addOption(contractOption("SetReviewerAvailabilityAction", "until", "--until <iso>"))
+    .addOption(contractOption("SetReviewerAvailabilityAction", "evidence", "--evidence <text>"))
     .requiredOption("--expect <rev>")
     .option("--as-operator")
     .option("--json")
@@ -366,7 +384,7 @@ export function registerReviewCommands(
 
   review.command("adopt-policy")
     .argument("<key>")
-    .argument("<version>")
+    .addArgument(contractArgument("AdoptPolicyAction", "version", "<version>"))
     .requiredOption("--expect <rev>")
     .option("--as-operator")
     .option("--json")
