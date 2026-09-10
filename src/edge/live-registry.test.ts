@@ -29,6 +29,74 @@ function registration(overrides: Partial<Parameters<LiveIngressRegistry["registe
   };
 }
 
+test("§3.2 session custody binds one attested actor; renewal keeps it and expiry or deregistration revokes it", () => {
+  let now = 0;
+  const live = new LiveIngressRegistry({ now: () => now });
+  const input = registration({ runtimeAttestation: first });
+  live.register(input, 60_000);
+  const custody = live.sessionCustody("thread-1");
+  assert.ok(custody.available);
+  assert.deepEqual(live.resolveSession(custody.token), { actor: "ariadne", session_id: "thread-1" });
+  now = 30_000;
+  live.register(input, 60_000);
+  assert.deepEqual(live.sessionCustody("thread-1"), custody);
+  now = 90_001;
+  assert.equal(live.resolveSession(custody.token), null);
+  live.register(input, 60_000);
+  const next = live.sessionCustody("thread-1");
+  assert.ok(next.available);
+  assert.notEqual(next.token, custody.token);
+  live.deregister("ariadne", "codex", "thread-1");
+  assert.equal(live.resolveSession(next.token), null);
+});
+
+test("§3.2 shared-edge sessions remain distinct; ambiguous or unattested custody is explicitly deferred", () => {
+  const live = new LiveIngressRegistry();
+  live.register(registration({ runtimeAttestation: first }), 60_000);
+  const ariadne = live.sessionCustody("thread-1");
+  assert.ok(ariadne.available);
+  live.register(registration({ actor: "theoros", sessionId: "thread-2", runtimeAttestation: {
+    ok: true, attestation: { ...first.attestation, actor: "theoros" },
+  } }), 60_000);
+  const theoros = live.sessionCustody("thread-2");
+  assert.ok(theoros.available);
+  assert.notEqual(ariadne.token, theoros.token);
+  assert.deepEqual(live.resolveSession(theoros.token), { actor: "theoros", session_id: "thread-2" });
+  live.register(registration({ actor: "theoros", runtimeAttestation: first }), 60_000);
+  assert.deepEqual(live.sessionCustody("thread-1"), { available: false, reason: "session_actor_ambiguous" });
+  assert.equal(live.resolveSession(ariadne.token), null);
+  live.deregister("theoros", "codex", "thread-1");
+  assert.equal(live.resolveSession(ariadne.token), null, "removing an ambiguous peer does not revive the old token");
+  live.register(registration({ runtimeAttestation: second }), 60_000);
+  assert.deepEqual(live.sessionCustody("thread-1"), { available: false, reason: "session_attestation_unproven" });
+  assert.deepEqual(live.sessionCustody("missing"), { available: false, reason: "session_not_registered" });
+});
+
+test("two sessions of one actor retain independent custody; a bare id shared across providers revokes only that id", () => {
+  const live = new LiveIngressRegistry();
+  const a = registration({ sessionId: "A", runtimeAttestation: first });
+  live.register(a, 60_000);
+  const tokenA = live.sessionCustody("A");
+  assert.ok(tokenA.available);
+  live.register({ ...a, sessionId: "B" }, 60_000);
+  const tokenB = live.sessionCustody("B");
+  assert.ok(tokenB.available);
+  live.register(a, 60_000);
+  assert.deepEqual(live.sessionCustody("A"), tokenA);
+  assert.deepEqual(live.resolveSession(tokenB.token), { actor: "ariadne", session_id: "B" });
+
+  live.register({ ...a, provider: "claude" }, 60_000);
+  assert.deepEqual(live.sessionCustody("A"), { available: false, reason: "session_actor_ambiguous" });
+  live.deregister("ariadne", "claude", "A");
+  assert.equal(live.resolveSession(tokenA.token), null);
+  const fresh = live.sessionCustody("A");
+  assert.ok(fresh.available);
+  assert.notEqual(fresh.token, tokenA.token);
+  live.deregister("ariadne", "codex", "A");
+  assert.equal(live.resolveSession(fresh.token), null);
+  assert.deepEqual(live.sessionCustody("B"), tokenB);
+});
+
 test("a live session keeps its first snapshot while the surface keeps reporting the same artifacts", () => {
   const live = new LiveIngressRegistry();
   live.register(registration({ runtimeAttestation: first }), 60_000);

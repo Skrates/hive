@@ -123,7 +123,7 @@ program.command("broker")
     const housekeeping = setInterval(() => {
       void housekeepingTick({
         sweep: () => store.requeueExpiredLeases(),
-        publish: () => review.publisher.drainOnce(),
+        publish: () => review.housekeeping(),
         drainOutbox: () => broker.drainOutbox(),
         attention: () => attention.publisher.drainOnce(),
         ...(attention.slack ? { attentionSlack: () => attention.slack!.drainOnce() } : {}),
@@ -403,6 +403,8 @@ const BrokerConfig = z.object({
   HIVE_ATTENTION_ENABLED: z.string().optional(),
   HIVE_ATTENTION_HUMAN_ID: z.string().optional(),
   HIVE_ATTENTION_SLACK_USER_ID: z.string().optional(),
+  HIVE_REVIEW_LOGFIRE_TOKEN: z.string().min(1).optional(),
+  HIVE_REVIEW_LOGFIRE_REGION: z.enum(["us", "eu"]).optional(),
 });
 
 const EdgeConfig = z.object({

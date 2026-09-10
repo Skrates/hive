@@ -74,9 +74,10 @@ test("without GitHub configuration the runtime boots the store and publisher, di
   assert.equal(runtime.http.adminToken, ADMIN);
   assert.equal(runtime.http.store, runtime.store);
   assert.equal(runtime.http.broker, broker);
-  assert.equal(lines.length, 1, "exactly one boot line");
-  assert.match(lines[0] ?? "", /GitHub adapter disabled/u);
-  assert.match(lines[0] ?? "", /not set/u);
+  assert.equal(lines.length, 2, "one line per unconfigured adapter");
+  assert.match(lines[0] ?? "", /Logfire export disabled/u);
+  assert.match(lines[1] ?? "", /GitHub adapter disabled/u);
+  assert.match(lines[1] ?? "", /not set/u);
 
   // The store lives in the broker's own database (§9.3 tables beside the broker's).
   const names = tables(broker);
@@ -127,6 +128,37 @@ test("a partial configuration is a boot failure, not a half-adapter", () => {
   );
 });
 
+test("Logfire needs an explicit project region with its token; no token boots without export", async () => {
+  assert.throws(() => boot({ HIVE_REVIEW_LOGFIRE_TOKEN: "fake-never-exported" }), /HIVE_REVIEW_LOGFIRE_REGION/u);
+  const { broker, runtime, lines } = boot({ HIVE_REVIEW_LOGFIRE_REGION: "eu" });
+  assert.ok(lines.some(line => line.includes("Logfire export disabled")));
+  await runtime.housekeeping();
+  await runtime.stop();
+  broker.close();
+});
+
+test("a housekeeping tick never waits for a persistent reconciliation lane", async t => {
+  const dir = scratch();
+  const { broker, runtime } = boot({
+    HIVE_GITHUB_WEBHOOK_SECRET_FILE: secretFile(dir, "webhook.secret", FAKE_SECRET),
+    HIVE_GITHUB_APP_ID: "12345",
+    HIVE_GITHUB_APP_KEY_FILE: secretFile(dir, "app.pem", FAKE_PEM),
+    HIVE_GITHUB_SUMMON_TOKEN_FILE: secretFile(dir, "summon.token", "fake-token"),
+  });
+  t.after(async () => { await runtime.stop(); broker.close(); rmSync(dir, { recursive: true, force: true }); });
+  const stalled = new Promise<void>(() => {});
+  runtime.scheduler!.housekeeping = () => stalled;
+  const ticks = Array.from({ length: 20 }, () => runtime.housekeeping());
+  let timeout: NodeJS.Timeout | undefined;
+  try {
+    const outcome = await Promise.race([
+      Promise.all(ticks).then(() => "completed"),
+      new Promise<string>(resolve => { timeout = setTimeout(() => resolve("retained"), 100); }),
+    ]);
+    assert.equal(outcome, "completed", "periodic ticks must not retain waiters on the stalled lane");
+  } finally { if (timeout) clearTimeout(timeout); }
+});
+
 test("a secret file readable beyond its owner is refused at boot (never a bare env var, never a warning)", () => {
   const dir = scratch();
   try {
@@ -154,8 +186,8 @@ test("with owner-only secret files the adapter is enabled: HMAC ingress persists
     assert.deepEqual(runtime.github, { appId: "12345" });
     assert.ok(runtime.scheduler !== null);
     assert.ok(runtime.http.reconcile !== null);
-    assert.equal(lines.length, 1);
-    assert.match(lines[0] ?? "", /enabled as App 12345/u);
+    assert.equal(lines.length, 2);
+    assert.match(lines[1] ?? "", /enabled as App 12345/u);
     assert.doesNotMatch(lines.join("\n"), new RegExp(FAKE_SECRET, "u"), "the secret is never logged");
 
     const webhook = runtime.http.webhook;

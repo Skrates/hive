@@ -15,6 +15,7 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 import type { Clock } from "../../time.js";
 import { iso, systemClock } from "../../time.js";
 import type { InboxDelivery } from "../store.js";
+import { noReviewTelemetry, type ReviewTelemetry } from "../telemetry.js";
 
 /**
  * The slice of the store this handler touches: `inbox.put` returns `false` on a duplicate
@@ -95,7 +96,16 @@ export function handleWebhook(
   secret: string,
   input: WebhookInput,
   clock: Clock = systemClock,
+  telemetry: ReviewTelemetry = noReviewTelemetry,
 ): WebhookResult {
+  return telemetry.sync("review.ingress", {}, span => {
+    const result = admitWebhook(store, secret, input, clock);
+    span.setAttributes({ outcome: result.outcome, http_status: result.status });
+    return result;
+  });
+}
+
+function admitWebhook(store: InboxStore, secret: string, input: WebhookInput, clock: Clock): WebhookResult {
   if (!verifySignature(secret, input.rawBody, header(input.headers, "x-hub-signature-256"))) {
     return { status: 401, outcome: "hmac_rejected" };
   }

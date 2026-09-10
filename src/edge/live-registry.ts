@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import type { AttestationRead } from "./attestation.js";
 import { canonicalActor, type Provider } from "../domain.js";
 
@@ -55,6 +56,9 @@ export class LiveIngressRegistryError extends Error {
   }
 }
 
+export type SessionCustody = { available: true; token: string }
+  | { available: false; reason: "session_not_registered" | "session_actor_ambiguous" | "session_attestation_unproven" };
+
 export class LiveIngressRegistry {
   private readonly entries = new Map<string, LiveIngress>();
   /**
@@ -63,6 +67,7 @@ export class LiveIngressRegistry {
    * whether the older session stopped, and only its own lapsed heartbeat does.
    */
   private readonly sessions = new Map<string, LiveIngress>();
+  private readonly sessionTokens = new WeakMap<LiveIngress, string>();
   private readonly now: () => number;
 
   constructor(dependencies: { now?: () => number } = {}) {
@@ -98,6 +103,10 @@ export class LiveIngressRegistry {
         if (held.expiresAt <= this.now()) this.sessions.delete(sessionKey);
       }
       this.sessions.set(`${bindingKey}:${entry.sessionId}`, entry);
+      const token = previous && held !== undefined ? this.sessionTokens.get(previous) : undefined;
+      if (token !== undefined) this.sessionTokens.set(entry, token);
+      // A conflicting registration or attestation revokes existing custody immediately.
+      this.sessionCustody(entry.sessionId);
     }
     return entry;
   }
@@ -111,6 +120,37 @@ export class LiveIngressRegistry {
       return null;
     }
     return entry;
+  }
+
+  /** The CLI presents a bare session id. Exactly one live registration must own it. */
+  sessionCustody(sessionId: string): SessionCustody {
+    const now = this.now();
+    const matches = [...this.sessions.values()].filter(entry => entry.sessionId === sessionId && entry.expiresAt > now);
+    const [entry] = matches;
+    if (entry === undefined) return { available: false, reason: "session_not_registered" };
+    if (matches.length > 1) {
+      for (const match of matches) this.sessionTokens.delete(match);
+      return { available: false, reason: "session_actor_ambiguous" };
+    }
+    if (!entry.runtimeAttestation.ok || canonicalActor(entry.runtimeAttestation.attestation.actor) !== canonicalActor(entry.actor)) {
+      this.sessionTokens.delete(entry);
+      return { available: false, reason: "session_attestation_unproven" };
+    }
+    let token = this.sessionTokens.get(entry);
+    if (token === undefined) {
+      token = randomBytes(32).toString("hex");
+      this.sessionTokens.set(entry, token);
+    }
+    return { available: true, token };
+  }
+
+  resolveSession(token: string): { actor: string; session_id: string } | null {
+    for (const entry of this.sessions.values()) {
+      if (entry.sessionId !== null && entry.expiresAt > this.now() && this.sessionTokens.get(entry) === token) {
+        return { actor: canonicalActor(entry.actor), session_id: entry.sessionId };
+      }
+    }
+    return null;
   }
 
   /**

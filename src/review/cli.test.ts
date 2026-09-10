@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import Database from "better-sqlite3";
 import { Command } from "commander";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -49,14 +50,8 @@ function cli(env: NodeJS.ProcessEnv, transport: ReviewTransport) {
   const stdout: string[] = [];
   const run = async (...args: string[]): Promise<string[]> => {
     const program = new Command().name("hive").exitOverride().configureOutput({ writeErr: () => {}, writeOut: () => {} });
-    registerReviewCommands(program, transport, env);
-    const original = process.stdout.write.bind(process.stdout);
-    process.stdout.write = ((chunk: string | Uint8Array) => { stdout.push(String(chunk)); return true; }) as typeof process.stdout.write;
-    try {
-      await program.parseAsync(["review", ...args], { from: "user" });
-    } finally {
-      process.stdout.write = original;
-    }
+    registerReviewCommands(program, transport, env, text => { stdout.push(`${text}\n`); });
+    await program.parseAsync(["review", ...args], { from: "user" });
     return stdout;
   };
   return { run, stdout };
@@ -74,7 +69,7 @@ function tokenFile(t: test.TestContext, mode: number): string {
 test("§5.A2: --as-operator is refused before any request while a seat token is in the environment", async (t) => {
   const { transport, calls } = fakeTransport();
   const file = tokenFile(t, 0o600);
-  for (const variable of ["HIVE_DELIVERY_TOKEN", "HIVE_SESSION_TOKEN"]) {
+  for (const variable of ["HIVE_DELIVERY_TOKEN", "HIVE_DELIVERY_ID", "HIVE_SESSION_TOKEN", "HIVE_SESSION_TOKEN_FILE", "HIVE_ACTOR"]) {
     const { run } = cli({ [variable]: "seat-token", HIVE_OPERATOR_TOKEN_FILE: file }, transport);
     await assert.rejects(
       run("grant-rounds", "Skrates/hive#7", "2", "--reason", "one more burn", "--expect", "4", "--as-operator"),
@@ -111,7 +106,7 @@ test("§5.A2: the operator token file must be owner-only, is read for the write,
   assert.throws(() => resolveCustody({}, true), /HIVE_OPERATOR_TOKEN_FILE/);
 });
 
-test("operator-only verbs refuse without --as-operator; a seat write needs a delivery token; session custody is deferred", async () => {
+test("operator-only verbs refuse without --as-operator; a seat write needs delivery or session custody", async () => {
   const { transport, calls } = fakeTransport();
   const { run } = cli({ HIVE_DELIVERY_TOKEN: "turn-token" }, transport);
   for (const verb of [
@@ -122,13 +117,15 @@ test("operator-only verbs refuse without --as-operator; a seat write needs a del
   ]) {
     await assert.rejects(run(verb[0]!, "42:7", ...verb.slice(1), "--expect", "4"), /operator act/);
   }
-  assert.deepEqual(calls, []);
+  assert.equal(calls.length, 0);
 
   const { run: runCold } = cli({}, transport);
   await assert.rejects(runCold("classify", "42:7", "fnd_05", "P3", "--expect", "4"), /no custody/);
   const { run: runSession } = cli({ HIVE_SESSION_TOKEN: "s" }, transport);
-  await assert.rejects(runSession("classify", "42:7", "fnd_05", "P3", "--expect", "4"), /not implemented yet \(M2\)/);
-  assert.deepEqual(calls, []);
+  await runSession("classify", "42:7", "fnd_05", "P3", "--expect", "4");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]!.via, "edgeAct");
+  assert.equal(calls[0]!.token, "s");
 });
 
 test("--expect is mandatory on every write and must be a revision", async () => {
@@ -214,6 +211,45 @@ test("answer reads the report file, binds the current subject when none is given
     subject_key: `${"c".repeat(40)}:main`,
     submission: { arm: "testimony", testimony: { cause: null, deliverable: { comment_id: 12 }, scars: [] } },
   });
+});
+
+test("§3.2 CLI stores a session token privately, never echoes it, and refuses overwrites", async t => {
+  const root = mkdtempSync(join(tmpdir(), "review-session-cli-"));
+  const socket = join(root, "edge.sock");
+  const file = join(root, "session.token");
+  const token = "fake-session-credential";
+  const server = createServer((request, response) => {
+    assert.equal(request.url, "/review/session");
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ available: true, token }));
+  });
+  await new Promise<void>(resolve => server.listen(socket, resolve));
+  t.after(async () => {
+    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    rmSync(root, { recursive: true, force: true });
+  });
+  const { run, stdout } = cli({ HIVE_EDGE_SOCKET: socket }, fakeTransport().transport);
+  await run("session", "session-1", "--token-file", file);
+  assert.equal(readFileSync(file, "utf8"), token);
+  assert.equal(statSync(file).mode & 0o777, 0o600);
+  assert.ok(!stdout.join("").includes(token));
+  assert.deepEqual(resolveCustody({ HIVE_SESSION_TOKEN_FILE: file }, false), { kind: "session", token });
+  await assert.rejects(run("session", "session-1", "--token-file", file), /EEXIST/);
+});
+
+test("§9.1 generated operator arguments enforce the contract before transport", async t => {
+  const { transport, calls } = fakeTransport();
+  const { run } = cli({ HIVE_OPERATOR_TOKEN_FILE: tokenFile(t, 0o600) }, transport);
+  for (const args of [
+    ["grant-rounds", "42:7", "0", "--reason", "no"],
+    ["adopt-policy", "42:7", "1.5"],
+    ["availability", "42:7", "codex", "--unavailable", "--reason", "unknown", "--evidence", "e"],
+    ["availability", "42:7", "codex", "--unavailable", "--reason", "quota", "--until", "yesterday", "--evidence", "e"],
+    ["rule", "42:7", "fnd_1", "--resolution", "", "--evidence", "e"],
+  ]) await assert.rejects(run(...args, "--expect", "4", "--as-operator"));
+  assert.equal(calls.length, 0);
+  await run("adopt-policy", "42:7", "2", "--expect", "4", "--as-operator");
+  assert.deepEqual(calls[0]!.body!.action, { kind: "AdoptPolicy", version: 2 });
 });
 
 test("read and reconcile need only the edge socket; --as-operator reads through the broker", async (t) => {
