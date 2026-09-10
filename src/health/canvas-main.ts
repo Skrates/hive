@@ -11,11 +11,11 @@ async function main(): Promise<void> {
   }
   const config = CanvasConfig.parse(JSON.parse(readFileSync(configPath, "utf8")));
   const snapshot = await collectCanvas(config);
-  let status = "Snapshot only. Unattended refresh has not been enabled.";
+  let status = "Snapshot only";
   if (mode === "publish") {
     try {
       if (execFileSync("systemctl", ["--user", "is-active", "hive-health-canvas.timer"], { encoding: "utf8", timeout: 2_000 }).trim() === "active") {
-        status = "Unattended refresh enabled: broker timer runs every five minutes.";
+        status = "Auto-refresh 5m";
       }
     } catch { /* One-off publishing does not claim a scheduled updater. */ }
   }

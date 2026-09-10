@@ -14,7 +14,7 @@ test("health ingest binds edge, actor, provider and profile; rejects extra secre
     providerVersion: "test", homeEdge: "owner", workspace: "work", edgeWorkspaces: [{ edgeId: "owner", cwd: "/work" }],
     wakePolicy: "spawn", permissionProfile: "workspace-write", accountProfile: "/missing-health-test-profile" }));
   const slack: SlackTransport = { async replay() { throw Error("unused"); }, async reply() { throw Error("unused"); }, async react() {} };
-  const server = new BrokerHttpServer(new BrokerService(store, slack), { host: "127.0.0.1", port: 0, adminToken: "x".repeat(32) });
+  const server = new BrokerHttpServer(new BrokerService(store, slack), { host: "127.0.0.1", port: 0, adminToken: "x".repeat(32), review: null });
   const { port } = await server.start();
   t.after(async () => { await server.stop(); store.close(); });
   const report = await probeProfile("seat", "/missing-health-test-profile", "claude");

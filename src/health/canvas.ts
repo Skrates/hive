@@ -12,9 +12,9 @@ export const CanvasConfig = z.object({
   doctrineRoot: z.string(), brokerDb: z.string(), canvasId: z.string().optional(),
   usageUrl: z.url(),
   probes: z.array(z.object({ actor: z.string(), edgeId: z.string(), command: Command })).default([]),
-  // Only explicit operator mappings join a collector to a seat when its local config is absent.
-  usageBindings: z.array(z.object({ actor: z.string(), edgeId: z.string(), profileId: z.string() })).default([]),
-  accountChanges: z.array(z.object({ actors: z.array(z.string()).min(1), label: z.string(), note: z.string(), previousPoolIds: z.array(z.string()).optional() })).default([]),
+  archiveUrl: z.url(),
+  // The manual roster owns collector joins; stale profile probes cannot override it.
+  usageBindings: z.array(z.object({ actor: z.string(), edgeId: z.string(), profileId: z.string() })).min(1),
 });
 export type CanvasConfig = z.infer<typeof CanvasConfig>;
 const Text = z.string().max(512);
@@ -43,7 +43,7 @@ export interface CanvasSnapshot {
   doctor: DoctorProfile[]; probes: HealthObservation[]; failedProbes: string[];
   usageState: string; brokerState: string;
   bindings: CanvasConfig["usageBindings"];
-  accountChanges: CanvasConfig["accountChanges"];
+  archiveUrl: string;
 }
 
 async function commandJson(command: string[]): Promise<any> {
@@ -98,7 +98,7 @@ export async function collectCanvas(config: CanvasConfig): Promise<CanvasSnapsho
     } finally { db.close(); }
   } catch { brokerState = "unreachable_or_unreadable"; }
   const snapshot: CanvasSnapshot = { generatedAt: new Date().toISOString(), doctrineCommit: commit, seats, pools: [], doctor: [],
-    probes: persisted, failedProbes: [], usageState: "unavailable", brokerState, bindings: config.usageBindings, accountChanges: config.accountChanges };
+    probes: persisted, failedProbes: [], usageState: "unavailable", brokerState, bindings: config.usageBindings, archiveUrl: config.archiveUrl };
   await Promise.all([
     (async () => {
       try {
@@ -150,97 +150,114 @@ function cell(value: unknown): string {
 function table(headers: string[], rows: unknown[][]): string {
   return [headers, headers.map(() => "---"), ...rows].map(row => `| ${row.map(cell).join(" | ")} |`).join("\n");
 }
-function stamp(value: string | null, now: string): string { return value ? `${value} (${age(value, now)})` : "never observed"; }
+function displayName(actor: string): string {
+  return actor.charAt(0).toUpperCase() + actor.slice(1);
+}
 
-export function renderCanvas(s: CanvasSnapshot, refreshStatus = "Snapshot only. Unattended refresh has not been enabled."): string {
-  const attention: string[] = [];
-  const overview: unknown[][] = [];
-  const details: string[] = [];
-  const joined = new Set<string>();
-  const retiredPools = new Set(s.accountChanges.flatMap(c => c.previousPoolIds ?? []));
-  // Display policy only: retained source history is never deleted or rewritten.
-  const currentReporters = s.doctor.filter(d => d.configured && !retiredPools.has(d.pool_id ?? ""));
-  const currentIds = new Set(currentReporters.map(d => d.profile_id));
-  const currentPools = s.pools.filter(p => !retiredPools.has(p.id) && p.profiles.some(d => currentIds.has(d.id)));
-  if (s.usageState !== "ready") attention.push(`Usage aggregator: ${s.usageState}; profile and quota status unverified.`);
-  if (s.brokerState !== "observed") attention.push(`Hive broker: ${s.brokerState}; subscriptions and deliveries unverified.`);
-  for (const seat of s.seats) {
-    const p = s.probes.find(p => p.actor === seat.actor && p.provider === seat.provider &&
-      p.edgeId === seat.subscription?.edge && !seat.profile.startsWith("~/") && p.accountProfile === seat.profile);
-    const binding = p?.usageProfileId && p.usageEdgeId ? { profileId: p.usageProfileId, edgeId: p.usageEdgeId }
-      : s.bindings.find(b => b.actor === seat.actor);
-    const d = binding ? currentReporters.find(d => d.profile_id === binding.profileId && d.edge_id === binding.edgeId && d.provider === seat.provider) : undefined;
-    if (d) joined.add(d.profile_id);
-    const pool = d ? currentPools.find(pool => pool.id === d.pool_id) : undefined;
-    const probeFresh = p && !stale(p.observedAt, s.generatedAt);
-    const auth = p ? `${stale(p.auth.observedAt, s.generatedAt) ? "stale / " : ""}${p.auth.state}` : "unverified";
-    const missing = seat.intendedSkills && p ? Object.keys(seat.intendedSkills).filter(n => !(n in p.skills)) : [];
-    const changed = seat.intendedSkills && p ? Object.keys(seat.intendedSkills).filter(n => n in p.skills && p.skills[n] !== seat.intendedSkills![n]) : [];
-    const missingPlugins = p ? seat.intendedPlugins.filter(n => !p.plugins.some(i => i.name === n && i.installed !== null)) : [];
-    const installation = !p ? "unverified" : `${probeFresh ? "" : "stale / "}${missing.length} missing; ${changed.length} differ from intended`;
-    const ownAttention: string[] = [];
-    const accountChange = s.accountChanges.find(change => change.actors.includes(seat.actor));
-    if (accountChange?.note) ownAttention.push(`current account: ${accountChange.label} (operator confirmed); ${accountChange.note}`);
-    const receiving = p?.receiving;
-    const expired = seat.subscription?.expiresAt != null && Date.parse(seat.subscription.expiresAt) <= Date.parse(s.generatedAt);
-    const receivingState = receiving && receiving.expiresAt > Date.parse(s.generatedAt) ? `receiving session ${receiving.sessionId ?? "unnamed"}`
-      : receiving ? "receiving heartbeat expired" : p?.receiving === null ? "no registered receiving session at observation" : "receiving session unverified";
-    if (!p) ownAttention.push(s.failedProbes.includes(seat.actor) ? "maintenance probe unreachable or failed (not an auth verdict)" : "maintenance never observed");
+function resetIn(value: string | null, now: string): string {
+  if (!value || !Number.isFinite(Date.parse(value))) return "unknown";
+  const minutes = Math.ceil((Date.parse(value) - Date.parse(now)) / 60_000);
+  if (minutes <= 0) return "awaiting refresh";
+  if (minutes < 60) return `${minutes}m`;
+  if (minutes < 1440) return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+  return `${Math.floor(minutes / 1440)}d ${Math.floor((minutes % 1440) / 60)}h`;
+}
+
+function mcpName(name: string): string {
+  if (name.startsWith("plugin:cloudflare:")) return "Cloudflare";
+  return name.replace(/^claude\.ai /, "").replace(/^plugin:[^:]+:/, "");
+}
+
+/** One row per declared seat. Detailed probe/collector evidence stays in the JSON receipt. */
+export function renderCanvas(s: CanvasSnapshot, refreshStatus = "Snapshot only"): string {
+  const attention = new Map<string, string[]>();
+  const add = (issue: string, actor: string) => {
+    const actors = attention.get(issue) ?? [];
+    if (!actors.includes(actor)) actors.push(actor);
+    attention.set(issue, actors);
+  };
+  if (s.usageState !== "ready") add("usage feed unavailable", "Usage");
+  if (s.brokerState !== "observed") add("broker state unavailable", "Hive");
+
+  const rows: string[][] = [];
+  // The explicit binding list owns order and membership, just as the app's
+  // roster does. Independent/historical collectors cannot add a sixth row.
+  for (const binding of s.bindings) {
+    const seat = s.seats.find(seat => seat.actor === binding.actor);
+    const name = displayName(binding.actor);
+    const d = s.doctor.find(d => d.configured && d.profile_id === binding.profileId &&
+      d.edge_id === binding.edgeId && (!seat || d.provider === seat.provider));
+    const pool = d ? s.pools.find(pool => pool.id === d.pool_id && pool.profiles.some(p => p.id === binding.profileId)) : undefined;
+    const usage = pool?.windows.length
+      ? pool.windows.map(w => `${w.label} ${Math.round(w.utilization * 100)}%`).join(" · ")
+      : "No reading";
+    const resets = pool?.windows.length
+      ? pool.windows.map(w => `${w.label} ${resetIn(w.resets_at, s.generatedAt)}`).join(" · ")
+      : "—";
+    const quotaAge = pool ? age(pool.sampled_at, s.generatedAt) : "unknown";
+    const edge = seat?.subscription;
+    const expired = edge?.expiresAt != null && Date.parse(edge.expiresAt) <= Date.parse(s.generatedAt);
+    const edgeState = !edge ? "unknown" : expired ? "expired" : stale(edge.lastSeen, s.generatedAt) ? "stale" : "online";
+    rows.push([`${name} · ${edge?.edge ?? seat?.machine ?? "unknown host"}`, usage, resets, `${quotaAge} · ${edgeState}`]);
+
+    if (!d) add("quota collector has no matched report", name);
     else {
-      if (!probeFresh) ownAttention.push("maintenance observation stale");
-      if (p.auth.state !== "local_login_present") ownAttention.push(`provider auth: ${auth}`);
-      if (p.inventory.state !== "observed") ownAttention.push(p.inventory.state);
-      const mcp = p.mcp.filter(c => !["connected", "tools_available", "none_configured", "disabled"].includes(c.state));
-      if (mcp.length) ownAttention.push(`MCP: ${mcp.map(c => `${c.name} ${c.state}`).join(", ")}`);
-      if (missing.length || changed.length) ownAttention.push(`skills: ${missing.length} missing, ${changed.length} differ from intended source`);
-      if (missingPlugins.length) ownAttention.push(`plugins missing: ${missingPlugins.join(", ")}`);
-      const badPlugins = p.plugins.filter(i => ["missing", "missing_files", "disabled_but_intended", "version_differs"].includes(i.state));
-      if (badPlugins.length) ownAttention.push(`plugin inventory: ${badPlugins.map(i => `${i.name} ${i.state}`).join(", ")}`);
+      if (stale(d.last_received_at, s.generatedAt)) add(`collector receipt ${age(d.last_received_at, s.generatedAt)}`, name);
+      if (d.last_outcome === "conflict") add(`latest quota rejected (${d.last_conflict?.kind ?? "conflict"})`, name);
     }
-    if (!d) ownAttention.push("usage collector binding unverified / no matched report");
+    if (!pool?.windows.length) add("quota unavailable", name);
+    if (pool && stale(pool.sampled_at, s.generatedAt)) add(`quota sample ${quotaAge}`, name);
+    if (pool && pool.status !== "ok") add(`quota ${pool.status.replaceAll("_", " ")}`, name);
+    if (edgeState === "stale" || expired) add(`Hive edge ${edgeState}`, name);
+    if (seat?.delivery && ["failed", "undeliverable"].includes(seat.delivery.status)) add(`last delivery ${seat.delivery.status}`, name);
+
+    const p = seat ? s.probes.find(p => p.actor === seat.actor && p.provider === seat.provider &&
+      p.edgeId === seat.subscription?.edge && !seat.profile.startsWith("~/") && p.accountProfile === seat.profile) : undefined;
+    // Stale maintenance is one actionable gap, not a list of old auth/plugin
+    // failures presented as current. Quota and edge freshness are independent.
+    if (!p || stale(p.observedAt, s.generatedAt)) {
+      add(p ? `maintenance checks stale (${age(p.observedAt, s.generatedAt)})`
+        : s.failedProbes.includes(binding.actor) ? "maintenance check failed" : "maintenance not observed", name);
+      continue;
+    }
+    if (stale(p.auth.observedAt, s.generatedAt)) add("provider auth check stale", name);
+    else if (p.auth.state !== "local_login_present") add(`provider auth ${p.auth.state.replaceAll("_", " ")}`, name);
+    const reconnect = new Set<string>();
+    const uncertain = new Set<string>();
+    for (const mcp of p.mcp) {
+      if (stale(mcp.observedAt, s.generatedAt)) { add("MCP checks stale", name); continue; }
+      if (mcp.state === "reauth_required") reconnect.add(mcpName(mcp.name));
+      else if (!["connected", "tools_available", "none_configured", "disabled"].includes(mcp.state)) uncertain.add(mcpName(mcp.name));
+    }
+    if (reconnect.size) add(`reconnect ${[...reconnect].join(", ")}`, name);
+    if (uncertain.size) add(`check ${[...uncertain].join(", ")} connections`, name);
+    if (stale(p.inventory.observedAt, s.generatedAt)) add("installation checks stale", name);
     else {
-      if (stale(d.last_received_at, s.generatedAt)) ownAttention.push(`collector last receipt ${age(d.last_received_at, s.generatedAt)}`);
-      if (d.last_outcome === "conflict") ownAttention.push(`latest usage rejected: ${d.last_conflict?.kind ?? "conflict"}`);
-      if (!pool || pool.windows.length === 0) ownAttention.push("no usable quota sample for the current collector");
+      if (p.inventory.state !== "observed") add(`installation ${p.inventory.state.replaceAll("_", " ")}`, name);
+      const intended = seat?.intendedSkills;
+      if (intended) {
+        const missing = Object.keys(intended).filter(n => !(n in p.skills));
+        const changed = Object.keys(intended).filter(n => n in p.skills && p.skills[n] !== intended[n]);
+        if (missing.length) add(`${missing.length} skills missing`, name);
+        if (changed.length) add(`${changed.length} skills differ from intended`, name);
+      }
+      const badPlugins = new Set(p.plugins.filter(i => ["missing", "missing_files", "disabled_but_intended", "version_differs"].includes(i.state)).map(i => i.name));
+      for (const plugin of seat?.intendedPlugins ?? []) if (!p.plugins.some(i => i.name === plugin && i.installed !== null)) badPlugins.add(plugin);
+      if (badPlugins.size) add(`${badPlugins.size} plugins need checking`, name);
     }
-    if (pool && stale(pool.sampled_at, s.generatedAt)) ownAttention.push(`quota sample ${age(pool.sampled_at, s.generatedAt)}`);
-    if (pool && pool.status !== "ok") ownAttention.push(`pool status ${pool.status} (pool evidence, not this profile's auth test)`);
-    if (seat.subscription && stale(seat.subscription.lastSeen, s.generatedAt)) ownAttention.push(`Hive edge last seen ${age(seat.subscription.lastSeen, s.generatedAt)}`);
-    if (expired) ownAttention.push("Hive subscription expired; new wakes are unroutable");
-    if (seat.delivery && ["failed", "undeliverable"].includes(seat.delivery.status)) ownAttention.push(`last Hive delivery ${seat.delivery.status}`);
-    attention.push(...ownAttention.map(text => `${seat.actor}: ${text}.`));
-    overview.push([seat.actor, `${seat.provider} / ${seat.subscription?.edge ?? seat.machine}`, accountChange ? `${accountChange.label}; collector ${d?.profile_id ?? "unmatched"}` : d?.profile_id ?? "unmatched",
-      auth, installation, expired ? "subscription expired; unroutable" : seat.subscription ? `edge ${age(seat.subscription.lastSeen, s.generatedAt)}; ${receivingState}` : "no observed subscription"]);
-    details.push(`## ${cell(seat.actor)}\n\nProfile: ${cell(seat.profile)}. Health source: ${cell(p ? `${p.edgeId} / ${p.sourceHost}` : `unverified; expected ${seat.subscription?.edge ?? seat.machine}`)}. Maintenance observed: ${stamp(p?.observedAt ?? null, s.generatedAt)}.\n\n` +
-      (accountChange ? `Current account: ${cell(accountChange.label)}, shared by ${accountChange.actors.map(cell).join(", ")} (operator confirmed). ${cell(accountChange.note)}\n\n` : "") +
-      `Provider auth: ${auth}; checked ${stamp(p?.auth.observedAt ?? null, s.generatedAt)}. Local login presence does not prove a successful provider request.\n\n` +
-      `Skills on disk: ${cell(p?.skillsRoot ?? "unverified or disabled")}; receipt ${cell(p?.doctrineCommit ?? "absent")}; intended ${s.doctrineCommit}. Missing: ${cell(missing.join(", ") || (p ? "none" : "unverified"))}. Differ from intended: ${cell(changed.join(", ") || (p ? "none" : "unverified"))}. An older receipt alone does not prove that files differ. Existing-session loaded skills and plugins: unverified.\n\n` +
-      table(["MCP server", "Connection / auth observation", "Checked at"], p ? p.mcp.map(c => [c.name, c.state, stamp(c.observedAt, s.generatedAt)]) : [["unknown", "unverified", "never observed"]]) + "\n\n" +
-      table(["Plugin / marketplace", "Disk version(s)", "Intended cached catalog version", "Evidence"], p?.plugins.length ? p.plugins.map(i => [i.name, i.installed ?? "missing", i.intended ?? "not declared", i.state]) : [["unknown", "unverified", "not declared", "unverified"]]) + "\n\n" +
-      `Plugin inventory checked: ${stamp(p?.inventory.observedAt ?? null, s.generatedAt)}. Cached catalogs are not a live marketplace version check.\n\n` +
-      `Hive subscription session: ${cell(seat.subscription?.sessionId ?? "not pinned")}; expires: ${cell(seat.subscription?.expiresAt ?? "no expiry / unknown")}. ` +
-      (seat.delivery ? `Most recent delivery: #${seat.delivery.id}, ${seat.delivery.status}, ${stamp(seat.delivery.at, s.generatedAt)}.` : "No observed delivery.") +
-      ` ${receivingState}. Reported runtime attestation: ${cell(receiving?.attestation ?? "unverified")}; it is a session claim, not verification of loaded files. An edge heartbeat or past delivery is not current session readiness.`);
   }
-  for (const d of currentReporters.filter(d => !joined.has(d.profile_id))) {
-    overview.push([`collector: ${d.profile_id}`, `${d.provider ?? "unknown"} / ${d.edge_id ?? "unknown edge"}`, d.profile_id, "unverified", "unverified", "no enrolled seat binding"]);
-    // Collectors are also valid outside Hive seats. Their observations remain
-    // visible; absence of a seat is not itself a collector failure.
-    if (stale(d.last_received_at, s.generatedAt)) attention.push(`${d.profile_id}: collector receipt ${age(d.last_received_at, s.generatedAt)}.`);
-    if (d.last_outcome === "conflict") attention.push(`${d.profile_id}: latest usage rejected: ${d.last_conflict?.kind ?? "conflict"}.`);
-    const pool = currentPools.find(p => p.id === d.pool_id);
-    if (!pool || !pool.windows.length) attention.push(`${d.profile_id}: no usable quota sample.`);
-    else if (stale(pool.sampled_at, s.generatedAt)) attention.push(`${d.profile_id}: quota sample ${age(pool.sampled_at, s.generatedAt)}.`);
+
+  const shared = new Map<string, string[]>();
+  for (const b of s.bindings) {
+    const key = `${b.edgeId}/${b.profileId}`;
+    shared.set(key, [...(shared.get(key) ?? []), displayName(b.actor)]);
   }
-  return `${refreshStatus}\n\nUpdated ${s.generatedAt}. Refresh target: every 5 minutes; treat this entire canvas as stale after 15 minutes without an update.\n\n` +
-    `## Needs attention\n\n${attention.length ? attention.map(t => `- ${cell(t)}`).join("\n") : "No failures observed; unverified checks remain unverified."}\n\n` +
-    `## Current seats and reporters\n\n${table(["Seat / reporter", "Provider / machine", "Usage profile", "Provider auth", "Skills on disk", "Hive"], overview)}\n\n` +
-    `## Quota pools\n\nPools are listed once. Profiles in the same pool share the reported quota; provisional bindings do not establish shared identity. Retained windows can be older than collector receipts.\n\n` +
-    table(["Pool ID / label", "Identity / status", "Profile bindings", "Utilization / reset", "Quota sample"], currentPools.map(p => [
-      `${p.id} / ${p.label}`, `${p.identity_state} / ${p.status}`, p.profiles.filter(i => currentIds.has(i.id)).map(i => `${i.id} (${i.binding_confidence})`).join(", "),
-      p.windows.map(w => `${w.label}: ${(w.utilization * 100).toFixed(0)}%; reset ${w.resets_at ?? "unknown"}`).join("; "), stamp(p.sampled_at, s.generatedAt),
-    ])) + "\n\n## Collector observations\n\n" + table(["Profile / edge", "Last receipt", "Last attempted sample", "Outcome / conflict"], currentReporters.map(d => [
-      `${d.profile_id} / ${d.edge_id ?? "unknown"}`, stamp(d.last_received_at, s.generatedAt), stamp(d.last_sampled_at, s.generatedAt),
-      `${d.last_outcome ?? "never"}; ${d.last_conflict ? `${d.last_conflict.kind} at ${d.last_conflict.at}` : "no recorded conflict"}`,
-    ])) + "\n\n" + details.join("\n\n");
+  const sharing = [...shared.values()].filter(actors => actors.length > 1)
+    .map(actors => `${actors.join(" + ")} share one subscription.`).join(" ");
+  const updated = new Date(s.generatedAt).toISOString().slice(0, 16).replace("T", " ") + " UTC";
+  return `Updated ${updated} · ${refreshStatus} · stale after 15m.\n\n` +
+    `## Needs attention\n\n${attention.size ? [...attention].map(([issue, actors]) => `- **${cell(actors.join(", "))}:** ${cell(issue)}.`).join("\n") : "No current issues observed."}\n\n` +
+    `## Seats\n\n${table(["Seat", "Used", "Reset in", "Quota age · Hive edge"], rows)}\n\n` +
+    `${sharing ? `${sharing} ` : ""}${s.bindings.length} seats · ${shared.size} ${shared.size === 1 ? "subscription" : "subscriptions"}.\n\n` +
+    `[Earlier State of the Weave — August 6 archive](${s.archiveUrl})\n`;
 }

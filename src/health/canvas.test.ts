@@ -19,100 +19,108 @@ function snapshot(): CanvasSnapshot {
     { profile_id: "silent", edge_id: "edge", provider: null, configured: true, last_received_at: null,
       last_sampled_at: null, last_outcome: null, pool_id: null, last_conflict: null }],
     probes: [], failedProbes: ["one"], usageState: "ready", brokerState: "observed",
-    bindings: [{ actor: "one", profileId: "collector-one", edgeId: "edge" }], accountChanges: [],
+    bindings: [{ actor: "one", profileId: "collector-one", edgeId: "edge" },
+      { actor: "never", profileId: "silent", edgeId: "edge" }], archiveUrl: "https://example.test/archive",
   };
 }
 
-test("never-seen seats and collectors remain visible and a pool failure is not profile auth", () => {
-  const output = renderCanvas(snapshot());
-  assert.match(output, /\| never \|/);
-  assert.match(output, /\| collector: silent \|/);
-  assert.match(output, /maintenance probe unreachable or failed \(not an auth verdict\)/);
-  assert.match(output, /pool status auth_expired \(pool evidence, not this profile's auth test\)/);
-  assert.match(output, /latest usage rejected: invalid_reset/);
-  assert.match(output, /quota sample 4d ago/);
-});
-
-test("receipt age cannot refresh a quota sample, and future/invalid dates never look fresh", () => {
-  assert.equal(age("nonsense", now), "invalid observation time");
-  assert.equal(age("2026-09-06T00:00:00Z", now), "invalid observation time");
-  const output = renderCanvas(snapshot());
-  assert.match(output, /2026-09-01T00:00:00.000Z \(4d ago\)/);
-  assert.match(output, /2026-09-05T15:00:00.000Z \(0m ago\)/);
-});
-
-test("a healthy independent collector needs no artificial seat assignment", () => {
+test("only roster seats appear, including no-reading placeholders", () => {
   const s = snapshot();
-  s.seats = []; s.bindings = []; s.failedProbes = [];
-  s.doctor = [{ ...s.doctor[0]!, last_outcome: "accepted", last_conflict: null }];
-  s.pools[0] = { ...s.pools[0]!, status: "ok", sampled_at: now, windows: [{ label: "7d", utilization: 0.5, resets_at: null }] };
-  let output = renderCanvas(s);
-  assert.match(output, /collector: collector-one/);
-  assert.match(output, /no enrolled seat binding/);
-  assert.match(output, /No failures observed/);
-  s.doctor[0]!.last_received_at = null;
-  output = renderCanvas(s);
-  assert.match(output, /collector-one: collector receipt never observed/);
-});
-
-test("same actor under a different pinned profile cannot supply a health verdict", async () => {
-  const s = snapshot();
-  const p = await probeProfile("one", "/missing-health-test-profile", "claude");
-  p.observedAt = now; p.auth = { state: "local_login_present", observedAt: now };
-  s.probes.push({ ...p, edgeId: "edge" });
-  assert.doesNotMatch(renderCanvas(s), /local_login_present/);
-});
-
-test("account replacement annotates history without fabricating or merging quota pools", () => {
-  const s = snapshot();
-  s.accountChanges = [{ actors: ["one", "never"], label: "Shared personal Max", note: "Previous Team samples are historical; new identity unreported." }];
-  const output = renderCanvas(s);
-  assert.match(output, /Shared personal Max, shared by one, never/);
-  assert.match(output, /pool-shared \/ Max/);
-  assert.equal(s.pools.length, 1);
-  s.accountChanges[0]!.note = "";
-  const resolved = renderCanvas(s);
-  assert.doesNotMatch(resolved.split("## Current seats")[0]!, /current account:/);
-  assert.match(resolved, /Shared personal Max, shared by one, never/);
-});
-
-test("retired reporters and pools are hidden without dropping current seats or mutating history", () => {
-  const s = snapshot();
-  s.doctor.push({ ...s.doctor[0]!, configured: false, profile_id: "retired-reporter" });
-  s.pools[0]!.profiles.push({ id: "retired-reporter", binding_confidence: "provisional" });
-  s.pools.push({ ...s.pools[0]!, id: "empty-old-pool", profiles: [] });
-  s.accountChanges = [{ actors: ["one"], label: "Shared personal Max", note: "Awaiting current usage", previousPoolIds: ["pool-shared"] }];
   const before = structuredClone(s);
   const output = renderCanvas(s);
-  for (const retired of ["retired-reporter", "empty-old-pool", "pool-shared", "collector-one"]) assert.ok(!output.includes(retired));
-  assert.match(output, /\| one \|/);
-  assert.match(output, /\| never \|/);
-  assert.match(output, /\| collector: silent \|/);
-  assert.match(output, /Shared personal Max/);
+  assert.match(output, /\| Never · shared-host \| No reading/);
+  assert.doesNotMatch(output, /collector:|Quota pools|Collector observations|Plugin \/ marketplace|pool-shared/);
+  assert.match(output, /maintenance check failed/);
+  assert.match(output, /latest quota rejected \(invalid_reset\)/);
   assert.deepEqual(s, before);
 });
 
-test("cx53 health requires the exact edge and absolute profile, never a local Mac or suffix match", async () => {
+test("receipt age cannot refresh quota age and reset times are compact", () => {
+  assert.equal(age("nonsense", now), "invalid observation time");
+  assert.equal(age("2026-09-06T00:00:00Z", now), "invalid observation time");
   const s = snapshot();
-  s.seats[0]!.subscription = { edge: "cx53", lastSeen: now, expiresAt: null, sessionId: null };
-  const p = { ...await probeProfile("one", "/missing-health-test-profile", "claude"), edgeId: "cx53", sourceHost: "agent-cx53", accountProfile: "/profiles/one", observedAt: now };
-  p.auth = { state: "local_login_present", observedAt: now };
-  s.probes = [p];
-  assert.match(renderCanvas(s), /Health source: cx53 \/ agent-cx53/);
-  p.edgeId = "mac";
-  assert.doesNotMatch(renderCanvas(s), /local_login_present/);
-  p.edgeId = "cx53"; s.seats[0]!.profile = "~/profiles/one";
-  assert.doesNotMatch(renderCanvas(s), /local_login_present/);
+  s.pools[0]!.windows = [{ label: "7d", utilization: 0.54, resets_at: "2026-09-07T15:00:00.000Z" }];
+  const output = renderCanvas(s);
+  assert.match(output, /7d 54%/);
+  assert.match(output, /7d 2d 0h/);
+  assert.match(output, /quota sample 4d ago/);
+  s.pools[0]!.windows[0]!.resets_at = null;
+  assert.match(renderCanvas(s), /7d unknown/);
+  s.pools[0]!.windows[0]!.resets_at = now;
+  assert.match(renderCanvas(s), /7d awaiting refresh/);
 });
 
-test("expired subscriptions and matched collectors without usable quotas need attention", () => {
+test("retired and independent collectors cannot add extra rows or alerts", () => {
+  const s = snapshot();
+  s.doctor.push({ ...s.doctor[0]!, configured: true, profile_id: "unrelated" });
+  s.doctor.push({ ...s.doctor[0]!, configured: false, profile_id: "retired" });
+  assert.doesNotMatch(renderCanvas(s), /unrelated|retired|collector:/);
+});
+
+test("explicit shared binding wins over an old probe's collector mapping", async () => {
+  const s = snapshot();
+  s.seats[0]!.subscription = { edge: "edge", lastSeen: now, expiresAt: null, sessionId: null };
+  const p = { ...await probeProfile("one", "/missing-health-test-profile", "claude"),
+    edgeId: "edge", accountProfile: "/profiles/one", observedAt: now,
+    usageProfileId: "obsolete-mac", usageEdgeId: "edge-mac" };
+  s.probes.push(p);
+  s.bindings[1] = { actor: "never", profileId: "collector-one", edgeId: "edge" };
+  s.doctor[0]!.last_outcome = "accepted";
+  s.pools[0] = { ...s.pools[0]!, status: "ok", sampled_at: now,
+    windows: [{ label: "7d", utilization: 0.5, resets_at: null }] };
+  const output = renderCanvas(s);
+  assert.equal((output.match(/7d 50%/g) ?? []).length, 2);
+  assert.match(output, /One \+ Never share one subscription/);
+  assert.match(output, /2 seats · 1 subscription/);
+  assert.doesNotMatch(output, /obsolete-mac|quota collector has no matched report|invalid_reset/);
+});
+
+test("stale maintenance groups uncertainty without repeating old reauthentication or drift", async () => {
+  const s = snapshot();
+  const p = { ...await probeProfile("one", "/missing-health-test-profile", "claude"),
+    edgeId: "edge", accountProfile: "/profiles/one", observedAt: "2026-09-02T15:00:00.000Z" };
+  p.mcp = [{ name: "Vercel", state: "reauth_required", observedAt: p.observedAt }];
+  s.seats[0]!.subscription = { edge: "edge", lastSeen: now, expiresAt: null, sessionId: null };
+  s.seats[0]!.intendedSkills = { changed: "new" }; p.skills = { changed: "old" };
+  s.probes = [p];
+  const output = renderCanvas(s);
+  assert.match(output, /maintenance checks stale \(3d ago\)/);
+  assert.doesNotMatch(output, /reconnect Vercel|skills differ/);
+});
+
+test("fresh reauthentication problems are grouped by service without plugin inventories", async () => {
+  const s = snapshot();
+  const p = { ...await probeProfile("one", "/missing-health-test-profile", "claude"),
+    edgeId: "edge", accountProfile: "/profiles/one", observedAt: now };
+  p.mcp = ["api", "builds", "bindings", "observability"].map(name => ({ name: `plugin:cloudflare:cloudflare-${name}`, state: "reauth_required", observedAt: now }));
+  s.seats[0]!.subscription = { edge: "edge", lastSeen: now, expiresAt: null, sessionId: null }; s.probes = [p];
+  const output = renderCanvas(s);
+  assert.match(output, /reconnect Cloudflare/);
+  assert.equal((output.match(/Cloudflare/g) ?? []).length, 1);
+  assert.doesNotMatch(output, /cloudflare-api|cloudflare-builds/);
+});
+
+test("health still requires the exact edge and absolute profile", async () => {
+  const s = snapshot();
+  s.seats[0]!.subscription = { edge: "cx53", lastSeen: now, expiresAt: null, sessionId: null };
+  const p = { ...await probeProfile("one", "/missing-health-test-profile", "claude"), edgeId: "cx53",
+    accountProfile: "/profiles/one", observedAt: now };
+  s.probes = [p];
+  assert.doesNotMatch(renderCanvas(s), /\*\*One:\*\* maintenance not observed/);
+  p.edgeId = "mac";
+  assert.match(renderCanvas(s), /maintenance not observed/);
+  p.edgeId = "cx53"; s.seats[0]!.profile = "~/profiles/one";
+  assert.match(renderCanvas(s), /maintenance not observed/);
+});
+
+test("expired subscriptions and unavailable feeds remain explicit", () => {
   const s = snapshot();
   s.seats[0]!.subscription = { edge: "edge", lastSeen: now, expiresAt: "2026-09-05T14:59:00.000Z", sessionId: "live" };
-  s.doctor[0]!.pool_id = null;
+  s.usageState = "unavailable";
   const output = renderCanvas(s);
-  assert.match(output, /subscription expired; new wakes are unroutable/);
-  assert.match(output, /subscription expired; unroutable/);
-  assert.match(output, /no usable quota sample/);
+  assert.match(output, /Hive edge expired/);
+  assert.match(output, /usage feed unavailable/);
+  assert.match(output, /quota unavailable/);
 });
 
 test("probe reads an explicitly declared skills directory", async t => {
