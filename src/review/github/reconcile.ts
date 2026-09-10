@@ -437,14 +437,13 @@ export class ReconcileScheduler {
   }
 
   /** One periodic pass; live ObservePR admissions own stalls (A4/D6), never a new system act. */
-  async housekeeping(): Promise<void> {
+  housekeeping(): void {
     this.drainInbox();
     const now = this.deps.clock.now().getTime();
     if (now >= this.nextSweepAt) {
       this.nextSweepAt = now + (this.deps.intervalMs ?? 5 * 60_000);
       this.sweep();
     }
-    await Promise.all([...this.lanes.values()].map(lane => lane.running ?? Promise.resolve()));
   }
 
   /** §7 "Gaps": on start, ask the App for failed deliveries in the last 24 h and redeliver each. */

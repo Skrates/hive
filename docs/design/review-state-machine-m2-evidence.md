@@ -26,6 +26,8 @@ attestation is known, and its attested actor matches the registered actor. Other
 reports `session_not_registered`, `session_actor_ambiguous`, or `session_attestation_unproven`.
 No token is issued on a deferred binding. Expiry, deregistration, session replacement and
 ambiguity revoke old tokens; removing ambiguity never revives a revoked token.
+The broker separately requires a currently unexpired subscription assigning the resolved actor
+to the authenticated edge.
 
 The operator of a live session runs:
 
@@ -55,6 +57,11 @@ in-memory exporter. With the credential and region set, a bounded batch exporter
 with `service.name=review`. A token without its region refuses boot. Credentials, report bodies
 and arbitrary exception text are not span attributes. Dashboards and live-export proof remain
 outside this code change.
+
+The housekeeping span measures each scheduling pass and reports actual admitted stall,
+reassignment and transport-exhaustion counts since the prior pass. It never awaits persistent
+reconciliation lanes. The publisher and reconciler retain their own single-flight ownership,
+so a stalled GitHub read cannot retain another housekeeping span on every five-second tick.
 
 ## Verification
 

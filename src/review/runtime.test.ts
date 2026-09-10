@@ -137,6 +137,28 @@ test("Logfire needs an explicit project region with its token; no token boots wi
   broker.close();
 });
 
+test("a housekeeping tick never waits for a persistent reconciliation lane", async t => {
+  const dir = scratch();
+  const { broker, runtime } = boot({
+    HIVE_GITHUB_WEBHOOK_SECRET_FILE: secretFile(dir, "webhook.secret", FAKE_SECRET),
+    HIVE_GITHUB_APP_ID: "12345",
+    HIVE_GITHUB_APP_KEY_FILE: secretFile(dir, "app.pem", FAKE_PEM),
+    HIVE_GITHUB_SUMMON_TOKEN_FILE: secretFile(dir, "summon.token", "fake-token"),
+  });
+  t.after(async () => { await runtime.stop(); broker.close(); rmSync(dir, { recursive: true, force: true }); });
+  const stalled = new Promise<void>(() => {});
+  runtime.scheduler!.housekeeping = () => stalled;
+  const ticks = Array.from({ length: 20 }, () => runtime.housekeeping());
+  let timeout: NodeJS.Timeout | undefined;
+  try {
+    const outcome = await Promise.race([
+      Promise.all(ticks).then(() => "completed"),
+      new Promise<string>(resolve => { timeout = setTimeout(() => resolve("retained"), 100); }),
+    ]);
+    assert.equal(outcome, "completed", "periodic ticks must not retain waiters on the stalled lane");
+  } finally { if (timeout) clearTimeout(timeout); }
+});
+
 test("a secret file readable beyond its owner is refused at boot (never a bare env var, never a warning)", () => {
   const dir = scratch();
   try {

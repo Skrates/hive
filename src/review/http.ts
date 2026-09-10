@@ -228,9 +228,9 @@ function seatPrincipal(
       || typeof record.actor !== "string" || "delivery_id" in record || "generation" in record) {
       return { status: 400, error: "bad_request", detail: "session custody needs one session_id and its edge-resolved actor" };
     }
-    const subscription = broker.getSubscription(record.actor);
+    const subscription = broker.getActiveSubscription(record.actor);
     if (!subscription?.edgeWorkspaces.some(workspace => workspace.edgeId === edgeId)) {
-      return { status: 401, error: "unauthorized", detail: "session actor is not assigned to this edge" };
+      return { status: 401, error: "unauthorized", detail: "session actor has no live subscription assigned to this edge" };
     }
     return { kind: "seat", actor: record.actor, custody: { session_id: record.session_id } };
   }

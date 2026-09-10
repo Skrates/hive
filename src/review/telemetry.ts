@@ -8,11 +8,11 @@ import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-proto";
 
 export type ReviewSpanName = "review.ingress" | "review.reconcile" | "review.admit"
   | "review.publish" | "review.housekeeping" | "review.outbox";
-interface ActiveSpan { span: Span; name: ReviewSpanName; parent: ActiveSpan | undefined; counts: Record<string, number> }
 
 export class ReviewTelemetry {
-  private readonly active = new AsyncLocalStorage<ActiveSpan>();
+  private readonly active = new AsyncLocalStorage<Span>();
   private readonly provider: NodeTracerProvider;
+  private counts: Record<string, number> = {};
 
   constructor(processors: SpanProcessor[] = []) {
     this.provider = new NodeTracerProvider({
@@ -24,34 +24,36 @@ export class ReviewTelemetry {
   private start(name: ReviewSpanName, attributes: Attributes): Span {
     const parent = this.active.getStore();
     return this.provider.getTracer("hive.review").startSpan(name, { attributes },
-      parent ? trace.setSpan(ROOT_CONTEXT, parent.span) : ROOT_CONTEXT);
+      parent ? trace.setSpan(ROOT_CONTEXT, parent) : ROOT_CONTEXT);
   }
 
   sync<T>(name: ReviewSpanName, attributes: Attributes, work: (span: Span) => T): T {
     const span = this.start(name, attributes);
-    try { return this.active.run({ span, name, parent: this.active.getStore(), counts: {} }, () => work(span)); }
+    try { return this.active.run(span, () => work(span)); }
     catch (error) { span.setStatus({ code: SpanStatusCode.ERROR }); throw error; }
     finally { span.end(); }
   }
 
   async run<T>(name: ReviewSpanName, attributes: Attributes, work: (span: Span) => Promise<T>): Promise<T> {
     const span = this.start(name, attributes);
-    try { return await this.active.run({ span, name, parent: this.active.getStore(), counts: {} }, () => work(span)); }
+    try { return await this.active.run(span, () => work(span)); }
     catch (error) { span.setStatus({ code: SpanStatusCode.ERROR }); throw error; }
     finally { span.end(); }
   }
 
   stop(): Promise<void> { return this.provider.shutdown(); }
-  attributes(attributes: Attributes): void { this.active.getStore()?.span.setAttributes(attributes); }
+  attributes(attributes: Attributes): void { this.active.getStore()?.setAttributes(attributes); }
 
   housekeepingCounts(counts: Record<string, number>): void {
     this.attributes(counts);
-    for (let current = this.active.getStore(); current; current = current.parent) {
-      if (current.name !== "review.housekeeping") continue;
-      for (const [name, value] of Object.entries(counts)) current.counts[name] = (current.counts[name] ?? 0) + value;
-      current.span.setAttributes(current.counts);
-      return;
-    }
+    for (const [name, value] of Object.entries(counts)) this.counts[name] = (this.counts[name] ?? 0) + value;
+  }
+
+  /** Actual admitted consequences since the previous periodic pass, not scheduled work. */
+  takeHousekeepingCounts(): Record<string, number> {
+    const counts = { stalls: 0, reassignments: 0, transport_exhaustion: 0, ...this.counts };
+    this.counts = {};
+    return counts;
   }
 }
 

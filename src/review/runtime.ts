@@ -122,7 +122,9 @@ export function bootReviewRuntime(input: ReviewRuntimeInput): ReviewRuntime {
       publisher,
       scheduler: null,
       github: null,
-      housekeeping: () => telemetry.run("review.housekeeping", { adapter_enabled: false }, () => publisher.drainOnce()),
+      housekeeping: () => telemetry.sync("review.housekeeping", {
+        adapter_enabled: false, ...telemetry.takeHousekeepingCounts(),
+      }, () => publisher.drainOnce()),
       http: { store, broker, webhook: null, adminToken: input.adminToken, reconcile: null },
       start: () => {},
       stop: async () => { await publisher.stop(); await telemetry.stop(); },
@@ -141,11 +143,11 @@ export function bootReviewRuntime(input: ReviewRuntimeInput): ReviewRuntime {
     publisher,
     scheduler,
     github: { appId },
-    housekeeping: () => telemetry.run("review.housekeeping", {
-      adapter_enabled: true, stalls: 0, reassignments: 0, transport_exhaustion: 0,
-    }, async () => {
-      const [handled] = await Promise.all([publisher.drainOnce(), scheduler.housekeeping()]);
-      return handled;
+    housekeeping: () => telemetry.sync("review.housekeeping", {
+      adapter_enabled: true, ...telemetry.takeHousekeepingCounts(),
+    }, () => {
+      scheduler.housekeeping();
+      return publisher.drainOnce();
     }),
     http: {
       store,
