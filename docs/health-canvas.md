@@ -10,7 +10,7 @@ The broker ledger supplies current enrollment, edge heartbeats, and last-deliver
 
 Fresh maintenance failures are grouped into short actions: reconnect services, inspect missing/differing skills, or check plugin installations. Four Cloudflare authentication failures become one Cloudflare action. A stale maintenance report produces one stale-check notice; its old auth and inventory failures are not repeated as current findings. This does not turn unknown or stale evidence into healthy status.
 
-Full per-profile MCP/plugin inventories, hashes, paths, collector details, and original observation timestamps remain in the owner-only `.md.json` report written alongside each canvas refresh. They are not repeated on the overview. Provider checks remain read-only and never start a model turn, refresh an account login, or modify installed skills/plugins.
+Full per-profile MCP/plugin inventories, hashes, paths, collector details, quota reset times, and original observation timestamps remain in the owner-only `.md.json` report written alongside each canvas refresh. They are not repeated on the overview. Provider checks remain read-only and never start a model turn, refresh an account login, or modify installed skills/plugins.
 
 ## Broker configuration
 
@@ -46,7 +46,7 @@ Build and check with `bun run check` and `bun run build`. Stage the exact commit
 node dist/health/canvas-main.js ~/.config/hive/health-canvas.json ~/.local/state/hive/health-canvas.md preview
 ```
 
-Preview writes Markdown plus the complete sanitized JSON report, both mode 0600. Check the five rows, shared usage, attention grouping, unknown/stale states, reset times, and historical-board link before publishing.
+Preview writes Markdown plus the complete sanitized JSON report, both mode 0600. Check the five rows, shared usage, attention grouping, unknown/stale states and historical-board link before publishing.
 
 ```sh
 systemctl --user start hive-health-canvas.service

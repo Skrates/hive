@@ -154,15 +154,6 @@ function displayName(actor: string): string {
   return actor.charAt(0).toUpperCase() + actor.slice(1);
 }
 
-function resetIn(value: string | null, now: string): string {
-  if (!value || !Number.isFinite(Date.parse(value))) return "unknown";
-  const minutes = Math.ceil((Date.parse(value) - Date.parse(now)) / 60_000);
-  if (minutes <= 0) return "awaiting refresh";
-  if (minutes < 60) return `${minutes}m`;
-  if (minutes < 1440) return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
-  return `${Math.floor(minutes / 1440)}d ${Math.floor((minutes % 1440) / 60)}h`;
-}
-
 function mcpName(name: string): string {
   if (name.startsWith("plugin:cloudflare:")) return "Cloudflare";
   return name.replace(/^claude\.ai /, "").replace(/^plugin:[^:]+:/, "");
@@ -191,14 +182,11 @@ export function renderCanvas(s: CanvasSnapshot, refreshStatus = "Snapshot only")
     const usage = pool?.windows.length
       ? pool.windows.map(w => `${w.label} ${Math.round(w.utilization * 100)}%`).join(" · ")
       : "No reading";
-    const resets = pool?.windows.length
-      ? pool.windows.map(w => `${w.label} ${resetIn(w.resets_at, s.generatedAt)}`).join(" · ")
-      : "—";
     const quotaAge = pool ? age(pool.sampled_at, s.generatedAt) : "unknown";
     const edge = seat?.subscription;
     const expired = edge?.expiresAt != null && Date.parse(edge.expiresAt) <= Date.parse(s.generatedAt);
     const edgeState = !edge ? "unknown" : expired ? "expired" : stale(edge.lastSeen, s.generatedAt) ? "stale" : "online";
-    rows.push([`${name} · ${edge?.edge ?? seat?.machine ?? "unknown host"}`, usage, resets, `${quotaAge} · ${edgeState}`]);
+    rows.push([`${name} · ${edge?.edge ?? seat?.machine ?? "unknown host"}`, usage, `${quotaAge} · ${edgeState}`]);
 
     if (!d) add("quota collector has no matched report", name);
     else {
@@ -257,7 +245,7 @@ export function renderCanvas(s: CanvasSnapshot, refreshStatus = "Snapshot only")
   const updated = new Date(s.generatedAt).toISOString().slice(0, 16).replace("T", " ") + " UTC";
   return `Updated ${updated} · ${refreshStatus} · stale after 15m.\n\n` +
     `## Needs attention\n\n${attention.size ? [...attention].map(([issue, actors]) => `- **${cell(actors.join(", "))}:** ${cell(issue)}.`).join("\n") : "No current issues observed."}\n\n` +
-    `## Seats\n\n${table(["Seat", "Used", "Reset in", "Quota age · Hive edge"], rows)}\n\n` +
+    `## Seats\n\n${table(["Seat", "Used", "Quota age · Hive edge"], rows)}\n\n` +
     `${sharing ? `${sharing} ` : ""}${s.bindings.length} seats · ${shared.size} ${shared.size === 1 ? "subscription" : "subscriptions"}.\n\n` +
     `[Earlier State of the Weave — August 6 archive](${s.archiveUrl})\n`;
 }

@@ -35,19 +35,16 @@ test("only roster seats appear, including no-reading placeholders", () => {
   assert.deepEqual(s, before);
 });
 
-test("receipt age cannot refresh quota age and reset times are compact", () => {
+test("receipt age cannot refresh quota age; reset details stay in the evidence", () => {
   assert.equal(age("nonsense", now), "invalid observation time");
   assert.equal(age("2026-09-06T00:00:00Z", now), "invalid observation time");
   const s = snapshot();
   s.pools[0]!.windows = [{ label: "7d", utilization: 0.54, resets_at: "2026-09-07T15:00:00.000Z" }];
   const output = renderCanvas(s);
   assert.match(output, /7d 54%/);
-  assert.match(output, /7d 2d 0h/);
+  assert.doesNotMatch(output, /Reset in|2d 0h/);
   assert.match(output, /quota sample 4d ago/);
-  s.pools[0]!.windows[0]!.resets_at = null;
-  assert.match(renderCanvas(s), /7d unknown/);
-  s.pools[0]!.windows[0]!.resets_at = now;
-  assert.match(renderCanvas(s), /7d awaiting refresh/);
+
 });
 
 test("retired and independent collectors cannot add extra rows or alerts", () => {
