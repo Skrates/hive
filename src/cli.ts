@@ -12,6 +12,7 @@ import { BrokerService, housekeepingTick } from "./broker/service.js";
 import { SlackCanaryPoster, SlackSocketIngress, SlackWebTransport } from "./broker/slack.js";
 import { BrokerStore, LegacyDatabaseError } from "./broker/store.js";
 import { SlackDeafnessWatchdog } from "./broker/watchdog.js";
+import { startHealthReporter } from "./health/edge-reporter.js";
 import { SubscriptionInputSchema, type Delivery, type SeatWakeReceipt } from "./domain.js";
 import { ensureEdgeStateDirs } from "./edge/bootstrap.js";
 import { BrokerClient } from "./edge/broker-client.js";
@@ -77,6 +78,7 @@ program.command("broker")
       host: config.HIVE_BROKER_HOST,
       port: config.HIVE_BROKER_PORT,
       adminToken: config.HIVE_ADMIN_TOKEN,
+      ...(config.HIVE_HEALTH_CANVAS_CONFIG ? { healthCanvasConfigPath: config.HIVE_HEALTH_CANVAS_CONFIG } : {}),
       review: review.http,
     });
     const slack = new SlackSocketIngress(
@@ -178,7 +180,9 @@ program.command("edge")
     await control.start();
     const controller = new AbortController();
     const run = edge.run(controller.signal);
+    const stopHealth = startHealthReporter(broker, live);
     await untilSignal(async () => {
+      stopHealth();
       controller.abort();
       await control.stop();
       await run;
@@ -352,6 +356,7 @@ const BrokerConfig = z.object({
   HIVE_SLACK_BOT_TOKEN: z.string().startsWith("xoxb-"),
   HIVE_SLACK_WORKSPACE_ID: z.string().min(1),
   HIVE_ADMISSION_POLICY: z.string().min(2),
+  HIVE_HEALTH_CANVAS_CONFIG: z.string().min(1).optional(),
   // Deafness threshold: silence past this while subscriptions are live opens a
   // link probe; unexplained silence then forces a Socket Mode reconnect, and a
   // second consecutive unexplained cycle exits for systemd.

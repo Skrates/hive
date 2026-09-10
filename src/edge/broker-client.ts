@@ -38,6 +38,14 @@ export class BrokerClient {
     private readonly token: string,
   ) {}
 
+  async healthProfiles(signal?: AbortSignal): Promise<Array<{ actor: string; provider: string; accountProfile: string; skillsDirectory: string | null }>> {
+    return this.json(await this.request("/v1/health/profiles", { method: "GET", signal: AbortSignal.any([AbortSignal.timeout(15_000), ...(signal ? [signal] : [])]) }));
+  }
+
+  async reportHealth(report: unknown, signal?: AbortSignal): Promise<void> {
+    await this.json(await this.request("/v1/health", { method: "POST", body: JSON.stringify(report), signal: AbortSignal.any([AbortSignal.timeout(15_000), ...(signal ? [signal] : [])]) }));
+  }
+
   async claim(after: number, waitMs = 25_000, busySlots: readonly BusySlot[] = []): Promise<Delivery | null> {
     const busy = busySlots.length > 0 ? `&busy=${encodeURIComponent(formatBusySlots(busySlots))}` : "";
     const response = await this.request(`/v1/deliveries?after=${after}&wait_ms=${waitMs}${busy}`, { method: "GET" });

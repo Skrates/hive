@@ -234,6 +234,13 @@ export class BrokerStore {
         FOREIGN KEY(home_edge) REFERENCES edges(edge_id)
       );
 
+      CREATE TABLE IF NOT EXISTS profile_health (
+        actor TEXT PRIMARY KEY REFERENCES subscriptions(actor) ON DELETE CASCADE,
+        edge_id TEXT NOT NULL,
+        received_at TEXT NOT NULL,
+        report_json TEXT NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS slack_events (
         event_id TEXT PRIMARY KEY,
         workspace_id TEXT NOT NULL,
@@ -539,6 +546,17 @@ export class BrokerStore {
       }
       return value;
     })();
+  }
+
+  healthProfiles(edgeId: string): Array<{ actor: string; provider: string; accountProfile: string }> {
+    return this.db.prepare("SELECT actor,provider,account_profile AS accountProfile FROM subscriptions WHERE home_edge=? ORDER BY actor")
+      .all(edgeId) as Array<{ actor: string; provider: string; accountProfile: string }>;
+  }
+
+  recordHealth(edgeId: string, report: { actor: string }): void {
+    this.db.prepare(`INSERT INTO profile_health(actor,edge_id,received_at,report_json) VALUES(?,?,?,?)
+      ON CONFLICT(actor) DO UPDATE SET edge_id=excluded.edge_id,received_at=excluded.received_at,report_json=excluded.report_json`)
+      .run(report.actor, edgeId, iso(this.clock), JSON.stringify(report));
   }
 
   createEdge(edgeId: string): string {

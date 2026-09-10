@@ -4,11 +4,15 @@ import { canonicalActor, DeliveryResultInputSchema, DispatchNoticesSchema, Reaso
 import { routeReview, type ReviewHttpDeps } from "../review/http.js";
 import { BrokerService } from "./service.js";
 import { InvalidTransitionError, SeatWakeRefusedError, StaleLeaseError, TurnSlotReductionError } from "./store.js";
+import { ProfileReport } from "../health/report.js";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
 export interface BrokerHttpConfig {
   host: string;
   port: number;
   adminToken: string;
+  healthCanvasConfigPath?: string;
   /**
    * The review surface (design §5, §9; `src/review/http.ts`). Null mounts none of
    * it — the state a broker is in before the integrator wires a `ReviewStore`.
@@ -93,6 +97,22 @@ export class BrokerHttpServer {
     }
 
     const edgeId = this.requireEdge(request);
+    if (request.method === "GET" && url.pathname === "/v1/health/profiles") {
+      const config = this.config.healthCanvasConfigPath ? JSON.parse(readFileSync(this.config.healthCanvasConfigPath, "utf8")) : null;
+      const registry = config ? JSON.parse(readFileSync(join(config.doctrineRoot, "seats/registry.json"), "utf8")) : {};
+      return json(response, 200, this.broker.store.healthProfiles(edgeId).map(profile => ({ ...profile,
+        skillsDirectory: registry[profile.actor]?.skills_dir !== undefined ? registry[profile.actor].skills_dir : join(profile.accountProfile, "skills"),
+      })));
+    }
+    if (request.method === "POST" && url.pathname === "/v1/health") {
+      const report = ProfileReport.parse(await readJson(request));
+      const profile = this.broker.store.healthProfiles(edgeId).find(p => p.actor === report.actor);
+      if (!profile || profile.provider !== report.provider || profile.accountProfile !== report.accountProfile) {
+        throw new HttpError(403, "profile_mismatch");
+      }
+      this.broker.store.recordHealth(edgeId, report);
+      return json(response, 200, { ok: true });
+    }
     if (request.method === "GET" && url.pathname === "/v1/deliveries") {
       const after = integerParam(url.searchParams.get("after"), 0);
       const waitMs = integerParam(url.searchParams.get("wait_ms"), 0);

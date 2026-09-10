@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh Hive profile health every five minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+Unit=hive-health-canvas.service
+
+[Install]
+WantedBy=timers.target
