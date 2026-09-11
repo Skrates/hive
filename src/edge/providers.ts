@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
-import { canonicalActor, type Delivery, type Provider, type Subscription } from "../domain.js";
+import { canonicalActor, ReasonSchema, type Reason, type Delivery, type Provider, type Subscription } from "../domain.js";
 import { UdsHttpError, udsRequestJson } from "../local/uds.js";
 import { clampEffortToCodexModel, clampEffortToMax, clampEffortToXhigh, type WakeEffort } from "./effort.js";
 import type { LiveIngress } from "./live-registry.js";
@@ -30,6 +30,13 @@ export type ProviderDispatch = ProviderDispatchBase & (
     /** Dispatch was accepted, but the provider has not produced an outcome. */
     processed: false;
     outcome?: never;
+    failure?: never;
+  }
+  | {
+    /** A completed attempt failed; retain its outcome for the retry notice. */
+    processed: false;
+    outcome: string;
+    failure: Reason;
   }
 );
 
@@ -110,7 +117,7 @@ export class CodexProvider implements ProviderAdapter {
   }
 
   async deliverLive(ingress: LiveIngress, delivery: Delivery, framed: string): Promise<ProviderDispatch> {
-    let result: { receipt?: unknown; outcome?: unknown; processed?: unknown };
+    let result: { receipt?: unknown; outcome?: unknown; processed?: unknown; failure?: unknown };
     try {
       result = await udsRequestJson(ingress.socketPath, "POST", "/deliver", { delivery, framed });
     } catch (error) {
@@ -124,12 +131,16 @@ export class CodexProvider implements ProviderAdapter {
       || receipt.length > MAX_CODEX_LIVE_RECEIPT_CHARS) {
       throw new Error("Codex live ingress invalid response");
     }
-    if (result.processed !== true) throw new Error("Codex live ingress returned before turn completion");
+
     const outcome = result.outcome;
     if (typeof outcome !== "string" || outcome.length === 0
       || outcome.length > MAX_CODEX_LIVE_OUTCOME_CHARS) {
       throw new Error("Codex live ingress invalid outcome");
     }
+    if (result.processed === false) {
+      return { receipt, outcome, processed: false, failure: ReasonSchema.parse(result.failure) };
+    }
+    if (result.processed !== true) throw new Error("Codex live ingress returned before turn completion");
     return { receipt, outcome, processed: true };
   }
 
@@ -533,9 +544,40 @@ async function runHeadless(
     child.once("error", reject);
     child.once("close", resolve);
   });
-  if (code !== 0) throw new Error(`${command} exited ${code}: ${Buffer.concat(stderr).toString("utf8").slice(-2_000)}`);
   const output = Buffer.concat(stdout).toString("utf8");
-  return { receipt: output.slice(-4_000), outcome: headlessAcknowledgement(output), processed: true };
+  const result = headlessDispatchResult(output);
+  // Claude may exit nonzero alongside its structured error result. Preserve
+  // that result and the seat's text instead of throwing them away.
+  if (!result.processed && result.failure) return result;
+  if (code !== 0) throw new Error(`${command} exited ${code}: ${Buffer.concat(stderr).toString("utf8").slice(-2_000)}`);
+  return result;
+}
+
+/**
+ * Read failure events from the full stream, before the diagnostic tail is cut.
+ * Codex can emit an error item for a dead tool runtime and still exit zero with
+ * turn.completed. Ordinary command failures are command_execution items, not
+ * runtime error items; a seat can recover from those within its turn.
+ */
+export function headlessDispatchResult(output: string): ProviderDispatch {
+  let failure: Reason | undefined;
+  for (const line of output.split("\n")) {
+    let value: Record<string, unknown>;
+    try { value = JSON.parse(line); } catch { continue; }
+    if (!value || typeof value !== "object") continue;
+    const item = value.item as Record<string, unknown> | undefined;
+    if ((value.type === "item.completed" && item?.type === "error")
+      || value.type === "turn.failed" || value.type === "error") {
+      failure = { code: "provider_runtime_failed", detail: "Codex reported a runtime error in the provider stream" };
+    }
+    if (value.type === "result" && (value.is_error === true
+      || (typeof value.subtype === "string" && value.subtype !== "success"))) {
+      failure = { code: "provider_runtime_failed", detail: "Provider reported an unsuccessful result" };
+    }
+  }
+  const receipt = output.slice(-4_000);
+  const outcome = headlessAcknowledgement(output, failure ? "Headless provider turn failed without a textual outcome." : undefined);
+  return failure ? { receipt, outcome, processed: false, failure } : { receipt, outcome, processed: true };
 }
 
 /**
@@ -546,7 +588,7 @@ async function runHeadless(
  * fallback when a disturbed run emits no usable `result`. Runs on the FULL
  * stream — never on a truncated receipt.
  */
-export function headlessAcknowledgement(output: string): string {
+export function headlessAcknowledgement(output: string, fallback = "Headless provider turn completed successfully."): string {
   let resultText: string | null = null;
   let agentMessageText: string | null = null;
   let lastAssistantText: string | null = null;
@@ -568,7 +610,7 @@ export function headlessAcknowledgement(output: string): string {
       // Provider outputs are JSONL on supported surfaces; non-JSON diagnostics are ignored.
     }
   }
-  const best = resultText ?? agentMessageText ?? lastAssistantText ?? "Headless provider turn completed successfully.";
+  const best = resultText ?? agentMessageText ?? lastAssistantText ?? fallback;
   return best.length <= 2_500 ? best : `${best.slice(0, 2_497)}…`;
 }
 

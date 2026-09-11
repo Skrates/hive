@@ -3,7 +3,7 @@ import { realpath, stat } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { dedupeKey, type Delivery } from "../domain.js";
+import { dedupeKey, type Reason, type Delivery } from "../domain.js";
 import { attestationWire, readWakeAttestation } from "../edge/attestation.js";
 import { prepareSocketPath, udsRequestJson } from "../local/uds.js";
 import { CodexAppServerClient } from "./app-server.js";
@@ -48,7 +48,8 @@ const MAX_CODEX_LIVE_OUTCOME_CHARS = 30_000;
 interface CompletedLiveDelivery {
   receipt: string;
   outcome: string;
-  processed: true;
+  processed: boolean;
+  failure?: Reason;
 }
 
 type LiveTarget =
@@ -333,12 +334,9 @@ export async function completeCodexDelivery(
     accepted.turnId,
     remainingBefore(deadline, now),
   );
-  if (completion.status !== "completed") {
-    throw new Error(`Codex app-server turn ${accepted.turnId} ${completion.status}`);
-  }
   const text = boundedLiveOutcome(
     completion.assistantText?.trim()
-      || `Codex ${accepted.mode} turn ${accepted.turnId} completed without a textual final message.`,
+      || `Codex ${accepted.mode} turn ${accepted.turnId} ${completion.status} without a textual final message.`,
   );
   return {
     receipt: JSON.stringify({
@@ -350,7 +348,10 @@ export async function completeCodexDelivery(
       status: completion.status,
     }),
     outcome: text,
-    processed: true,
+    processed: completion.status === "completed",
+    ...(completion.status === "completed" ? {} : {
+      failure: { code: "provider_runtime_failed", detail: `Codex turn ${completion.status}` },
+    }),
   };
 }
 
@@ -373,12 +374,9 @@ export async function completeDesktopDelivery(
     accepted,
     remainingBefore(deadline, now),
   );
-  if (completion.status !== "completed") {
-    throw new Error(`Codex Desktop turn ${accepted.turnId} ${completion.status}`);
-  }
   const text = boundedLiveOutcome(
     completion.assistantText?.trim()
-      || `Codex Desktop ${accepted.mode} turn ${accepted.turnId} completed without a textual final message.`,
+      || `Codex Desktop ${accepted.mode} turn ${accepted.turnId} ${completion.status} without a textual final message.`,
   );
   return {
     receipt: JSON.stringify({
@@ -390,7 +388,10 @@ export async function completeDesktopDelivery(
       status: completion.status,
     }),
     outcome: text,
-    processed: true,
+    processed: completion.status === "completed",
+    ...(completion.status === "completed" ? {} : {
+      failure: { code: "provider_runtime_failed", detail: `Codex turn ${completion.status}` },
+    }),
   };
 }
 

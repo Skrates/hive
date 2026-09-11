@@ -1551,3 +1551,27 @@ test("an actor id obeys the addressing grammar, so every legal actor round-trips
   assert.throws(() => parseBusySlots("ta,los:1"), BusySlotFormatError);
   assert.throws(() => parseBusySlots("9gnomon:1"), BusySlotFormatError);
 });
+
+
+test("failed provider attempts retain reasons and outcomes through backoff and exhaustion", () => {
+  const { store, clock } = fixture({ maxAttempts: 2 });
+  store.ingestEvent(event());
+  const first = store.claimNext("mac", 0)!;
+  const reason = { code: "provider_runtime_failed", detail: "runtime unavailable" };
+  const outcome = "Blocked before claiming: tool runtime could not start.";
+  const pending = store.release(first.id, "mac", first.leaseGeneration!, reason, outcome);
+  assert.equal(pending.status, "pending");
+  assert.deepEqual(pending.reasons, [reason]);
+  assert.equal(store.claimNext("mac", 0), null, "backoff prevents immediate respawn");
+  assert.ok(store.listUnsentOutbox().some(row => row.text.includes(outcome)));
+  clock.advance(retryBackoffMs(1));
+  const second = store.claimNext("mac", 0)!;
+  assert.ok(second);
+  const failed = store.release(second.id, "mac", second.leaseGeneration!, reason, outcome);
+  assert.equal(failed.status, "failed");
+  assert.deepEqual(failed.reasons, [reason]);
+  assert.equal(store.listUnsentOutbox().filter(row => row.text.includes(outcome)).length, 2);
+  clock.advance(60 * 60_000);
+  assert.equal(store.claimNext("mac", 0), null, "attempt bound stops retries");
+  store.close();
+});
