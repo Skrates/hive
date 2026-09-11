@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -14,7 +14,7 @@ import {
   type ProviderAdapter,
   type ProviderDispatch,
 } from "./providers.js";
-import { headlessAcknowledgement, type HeadlessDispatch } from "./providers.js";
+import { headlessDispatchResult, headlessAcknowledgement, type HeadlessDispatch } from "./providers.js";
 import { EdgeService } from "./service.js";
 import { EdgeStore, type AttestationBinding } from "./store.js";
 
@@ -118,7 +118,7 @@ function delivery(id: number, overrides: Partial<Delivery> = {}): Delivery {
 }
 
 interface FinishRecord { deliveryId: number; result: DeliveryResultInput }
-interface ReleaseRecord { deliveryId: number; reason: Reason }
+interface ReleaseRecord { deliveryId: number; reason: Reason; outcome: string | null }
 
 class FakeBroker {
   readonly edgeId = "mac";
@@ -160,8 +160,8 @@ class FakeBroker {
     this.finishes.push({ deliveryId: value.id, result });
     return { ...value, status: result.status };
   }
-  async release(value: Delivery, reason: Reason): Promise<Delivery> {
-    this.releases.push({ deliveryId: value.id, reason });
+  async release(value: Delivery, reason: Reason, outcome: string | null = null): Promise<Delivery> {
+    this.releases.push({ deliveryId: value.id, reason, outcome });
     return { ...value, status: "pending" };
   }
   async outcome(deliveryId: number, text: string): Promise<Delivery> {
@@ -1163,3 +1163,21 @@ test("a live delivery with a conflicting Effort overlay publishes the conflict, 
   store.close();
 });
 
+
+
+test("delivery 2593 runtime error releases the failed attempt with its actual outcome", async () => {
+  const stream = readFileSync("test/fixtures/codex-preclaim-runtime-error.jsonl", "utf8");
+  const parsed = headlessDispatchResult(stream);
+  assert.equal(parsed.processed, false);
+  const broker = new FakeBroker([delivery(1)]);
+  const store = new EdgeStore(":memory:");
+  const edge = new EdgeService(asBrokerClient(broker), store, new LiveIngressRegistry(),
+    [new StubAdapter({ headlessResult: parsed })]);
+  await edge.processOne();
+  assert.equal(broker.finishes.length, 0);
+  assert.equal(broker.releases[0]?.reason.code, "provider_runtime_failed");
+  assert.match(broker.releases[0]?.outcome ?? "", /Blocked before claiming/);
+  assert.equal(store.get(1)?.status, "released");
+  assert.equal(store.get(1)?.provider_receipt, parsed.receipt);
+  store.close();
+});
