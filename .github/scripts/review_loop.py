@@ -737,7 +737,11 @@ EXEMPT_PATHS_ENV = "REVIEW_LOOP_EXEMPT_PATHS"
 # per repository and must not have the helper re-read one it already dated.
 EXEMPT_PATHS_SINCE_ENV = "REVIEW_LOOP_EXEMPT_PATHS_SINCE"
 DEFAULT_SKILL_AUDIT_ACTOR = "theoros"
-SKILL_AUDIT_WINDOW_DAYS = 7
+SKILL_AUDIT_WORKFLOW_FILE = "skill-audit.yml"
+# First-run / missing-workflow lookback. Consecutive runs watermark from the
+# previous successful run of this workflow, so a delayed schedule cannot leave
+# skill commits between two windows; 14 days is only the bootstrap overlap.
+SKILL_AUDIT_FALLBACK_DAYS = 14
 # How far back the scheduled terminal sweep looks for fork closures the
 # ``pull_request`` event could not export.  Wider than any plausible schedule
 # gap on purpose: re-emitting a closure already exported is free (the span
@@ -7982,20 +7986,88 @@ def skills_changed_since(github: GitHubApi, since: datetime) -> bool:
     return False
 
 
-def send_skill_audit() -> None:
+def _skill_audit_run_started(run: Mapping[str, Any]) -> datetime | None:
+    raw = run.get("created_at")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        parsed = parse_github_time(raw.strip())
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed
+
+
+def skill_audit_window_start(
+    github: GitHubApi,
+    *,
+    now: datetime,
+    current_run_id: str,
+) -> tuple[datetime, str]:
+    """Start the window at the previous successful skill-audit run.
+
+    The routine's own run record is the watermark: no Slack history, no
+    committed marker, no second store to drift.  A run that failed never
+    advances it, so a failure widens the next window instead of dropping the
+    skill commits it missed.  A successful run that posted nothing is still
+    coverage — it looked and found no skill-corpus commits.  Overlap is the
+    safe direction: a commit audited twice is noise, a commit audited never
+    is the hole this exists to close.
+    """
+    page = 1
+    per_page = 100
+    try:
+        while True:
+            payload = github.get(
+                f"actions/workflows/{SKILL_AUDIT_WORKFLOW_FILE}/runs",
+                query={"status": "success", "per_page": per_page, "page": page},
+            )
+            entries = (
+                payload.get("workflow_runs") if isinstance(payload, Mapping) else None
+            )
+            if not isinstance(entries, list) or not entries:
+                break
+            for run in entries:
+                if not isinstance(run, Mapping):
+                    continue
+                if str(run.get("id")) == str(current_run_id):
+                    continue
+                started = _skill_audit_run_started(run)
+                if started is not None:
+                    return started, "previous successful skill-audit run"
+            if len(entries) < per_page:
+                break
+            page += 1
+    except ApiHttpError as error:
+        if error.status_code != 404:
+            raise
+    return (
+        now - timedelta(days=SKILL_AUDIT_FALLBACK_DAYS),
+        f"{SKILL_AUDIT_FALLBACK_DAYS}-day fallback — no previous successful run",
+    )
+
+
+def send_skill_audit(*, now: datetime | None = None) -> None:
     """Post the weekly one-pass skill-audit wake, or say why not.
 
     Skills are exempt from the per-PR review loop (Hákon's ruling,
     2026-08-21); this single weekly pass is their entire quality gate. A
-    quiet week posts nothing — a wake with no possible work is noise.
+    quiet window posts nothing — a wake with no possible work is noise.
+    The lookback is the previous successful run of this workflow, not a
+    fixed number of days, so a delayed or dropped schedule cannot leave
+    skill commits between two consecutive windows.
     """
     repository = required_env("GITHUB_REPOSITORY")
     github = GitHubApi(required_env("GITHUB_TOKEN"), repository)
-    since = datetime.now(timezone.utc) - timedelta(days=SKILL_AUDIT_WINDOW_DAYS)
+    moment = datetime.now(timezone.utc) if now is None else now
+    since, source = skill_audit_window_start(
+        github, now=moment, current_run_id=current_run_id()
+    )
+    since_stamp = since.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
+    now_stamp = moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
     if not skills_changed_since(github, since):
         print(
             f"no skill-corpus commits in {repository} since "
-            f"{since.date()} - skipping the audit wake"
+            f"{since_stamp} ({source}) - skipping the audit wake"
         )
         return
     slack = SlackApi(required_env("HIVE_BOT_TOKEN"), required_env("HIVE_CHANNEL"))
@@ -8007,7 +8079,8 @@ def send_skill_audit() -> None:
         "exempt from per-PR Codex review (Hákon's ruling, 2026-08-21); this "
         "audit is their entire quality gate.\n\n"
         f"Repo: `{repository}`. Audit every skill file under {roots} "
-        f"changed in the last {SKILL_AUDIT_WINDOW_DAYS} days "
+        f"changed since {since_stamp} "
+        f"({source}; window {since_stamp} → {now_stamp}) "
         "(`git log --since` over those roots on the default branch), judged "
         "once against `writing-skills`. Land repairs as direct commits or "
         "follow-up tickets. One pass means one pass: no re-review, no burn "
@@ -8020,7 +8093,9 @@ def send_skill_audit() -> None:
         **{
             "logfire.msg": f"weekly skill audit woke `{actor}`",
             "audit_actor": actor,
-            "window_days": SKILL_AUDIT_WINDOW_DAYS,
+            "window_since": since_stamp,
+            "window_until": now_stamp,
+            "window_source": source,
         },
     )
 
