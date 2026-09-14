@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { canonicalActor, type Delivery, type Provider, type Subscription } from "../domain.js";
@@ -392,7 +392,7 @@ export class ClaudeProvider implements ProviderAdapter {
     const profile = requireAccountProfile(subscription);
     return runHeadless(
       process.env.HIVE_CLAUDE_COMMAND ?? "claude",
-      ["-p", "--resume", subscription.sessionId, "--output-format", "stream-json", "--verbose", ...claudeEffortArgs(context.effort), ...claudePermissionArgs(subscription.permissionProfile), ...claudePromptSlotArgs(profile), framed],
+      claudeResumeArgs(subscription.sessionId, subscription.permissionProfile, profile, cwd, framed, context.effort),
       cwd,
       null,
       { CLAUDE_CONFIG_DIR: profile },
@@ -404,7 +404,7 @@ export class ClaudeProvider implements ProviderAdapter {
     const profile = requireAccountProfile(subscription);
     return runHeadless(
       process.env.HIVE_CLAUDE_COMMAND ?? "claude",
-      ["-p", "--output-format", "stream-json", "--verbose", ...claudeEffortArgs(context.effort), ...claudePermissionArgs(subscription.permissionProfile), ...claudePromptSlotArgs(profile), framed],
+      claudeSpawnArgs(subscription.permissionProfile, profile, cwd, framed, context.effort),
       cwd,
       null,
       { CLAUDE_CONFIG_DIR: profile },
@@ -437,6 +437,100 @@ export function claudePromptSlotArgs(accountProfile: string): string[] {
   const appendFile = join(accountProfile, "system-prompt-append.md");
   if (!existsSync(appendFile)) return [];
   return ["--append-system-prompt-file", appendFile, "--exclude-dynamic-system-prompt-sections"];
+}
+
+/**
+ * Presence-switched `--add-dir` group: every immediate child of `cwd` that
+ * carries `.claude/skills/` is added so a headless wake whose cwd is a
+ * workspace of checkouts still discovers each repo's skills. A cwd that is
+ * itself a repo root yields `[]` — the harness already scans it. One level
+ * only: the workspace convention is one checkout per child directory.
+ *
+ * Over `CLAUDE_SKILL_DIR_CAP` skill-bearing children, log once and add none
+ * rather than silently truncating (ADR-0003 R-3).
+ */
+export const CLAUDE_SKILL_DIR_CAP = 32;
+
+export function claudeSkillDirArgs(cwd: string): string[] {
+  if (hasClaudeSkillsDir(cwd)) return [];
+
+  let names: string[];
+  try {
+    names = readdirSync(cwd);
+  } catch {
+    return [];
+  }
+
+  const seen = new Set<string>();
+  const dirs: string[] = [];
+  for (const name of names) {
+    const child = join(cwd, name);
+    let real: string;
+    try {
+      if (!statSync(child).isDirectory() || !hasClaudeSkillsDir(child)) continue;
+      real = realpathSync(child);
+    } catch {
+      continue;
+    }
+    if (seen.has(real)) continue;
+    seen.add(real);
+    dirs.push(real);
+  }
+  dirs.sort();
+  if (dirs.length > CLAUDE_SKILL_DIR_CAP) {
+    console.error("hive edge claude skill-dir cap exceeded", {
+      cwd,
+      count: dirs.length,
+      cap: CLAUDE_SKILL_DIR_CAP,
+    });
+    return [];
+  }
+  return dirs.flatMap((dir) => ["--add-dir", dir]);
+}
+
+function hasClaudeSkillsDir(dir: string): boolean {
+  try {
+    return statSync(join(dir, ".claude", "skills")).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/** Resume argv: a resumed session re-discovers skills, so the skill-dir group rides here too. */
+export function claudeResumeArgs(
+  sessionId: string,
+  permissionProfile: string,
+  accountProfile: string,
+  cwd: string,
+  framed: string,
+  effort: WakeEffort | null,
+): string[] {
+  return [
+    "-p", "--resume", sessionId, "--output-format", "stream-json", "--verbose",
+    ...claudeEffortArgs(effort),
+    ...claudePermissionArgs(permissionProfile),
+    ...claudePromptSlotArgs(accountProfile),
+    ...claudeSkillDirArgs(cwd),
+    framed,
+  ];
+}
+
+/** Spawn argv: same flag groups as resume, minus `--resume`. */
+export function claudeSpawnArgs(
+  permissionProfile: string,
+  accountProfile: string,
+  cwd: string,
+  framed: string,
+  effort: WakeEffort | null,
+): string[] {
+  return [
+    "-p", "--output-format", "stream-json", "--verbose",
+    ...claudeEffortArgs(effort),
+    ...claudePermissionArgs(permissionProfile),
+    ...claudePromptSlotArgs(accountProfile),
+    ...claudeSkillDirArgs(cwd),
+    framed,
+  ];
 }
 
 /**

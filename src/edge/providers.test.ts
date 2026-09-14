@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -8,7 +8,7 @@ import type { Delivery, Subscription } from "../domain.js";
 import { prepareSocketPath } from "../local/uds.js";
 import type { LiveIngress } from "./live-registry.js";
 import { delimiter, dirname } from "node:path";
-import { ingressInboxDirectory, ClaudeProvider, claudePromptSlotArgs, CODEX_NETWORK_DOMAINS, codexPermissionArgs, codexSpawnArgs, codexResumeTurn, codexSpawnTurn, CodexProvider, composeChildEnv, GrokProvider, grokPermissionArgs, prependPathEntry, ProviderPreDispatchError, requireAccountProfile, resolveEdgeSocketPath } from "./providers.js";
+import { ingressInboxDirectory, ClaudeProvider, CLAUDE_SKILL_DIR_CAP, claudePromptSlotArgs, claudeResumeArgs, claudeSkillDirArgs, claudeSpawnArgs, CODEX_NETWORK_DOMAINS, codexPermissionArgs, codexSpawnArgs, codexResumeTurn, codexSpawnTurn, CodexProvider, composeChildEnv, GrokProvider, grokPermissionArgs, prependPathEntry, ProviderPreDispatchError, requireAccountProfile, resolveEdgeSocketPath } from "./providers.js";
 import { drainInbox } from "../channel/claude-hook.js";
 
 function subscription(overrides: Partial<Subscription> = {}): Subscription {
@@ -187,6 +187,104 @@ test("Claude prompt-slot flags compose exactly when the rendered artifact exists
     ]);
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+function skillBearingChild(cwd: string, name: string): string {
+  const dir = join(cwd, name);
+  mkdirSync(join(dir, ".claude", "skills"), { recursive: true });
+  return realpathSync(dir);
+}
+
+test("claudeSkillDirArgs adds sorted --add-dir pairs for skill-bearing children only", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "hive-skill-dirs-"));
+  try {
+    const zeta = skillBearingChild(cwd, "zeta");
+    const alpha = skillBearingChild(cwd, "alpha");
+    mkdirSync(join(cwd, "plain"));
+    writeFileSync(join(cwd, "README"), "not a checkout\n");
+    assert.deepEqual(claudeSkillDirArgs(cwd), ["--add-dir", alpha, "--add-dir", zeta]);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("claudeSkillDirArgs is empty for an empty workspace", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "hive-skill-dirs-empty-"));
+  try {
+    assert.deepEqual(claudeSkillDirArgs(cwd), []);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("claudeSkillDirArgs deduplicates a symlinked child by realpath", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "hive-skill-dirs-link-"));
+  try {
+    const alpha = skillBearingChild(cwd, "alpha");
+    symlinkSync(alpha, join(cwd, "alpha-link"));
+    assert.deepEqual(claudeSkillDirArgs(cwd), ["--add-dir", alpha]);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("claudeSkillDirArgs is empty when cwd is itself a repo root", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "hive-skill-dirs-repo-"));
+  try {
+    mkdirSync(join(cwd, ".claude", "skills"), { recursive: true });
+    skillBearingChild(cwd, "nested");
+    assert.deepEqual(claudeSkillDirArgs(cwd), []);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("claudeSkillDirArgs logs once and adds none when the workspace is over cap", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "hive-skill-dirs-cap-"));
+  const errors: unknown[][] = [];
+  const previous = console.error;
+  console.error = (...args: unknown[]) => {
+    errors.push(args);
+  };
+  try {
+    for (let i = 0; i <= CLAUDE_SKILL_DIR_CAP; i += 1) {
+      skillBearingChild(cwd, `repo-${String(i).padStart(2, "0")}`);
+    }
+    assert.deepEqual(claudeSkillDirArgs(cwd), []);
+    assert.equal(errors.length, 1);
+    assert.equal(errors[0]![0], "hive edge claude skill-dir cap exceeded");
+    assert.deepEqual(errors[0]![1], {
+      cwd,
+      count: CLAUDE_SKILL_DIR_CAP + 1,
+      cap: CLAUDE_SKILL_DIR_CAP,
+    });
+  } finally {
+    console.error = previous;
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("Claude spawn and resume arg vectors splice the skill-dir group before the framed prompt", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "hive-skill-dirs-argv-"));
+  const profile = mkdtempSync(join(tmpdir(), "hive-skill-dirs-profile-"));
+  try {
+    const sokrates = skillBearingChild(cwd, "sokrates");
+    const hive = skillBearingChild(cwd, "hive");
+    const skillDirs = claudeSkillDirArgs(cwd);
+    assert.deepEqual(skillDirs, ["--add-dir", hive, "--add-dir", sokrates]);
+
+    const spawn = claudeSpawnArgs("workspace-write", profile, cwd, "framed", null);
+    const resume = claudeResumeArgs("session-1", "workspace-write", profile, cwd, "framed", null);
+    assert.equal(spawn.at(-1), "framed");
+    assert.equal(resume.at(-1), "framed");
+    assert.deepEqual(spawn.slice(-1 - skillDirs.length, -1), skillDirs);
+    assert.deepEqual(resume.slice(-1 - skillDirs.length, -1), skillDirs);
+    assert.deepEqual(spawn.slice(0, 4), ["-p", "--output-format", "stream-json", "--verbose"]);
+    assert.deepEqual(resume.slice(0, 5), ["-p", "--resume", "session-1", "--output-format", "stream-json"]);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+    rmSync(profile, { recursive: true, force: true });
   }
 });
 
