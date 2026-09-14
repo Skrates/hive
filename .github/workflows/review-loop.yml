@@ -278,7 +278,12 @@ jobs:
     # A merged fork PR carries no secrets on this event and so cannot be
     # announced here; the scheduled cross-repo digest reads it with its own
     # token, and is the completeness backstop for exactly that case.
-    if: github.event_name == 'pull_request' && github.event.pull_request.merged == true
+    # Same-repository heads only: a fork `pull_request` run has empty
+    # secrets, so `merge_digest.py announce` would red on required_env
+    # instead of deferring to that backstop.
+    if: >-
+      github.event_name == 'pull_request' && github.event.pull_request.merged == true
+      && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","cx53"]' || '["ubuntu-latest"]') }}
     steps:
       - name: Checkout trusted digest helper
