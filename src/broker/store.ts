@@ -658,6 +658,12 @@ export class BrokerStore {
     return row ? subscriptionFromRow(row) : null;
   }
 
+  /** Current eligibility, evaluated on the broker clock at consumption. */
+  getActiveSubscription(actor: string): Subscription | null {
+    const subscription = this.getSubscription(actor);
+    return subscription && !isExpired(subscription.expiresAt, this.clock.now()) ? subscription : null;
+  }
+
   /**
    * True if any subscription is currently live (no expiry, or an expiry still in
    * the future). The deafness watchdog only arms when the broker actually has an
@@ -806,8 +812,8 @@ export class BrokerStore {
       );
       if (inserted.changes === 0) return { created: false, deliveryId: null };
 
-      const subscription = this.getSubscription(event.actor);
-      if (!subscription || isExpired(subscription.expiresAt, this.clock.now())) {
+      const subscription = this.getActiveSubscription(event.actor);
+      if (!subscription) {
         return { created: true, deliveryId: null };
       }
       const now = iso(this.clock);
@@ -956,8 +962,8 @@ export class BrokerStore {
       if (replayed !== null) {
         return { deliveryId: replayed, actor: target, from, channelId, threadTs, created: false };
       }
-      const subscription = this.getSubscription(target);
-      if (!subscription || isExpired(subscription.expiresAt, this.clock.now())) {
+      const subscription = this.getActiveSubscription(target);
+      if (!subscription) {
         throw new SeatWakeRefusedError(
           "unroutable_actor",
           `no live subscription for actor \`${target}\` — this wake would reach no one`,
@@ -1052,8 +1058,8 @@ export class BrokerStore {
       const replayed = this.deliveryIdForEvent(eventId);
       if (replayed !== null) return { deliveryId: replayed };
 
-      const subscription = this.getSubscription(target);
-      if (!subscription || isExpired(subscription.expiresAt, this.clock.now())) {
+      const subscription = this.getActiveSubscription(target);
+      if (!subscription) {
         throw new SeatWakeRefusedError(
           "unroutable_actor",
           `no live subscription for actor \`${target}\` — this review request would reach no one`,

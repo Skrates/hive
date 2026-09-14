@@ -85,7 +85,10 @@ export class EdgeControlServer {
         surfaceVersion,
         runtimeAttestation,
       }, ttlMs);
-      return json(response, 200, ingress);
+      return json(response, 200, { ...ingress,
+        reviewCustody: sessionId === null ? { available: false, reason: "session_not_registered" }
+          : this.edge.live.sessionCustody(sessionId),
+      });
     }
 
     if (request.method === "POST" && request.url === "/live/deregister") {
@@ -155,6 +158,12 @@ export class EdgeControlServer {
       return this.relayBroker(response, 202, () => this.edge.broker.reviewReconcile(key));
     }
 
+    if (request.method === "POST" && request.url === "/review/session") {
+      const body = await readJson(request);
+      const custody = this.edge.live.sessionCustody(requiredString(body.session_id, "session_id"));
+      return json(response, custody.available ? 200 : 403, custody);
+    }
+
     if (request.method === "POST" && request.url === "/review/act") {
       const body = await readJson(request);
       const key = requiredString(body.key, "key");
@@ -166,10 +175,11 @@ export class EdgeControlServer {
       if (!action || typeof action !== "object" || Array.isArray(action)) throw new Error("missing action");
       if ("actor" in body || "principal" in body || "custody" in body) throw new Error("invalid custody");
       const source = this.edge.resolveMintSource(token);
-      if (!source) {
+      const session = source ? null : this.edge.live.resolveSession(token);
+      if (!source && !session) {
         return json(response, 403, {
-          error: "unknown_dispatch_token",
-          detail: "no dispatch on this edge holds that token — a turn can act only while it is running",
+          error: "unknown_custody_token",
+          detail: "no live delivery or attested session on this edge holds that token; custody may have expired or been revoked",
         });
       }
       try {
@@ -177,7 +187,8 @@ export class EdgeControlServer {
           act_id: actId,
           expected_revision: Number(expectedRevision),
           action: action as ReviewActForward["action"],
-          custody: { delivery_id: source.deliveryId, generation: source.generation },
+          custody: source ? { delivery_id: source.deliveryId, generation: source.generation }
+            : { session_id: session!.session_id, actor: session!.actor },
         });
         return json(response, status, receipt);
       } catch (error) {

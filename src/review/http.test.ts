@@ -8,6 +8,7 @@ import { SubscriptionInputSchema, type ReplaySnapshot, type SubscriptionInput } 
 import type { Action, Policy, Principal, Receipt, ReviewKey, ReviewState } from "./contract.js";
 import type { ReviewHttpDeps, ReviewStorePort } from "./http.js";
 import type { ApplyInput } from "./store.js";
+import { systemClock, type Clock } from "../time.js";
 
 const slack: SlackTransport = {
   async replay(): Promise<ReplaySnapshot> { throw new Error("not used"); },
@@ -70,8 +71,8 @@ function fakeStore(revision = 3) {
 
 interface Answer { status: number; body: string; json(): unknown }
 
-async function fixture(t: test.TestContext, overrides: Partial<ReviewHttpDeps> = {}) {
-  const broker = new BrokerStore(":memory:");
+async function fixture(t: test.TestContext, overrides: Partial<ReviewHttpDeps> = {}, clock: Clock = systemClock) {
+  const broker = new BrokerStore(":memory:", clock);
   t.after(() => broker.close());
   const edgeToken = broker.createEdge("dev");
   const fake = fakeStore();
@@ -211,12 +212,41 @@ test("POST acts: no credential ⇒ 401; delivery custody ⇒ the ledger's actor 
   const stolen = await act(body, { ...edgeHeaders, "x-hive-edge": "other", authorization: `Bearer ${otherToken}` });
   assert.equal(stolen.status, 401);
 
-  // Session custody is recognised only to be declared deferred (M2).
+  // Raw session credentials never cross to the broker: the edge must resolve them.
   const session = await act({ ...body, custody: { session_token: "s" } });
-  assert.equal(session.status, 401);
-  assert.match((session.json() as { detail: string }).detail, /M2/);
+  assert.equal(session.status, 400);
   assert.equal(fake.applied.length, 1);
   void edgeToken;
+});
+
+test("§3.2 broker accepts an edge-resolved session only for an actor assigned to that edge", async t => {
+  const { act, fake, edgeHeaders, broker } = await fixture(t);
+  const body = { act_id: "session-write", expected_revision: 3, action: CLASSIFY,
+    custody: { session_id: "interactive-1", actor: "ariadne" } };
+  const applied = await act(body);
+  assert.equal(applied.status, 200, applied.body);
+  assert.deepEqual(fake.applied[0]!.input.principal,
+    { kind: "seat", actor: "ariadne", custody: { session_id: "interactive-1" } });
+  const otherToken = broker.createEdge("other");
+  const foreign = await act(body, { ...edgeHeaders, "x-hive-edge": "other", authorization: `Bearer ${otherToken}` });
+  assert.equal(foreign.status, 401);
+  const mixed = await act({ ...body, custody: { ...body.custody, delivery_id: 1, generation: 1 } });
+  assert.equal(mixed.status, 400);
+  assert.equal(fake.applied.length, 1);
+});
+
+test("§3.2 session custody stops at subscription expiry even if the live surface still holds its token", async t => {
+  let now = new Date("2026-09-10T12:00:00.000Z");
+  const { act, broker, fake } = await fixture(t, {}, { now: () => now });
+  const subscription = broker.getSubscription("ariadne")!;
+  broker.upsertSubscription({ ...subscription, expiresAt: "2026-09-10T12:00:01.000Z" });
+  const body = { act_id: "before-expiry", expected_revision: 3, action: CLASSIFY,
+    custody: { session_id: "still-heartbeating", actor: "ariadne" } };
+  assert.equal((await act(body)).status, 200, "a finite but live subscription can act");
+  now = new Date("2026-09-10T12:00:01.000Z");
+  const expired = await act({ ...body, act_id: "at-expiry" });
+  assert.equal(expired.status, 401, expired.body);
+  assert.equal(fake.applied.length, 1, "the expired session never reaches admission");
 });
 
 test("POST acts: an operator token names an operator principal; a wrong token is 401", async (t) => {

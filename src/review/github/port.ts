@@ -17,6 +17,7 @@ import { createSign } from "node:crypto";
 import { fetch as undiciFetch } from "undici";
 import type { Policy } from "../contract.js";
 import type { Clock } from "../../time.js";
+import type { ReviewTelemetry } from "../telemetry.js";
 
 export interface GitHubPullRequest {
   repositoryId: number;
@@ -153,6 +154,7 @@ export class GitHubApiError extends Error {
 }
 
 export interface AppGitHubPortOptions {
+  telemetry?: ReviewTelemetry;
   appId: string;
   /** PEM private key of the App (tier-2 secret on the dev box, §7); never logged. */
   privateKeyPem: string;
@@ -226,6 +228,7 @@ export class AppGitHubPort implements GitHubPort {
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     });
     const text = await response.text();
+    this.recordResponse(response);
     if (response.status < 200 || response.status >= 300) throw new GitHubApiError(response.status, url, text.slice(0, 200));
     return { status: response.status, json: text === "" ? null : JSON.parse(text), link: response.headers.get("link") };
   }
@@ -239,6 +242,15 @@ export class AppGitHubPort implements GitHubPort {
       "x-github-api-version": API_VERSION,
       ...extra,
     };
+  }
+
+  private recordResponse(response: { status: number; headers: { get(name: string): string | null } }): void {
+    const attributes: Record<string, string | number> = { github_status: response.status };
+    for (const header of ["x-ratelimit-remaining", "x-ratelimit-reset", "x-ratelimit-resource"]) {
+      const value = response.headers.get(header);
+      if (value !== null) attributes[header.replaceAll("-", "_")] = value;
+    }
+    this.options.telemetry?.attributes(attributes);
   }
 
   /** Repository id → installation + full name, discovered once through the App's installations. */
@@ -296,6 +308,7 @@ export class AppGitHubPort implements GitHubPort {
       ...(options.body === undefined ? {} : { body: JSON.stringify(options.body) }),
     });
     const text = await response.text();
+    this.recordResponse(response);
     if (response.status === 304) return { status: 304, json: null, etag: options.etag ?? null };
     if (response.status < 200 || response.status >= 300) throw new GitHubApiError(response.status, url, text.slice(0, 200));
     return { status: response.status, json: text === "" ? null : JSON.parse(text), etag: response.headers.get("etag") };

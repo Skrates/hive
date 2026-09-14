@@ -371,6 +371,29 @@ test("a review act presents the turn's token; the edge names the delivery custod
   assert.equal(reviewActs.length, 2);
 });
 
+test("§3.2 registered session token reaches review writes; deregistration revokes it", async t => {
+  const { root, socketPath, reviewActs, server } = fixture();
+  t.after(async () => { await server.stop(); rmSync(root, { recursive: true, force: true }); });
+  await server.start();
+  const registration = await udsRequestJson<{ reviewCustody: { available: boolean; token: string } }>(socketPath, "POST", "/live/register", {
+    actor: "ariadne", provider: "codex", socketPath: "/tmp/session.sock", sessionId: "interactive-1", surfaceVersion: "test",
+    attestation: { ok: true, attestationId: "sha256:test", doctrineCommit: "a".repeat(40), actor: "ariadne" },
+  });
+  assert.equal(registration.reviewCustody.available, true);
+  const acquired = await udsRequestJson<{ available: boolean; token: string }>(socketPath, "POST", "/review/session", { session_id: "interactive-1" });
+  assert.equal(acquired.token, registration.reviewCustody.token);
+  const body = { key: "Skrates/hive#7", token: acquired.token, act_id: "session-act", expected_revision: 4,
+    action: { kind: "ClassifyFinding", finding_id: "fnd_05", priority: "P3" } };
+  assert.equal((await udsRequest(socketPath, "POST", "/review/act", body)).status, 200);
+  assert.deepEqual(reviewActs[0]!.input.custody, { session_id: "interactive-1", actor: "ariadne" });
+  await udsRequest(socketPath, "POST", "/live/deregister", { actor: "ariadne", provider: "codex" });
+  assert.equal((await udsRequest(socketPath, "POST", "/review/act", body)).status, 403);
+  const deferred = await udsRequest(socketPath, "POST", "/review/session", { session_id: "interactive-1" });
+  assert.equal(deferred.status, 403);
+  assert.equal(JSON.parse(deferred.body).reason, "session_not_registered");
+  assert.equal(reviewActs.length, 1);
+});
+
 test("review read and reconcile need only the socket and relay the broker's answer verbatim", async (t) => {
   const { root, socketPath, reviewReads, server } = fixture();
   t.after(async () => {
