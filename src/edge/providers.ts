@@ -443,8 +443,13 @@ export function claudePromptSlotArgs(accountProfile: string): string[] {
  * Presence-switched `--add-dir` group: every immediate child of `cwd` that
  * carries `.claude/skills/` is added so a headless wake whose cwd is a
  * workspace of checkouts still discovers each repo's skills. A cwd that is
- * itself a repo root yields `[]` — the harness already scans it. One level
- * only: the workspace convention is one checkout per child directory.
+ * itself a git checkout (`.git` file or directory) yields `[]` — the harness
+ * already scans it. One level only: the workspace convention is one checkout
+ * per child directory.
+ *
+ * `--add-dir` is variadic (`claude --add-dir ../apps ../lib`); callers must
+ * terminate the option list (`--`) before the framed prompt so the last
+ * directory does not consume it.
  *
  * Over `CLAUDE_SKILL_DIR_CAP` skill-bearing children, log once and add none
  * rather than silently truncating (ADR-0003 R-3).
@@ -452,7 +457,7 @@ export function claudePromptSlotArgs(accountProfile: string): string[] {
 export const CLAUDE_SKILL_DIR_CAP = 32;
 
 export function claudeSkillDirArgs(cwd: string): string[] {
-  if (hasClaudeSkillsDir(cwd)) return [];
+  if (isGitCheckoutRoot(cwd)) return [];
 
   let names: string[];
   try {
@@ -496,6 +501,16 @@ function hasClaudeSkillsDir(dir: string): boolean {
   }
 }
 
+/** A `.git` directory (ordinary clone) or file (linked worktree). */
+function isGitCheckoutRoot(dir: string): boolean {
+  try {
+    const git = statSync(join(dir, ".git"));
+    return git.isDirectory() || git.isFile();
+  } catch {
+    return false;
+  }
+}
+
 /** Resume argv: a resumed session re-discovers skills, so the skill-dir group rides here too. */
 export function claudeResumeArgs(
   sessionId: string,
@@ -511,6 +526,7 @@ export function claudeResumeArgs(
     ...claudePermissionArgs(permissionProfile),
     ...claudePromptSlotArgs(accountProfile),
     ...claudeSkillDirArgs(cwd),
+    "--",
     framed,
   ];
 }
@@ -529,6 +545,7 @@ export function claudeSpawnArgs(
     ...claudePermissionArgs(permissionProfile),
     ...claudePromptSlotArgs(accountProfile),
     ...claudeSkillDirArgs(cwd),
+    "--",
     framed,
   ];
 }

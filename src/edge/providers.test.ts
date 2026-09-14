@@ -229,12 +229,23 @@ test("claudeSkillDirArgs deduplicates a symlinked child by realpath", () => {
   }
 });
 
-test("claudeSkillDirArgs is empty when cwd is itself a repo root", () => {
+test("claudeSkillDirArgs is empty when cwd is itself a git checkout", () => {
   const cwd = mkdtempSync(join(tmpdir(), "hive-skill-dirs-repo-"));
   try {
-    mkdirSync(join(cwd, ".claude", "skills"), { recursive: true });
+    mkdirSync(join(cwd, ".git"));
     skillBearingChild(cwd, "nested");
     assert.deepEqual(claudeSkillDirArgs(cwd), []);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("claudeSkillDirArgs still adds children when cwd has workspace-level skills", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "hive-skill-dirs-workspace-skills-"));
+  try {
+    mkdirSync(join(cwd, ".claude", "skills"), { recursive: true });
+    const child = skillBearingChild(cwd, "sokrates");
+    assert.deepEqual(claudeSkillDirArgs(cwd), ["--add-dir", child]);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
@@ -276,12 +287,21 @@ test("Claude spawn and resume arg vectors splice the skill-dir group before the 
 
     const spawn = claudeSpawnArgs("workspace-write", profile, cwd, "framed", null);
     const resume = claudeResumeArgs("session-1", "workspace-write", profile, cwd, "framed", null);
+    // `--add-dir` is variadic; `--` stops it consuming the framed prompt.
     assert.equal(spawn.at(-1), "framed");
     assert.equal(resume.at(-1), "framed");
-    assert.deepEqual(spawn.slice(-1 - skillDirs.length, -1), skillDirs);
-    assert.deepEqual(resume.slice(-1 - skillDirs.length, -1), skillDirs);
+    assert.equal(spawn.at(-2), "--");
+    assert.equal(resume.at(-2), "--");
+    assert.deepEqual(spawn.slice(-2 - skillDirs.length, -2), skillDirs);
+    assert.deepEqual(resume.slice(-2 - skillDirs.length, -2), skillDirs);
     assert.deepEqual(spawn.slice(0, 4), ["-p", "--output-format", "stream-json", "--verbose"]);
     assert.deepEqual(resume.slice(0, 5), ["-p", "--resume", "session-1", "--output-format", "stream-json"]);
+    const empty = mkdtempSync(join(tmpdir(), "hive-skill-dirs-empty-argv-"));
+    try {
+      assert.deepEqual(claudeSpawnArgs("workspace-write", profile, empty, "framed", null).slice(-2), ["--", "framed"]);
+    } finally {
+      rmSync(empty, { recursive: true, force: true });
+    }
   } finally {
     rmSync(cwd, { recursive: true, force: true });
     rmSync(profile, { recursive: true, force: true });
