@@ -82,10 +82,10 @@ test("a failed live turn never becomes a processed outcome", async () => {
     async waitForCompletion() { return { status: "failed" as const, assistantText: null }; },
   };
   const now = Date.parse("2026-08-06T11:26:45.000Z");
-  await assert.rejects(
-    () => completeCodexDelivery(client, "thread-1", delivery(now), "wake", () => now),
-    /turn-failed failed/,
-  );
+  const result = await completeCodexDelivery(client, "thread-1", delivery(now), "wake", () => now);
+  assert.equal(result.processed, false);
+  assert.equal(result.failure?.code, "provider_runtime_failed");
+  assert.match(result.outcome, /turn-failed failed/);
 });
 
 test("a completed Desktop turn returns its final text separately from the diagnostic receipt", async () => {
@@ -152,10 +152,10 @@ test("an interrupted Desktop turn never becomes a processed outcome", async () =
     },
   };
   const now = Date.parse("2026-08-06T11:26:45.000Z");
-  await assert.rejects(
-    () => completeDesktopDelivery(client, "foreground-task", delivery(now), "wake", () => now),
-    /desktop-turn-42 interrupted/,
-  );
+  const result = await completeDesktopDelivery(client, "foreground-task", delivery(now), "wake", () => now);
+  assert.equal(result.processed, false);
+  assert.equal(result.failure?.code, "provider_runtime_failed");
+  assert.match(result.outcome, /desktop-turn-42 interrupted/);
 });
 
 test("a late-claimed delivery gets a full post-claim turn budget", async () => {

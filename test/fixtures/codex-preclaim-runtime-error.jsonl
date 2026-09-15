@@ -1,0 +1,6 @@
+{"type": "thread.started"}
+{"type": "item.completed", "item": {"id": "item_0", "type": "error", "message": "Code Mode is unavailable because failed to spawn code-mode host /home/hive/.local/bin/codex-code-mode-host: host executable was not found. Code mode will fail closed; enable `features.code_mode_host` and install `codex-code-mode-host`."}}
+{"type": "turn.started"}
+{"type": "item.completed", "item": {"id": "item_1", "type": "agent_message", "text": "I’ll read KRA-1435 and check its assignee before claiming it, then inspect the Zygos domain contract and repository instructions.\n"}}
+{"type": "item.completed", "item": {"id": "item_2", "type": "agent_message", "text": "Blocked before claiming: the execution tool cannot start because `/home/hive/.local/bin/codex-code-mode-host` is missing.\n\nI couldn’t read KRA-1435 or check its assignee. No Linear or repository changes were made. The Codex runtime needs repair before this delivery can proceed."}}
+{"type": "turn.completed", "usage": {"input_tokens": 56957, "cached_input_tokens": 28160, "cache_write_input_tokens": 0, "output_tokens": 271, "reasoning_output_tokens": 63}}
