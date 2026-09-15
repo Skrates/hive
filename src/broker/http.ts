@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { URL } from "node:url";
-import { canonicalActor, DeliveryResultInputSchema, DispatchNoticesSchema, OutcomePartInputSchema, ReasonSchema, SeatWakeMintSchema, SubscriptionInputSchema, BusySlotFormatError, parseBusySlots, type BusySlot } from "../domain.js";
+import { canonicalActor, DeliveryReleaseInputSchema, DeliveryResultInputSchema, DispatchNoticesSchema, OutcomePartInputSchema, SeatWakeMintSchema, SubscriptionInputSchema, BusySlotFormatError, parseBusySlots, type BusySlot } from "../domain.js";
 import { routeReview, type ReviewHttpDeps } from "../review/http.js";
 import { routeAttention, type AttentionHttpDeps } from "../attention/http.js";
 import { BrokerService } from "./service.js";
@@ -176,8 +176,8 @@ export class BrokerHttpServer {
         case "renew": return json(response, 200, this.broker.renew(deliveryId, edgeId, generation));
         case "reserve-spawn": return json(response, 200, { reserved: this.broker.reserveSpawn(deliveryId, edgeId, generation) });
         case "release": {
-          const reason = ReasonSchema.parse(body.reason);
-          return json(response, 200, this.broker.release(deliveryId, edgeId, generation, reason));
+          const { reason, outcome, stagedOutcomeParts } = DeliveryReleaseInputSchema.parse(body);
+          return json(response, 200, this.broker.release(deliveryId, edgeId, generation, reason, outcome, stagedOutcomeParts));
         }
         case "outcome-part": {
           this.broker.stageOutcomePart(deliveryId, edgeId, OutcomePartInputSchema.parse(body));

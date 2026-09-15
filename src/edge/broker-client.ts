@@ -85,10 +85,12 @@ export class BrokerClient {
   }
 
   /** ADR-0003 R-3: release a delivery back to the broker for another attempt after uncertainty. */
-  async release(delivery: Delivery, reason: Reason): Promise<Delivery> {
+  async release(delivery: Delivery, reason: Reason, outcome: string | null = null): Promise<Delivery> {
+    const generation = requiredGeneration(delivery);
+    const staged = await this.stageOutcome(delivery.id, generation, outcome);
     const response = await this.request(`/v1/deliveries/${delivery.id}/release`, {
       method: "POST",
-      body: JSON.stringify({ generation: requiredGeneration(delivery), reason }),
+      body: JSON.stringify({ generation, reason, ...staged }),
     });
     return this.json<Delivery>(response);
   }
@@ -144,25 +146,26 @@ export class BrokerClient {
     return this.json<Delivery>(response);
   }
 
-  /**
-   * An outcome longer than one request part is staged under the lease first,
-   * then the terminal transition carries the final part and the staged count:
-   * the broker joins them atomically, so a long outcome is neither cut nor
-   * refused as an oversized body (which would release and rerun the turn).
-   */
-  async finish(delivery: Delivery, result: Omit<DeliveryResultInput, "stagedOutcomeParts">): Promise<Delivery> {
-    const parts = result.outcome === null ? [null] : splitText(result.outcome, OUTCOME_TRANSPORT_PART_CHARS);
-    const staged = parts.slice(0, -1) as string[];
-    for (const [index, text] of staged.entries()) {
-      const answer = await this.request(`/v1/deliveries/${delivery.id}/outcome-part`, {
+  /** Stage the prefix under the lease; finish or release commits the tail and staged count. */
+  private async stageOutcome(deliveryId: number, generation: number, outcome: string | null) {
+    if (outcome === null) return { outcome: null, stagedOutcomeParts: 0 };
+    const parts = splitText(outcome, OUTCOME_TRANSPORT_PART_CHARS);
+    const tail = parts.pop()!;
+    for (const [index, text] of parts.entries()) {
+      const response = await this.request(`/v1/deliveries/${deliveryId}/outcome-part`, {
         method: "POST",
-        body: JSON.stringify({ generation: result.generation, index, text }),
+        body: JSON.stringify({ generation, index, text }),
       });
-      await this.json<{ staged: true }>(answer);
+      await this.json<{ staged: true }>(response);
     }
+    return { outcome: tail, stagedOutcomeParts: parts.length };
+  }
+
+  async finish(delivery: Delivery, result: Omit<DeliveryResultInput, "stagedOutcomeParts">): Promise<Delivery> {
+    const staged = await this.stageOutcome(delivery.id, result.generation, result.outcome);
     const response = await this.request(`/v1/deliveries/${delivery.id}/result`, {
       method: "POST",
-      body: JSON.stringify({ ...result, outcome: parts.at(-1) ?? null, stagedOutcomeParts: staged.length }),
+      body: JSON.stringify({ ...result, ...staged }),
     });
     return this.json<Delivery>(response);
   }

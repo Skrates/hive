@@ -16,7 +16,10 @@ import {
   SeatWakeRefusedError,
   StaleLeaseError,
 } from "./store.js";
-import { BusySlotFormatError, formatBusySlots, frameWakeInstruction, parseBusySlots, retryBackoffMs, splitText, SubscriptionInputSchema, workspaceCwd, type SlackEventInput, type SubscriptionInput } from "../domain.js";
+import { BusySlotFormatError, formatBusySlots, frameWakeInstruction, OUTCOME_TRANSPORT_PART_CHARS, parseBusySlots, retryBackoffMs, splitText, SubscriptionInputSchema, workspaceCwd, type SlackEventInput, type SubscriptionInput } from "../domain.js";
+import { BrokerClient } from "../edge/broker-client.js";
+import { BrokerHttpServer } from "./http.js";
+import { BrokerService, type SlackTransport } from "./service.js";
 import type { Clock } from "../time.js";
 
 class FakeClock implements Clock {
@@ -681,7 +684,7 @@ test("an outcome longer than one Slack message posts whole as ordered, self-iden
     store.markOutboxSent(entry!.outboxId, `300.${posted.length}`);
   }
   assert.ok(posted.length >= 3);
-  const footer = /\n\n\[delivery (\d+) · part (\d+)\/(\d+) · dedupe [^\]]+\]$/;
+  const footer = /\n\n\[delivery (\d+) · attempt 1 · part (\d+)\/(\d+) · dedupe [^\]]+\]$/;
   posted.forEach((post, index) => {
     const match = footer.exec(post);
     assert.ok(match, post.slice(-120));
@@ -1385,7 +1388,7 @@ test("a system wake follows the ordinary delivery lifecycle: claim, dispatch, ou
   store.recordOutcome(deliveryId, "burned two findings");
   assert.equal(store.getDelivery(deliveryId).status, "processed");
   const outcome = store.listUnsentOutbox().find((entry) => /burned two findings/.test(entry.text))!;
-  assert.match(outcome.text, /\[delivery \d+ · dedupe review:[0-9a-f]{16}:\d+ · ariadne\]/);
+  assert.match(outcome.text, /\[delivery \d+ · attempt 1 · dedupe review:[0-9a-f]{16}:\d+ · ariadne\]/);
   store.close();
 });
 
@@ -1618,4 +1621,110 @@ test("an actor id obeys the addressing grammar, so every legal actor round-trips
   }
   assert.throws(() => parseBusySlots("ta,los:1"), BusySlotFormatError);
   assert.throws(() => parseBusySlots("9gnomon:1"), BusySlotFormatError);
+});
+
+
+test("failed provider attempts retain reasons and outcomes through backoff and exhaustion", () => {
+  const { store, clock } = fixture({ maxAttempts: 2 });
+  store.ingestEvent(event());
+  const first = store.claimNext("mac", 0)!;
+  const reason = { code: "provider_runtime_failed", detail: "runtime unavailable" };
+  const outcome = "Blocked before claiming: tool runtime could not start.";
+  const pending = store.release(first.id, "mac", first.leaseGeneration!, reason, outcome);
+  assert.equal(pending.status, "pending");
+  assert.deepEqual(pending.reasons, [reason]);
+  assert.equal(store.claimNext("mac", 0), null, "backoff prevents immediate respawn");
+  assert.ok(store.listUnsentOutbox().some(row => row.text.includes(outcome)));
+  assert.ok(store.listUnsentOutbox().every(row => row.reaction !== "x"), "retryable attempts must not stamp terminal failure");
+  clock.advance(retryBackoffMs(1));
+  const second = store.claimNext("mac", 0)!;
+  assert.ok(second);
+  const failed = store.release(second.id, "mac", second.leaseGeneration!, reason, outcome);
+  assert.equal(failed.status, "failed");
+  assert.deepEqual(failed.reasons, [reason]);
+  const outcomes = store.listUnsentOutbox().filter(row => row.text.includes(outcome));
+  assert.equal(outcomes.length, 2);
+  assert.match(outcomes[0]!.text, / · attempt 1 · /);
+  assert.match(outcomes[1]!.text, / · attempt 2 · /);
+  assert.ok(outcomes.every(row => row.reaction === null), "the terminal notice owns the failure reaction");
+  const failures = store.listUnsentOutbox().filter(row => row.reaction === "x");
+  assert.equal(failures.length, 1);
+  assert.match(failures[0]!.text, /failed after 2 attempt\(s\)/);
+  clock.advance(60 * 60_000);
+  assert.equal(store.claimNext("mac", 0), null, "attempt bound stops retries");
+  store.close();
+});
+
+test("multipart failed attempts reach the outbox whole under the releasing lease", async (t) => {
+  const { store, clock, macToken } = fixture({ maxAttempts: 2 });
+  t.after(() => store.close());
+  const slack: SlackTransport = {
+    async replay() { throw new Error("unused"); },
+    async reply() { throw new Error("unused"); },
+    async react() { throw new Error("unused"); },
+  };
+  const server = new BrokerHttpServer(new BrokerService(store, slack), {
+    host: "127.0.0.1", port: 0, adminToken: "x".repeat(32), review: null, attention: null,
+  });
+  const { port } = await server.start();
+  t.after(() => server.stop());
+  const client = new BrokerClient(`http://127.0.0.1:${port}`, "mac", macToken);
+  store.ingestEvent(event());
+  const reason = { code: "provider_runtime_failed", detail: "runtime unavailable" };
+  // A single JSON body would exceed the broker's 1 MB cap after escaping.
+  const outcome = "begin" + "\u0001".repeat(2 * OUTCOME_TRANSPORT_PART_CHARS) + "end";
+  for (const attempt of [1, 2]) {
+    const delivery = store.claimNext("mac", 0)!;
+    assert.throws(
+      () => store.release(delivery.id, "mac", delivery.leaseGeneration!, reason, "partial", 1),
+      InvalidTransitionError,
+    );
+    assert.equal(store.getDelivery(delivery.id).status, "claimed");
+    assert.equal(store.listUnsentOutbox().length, 0);
+
+    const released = await client.release(delivery, reason, outcome);
+    assert.equal(released.status, attempt === 1 ? "pending" : "failed");
+    assert.deepEqual(released.reasons, [reason]);
+    assert.equal(store.db.prepare("SELECT 1 FROM outcome_parts").get(), undefined);
+    const posts: string[] = [];
+    const reactions: string[] = [];
+    for (let batch = store.listUnsentOutbox(); batch.length; batch = store.listUnsentOutbox()) {
+      for (const row of batch) {
+        if (row.reaction) reactions.push(row.reaction);
+        if (row.text.includes("\n\n[delivery ")) {
+          assert.equal(row.reaction, null);
+          posts.push(row.text);
+        }
+        store.markOutboxSent(row.outboxId, `300.${row.outboxId}`);
+      }
+    }
+    assert.deepEqual(reactions, attempt === 1 ? [] : ["x"]);
+    assert.ok(posts.length > 2);
+    const bodies = posts.map((post, index) => {
+      const footer = `\n\n[delivery ${delivery.id} · attempt ${attempt} · part ${index + 1}/${posts.length} · dedupe ${delivery.event.messageTs}:${delivery.id} · ${delivery.actor}]`;
+      assert.ok(post.endsWith(footer));
+      return post.slice(0, -footer.length);
+    });
+    assert.equal(bodies.join(""), outcome);
+    clock.advance(retryBackoffMs(attempt));
+  }
+});
+
+test("a successful provider retry stamps only success and identifies its attempt", () => {
+  const { store, clock } = fixture({ maxAttempts: 2 });
+  store.ingestEvent(event());
+  const first = store.claimNext("mac", 0)!;
+  store.release(first.id, "mac", first.leaseGeneration!, {
+    code: "provider_runtime_failed", detail: "runtime unavailable",
+  }, "Blocked before claiming.");
+  clock.advance(retryBackoffMs(1));
+  const second = store.claimNext("mac", 0)!;
+  const processed = store.finish(second.id, "mac", second.leaseGeneration!, "processed", [], "Done.");
+  assert.equal(processed.status, "processed");
+  const outbox = store.listUnsentOutbox();
+  assert.ok(outbox.every(row => row.reaction !== "x"));
+  const success = outbox.find(row => row.reaction === "white_check_mark")!;
+  assert.match(success.text, /^Done\./);
+  assert.match(success.text, / · attempt 2 · /);
+  store.close();
 });
