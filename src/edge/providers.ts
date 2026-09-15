@@ -555,19 +555,28 @@ async function runHeadless(
 
 /**
  * Read failure events from the full stream, before the diagnostic tail is cut.
- * Codex can emit an error item for a dead tool runtime and still exit zero with
- * turn.completed. Ordinary command failures are command_execution items, not
- * runtime error items; a seat can recover from those within its turn.
+ * Codex reports startup errors before turn.started (delivery 2593) yet can
+ * still exit zero with turn.completed. Those remain failed attempts. Within a
+ * turn, error items are nonfatal and completion can confirm recovery; neither
+ * startup errors nor fatal stream/turn errors are cleared by that completion.
  */
 export function headlessDispatchResult(output: string): ProviderDispatch {
   let failure: Reason | undefined;
+  let turnStarted = false;
+  let itemFailure: Reason | undefined;
   for (const line of output.split("\n")) {
     let value: Record<string, unknown>;
     try { value = JSON.parse(line); } catch { continue; }
     if (!value || typeof value !== "object") continue;
     const item = value.item as Record<string, unknown> | undefined;
-    if ((value.type === "item.completed" && item?.type === "error")
-      || value.type === "turn.failed" || value.type === "error") {
+    if (value.type === "turn.started") turnStarted = true;
+    if (value.type === "item.completed" && item?.type === "error") {
+      const reason = { code: "provider_runtime_failed", detail: "Codex reported a runtime error in the provider stream" };
+      if (turnStarted) itemFailure = reason;
+      else failure = reason;
+    }
+    if (value.type === "turn.completed") itemFailure = undefined;
+    if (value.type === "turn.failed" || value.type === "error") {
       failure = { code: "provider_runtime_failed", detail: "Codex reported a runtime error in the provider stream" };
     }
     if (value.type === "result" && (value.is_error === true
@@ -575,6 +584,7 @@ export function headlessDispatchResult(output: string): ProviderDispatch {
       failure = { code: "provider_runtime_failed", detail: "Provider reported an unsuccessful result" };
     }
   }
+  failure ??= itemFailure;
   const receipt = output.slice(-4_000);
   const outcome = headlessAcknowledgement(output, failure ? "Headless provider turn failed without a textual outcome." : undefined);
   return failure ? { receipt, outcome, processed: false, failure } : { receipt, outcome, processed: true };

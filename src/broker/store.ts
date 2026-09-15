@@ -1435,7 +1435,8 @@ export class BrokerStore {
       const current = this.getDelivery(deliveryId);
       if (TERMINAL.has(current.status)) throw new InvalidTransitionError("terminal delivery cannot be released");
       this.requeueOrFail(current, reason);
-      if (outcome !== null) this.enqueueOutbox(current, outcomePost(current, outcome), REACTION_FAILED);
+      // requeueOrFail owns the lifecycle reaction: only exhaustion stamps x.
+      if (outcome !== null) this.enqueueOutbox(current, outcomePost(current, outcome));
       return this.getDelivery(deliveryId);
     })();
   }
@@ -1696,7 +1697,7 @@ function dispatchedNotice(delivery: Delivery, notices: Reason[]): string {
 }
 
 function outcomePost(delivery: Delivery, text: string): string {
-  return `${text}\n\n[delivery ${delivery.id} · dedupe ${delivery.event.messageTs}:${delivery.id} · ${delivery.actor}]`;
+  return `${text}\n\n[delivery ${delivery.id} · attempt ${delivery.attempts} · dedupe ${delivery.event.messageTs}:${delivery.id} · ${delivery.actor}]`;
 }
 
 function failureNotice(delivery: Delivery, status: "failed" | "undeliverable", reasons: Reason[]): string {

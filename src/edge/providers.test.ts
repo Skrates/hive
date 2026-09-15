@@ -555,6 +555,25 @@ test("Claude error results cannot become successful completions", () => {
   })).processed, true);
 });
 
+test("completed Codex turns recover item errors but not startup or fatal errors", () => {
+  const itemError = { type: "item.completed", item: { type: "error", message: "runtime unavailable" } };
+  const started = { type: "turn.started" };
+  const answer = { type: "item.completed", item: { type: "agent_message", text: "Done through another tool." } };
+  const completed = { type: "turn.completed" };
+  const cases: [string, unknown[], boolean][] = [
+    ["recovered item error", [started, itemError, answer, completed], true],
+    ["startup failure", [itemError, started, answer, completed], false],
+    ["item error without completion", [started, itemError, answer], false],
+    ["fatal turn", [started, { type: "turn.failed" }, answer, completed], false],
+    ["fatal stream", [started, { type: "error" }, answer, completed], false],
+  ];
+  for (const [name, events, processed] of cases) {
+    const result = headlessDispatchResult(events.map(value => JSON.stringify(value)).join("\n"));
+    assert.equal(result.processed, processed, name);
+    assert.equal(result.outcome, answer.item.text, name);
+  }
+});
+
 test("a zero-exit Codex child emitting delivery 2593's stream is a failed attempt", async (t) => {
   const root = mkdtempSync(join(tmpdir(), "hive-preclaim-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
