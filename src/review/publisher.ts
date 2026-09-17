@@ -36,6 +36,7 @@ import {
 } from "./effects.js";
 import { boardComment, checkRun, slackBoardLine, threadState } from "./render.js";
 import type { UnknownSourceRecord } from "./store.js";
+import { noReviewTelemetry, type ReviewTelemetry } from "./telemetry.js";
 
 /**
  * GitHub-side projections (M1). `null` in M0: the Slack board line is the one projection.
@@ -114,6 +115,8 @@ export interface PublisherStore {
     unknown(reviewId: string): UnknownSourceRecord[];
   };
   readonly effects: {
+    /** Unfinished rows, including backoff and terminal failures invisible to the due-row query. */
+    backlog(sink: EffectSink): { pending_rows: number; stuck_rows: number };
     /** §8.1: the due rows of one sink (plus any row whose target names no sink — see the store). */
     pendingByTarget(now: string, sink: EffectSink, limit?: number): PublishableEffect[];
     claim(effectId: string): PublishableEffect | null;
@@ -200,6 +203,7 @@ export class ReviewPublisher {
     ports: ReviewPublisherPorts,
     private readonly clock: Clock,
     githubTimeoutMs: number = REVIEW_GITHUB_DISPATCH_TIMEOUT_MS,
+    private readonly telemetry: ReviewTelemetry = noReviewTelemetry,
   ) {
     this.ports = {
       slack: ports.slack,
@@ -241,12 +245,24 @@ export class ReviewPublisher {
   }
 
   private async pass(sink: EffectSink): Promise<number> {
-    const rows = this.boardFirst(this.store.effects.pendingByTarget(iso(this.clock), sink));
-    let handled = 0;
-    for (const row of rows) {
-      if (await this.handle(row)) handled += 1;
-    }
-    return handled;
+    return this.telemetry.run("review.outbox", { sink }, async span => {
+      const rows = this.boardFirst(this.store.effects.pendingByTarget(iso(this.clock), sink));
+      span.setAttributes({ ...this.store.effects.backlog(sink), due_targets: rows.length,
+        retries: rows.filter(row => row.attempts > 0).length });
+      let handled = 0;
+      for (const row of rows) {
+        const result = await this.telemetry.run("review.publish", {
+          effect_id: row.effect_id, target: row.target, attempts: row.attempts, outcome: "pending",
+        }, async publication => {
+          const result = await this.handle(row);
+          publication.setAttribute("handled", result);
+          return result;
+        });
+        if (result) handled += 1;
+      }
+      span.setAttribute("handled", handled);
+      return handled;
+    });
   }
 
   /**
@@ -363,12 +379,14 @@ export class ReviewPublisher {
   }
 
   private mark(row: PublishableEffect, outcome: "sent" | "obsolete"): boolean {
+    this.telemetry.attributes({ outcome });
     if (outcome === "sent") this.store.effects.markSent(row.effect_id);
     else this.store.effects.markObsolete(row.effect_id);
     return true;
   }
 
   private fail(row: PublishableEffect, error: unknown): void {
+    this.telemetry.attributes({ outcome: "failed" });
     console.error("hive review effect failed", row.effect_id, row.target, error);
     this.store.effects.markFailed(row.effect_id, this.nextAttemptAt(row.attempts));
   }

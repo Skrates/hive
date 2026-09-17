@@ -95,6 +95,11 @@ class FakeReviewStore implements PublisherStore {
     return found;
   }
   readonly effects = {
+    backlog: (sink: EffectSink): { pending_rows: number; stuck_rows: number } => {
+      const rows = this.rows.filter(row => inSink(row.target, sink) && ["pending", "claimed", "failed"].includes(row.status));
+      return { pending_rows: rows.filter(row => row.status !== "failed").length,
+        stuck_rows: rows.filter(row => row.status === "failed" || row.attempts > 0).length };
+    },
     pendingByTarget: (now: string, sink: EffectSink): PublishableEffect[] => {
       const byTarget = new Map<string, Row>();
       const eligible = this.rows.filter((r) => r.status === "pending" && (r.nextAttemptAt === null || r.nextAttemptAt <= now) && inSink(r.target, sink));

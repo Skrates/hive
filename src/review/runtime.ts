@@ -27,8 +27,11 @@ import { ReviewPublisher } from "./publisher.js";
 import { decide, fold, read } from "./reducer.js";
 import { readOwnerOnlyFile } from "./secret-file.js";
 import { ReviewStore } from "./store.js";
+import { reviewTelemetry, type ReviewTelemetry } from "./telemetry.js";
 
 export interface ReviewRuntimeEnv {
+  HIVE_REVIEW_LOGFIRE_TOKEN?: string | undefined;
+  HIVE_REVIEW_LOGFIRE_REGION?: "us" | "eu" | undefined;
   HIVE_GITHUB_WEBHOOK_SECRET_FILE?: string | undefined;
   HIVE_GITHUB_APP_ID?: string | undefined;
   HIVE_GITHUB_APP_KEY_FILE?: string | undefined;
@@ -36,6 +39,7 @@ export interface ReviewRuntimeEnv {
 }
 
 export interface ReviewRuntimeInput {
+  telemetry?: ReviewTelemetry;
   broker: BrokerStore;
   clock: Clock;
   adminToken: string;
@@ -47,13 +51,14 @@ export interface ReviewRuntimeInput {
 }
 
 export interface ReviewRuntime {
+  housekeeping(): Promise<number>;
   store: ReviewStore;
   publisher: ReviewPublisher;
   /** Present only when the GitHub adapter is enabled (M1). */
   scheduler: ReconcileScheduler | null;
   github: { appId: string } | null;
   http: ReviewHttpDeps;
-  /** Starts the reconcile loops (inbox drain, sweep, start-up redelivery ask); a no-op without the adapter. */
+  /** Requests startup redeliveries. The broker's existing tick calls housekeeping. */
   start(): void;
   stop(): Promise<void>;
 }
@@ -98,7 +103,9 @@ function readSecret(name: string, path: string): string {
 
 export function bootReviewRuntime(input: ReviewRuntimeInput): ReviewRuntime {
   const { broker, clock, log } = input;
-  const store = new ReviewStore(broker.db, { decide, fold, read, clock,
+  const telemetry = input.telemetry ?? reviewTelemetry(input.env.HIVE_REVIEW_LOGFIRE_TOKEN, input.env.HIVE_REVIEW_LOGFIRE_REGION);
+  if (!input.env.HIVE_REVIEW_LOGFIRE_TOKEN && !input.telemetry) log("[review] Logfire export disabled: HIVE_REVIEW_LOGFIRE_TOKEN is not set; spans use no-op export");
+  const store = new ReviewStore(broker.db, { decide, fold, read, clock, telemetry,
     onEffectExhausted: notice => {
       const channelId = notice.channelId ?? input.failureChannelId;
       if (channelId === undefined) throw new Error("no channel configured for review failure notices");
@@ -109,36 +116,47 @@ export function bootReviewRuntime(input: ReviewRuntimeInput): ReviewRuntime {
 
   if (resolved.config === null) {
     log(`[review] GitHub adapter disabled (${resolved.reason}): webhook ingress 404, no reconcile, Slack board line only (M0)`);
-    const publisher = new ReviewPublisher(store, { github: null, slack: broker }, clock);
+    const publisher = new ReviewPublisher(store, { github: null, slack: broker }, clock, undefined, telemetry);
     return {
       store,
       publisher,
       scheduler: null,
       github: null,
+      housekeeping: () => telemetry.sync("review.housekeeping", {
+        adapter_enabled: false, ...telemetry.takeHousekeepingCounts(),
+      }, () => publisher.drainOnce()),
       http: { store, broker, webhook: null, adminToken: input.adminToken, reconcile: null },
       start: () => {},
-      stop: () => publisher.stop(),
+      stop: async () => { await publisher.stop(); await telemetry.stop(); },
     };
   }
 
   const { appId, webhookSecret, privateKeyPem, summonToken } = resolved.config;
-  const github = new AppGitHubPort(input.fetch === undefined ? { appId, privateKeyPem, summonToken, clock } : { appId, privateKeyPem, summonToken, clock, fetch: input.fetch });
-  const publisher = new ReviewPublisher(store, { github, slack: broker }, clock);
-  const scheduler = new ReconcileScheduler({ store, github, clock, log });
+  const github = new AppGitHubPort({ appId, privateKeyPem, summonToken, clock, telemetry,
+    ...(input.fetch ? { fetch: input.fetch } : {}),
+  });
+  const publisher = new ReviewPublisher(store, { github, slack: broker }, clock, undefined, telemetry);
+  const scheduler = new ReconcileScheduler({ store, github, clock, log, telemetry });
   log(`[review] GitHub adapter enabled as App ${appId}: webhook ingress on /v1/github/webhook, reconcile scheduler armed`);
   return {
     store,
     publisher,
     scheduler,
     github: { appId },
+    housekeeping: () => telemetry.sync("review.housekeeping", {
+      adapter_enabled: true, ...telemetry.takeHousekeepingCounts(),
+    }, () => {
+      scheduler.housekeeping();
+      return publisher.drainOnce();
+    }),
     http: {
       store,
       broker,
-      webhook: (request) => handleWebhook(store, webhookSecret, request, clock),
+      webhook: (request) => handleWebhook(store, webhookSecret, request, clock, telemetry),
       adminToken: input.adminToken,
       reconcile: (key: ReviewKey) => scheduler.wake(key),
     },
     start: () => scheduler.start(),
-    stop: async () => { await scheduler.stop(); await publisher.stop(); },
+    stop: async () => { await scheduler.stop(); await publisher.stop(); await telemetry.stop(); },
   };
 }

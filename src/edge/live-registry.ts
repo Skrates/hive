@@ -1,5 +1,9 @@
 import type { AttestationRead } from "./attestation.js";
 import { canonicalActor, type Provider } from "../domain.js";
+import { randomBytes } from "node:crypto";
+
+export type SessionCustody = { available: true; token: string }
+  | { available: false; reason: "session_not_registered" | "session_actor_ambiguous" | "session_attestation_unproven" };
 
 /**
  * ADR-0003 R-4: a live surface announces "I can receive injections for this
@@ -45,6 +49,7 @@ export class LiveIngressRegistryError extends Error {
 
 export class LiveIngressRegistry {
   private readonly entries = new Map<string, LiveIngress>();
+  private readonly sessionTokens = new Map<string, { token: string; sessionId: string }>();
   private readonly now: () => number;
 
   constructor(dependencies: { now?: () => number } = {}) {
@@ -70,7 +75,9 @@ export class LiveIngressRegistry {
       runtimeAttestation: retainedAttestation(held, input.runtimeAttestation),
       expiresAt: this.now() + ttlMs,
     });
+    if (held === undefined) this.sessionTokens.delete(bindingKey);
     this.entries.set(bindingKey, entry);
+    if (entry.sessionId !== null) this.sessionCustody(entry.sessionId);
     return entry;
   }
 
@@ -80,6 +87,7 @@ export class LiveIngressRegistry {
     if (!entry) return null;
     if (entry.expiresAt <= this.now()) {
       this.entries.delete(bindingKey);
+      this.sessionTokens.delete(bindingKey);
       return null;
     }
     return entry;
@@ -92,6 +100,41 @@ export class LiveIngressRegistry {
    */
   deregister(actor: string, provider: Provider): void {
     this.entries.delete(key(actor, provider));
+    this.sessionTokens.delete(key(actor, provider));
+  }
+
+  /** §3.2: a session token proves one live, attested actor binding, never a caller's actor field. */
+  sessionCustody(sessionId: string): SessionCustody {
+    const entries = [...this.entries.values()].filter(entry =>
+      entry.sessionId === sessionId && this.get(entry.actor, entry.provider) !== null);
+    if (entries.length !== 1) {
+      for (const entry of entries) this.sessionTokens.delete(key(entry.actor, entry.provider));
+      return { available: false, reason: entries.length === 0 ? "session_not_registered" : "session_actor_ambiguous" };
+    }
+    const entry = entries[0]!;
+    const bindingKey = key(entry.actor, entry.provider);
+    if (!entry.runtimeAttestation.ok
+      || canonicalActor(entry.runtimeAttestation.attestation.actor) !== canonicalActor(entry.actor)) {
+      this.sessionTokens.delete(bindingKey);
+      return { available: false, reason: "session_attestation_unproven" };
+    }
+    let held = this.sessionTokens.get(bindingKey);
+    if (!held || held.sessionId !== sessionId) {
+      held = { token: randomBytes(32).toString("hex"), sessionId };
+      this.sessionTokens.set(bindingKey, held);
+    }
+    return { available: true, token: held.token };
+  }
+
+  resolveSession(token: string): { actor: string; session_id: string } | null {
+    for (const [bindingKey, held] of this.sessionTokens) {
+      if (held.token !== token) continue;
+      const custody = this.sessionCustody(held.sessionId);
+      if (!custody.available || custody.token !== token) return null;
+      const entry = this.entries.get(bindingKey);
+      return entry ? { actor: canonicalActor(entry.actor), session_id: held.sessionId } : null;
+    }
+    return null;
   }
 }
 
