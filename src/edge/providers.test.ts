@@ -8,7 +8,7 @@ import type { Delivery, Subscription } from "../domain.js";
 import { prepareSocketPath } from "../local/uds.js";
 import type { LiveIngress } from "./live-registry.js";
 import { delimiter, dirname } from "node:path";
-import { ingressInboxDirectory, ClaudeProvider, claudePromptSlotArgs, CODEX_NETWORK_DOMAINS, codexPermissionArgs, codexSpawnArgs, codexResumeTurn, codexSpawnTurn, CodexProvider, composeChildEnv, GrokProvider, grokPermissionArgs, prependPathEntry, ProviderPreDispatchError, requireAccountProfile, resolveEdgeSocketPath } from "./providers.js";
+import { headlessDispatchResult, ingressInboxDirectory, ClaudeProvider, claudePromptSlotArgs, CODEX_NETWORK_DOMAINS, codexPermissionArgs, codexSpawnArgs, codexResumeTurn, codexSpawnTurn, CodexProvider, composeChildEnv, GrokProvider, grokPermissionArgs, prependPathEntry, ProviderPreDispatchError, requireAccountProfile, resolveEdgeSocketPath } from "./providers.js";
 import { drainInbox } from "../channel/claude-hook.js";
 
 function subscription(overrides: Partial<Subscription> = {}): Subscription {
@@ -519,4 +519,74 @@ test("codex seats may reach GitHub and the hive socket, nothing else", () => {
     assert.ok(domains.includes(`"${host}"="allow"`), host);
   }
   assert.ok(!domains.includes("deny"));
+});
+
+
+test("runtime errors survive receipt truncation, but recovered command failures remain successful", () => {
+  const runtime = { type: "item.completed", item: { type: "error", message: "runtime unavailable" } };
+  const done = { type: "item.completed", item: { type: "agent_message", text: "Blocked before claiming." } };
+  const stream = [JSON.stringify(runtime), JSON.stringify({ type: "diagnostic", text: "x".repeat(5000) }),
+    JSON.stringify(done), JSON.stringify({ type: "turn.completed" })].join("\n");
+  const failed = headlessDispatchResult(stream);
+  assert.equal(failed.processed, false);
+  assert.equal(failed.receipt.includes("runtime unavailable"), false);
+  assert.equal(failed.outcome, "Blocked before claiming.");
+  assert.equal(headlessDispatchResult([
+    JSON.stringify({ type: "item.completed", item: { type: "command_execution", exit_code: 1 } }),
+    JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "Recovered and done." } }),
+    JSON.stringify({ type: "turn.completed" }),
+  ].join("\n")).processed, true);
+});
+
+test("Claude error results cannot become successful completions", () => {
+  for (const failure of [
+    { subtype: "success", is_error: true },
+    { subtype: "error_during_execution", result: null },
+  ]) {
+    const parsed = headlessDispatchResult([
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "Runtime failed." }] } }),
+      JSON.stringify({ type: "result", ...failure }),
+    ].join("\n"));
+    assert.equal(parsed.processed, false);
+    assert.equal(parsed.outcome, "Runtime failed.");
+  }
+  assert.equal(headlessDispatchResult(JSON.stringify({
+    type: "result", subtype: "success", is_error: false, result: "Done.",
+  })).processed, true);
+});
+
+test("completed Codex turns recover item errors but not startup or fatal errors", () => {
+  const itemError = { type: "item.completed", item: { type: "error", message: "runtime unavailable" } };
+  const started = { type: "turn.started" };
+  const answer = { type: "item.completed", item: { type: "agent_message", text: "Done through another tool." } };
+  const completed = { type: "turn.completed" };
+  const cases: [string, unknown[], boolean][] = [
+    ["recovered item error", [started, itemError, answer, completed], true],
+    ["startup failure", [itemError, started, answer, completed], false],
+    ["item error without completion", [started, itemError, answer], false],
+    ["fatal turn", [started, { type: "turn.failed" }, answer, completed], false],
+    ["fatal stream", [started, { type: "error" }, answer, completed], false],
+  ];
+  for (const [name, events, processed] of cases) {
+    const result = headlessDispatchResult(events.map(value => JSON.stringify(value)).join("\n"));
+    assert.equal(result.processed, processed, name);
+    assert.equal(result.outcome, answer.item.text, name);
+  }
+});
+
+test("a zero-exit Codex child emitting delivery 2593's stream is a failed attempt", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "hive-preclaim-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const stream = readFileSync("test/fixtures/codex-preclaim-runtime-error.jsonl", "utf8");
+  writeFileSync(join(root, "codex"), "#!/bin/sh\ncat <<'STREAM'\n" + stream + "STREAM\n", { mode: 0o700 });
+  const previousPath = process.env.PATH;
+  process.env.PATH = root + delimiter + previousPath;
+  t.after(() => { process.env.PATH = previousPath; });
+  const result = await new CodexProvider().spawn(subscription({ accountProfile: root }), root, "wake", {
+    deliveryId: 2593, token: "test-only", effort: null,
+  });
+  assert.equal(result.processed, false);
+  if (result.processed) assert.fail("runtime error was treated as success");
+  assert.equal(result.failure?.code, "provider_runtime_failed");
+  assert.match(result.outcome ?? "", /Blocked before claiming/);
 });

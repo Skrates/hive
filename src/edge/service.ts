@@ -295,6 +295,13 @@ export class EdgeService {
         this.store.setStatus(current.id, generation, "processed", dispatch.receipt);
         return;
       }
+      if (dispatch.failure) {
+        // Release uses the existing attempt bound/backoff. Outcome and retry
+        // disposition commit together, so neither Slack loss nor a crash hides it.
+        await this.broker.release(current, dispatch.failure, dispatch.outcome);
+        this.store.setStatus(current.id, generation, "released", dispatch.receipt);
+        return;
+      }
       // A non-completion-tracked live delivery (currently Claude inbox write)
       // is durable but the agent has not answered yet. The delivery stays
       // `dispatched` until the agent's `hive reply` closes it (R-6); if no

@@ -151,8 +151,8 @@ export class BrokerService {
   }
 
   /** ADR-0003 R-3: uncertainty releases the delivery for redelivery instead of declaring an outcome. */
-  release(deliveryId: number, edgeId: string, generation: number, reason: Reason): Delivery {
-    return this.store.release(deliveryId, edgeId, generation, reason);
+  release(deliveryId: number, edgeId: string, generation: number, reason: Reason, outcome: string | null = null): Delivery {
+    return this.store.release(deliveryId, edgeId, generation, reason, outcome);
   }
 
   /** ADR-0003 R-6: agent outcome reports are not lease-fenced and always reach the thread. */

@@ -1429,12 +1429,14 @@ export class BrokerStore {
    * thread-visible notice; otherwise the delivery requeues behind exponential
    * backoff and the retry is announced in the thread.
    */
-  release(deliveryId: number, edgeId: string, generation: number, reason: Reason): Delivery {
+  release(deliveryId: number, edgeId: string, generation: number, reason: Reason, outcome: string | null = null): Delivery {
     return this.db.transaction(() => {
       this.assertLease(deliveryId, edgeId, generation);
       const current = this.getDelivery(deliveryId);
       if (TERMINAL.has(current.status)) throw new InvalidTransitionError("terminal delivery cannot be released");
       this.requeueOrFail(current, reason);
+      // requeueOrFail owns the lifecycle reaction: only exhaustion stamps x.
+      if (outcome !== null) this.enqueueOutbox(current, outcomePost(current, outcome));
       return this.getDelivery(deliveryId);
     })();
   }
@@ -1491,10 +1493,10 @@ export class BrokerStore {
     const nextAttemptAt = new Date(this.clock.now().getTime() + retryBackoffMs(delivery.attempts)).toISOString();
     this.db.prepare(`
       UPDATE deliveries
-      SET status='pending', lease_generation=NULL, lease_slot=NULL, claimed_by=NULL, next_attempt_at=?,
+      SET status='pending', reasons_json=?, lease_generation=NULL, lease_slot=NULL, claimed_by=NULL, next_attempt_at=?,
           accepted_at=NULL, dispatch_started_at=NULL, dispatched_at=NULL, updated_at=?
       WHERE delivery_id=? AND status IN ('claimed', 'accepted_local', 'dispatching', 'dispatched')
-    `).run(nextAttemptAt, now, delivery.id);
+    `).run(JSON.stringify([reason]), nextAttemptAt, now, delivery.id);
     this.enqueueOutbox(
       delivery,
       `⟳ retrying delivery ${delivery.id} to ${delivery.actor} (attempt ${delivery.attempts}/${delivery.subscription.maxAttempts} did not confirm: ${reason.code})`,
@@ -1695,7 +1697,7 @@ function dispatchedNotice(delivery: Delivery, notices: Reason[]): string {
 }
 
 function outcomePost(delivery: Delivery, text: string): string {
-  return `${text}\n\n[delivery ${delivery.id} · dedupe ${delivery.event.messageTs}:${delivery.id} · ${delivery.actor}]`;
+  return `${text}\n\n[delivery ${delivery.id} · attempt ${delivery.attempts} · dedupe ${delivery.event.messageTs}:${delivery.id} · ${delivery.actor}]`;
 }
 
 function failureNotice(delivery: Delivery, status: "failed" | "undeliverable", reasons: Reason[]): string {

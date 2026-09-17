@@ -79,10 +79,10 @@ export class BrokerClient {
   }
 
   /** ADR-0003 R-3: release a delivery back to the broker for another attempt after uncertainty. */
-  async release(delivery: Delivery, reason: Reason): Promise<Delivery> {
+  async release(delivery: Delivery, reason: Reason, outcome: string | null = null): Promise<Delivery> {
     const response = await this.request(`/v1/deliveries/${delivery.id}/release`, {
       method: "POST",
-      body: JSON.stringify({ generation: requiredGeneration(delivery), reason }),
+      body: JSON.stringify({ generation: requiredGeneration(delivery), reason, outcome }),
     });
     return this.json<Delivery>(response);
   }

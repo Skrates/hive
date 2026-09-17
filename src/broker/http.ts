@@ -168,7 +168,7 @@ export class BrokerHttpServer {
         case "reserve-spawn": return json(response, 200, { reserved: this.broker.reserveSpawn(deliveryId, edgeId, generation) });
         case "release": {
           const reason = ReasonSchema.parse(body.reason);
-          return json(response, 200, this.broker.release(deliveryId, edgeId, generation, reason));
+          return json(response, 200, this.broker.release(deliveryId, edgeId, generation, reason, body.outcome == null ? null : requiredString(body.outcome, "outcome")));
         }
         case "result": {
           const result = DeliveryResultInputSchema.parse(body);
