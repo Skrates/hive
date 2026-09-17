@@ -768,6 +768,11 @@ _EDIT_STAMP_KEYS = ("updated_at", "lastEditedAt", "last_edited_at")
 # must not parse that body as as-of-closure evidence.  Identity (id, author,
 # head, review association, path, line) still is.
 BODY_AS_OF_CLOSURE = "body_as_of_closure"
+# A Codex review submitted before closure whose summary was edited after it and
+# which has no surviving inline findings.  Its id, head and ``submitted_at``
+# prove a round was consumed; its verdict is unrecoverable, so it is neither
+# ``clean`` nor ``findings`` and never closes review.
+UNKNOWN_REVIEW_RESULT = "unknown"
 
 
 def required_env(name: str) -> str:
@@ -2724,8 +2729,9 @@ def _untrusted_body_without_inline_findings(
     """True when identity is kept but the item cannot be dated as a verdict.
 
     A post-closure edit clears the body.  Surviving inline comments still
-    classify the round; with none, the review is omitted from the result
-    stream and must not be the history selector's latest review for the head.
+    classify the round; with none, the review enters the result stream as
+    ``UNKNOWN_REVIEW_RESULT`` — the round was consumed, its verdict is not
+    known — and must not be the history selector's latest review for the head.
     """
     return item.get(BODY_AS_OF_CLOSURE) is False and not inline_findings
 
@@ -2825,11 +2831,14 @@ def codex_result_events(
         if review.get(BODY_AS_OF_CLOSURE) is False:
             # Summary text is a post-closure edit.  Classify from pre-closure
             # inline comments; with none, the review cannot be dated as a
-            # verdict and must not become CLEAN or a phantom findings round.
+            # verdict — but its id, head and submission time still prove the
+            # round, so it is kept as a non-closing unknown result rather than
+            # dropped, and never read as CLEAN or as a findings round.
             inlines = inline_findings_for(review)
             if _untrusted_body_without_inline_findings(review, inlines):
-                continue
-            kind = "findings"
+                kind = UNKNOWN_REVIEW_RESULT
+            else:
+                kind = "findings"
         else:
             kind = review_kind(review, body, head_sha)
         events.append(
@@ -3066,11 +3075,25 @@ def latest_result_by_head(
     time cannot carry that proof on their own — GitHub stamps whole seconds, so
     a newer verdict of the same kind in the same second is invisible to both
     (KRA-1368).
+
+    An ``UNKNOWN_REVIEW_RESULT`` wins a head only when nothing else does: its
+    verdict is unrecoverable, so it cannot supersede a known result on the
+    same head, and a known result supersedes it whenever it lands.
     """
     latest: dict[str, tuple[datetime, int, str, str, str]] = {}
     for at, order, head, kind, source, identity in events:
         previous = latest.get(head)
-        if previous is None or (at, order) >= (previous[0], previous[1]):
+        if previous is None:
+            latest[head] = (at, order, kind, source, identity)
+            continue
+        unknown = kind == UNKNOWN_REVIEW_RESULT
+        previous_unknown = previous[2] == UNKNOWN_REVIEW_RESULT
+        if unknown and not previous_unknown:
+            continue
+        if (previous_unknown and not unknown) or (at, order) >= (
+            previous[0],
+            previous[1],
+        ):
             latest[head] = (at, order, kind, source, identity)
     return {
         head: {"kind": kind, "source": source, "at": at, "identity": identity}
@@ -3174,10 +3197,12 @@ def round_history(
     digest: an earlier review's comments on the same unchanged head are
     superseded by the later review's own complete assessment (an intervening
     CLEAN may have resolved them), so merging rounds would hand Theoros
-    findings that are no longer live.  A later review omitted from that
-    stream — a post-closure-edited summary with no surviving inlines — is
-    not a candidate; when ``latest_results`` names the winning Codex review,
-    that identity is the digest, not a second latest-per-head scan.
+    findings that are no longer live.  A post-closure-edited summary with no
+    surviving inlines is not a digest candidate; when ``latest_results`` names
+    the winning Codex review, that identity is the digest, not a second
+    latest-per-head scan.  Where such a review is the only result on its head,
+    the round is reported as consumed with an unknown verdict: never CLEAN,
+    never closing, no findings invented.
 
     Each head's verdict is read from the producer that actually won it, not
     from whichever record exists.  A head can carry both a Codex review and a
@@ -3290,6 +3315,13 @@ def round_history(
                     "digest in the verdict comment)"
                 )
                 counts = {"p1": 0, "p2": 0, "p3": 0, "total": 0}
+            locations = []
+        elif kind == UNKNOWN_REVIEW_RESULT:
+            verdict = (
+                "review submitted, summary edited after closure "
+                "(verdict unknown; not evidence of CLEAN)"
+            )
+            counts = severity_counts([])
             locations = []
         elif head not in findings_by_head:
             verdict = "CLEAN (Codex clean comment)"

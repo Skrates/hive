@@ -1330,7 +1330,7 @@ def run_digest(*, dry_run: bool = False, since_override: str | None = None) -> N
     token = required_env("WEAVE_DIGEST_TOKEN")
     codex_login = os.environ.get("CODEX_LOGIN", review_loop.CODEX_LOGIN)
     now = datetime.now(timezone.utc)
-    self_repo = os.environ.get("GITHUB_REPOSITORY", "RationallyPrime/weave-doctrine")
+    self_repo = os.environ.get("GITHUB_REPOSITORY", "Skrates/weave-doctrine")
     run_id = os.environ.get("GITHUB_RUN_ID", "")
     parsed_override: datetime | None = None
     if since_override:
