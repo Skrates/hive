@@ -14,6 +14,7 @@ import {
 } from "./contract.js";
 import { parseReviewKey } from "./key.js";
 import type { ApplyInput } from "./store.js";
+import { writeJsonResponse } from "../http.js";
 
 /**
  * The review surface of the broker's HTTP API (design §5.A1–A2, §7 ingress, §9).
@@ -296,8 +297,6 @@ function notFound(response: ServerResponse): true {
 }
 
 function json(response: ServerResponse, status: number, value: unknown): true {
-  const body = JSON.stringify(value);
-  response.writeHead(status, { "content-type": "application/json", "content-length": Buffer.byteLength(body) });
-  response.end(body);
+  writeJsonResponse(response, status, value);
   return true;
 }

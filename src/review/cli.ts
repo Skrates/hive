@@ -3,6 +3,7 @@ import type { Command } from "commander";
 import { readFileSync } from "node:fs";
 import { resolveEdgeSocketPath } from "../edge/providers.js";
 import { udsRequest, udsRequestJson } from "../local/uds.js";
+import { formatHttpErrorEnvelope, parseHttpErrorEnvelope } from "../http.js";
 import {
   validateAction,
   validatePolicy,
@@ -592,13 +593,6 @@ export function defaultReviewTransport(env: NodeJS.ProcessEnv = process.env): Re
 
 /** The broker's `{error, detail}` envelope when that is what came back; the raw body otherwise. */
 function refusalDetail(status: number, body: string): string {
-  try {
-    const value = JSON.parse(body) as { error?: unknown; detail?: unknown };
-    if (typeof value.error === "string") {
-      return typeof value.detail === "string" ? `${value.error} — ${value.detail}` : value.error;
-    }
-  } catch {
-    // fall through to the raw body below
-  }
-  return `HTTP ${status}: ${body.slice(0, 500)}`;
+  const envelope = parseHttpErrorEnvelope(body);
+  return envelope === null ? `HTTP ${status}: ${body.slice(0, 500)}` : formatHttpErrorEnvelope(envelope);
 }

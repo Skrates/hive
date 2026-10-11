@@ -11,6 +11,7 @@ import { readCodexForegroundBinding, type CodexForegroundBinding } from "./bindi
 import { resolveEdgeSocketPath } from "../edge/providers.js";
 import { CodexDesktopIpcClient } from "./desktop-ipc.js";
 import { CodexThreadCatalog } from "./discovery.js";
+import { writeJsonResponse as sendJson } from "../http.js";
 
 /**
  * ADR-0003 R-4: the Codex live surface. Connects to the Codex app-server
@@ -299,12 +300,6 @@ function bindingStatus(actor: string, target: LiveTarget | null): BindingStatus 
   if (!target) return { actor, mode: "unavailable" };
   if (target.kind === "dedicated") return { actor, mode: "dedicated" };
   return { actor, mode: "desktop", cwd: target.cwd, revision: target.revision };
-}
-
-function sendJson(response: ServerResponse, status: number, value: unknown): void {
-  const encoded = JSON.stringify(value);
-  response.writeHead(status, { "content-type": "application/json", "content-length": Buffer.byteLength(encoded) });
-  response.end(encoded);
 }
 
 /**

@@ -11,10 +11,10 @@ import {
   handleSlackEnvelope,
   MISSING_SLACK_EVENT_ID_DIAGNOSTIC,
   replyArguments,
-  safeErrorName,
   type SlackEnvelopeHandlerInput,
 } from "./slack.js";
 import { BrokerStore } from "./store.js";
+import { safeErrorName } from "./error-name.js";
 
 const WORKSPACE_ID = "T1";
 

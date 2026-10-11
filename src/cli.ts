@@ -23,6 +23,7 @@ import { ClaudeProvider, CodexProvider, GrokProvider, resolveEdgeSocketPath } fr
 import { EdgeService } from "./edge/service.js";
 import { EdgeStore } from "./edge/store.js";
 import { udsRequestJson, UdsHttpError } from "./local/uds.js";
+import { formatHttpErrorEnvelope, parseHttpErrorEnvelope } from "./http.js";
 import {
   assertCodexAttachmentActor,
   CODEX_ATTACHMENT_CONFIRMATION_TIMEOUT_MS,
@@ -398,15 +399,8 @@ const EdgeConfig = z.object({
  * seat must always be able to see what actually happened.
  */
 function refusalDetail(body: string): string {
-  try {
-    const value = JSON.parse(body) as { error?: unknown; detail?: unknown };
-    if (typeof value.error === "string") {
-      return typeof value.detail === "string" ? `${value.error} — ${value.detail}` : value.error;
-    }
-  } catch {
-    // fall through to the raw body below
-  }
-  return body.slice(0, 500);
+  const envelope = parseHttpErrorEnvelope(body);
+  return envelope === null ? body.slice(0, 500) : formatHttpErrorEnvelope(envelope);
 }
 
 function requiredEnv(name: string): string {
