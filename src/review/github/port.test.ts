@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { generateKeyPairSync, verify as verifySignature } from "node:crypto";
 import test from "node:test";
 import type { Clock } from "../../time.js";
-import { AppGitHubPort, GitHubApiError, type FetchLike } from "./port.js";
+import { AppGitHubPort, GitHubApiError, issueCommentRecord, reviewCommentRecord, reviewRecord, type FetchLike } from "./port.js";
 
 // A throwaway RSA key generated per test process: obviously not the App's key.
 const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
@@ -153,6 +153,40 @@ test("record listings: kinds, versions, reviewed heads and pagination", async ()
   assert.equal(issues.at(-1)?.id, 5560110170);
   assert.equal(calls.filter((c) => c.url.includes("/issues/66/comments")).length, 2);
   assert.deepEqual(await p.listFiles(1054, 66), [{ path: "src/a.ts", sha: "d".repeat(40), status: "modified" }]);
+});
+
+test("record mappers share base defaults and keep review-comment source-field priority", () => {
+  const empty = {};
+  const records = [reviewRecord(empty), reviewCommentRecord(empty), issueCommentRecord(empty)];
+  for (const record of records) {
+    assert.equal(record.id, 0);
+    assert.equal(record.authorLogin, "");
+    assert.equal(record.body, "");
+    assert.equal(record.raw, empty);
+  }
+
+  const populated = { id: 12, user: { login: "reviewer" }, body: "review text" };
+  const populatedRecords = [reviewRecord(populated), reviewCommentRecord(populated), issueCommentRecord(populated)];
+  for (const record of populatedRecords) {
+    assert.equal(record.id, 12);
+    assert.equal(record.authorLogin, "reviewer");
+    assert.equal(record.body, "review text");
+    assert.equal(record.raw, populated);
+  }
+
+  const positioned = reviewCommentRecord({
+    id: 7,
+    line: 3,
+    original_line: 9,
+    commit_id: "live-head",
+    original_commit_id: "reviewed-head",
+  });
+  assert.equal(positioned.line, 3, "the current line takes priority when present");
+  assert.equal(positioned.commitId, "reviewed-head", "the original commit takes priority when present");
+
+  const repositioned = reviewCommentRecord({ id: 8, line: null, original_line: 11, commit_id: "live-head" });
+  assert.equal(repositioned.line, 11, "the original line is the fallback for an outdated comment");
+  assert.equal(repositioned.commitId, "live-head", "the live commit is the fallback when no original commit is present");
 });
 
 test("getBlobSha: the contents sha at a ref; 404 is null; other errors throw GitHubApiError", async () => {

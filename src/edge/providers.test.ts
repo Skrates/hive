@@ -154,18 +154,28 @@ test("an invalid permission profile is a deterministic pre-dispatch failure", ()
   );
 });
 
-test("Grok Build maps all three Hive profiles onto --permission-mode; unknowns fail pre-dispatch", (t) => {
-  const directory = mkdtempSync(join(tmpdir(), "hive-grok-profile-"));
+test("Grok and Claude share all three Hive permission profiles; unknowns fail pre-dispatch", (t) => {
+  const directory = mkdtempSync(join(tmpdir(), "hive-provider-profile-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const grok = new GrokProvider();
+  const claude = new ClaudeProvider({ ingressRoot: directory });
+  const profiles = ["read-only", "workspace-write", "danger-full-access"] as const;
 
   assert.deepEqual(grokPermissionArgs("read-only"), ["--permission-mode", "plan"]);
   assert.deepEqual(grokPermissionArgs("workspace-write"), ["--permission-mode", "acceptEdits"]);
   assert.deepEqual(grokPermissionArgs("danger-full-access"), ["--permission-mode", "bypassPermissions"]);
-  grok.preflight(subscription({ provider: "grok", permissionProfile: "danger-full-access", accountProfile: directory }));
+  for (const permissionProfile of profiles) {
+    const profileSubscription = subscription({ permissionProfile, accountProfile: directory });
+    assert.doesNotThrow(() => grok.preflight({ ...profileSubscription, provider: "grok" }));
+    assert.doesNotThrow(() => claude.preflight({ ...profileSubscription, provider: "claude" }));
+  }
 
   assert.throws(
     () => grok.preflight(subscription({ provider: "grok", permissionProfile: "yolo", accountProfile: directory })),
+    (error: unknown) => error instanceof ProviderPreDispatchError && error.code === "provider_permission_profile_invalid",
+  );
+  assert.throws(
+    () => claude.preflight(subscription({ provider: "claude", permissionProfile: "yolo", accountProfile: directory })),
     (error: unknown) => error instanceof ProviderPreDispatchError && error.code === "provider_permission_profile_invalid",
   );
 });

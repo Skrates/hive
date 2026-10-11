@@ -3,6 +3,7 @@ import { WebClient } from "@slack/web-api";
 import { isAdmitted, parseAddressedWake, type AdmissionPolicy } from "../addressing.js";
 import { EVERYONE, type ReplaySnapshot, type SlackEventInput } from "../domain.js";
 import { CANARY_REQUEST_TIMEOUT_MS, CanaryRegistry, PROBE_EVENT_TYPE, type CanaryIdentity, type CanaryWatch, type ProbeWatcher } from "./canary.js";
+import { safeErrorName } from "./error-name.js";
 import type { ProbePoster } from "./probe.js";
 import type { BrokerService, SlackTransport } from "./service.js";
 
@@ -535,15 +536,4 @@ export class SlackSocketIngress implements ProbeWatcher {
     await this.stop();
     await this.start();
   }
-}
-
-/**
- * Reduce an unknown error to its TYPE name only — never its message. An exception
- * raised while handling a Slack envelope can carry event body text, and thus
- * secret- or prompt-shaped data; the class name is a code identifier that cannot.
- * Truncating the message is not sanitisation, so we drop it entirely.
- */
-export function safeErrorName(error: unknown): string {
-  if (error instanceof Error) return error.constructor.name;
-  return "non-error thrown";
 }

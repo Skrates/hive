@@ -1,5 +1,6 @@
 import { withDeadline } from "./deadline.js";
 import type { ProbeOutcome } from "./probe.js";
+import { safeErrorName } from "./error-name.js";
 
 /**
  * Deafness watchdog for the Slack Socket Mode link.
@@ -291,7 +292,7 @@ export class SlackDeafnessWatchdog {
       await withDeadline(this.port.restart(), this.restartTimeoutMs, "socket restart");
     } catch (error) {
       this.port.log(
-        `[watchdog] the forced reconnect did not complete (${errorName(error)}) — abandoning it; the transport `
+        `[watchdog] the forced reconnect did not complete (${safeErrorName(error)}) — abandoning it; the transport `
         + "clock stays stale, so the next cycle reads it as wedged and exits for the supervisor",
       );
     }
@@ -328,13 +329,4 @@ export class SlackDeafnessWatchdog {
 
 function describeIdle(idleMs: number): string {
   return Number.isFinite(idleMs) ? `${Math.round(idleMs / 1_000)}s` : "∞ (no event since boot)";
-}
-
-/**
- * The exception TYPE only. A restart or probe failure can carry Slack body text,
- * so the message is dropped entirely rather than truncated.
- */
-function errorName(error: unknown): string {
-  if (error instanceof Error) return error.constructor.name;
-  return "non-error thrown";
 }

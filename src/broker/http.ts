@@ -7,6 +7,7 @@ import { InvalidTransitionError, SeatWakeRefusedError, StaleLeaseError, TurnSlot
 import { ProfileReport } from "../health/report.js";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { writeJsonResponse } from "../http.js";
 
 export interface BrokerHttpConfig {
   host: string;
@@ -273,7 +274,5 @@ function json(response: ServerResponse, status: number, value: unknown): void {
     response.end();
     return;
   }
-  const body = JSON.stringify(value);
-  response.writeHead(status, { "content-type": "application/json", "content-length": Buffer.byteLength(body) });
-  response.end(body);
+  writeJsonResponse(response, status, value);
 }

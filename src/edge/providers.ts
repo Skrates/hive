@@ -346,7 +346,7 @@ export class ClaudeProvider implements ProviderAdapter {
   constructor(private readonly inbox: ClaudeInboxConfig) {}
 
   preflight(subscription: Subscription): void {
-    claudePermissionArgs(subscription.permissionProfile);
+    permissionProfileArgs(subscription.permissionProfile);
     requireAccountProfile(subscription);
   }
 
@@ -392,7 +392,7 @@ export class ClaudeProvider implements ProviderAdapter {
     const profile = requireAccountProfile(subscription);
     return runHeadless(
       process.env.HIVE_CLAUDE_COMMAND ?? "claude",
-      ["-p", "--resume", subscription.sessionId, "--output-format", "stream-json", "--verbose", ...claudeEffortArgs(context.effort), ...claudePermissionArgs(subscription.permissionProfile), ...claudePromptSlotArgs(profile), framed],
+      ["-p", "--resume", subscription.sessionId, "--output-format", "stream-json", "--verbose", ...claudeEffortArgs(context.effort), ...permissionProfileArgs(subscription.permissionProfile), ...claudePromptSlotArgs(profile), framed],
       cwd,
       null,
       { CLAUDE_CONFIG_DIR: profile },
@@ -404,7 +404,7 @@ export class ClaudeProvider implements ProviderAdapter {
     const profile = requireAccountProfile(subscription);
     return runHeadless(
       process.env.HIVE_CLAUDE_COMMAND ?? "claude",
-      ["-p", "--output-format", "stream-json", "--verbose", ...claudeEffortArgs(context.effort), ...claudePermissionArgs(subscription.permissionProfile), ...claudePromptSlotArgs(profile), framed],
+      ["-p", "--output-format", "stream-json", "--verbose", ...claudeEffortArgs(context.effort), ...permissionProfileArgs(subscription.permissionProfile), ...claudePromptSlotArgs(profile), framed],
       cwd,
       null,
       { CLAUDE_CONFIG_DIR: profile },
@@ -656,11 +656,11 @@ function codexSocketPermissionProfile(name: string, parent: ":read-only" | ":wor
 }
 
 /**
- * The shipping CLI carries `--permission-mode` with Claude-compatible
- * vocabulary (the public docs lag the binary — verified live on the seat pod,
- * 2026-08-08), so all three Hive profiles map directly.
+ * Grok's shipping CLI carries Claude-compatible `--permission-mode` values
+ * (public docs lag the binary; verified live on the seat pod, 2026-08-08), so
+ * both adapters use this map.
  */
-export function grokPermissionArgs(profile: string): string[] {
+function permissionProfileArgs(profile: string): string[] {
   switch (profile) {
     case "read-only": return ["--permission-mode", "plan"];
     case "workspace-write": return ["--permission-mode", "acceptEdits"];
@@ -669,11 +669,6 @@ export function grokPermissionArgs(profile: string): string[] {
   }
 }
 
-function claudePermissionArgs(profile: string): string[] {
-  switch (profile) {
-    case "read-only": return ["--permission-mode", "plan"];
-    case "workspace-write": return ["--permission-mode", "acceptEdits"];
-    case "danger-full-access": return ["--permission-mode", "bypassPermissions"];
-    default: throw new ProviderPreDispatchError("provider_permission_profile_invalid");
-  }
+export function grokPermissionArgs(profile: string): string[] {
+  return permissionProfileArgs(profile);
 }

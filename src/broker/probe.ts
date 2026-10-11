@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { ProbeWatcher } from "./canary.js";
 import { withDeadline } from "./deadline.js";
-import { safeErrorName } from "./slack.js";
+import { safeErrorName } from "./error-name.js";
 
 /**
  * The end-to-end canary that tells a QUIET Slack link from a DEAF one.

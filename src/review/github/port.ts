@@ -82,48 +82,62 @@ export interface MeterPort {
 // Record mapping (shared with the fixture-driven classify tests so both read GitHub alike)
 // ---------------------------------------------------------------------------------------
 
-/** A `GET /pulls/{n}/reviews` row → record; `version` is `submitted_at`, `commitId` the reviewed head. */
-export function reviewRecord(row: Record<string, unknown>): GitHubRecord {
+function recordBaseFields(
+  row: Record<string, unknown>,
+): Pick<GitHubRecord, "id" | "authorLogin" | "body" | "raw"> {
   return {
-    kind: "review",
     id: num(row.id) ?? 0,
-    version: str(row.submitted_at),
     authorLogin: isRecord(row.user) ? str(row.user.login) : "",
     body: str(row.body),
+    raw: row,
+  };
+}
+
+/** A `GET /pulls/{n}/reviews` row → record; `version` is `submitted_at`, `commitId` the reviewed head. */
+export function reviewRecord(row: Record<string, unknown>): GitHubRecord {
+  const base = recordBaseFields(row);
+  return {
+    kind: "review",
+    id: base.id,
+    version: str(row.submitted_at),
+    authorLogin: base.authorLogin,
+    body: base.body,
     path: null,
     line: null,
     commitId: typeof row.commit_id === "string" ? row.commit_id : null,
-    raw: row,
+    raw: base.raw,
   };
 }
 
 /** A `GET /pulls/{n}/comments` row → record; `original_commit_id` and `original_line` survive GitHub's repositioning. */
 export function reviewCommentRecord(row: Record<string, unknown>): GitHubRecord {
+  const base = recordBaseFields(row);
   return {
     kind: "review_comment",
-    id: num(row.id) ?? 0,
+    id: base.id,
     version: str(row.updated_at),
-    authorLogin: isRecord(row.user) ? str(row.user.login) : "",
-    body: str(row.body),
+    authorLogin: base.authorLogin,
+    body: base.body,
     path: typeof row.path === "string" ? row.path : null,
     line: num(row.line) ?? num(row.original_line),
     commitId: typeof row.original_commit_id === "string" ? row.original_commit_id : typeof row.commit_id === "string" ? row.commit_id : null,
-    raw: row,
+    raw: base.raw,
   };
 }
 
 /** A `GET /issues/{n}/comments` row → record; `version` is `updated_at` (the summary comment is edited in place). */
 export function issueCommentRecord(row: Record<string, unknown>): GitHubRecord {
+  const base = recordBaseFields(row);
   return {
     kind: "issue_comment",
-    id: num(row.id) ?? 0,
+    id: base.id,
     version: str(row.updated_at),
-    authorLogin: isRecord(row.user) ? str(row.user.login) : "",
-    body: str(row.body),
+    authorLogin: base.authorLogin,
+    body: base.body,
     path: null,
     line: null,
     commitId: null,
-    raw: row,
+    raw: base.raw,
   };
 }
 

@@ -5,6 +5,7 @@ import { parseAttestationWire } from "./attestation.js";
 import { BrokerHttpError, type ReviewActForward } from "./broker-client.js";
 import { LiveIngressRegistryError } from "./live-registry.js";
 import type { EdgeService } from "./service.js";
+import { parseHttpErrorEnvelope, writeJsonResponse as json, type HttpErrorEnvelope } from "../http.js";
 
 export interface EdgeControlConfig {
   /** Owner-only Unix domain socket path for the local control plane. */
@@ -226,18 +227,9 @@ async function readJson(request: IncomingMessage): Promise<Record<string, unknow
  * broker error uses. A non-JSON body (a proxy page, a truncated response) is
  * never guessed at — it surfaces as an opaque relay failure with the raw text.
  */
-function parseErrorBody(body: string): { error: string; detail?: string } {
-  try {
-    const value = JSON.parse(body) as { error?: unknown; detail?: unknown };
-    if (typeof value.error === "string") {
-      return typeof value.detail === "string"
-        ? { error: value.error, detail: value.detail }
-        : { error: value.error };
-    }
-  } catch {
-    // fall through to the opaque shape below
-  }
-  return { error: "broker_relay_failed", detail: body.slice(0, 500) };
+function parseErrorBody(body: string): HttpErrorEnvelope {
+  return parseHttpErrorEnvelope(body)
+    ?? { error: "broker_relay_failed", detail: body.slice(0, 500) };
 }
 
 function requiredString(value: unknown, name: string): string {
@@ -260,10 +252,4 @@ function safeControlError(error: unknown): string {
     || message.startsWith("missing ")
   ) return message;
   return "edge_request_failed";
-}
-
-function json(response: ServerResponse, status: number, value: unknown): void {
-  const body = JSON.stringify(value);
-  response.writeHead(status, { "content-type": "application/json", "content-length": Buffer.byteLength(body) });
-  response.end(body);
 }
