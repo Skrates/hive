@@ -348,7 +348,10 @@ export class AttentionStore {
       `);
       this.db.prepare("INSERT OR IGNORE INTO attention_schema(singleton, version, created_at) VALUES (1, ?, ?)")
         .run(ATTENTION_STORE_VERSION, this.nowIso());
-    })();
+    // Immediate: a deferred migration that reads the schema and then writes cannot wait out a
+    // concurrent writer (SQLITE_BUSY_SNAPSHOT); taking the write lock first lets the busy
+    // timeout do its job.
+    }).immediate();
   }
 
   private nowIso(): string {

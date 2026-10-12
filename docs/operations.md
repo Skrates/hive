@@ -323,3 +323,127 @@ true for an operator's Send-later message. It is NOT generally true for messages
 seat through a Slack API client — those post under that app's bot identity, and an unadmitted bot
 is dropped with a thread notice. Admitting such an identity widens the trust set to everyone who
 can make that app post; that is an operator policy decision, never a default.
+
+## Hive Attention (ADR-0004)
+
+A durable queue of human interventions on the broker's own database. Seats ring a bell; the
+human takes the next item at a natural handoff; the response returns to the originating work
+context as an ordinary Hive delivery. Nothing about it pushes: a summons writes attention state
+only — no Slack mention, DM, toast or focus change.
+
+### Configuration
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `HIVE_ATTENTION_ENABLED` | `false` | Accept mutations and publish returns. `true`/`false` (or `1`/`0`); anything else refuses to boot. |
+| `HIVE_ATTENTION_HUMAN_ID` | `hakon` | The queue identity. Not a person-profile lookup, never a provider actor. |
+
+The human uses the existing operator credential (`HIVE_BROKER_URL` + `HIVE_ADMIN_TOKEN`) directly
+against the broker. The CLI refuses it inside an agent's execution environment
+(`HIVE_DELIVERY_TOKEN`/`HIVE_SESSION_TOKEN` present). Seats never see it.
+
+Disabled means: no new mutations, no new return publication; reads stay available, and a delivery
+already minted keeps its ordinary lifecycle — disabling never cancels a running provider turn.
+`hive attention capabilities` states which.
+
+### The loop
+
+```sh
+hive attention start --file ./current-design-work.json        # already-begun human work
+hive attention queue                                           # pull, never pushed
+hive attention next                                            # a repeated next returns the active item
+hive attention show 42 --json
+hive attention resolve 42 --expected-revision 3 --outcome selected \
+  --response "Use candidate C; retain the current lighting." --next
+hive attention defer 51 --expected-revision 1 --until 2026-10-13T09:00:00Z --reason "Needs tomorrow's input" --next
+hive attention defer 52 --expected-revision 1 --indefinite --reason "parked"
+hive attention requeue 52 --expected-revision 2 --reason "Input arrived"
+hive attention cancel 53 --expected-revision 1 --reason "obsolete" --next
+hive attention add --file ./rannis-intervention.json          # human-first work, queued
+```
+
+`--next` means "my part here is finished; show me the next one" — it does not claim the receiving
+seat has started. The receipt distinguishes response saved, return pending/minted, and later
+reads show `processed` once core Hive recorded the continuation's outcome. Every mutation is
+journalled 0600 under `~/.hive/attention/requests/<command_id>.json` before it is sent; on a
+timeout the CLI prints the id: reconcile with `hive attention receipt <id>`, or resend the exact
+bytes with `hive attention retry-command <id>` (a replay, never a duplicate).
+
+Exit codes: 0 success/replay/`already_active`/`empty`; 2 malformed/oversized/schema; 3 auth or
+source authority; 4 not found or attention unavailable on an older broker; 5 revision/state/key/
+generation conflict; 6 temporary — retry the same command id; 7 unexpected server failure.
+
+### Seats: binding and summoning
+
+A seat binds a source once per work context, then summons with saved envelopes:
+
+```sh
+# Headless turn (while HIVE_DELIVERY_TOKEN is valid):
+hive attention bind --project birthday-film --work parents-likeness-round-2 \
+  --return actor-context --out ./attention-source.json
+# Live session (exact actor + session the surface announced; Claude's hook writes
+# ~/.hive/attention/sessions/<actor>/<session>.json and tells the session once):
+hive attention bind --session-file ~/.hive/attention/sessions/fable/<session>.json \
+  --project hive --work KRA-1500 --return pinned-session --channel C0BGBEQQQHH --thread <ts> --out ./src.json
+# Operator enrollment, run on the source edge (verified session or context-restored only):
+hive attention bind --operator --actor talos --project p --work w --return actor-context \
+  --cwd /workspace/talos/1 --channel C0BGBEQQQHH --thread <ts> --out ./src.json
+hive attention summon --source-file ./attention-source.json --file ./summon.json
+```
+
+The source file (0600, never overwritten) holds a random handle the edge stored only as a hash,
+bound to the issuing broker. Sources stay valid after the turn ends — no actor lease is held for
+the human — until `hive attention source revoke <id> --reason …`. Revocation stops new writes;
+queued work, provenance, receipt recovery and an already-recorded response's return survive it.
+
+Return modes: `pinned-session` needs a verified session id, an observed cwd, the actor's home edge
+and a single-slot actor; `actor-context` restores context through ordinary routing (including slot
+allocation) and says so in the envelope; `none` records the response with no wake. A returning
+source needs a real Slack thread (the dispatch's own, or `--channel/--thread`, which the broker
+reads once to prove it exists).
+
+### Returns
+
+The broker's five-second housekeeping tick runs the return drain as its own job beside review
+publication and the outbox: due returns are minted in one transaction with their `minted` phase
+(max 25 per pass), then minted returns whose delivery ended are settled. An actor without a live
+subscription is `blocked` and rechecked every 60 s; route drift (provider, home edge, account
+profile or slot configuration changed since capture) is `failed` and waits for the operator:
+
+```sh
+hive attention show 42                                         # phase, transport status, reason
+hive attention retry-return 42 --expected-revision 4 --return-generation 1
+hive attention reroute-return 42 --expected-revision 4 --return-generation 1 \
+  --source src_… --reason "seat moved to cx53"
+```
+
+Retry is idempotent while a delivery is in flight and refuses a processed return; a failed
+generation is superseded by a new one with a new dedupe key. Reroute is allowed only before
+minting or after the previous delivery ended — it cannot retract a running turn.
+
+### Doctor, status and logs
+
+`hive attention doctor --json [--source-file …]` reports broker reachability/UUID, enabled state,
+schema and store versions, CLI compatibility, edge reachability and source validity; it never
+prints secrets. `hive attention queue` shows the active item, eligible/deferred counts, oldest
+eligible age, next due deferral, and pending/blocked/failed returns with route warnings. Logs name
+command/item/source ids, generations and delivery ids — never response bodies, handles or artifact
+contents.
+
+### Rollout and rollback
+
+1. Back up the broker database with SQLite's online backup (or with the broker stopped) and verify
+   the copy opens; never copy the main file without its WAL.
+2. Deploy the broker with attention disabled. Migrations only add `attention_*` tables, a module
+   version, and two routing columns on `deliveries`; the broker generation stays 5. A newer
+   attention store refuses to boot with a diagnostic.
+3. Deploy the upgraded edges and provider surfaces (the Claude hook and Codex bridge announce
+   `attentionProtocol: 1`; an edge declares protocol 1 on each claim), then the CLI and the
+   `hive-attention` launcher.
+4. Inspect `hive attention doctor` and source bindings on the pilot seats; then set
+   `HIVE_ATTENTION_ENABLED=true` and restart the broker.
+
+Rolling back: disable first (no new mutations or publication), let every minted attention delivery
+reach a recorded terminal phase (`hive attention queue` shows none minted), then downgrade. An old
+edge never claims a protocol-1 delivery, so a partially downgraded fleet leaves continuations
+pending rather than ignoring their constraints. Attention tables are kept for re-upgrade and audit.

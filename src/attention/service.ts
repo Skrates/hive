@@ -139,9 +139,16 @@ export class AttentionService {
     return receipt;
   }
 
-  source(sourceId: string): SourceView {
+  /**
+   * The operator reads any source; an edge reads only the sources it issued, as `sources()` is
+   * operator-only — a source's session and cwd are its edge's business. Another edge's source
+   * answers exactly as an unknown one does.
+   */
+  source(sourceId: string, caller: AttentionCaller): SourceView {
     const view = this.store.source(sourceId);
-    if (!view) throw new AttentionRefusal(404, "source_not_found", `no attention source ${sourceId}`);
+    if (!view || (caller.kind === "edge" && view.edge_id !== caller.edgeId)) {
+      throw new AttentionRefusal(404, "source_not_found", `no attention source ${sourceId} for this caller`);
+    }
     return view;
   }
 

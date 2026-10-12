@@ -8,6 +8,7 @@ import {
   assertPinnedDesktopAccount,
   completeCodexDelivery,
   completeDesktopDelivery,
+  assertAttentionSession,
   DesktopFollowerRetirement,
   desktopDeliveryKey,
   liveRuntimeHome,
@@ -307,3 +308,20 @@ function delivery(now: number, createdAt: number = now): Delivery {
     },
   };
 }
+
+test("A25 the bridge accepts a constrained return only into the exact captured session and cwd", () => {
+  const base = delivery(Date.now());
+  const target = {
+    kind: "attention_return" as const, protocol: 1 as const, source_id: `src_${"b".repeat(32)}`,
+    resolution_command_id: "5c0f2c1e-8b8e-4c55-a3a6-0e5c8f8f2d10", generation: 1, actor: base.actor, mode: "pinned_session" as const,
+    pinned: { provider: "codex" as const, home_edge: "mac", account_profile_fingerprint: "f".repeat(64), session_id: "task-1", cwd: "/work/hive" },
+  };
+  const constrained = { ...base, continuationTarget: target };
+  assert.doesNotThrow(() => assertAttentionSession(constrained, { kind: "desktop", sessionId: "task-1", cwd: "/work/hive" }, null));
+  assert.doesNotThrow(() => assertAttentionSession(constrained, { kind: "dedicated", sessionId: "task-1" }, null), "an unknown dedicated cwd defers to the session match");
+  assert.throws(() => assertAttentionSession(constrained, { kind: "desktop", sessionId: "task-2", cwd: "/work/hive" }, null), /attention_session_mismatch/u);
+  assert.throws(() => assertAttentionSession(constrained, { kind: "desktop", sessionId: "task-1", cwd: "/work/other" }, null), /attention_session_mismatch/u);
+  assert.throws(() => assertAttentionSession(constrained, { kind: "dedicated", sessionId: "task-1" }, "/work/other"), /attention_session_mismatch/u);
+  assert.doesNotThrow(() => assertAttentionSession(base, { kind: "desktop", sessionId: "anything", cwd: "/x" }, null), "ordinary envelopes are unchanged");
+  assert.doesNotThrow(() => assertAttentionSession({ ...base, continuationTarget: { ...target, mode: "actor_context", pinned: null } }, { kind: "dedicated", sessionId: "x" }, null));
+});

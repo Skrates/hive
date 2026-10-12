@@ -10,6 +10,11 @@ import { AttentionRefusal } from "./store.js";
  * The attention surface of the broker's HTTP API (ADR-0004 §7). Mounted before the generic
  * edge gate, as the review surface is: it authenticates its own callers.
  *
+ * Read scope: queue, item and event reads are the private-workspace view shared by every
+ * authenticated edge and the operator (ADR-0004 §7); a committed receipt is readable only by its
+ * issuing edge or the operator; a source only by its own edge or the operator; the source list
+ * only by the operator.
+ *
  * - An operator presents the existing flat admin credential (`Authorization: Bearer`).
  * - An edge presents its machine credential (`Bearer` + `x-hive-edge`). A seat mutation also
  *   names the source the edge resolved from a local handle (`x-hive-attention-source`) and the
@@ -78,7 +83,7 @@ async function dispatch(request: IncomingMessage, response: ServerResponse, url:
   }
 
   const source = SOURCE_PATH.exec(path);
-  if (source?.[1] && method === "GET") return json(response, 200, service.source(source[1]));
+  if (source?.[1] && method === "GET") return json(response, 200, service.source(source[1], caller));
 
   if (method === "GET" && path === "/v1/attention/queue") {
     const limit = url.searchParams.get("limit");

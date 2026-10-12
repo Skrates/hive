@@ -51,6 +51,11 @@ export function udsRequest(
         socketPath,
         method,
         path,
+        // One connection per request. Node's default agent keeps sockets alive, so a second
+        // request from one process (the Claude hook's guard read, then its registration) could
+        // reuse a connection the edge already dropped — or one from before an edge restart —
+        // and fail with EPIPE. A local owner-only socket gains nothing from reuse.
+        agent: false,
         headers: payload === null
           ? {}
           : { "content-type": "application/json", "content-length": Buffer.byteLength(payload) },
