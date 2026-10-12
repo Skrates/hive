@@ -104,7 +104,16 @@ export class AttentionService {
     return this.store.bindSource({ edgeId: caller.edgeId, operator: caller.operator }, command);
   }
 
-  queue(humanId: string | null, state: string | null, after: string | null, limit: number | null): QueuePage {
+  /**
+   * Queue, item and event reads are the shared private-workspace view, but a source's session,
+   * cwd and originating delivery are its own edge's business: another edge sees them redacted.
+   */
+  private redact<T extends ItemView>(item: T, caller: AttentionCaller): T {
+    if (caller.kind === "operator" || item.source === null || item.source.edge_id === caller.edgeId) return item;
+    return { ...item, source: { ...item.source, session_id: null, session_absence: "redacted_for_other_edge", cwd: null, source_delivery_id: null } };
+  }
+
+  queue(humanId: string | null, state: string | null, after: string | null, limit: number | null, caller: AttentionCaller): QueuePage {
     let states: ItemState[] | undefined;
     if (state === "all") states = [...ITEM_STATES];
     else if (state !== null) {
@@ -114,21 +123,22 @@ export class AttentionService {
       }
       states = named;
     }
-    return this.store.queue(humanId ?? this.store.humanId, {
+    const page = this.store.queue(humanId ?? this.store.humanId, {
       ...(states ? { states } : {}),
       after,
       ...(limit !== null ? { limit } : {}),
     });
+    return { ...page, items: page.items.map((item) => this.redact(item, caller)) };
   }
 
-  item(itemId: number): ItemView {
+  item(itemId: number, caller: AttentionCaller): ItemView {
     const view = this.store.item(itemId);
     if (!view) throw new AttentionRefusal(404, "item_not_found", `no attention item ${itemId}`);
-    return view;
+    return this.redact(view, caller);
   }
 
-  events(itemId: number): EventView[] {
-    this.item(itemId);
+  events(itemId: number, caller: AttentionCaller): EventView[] {
+    this.item(itemId, caller);
     return this.store.events(itemId);
   }
 

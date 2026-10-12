@@ -90,6 +90,16 @@ export const validateSourceFile = attentionValidator<SourceFile>("SourceFile");
  * than persisted as text nobody can compare.
  */
 export function canonicalInstant(value: string): string | null {
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})/.exec(value);
+  if (!match) return null;
+  const [year, month, day, hour, minute, second] = match.slice(1).map(Number) as [number, number, number, number, number, number];
+  // `Date` silently rolls 2026-02-31 over to March 3; the written calendar fields must survive
+  // a round trip unchanged or the instant is refused.
+  const wall = new Date(Date.UTC(year, month - 1, day, hour, minute, second));
+  if (
+    wall.getUTCFullYear() !== year || wall.getUTCMonth() !== month - 1 || wall.getUTCDate() !== day
+    || wall.getUTCHours() !== hour || wall.getUTCMinutes() !== minute || wall.getUTCSeconds() !== second
+  ) return null;
   const parsed = new Date(value);
   if (Number.isNaN(parsed.getTime())) return null;
   return parsed.toISOString();

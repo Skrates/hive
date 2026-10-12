@@ -71,7 +71,9 @@ export function principalKey(principal: AttentionPrincipal): string {
   switch (principal.kind) {
     case "operator": return "operator";
     case "edge": return `edge:${principal.edgeId}`;
-    case "source": return `source:${principal.sourceId}`;
+    // The edge is part of the identity, so another edge presenting the same source id can
+    // never be answered a replayed receipt.
+    case "source": return `source:${principal.edgeId}/${principal.sourceId}`;
   }
 }
 
@@ -837,7 +839,15 @@ export class AttentionStore {
         thread = { channel: source.event.channelId, ts: source.event.threadTs };
       }
       cwd = evidence.cwd;
-      if (evidence.route === "resume") {
+      if (evidence.route === "pinned_resume") {
+        // An exact-session attention return resumed a captured session, which need not be the
+        // actor's enrolled one; the delivery's own broker-written target is the authority.
+        const target = source.continuationTarget;
+        if (target === null || target.mode !== "pinned_session" || target.pinned.session_id !== evidence.session_id) {
+          throw new AttentionRefusal(403, "source_evidence_rejected", "pinned-resume evidence does not match the delivery's captured session");
+        }
+        session = { id: target.pinned.session_id, absence: null };
+      } else if (evidence.route === "resume") {
         // The broker's own enrollment names the resumed session; the edge's evidence must agree.
         if (subscription.sessionId === null || evidence.session_id !== subscription.sessionId) {
           throw new AttentionRefusal(403, "source_evidence_rejected", "resume evidence does not match the actor's enrolled session");

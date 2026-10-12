@@ -11,7 +11,8 @@ import { AttentionRefusal } from "./store.js";
  * edge gate, as the review surface is: it authenticates its own callers.
  *
  * Read scope: queue, item and event reads are the private-workspace view shared by every
- * authenticated edge and the operator (ADR-0004 §7); a committed receipt is readable only by its
+ * authenticated edge and the operator (ADR-0004 §7), with another edge's source session, cwd
+ * and delivery redacted; a committed receipt is readable only by its
  * issuing edge or the operator; a source only by its own edge or the operator; the source list
  * only by the operator.
  *
@@ -91,13 +92,13 @@ async function dispatch(request: IncomingMessage, response: ServerResponse, url:
     if (parsedLimit !== null && (!Number.isInteger(parsedLimit) || parsedLimit < 1 || parsedLimit > 100)) {
       throw new AttentionRefusal(400, "invalid_limit", "limit is an integer from 1 to 100");
     }
-    return json(response, 200, service.queue(url.searchParams.get("human"), url.searchParams.get("state"), url.searchParams.get("after"), parsedLimit));
+    return json(response, 200, service.queue(url.searchParams.get("human"), url.searchParams.get("state"), url.searchParams.get("after"), parsedLimit, caller));
   }
 
   const item = ITEM_PATH.exec(path);
   if (item?.[1] && method === "GET") {
     const itemId = Number(item[1]);
-    return json(response, 200, item[2] ? service.events(itemId) : service.item(itemId));
+    return json(response, 200, item[2] ? service.events(itemId, caller) : service.item(itemId, caller));
   }
 
   const command = COMMAND_PATH.exec(path);

@@ -452,4 +452,8 @@ contents.
 Rolling back: disable first (no new mutations or publication), let every minted attention delivery
 reach a recorded terminal phase (`hive attention queue` shows none minted), then downgrade. An old
 edge never claims a protocol-1 delivery, so a partially downgraded fleet leaves continuations
-pending rather than ignoring their constraints. Attention tables are kept for re-upgrade and audit.
+pending rather than ignoring their constraints — and, because only a claim terminalizes an expired
+delivery, they stay `minted` until an upgraded edge polls again; inspect them with
+`hive attention queue` rather than reading their silence as success. An upgraded edge keeps
+working against an older broker (a delivery without the continuation field routes ordinarily).
+Attention tables are kept for re-upgrade and audit.

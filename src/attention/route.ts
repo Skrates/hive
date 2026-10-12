@@ -48,9 +48,11 @@ export type AttentionRouteRefusal =
  */
 export function effectiveDeliveryRoute(
   subscription: Subscription,
-  target: AttentionContinuationTarget | null,
+  // `undefined` is a delivery serialized by a broker that predates the field: ordinary.
+  // An edge upgraded ahead of its broker must keep routing every ordinary wake.
+  target: AttentionContinuationTarget | null | undefined,
 ): EffectiveRoute {
-  if (target === null || target.mode === "actor_context") return { kind: "ordinary" };
+  if (target === null || target === undefined || target.mode === "actor_context") return { kind: "ordinary" };
   const pinned = target.pinned;
   if (target.actor !== subscription.actor) {
     return { kind: "refused", code: "attention_actor_changed", detail: `return was captured for ${target.actor}, delivery routes ${subscription.actor}` };

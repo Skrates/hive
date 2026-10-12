@@ -573,20 +573,24 @@ export function registerAttentionCommands(
     .option("--provider <provider>", "live binding: codex or claude when ambiguous")
     .option("--operator", "explicit operator enrollment on this (source) edge")
     .option("--cwd <path>", "operator binding: the work context directory", process.cwd())
+    .option("--command-id <uuid>", "reuse the command id of a bind whose outcome was unknown (a replay returns the same source)")
     .option("--channel <id>", "Slack channel of the return thread")
     .option("--thread <ts>", "Slack thread ts of the return thread")
     .option("--json", "one JSON object")
     .description("enroll this work context as an attention source")
     .action(run(async (options: JsonOption & {
       project: string; work: string; return: string; out: string; actor?: string; session?: string; sessionFile?: string;
-      provider?: string; operator?: boolean; cwd: string; channel?: string; thread?: string;
+      provider?: string; operator?: boolean; cwd: string; channel?: string; thread?: string; commandId?: string;
     }) => {
       const returnMode = RETURN_MODES[options.return];
       if (!returnMode) throw new CliFailure(EXIT_USAGE, "--return is pinned-session, actor-context or none");
       if ((options.channel === undefined) !== (options.thread === undefined)) throw new CliFailure(EXIT_USAGE, "--channel and --thread go together");
       const out = resolve(options.out);
       if (existsSync(out)) throw new CliFailure(EXIT_USAGE, `${out} exists; a source file is never overwritten — choose a per-work path`);
-      const commandId = randomUUID();
+      if (options.commandId !== undefined && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(options.commandId)) {
+        throw new CliFailure(EXIT_USAGE, "--command-id is a lowercase UUID");
+      }
+      const commandId = options.commandId ?? randomUUID();
       const base = {
         command_id: commandId,
         project_id: options.project,
@@ -623,7 +627,9 @@ export function registerAttentionCommands(
         answer = await transport.edge("/attention/bind", body);
       } catch (error) {
         if (!(error instanceof AttentionTransportError)) throw error;
-        throw new CliFailure(EXIT_UNKNOWN_OUTCOME, `bind ${commandId} has an unknown outcome (${error.message}); rerun bind — a replay returns the same source`,
+        throw new CliFailure(EXIT_UNKNOWN_OUTCOME,
+          `bind ${commandId} has an unknown outcome (${error.message}); rerun the same bind with --command-id ${commandId} — `
+          + "a replay returns the same source (a dispatch bind must still be inside its turn)",
           { error: "outcome_unknown", command_id: commandId });
       }
       const code = exitCodeFor(answer.status);

@@ -430,6 +430,29 @@ test("A17 a dispatch-backed source outlives its delivery and names the actor fro
   h.close();
 });
 
+test("a turn resuming a captured session can bind from it; mismatched pinned evidence is refused", () => {
+  const h = harness();
+  const source = liveSource(h.store, { session: "session-captured" });
+  const item = summon(h.store, source).item!;
+  const taken = next(h.store);
+  resolve(h.store, item.item_id, taken.item!.revision);
+  const ret = h.store.dueReturns()[0]!;
+  const target = JSON.parse(ret.target_json);
+  const { deliveryId } = h.broker.mintSystemWake({ origin: "attention", actor: "fable", channelId: THREAD.channel_id, threadTs: THREAD.thread_ts, text: "t", render: "r", dedupeKey: "d:1", continuationTarget: target });
+  const claimed = h.broker.claimNext("edge-a", 0, [], 1)!;
+  assert.equal(claimed.id, deliveryId);
+  const bind = (sessionId: string) => h.store.bindSource({ edgeId: "edge-a", operator: false }, {
+    schema_version: 1, command_id: randomUUID(), action: "source_bind",
+    payload: { project_id: "birthday-film", work_id: "round-3", return_mode: "pinned_session", thread: null,
+      evidence: { kind: "dispatch", source_delivery_id: claimed.id, generation: claimed.leaseGeneration!, route: "pinned_resume", session_id: sessionId, cwd: "/work/hive" } },
+  });
+  assert.throws(() => bind("session-other"), refused("source_evidence_rejected", 403));
+  const bound = bind("session-captured").receipt.source!;
+  assert.equal(bound.session_id, "session-captured");
+  assert.equal(bound.return_mode, "pinned_session");
+  h.close();
+});
+
 test("A35 actor retirement still works beside attention history, which stays readable", () => {
   const h = harness();
   const source = liveSource(h.store);

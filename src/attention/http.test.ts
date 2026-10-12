@@ -91,6 +91,21 @@ test("the broker surface authenticates its own callers and refuses malformed or 
     assert.equal((await call(baseUrl, "GET", `/v1/attention/sources/${bound.source_id}`, { authorization: `Bearer ${otherToken}`, "x-hive-edge": "edge-z" })).status, 404,
       "another edge's source answers as unknown");
     assert.equal((await call(baseUrl, "GET", `/v1/attention/sources/${bound.source_id}`, operator)).status, 200);
+    // Shared item reads redact another edge's session, cwd and delivery.
+    const live = h.store.bindSource({ edgeId: "edge-a", operator: false }, {
+      schema_version: 1, command_id: randomUUID(), action: "source_bind",
+      payload: { project_id: "birthday-film", work_id: "parents-likeness-round-2", return_mode: "pinned_session", thread: THREAD,
+        evidence: { kind: "live_registration", actor: "fable", provider: "claude", session_id: "session-secret", cwd: "/home/fable/secret", surface_version: "t" } },
+    }).receipt.source!;
+    const rung = h.store.execute({ kind: "source", edgeId: "edge-a", sourceId: live.source_id }, { schema_version: 1, command_id: randomUUID(), action: "summon", payload: packet() }).receipt;
+    const path = `/v1/attention/items/${rung.item!.item_id}`;
+    const foreign = (await call(baseUrl, "GET", path, { authorization: `Bearer ${otherToken}`, "x-hive-edge": "edge-z" })).body as { source: { session_id: unknown; cwd: unknown } };
+    assert.equal(foreign.source.session_id, null);
+    assert.equal(foreign.source.cwd, null);
+    const own = (await call(baseUrl, "GET", path, edge)).body as { source: { session_id: unknown } };
+    assert.equal(own.source.session_id, "session-secret");
+    const queue = (await call(baseUrl, "GET", "/v1/attention/queue", { authorization: `Bearer ${otherToken}`, "x-hive-edge": "edge-z" })).body as { items: Array<{ source: { cwd: unknown } | null }> };
+    assert.ok(queue.items.every((item) => item.source === null || item.source.cwd === null));
     assert.equal((await call(baseUrl, "GET", "/v1/attention/sources", operator)).status, 200);
     assert.equal((await call(baseUrl, "GET", "/v1/attention/items/99", operator)).status, 404);
     assert.equal((await call(baseUrl, "GET", `/v1/attention/commands/${randomUUID()}`, edge)).status, 404);

@@ -1258,15 +1258,29 @@ test("A25 a pinned return goes live only into the captured session through a pro
   const resumed = (await runPinned(sub, other, pinnedTarget(sub, cwd))).adapter.calls;
   assert.deepEqual(resumed, [{ route: "resume", sessionId: "thread-captured", cwd }]);
 
-  // A surface predating the receiver-side check is never handed a constrained envelope.
-  const old = new LiveIngressRegistry();
-  liveEntry(old, "thread-captured", { attentionProtocol: 0 });
-  assert.equal((await runPinned(sub, old, pinnedTarget(sub, cwd))).adapter.calls[0]!.route, "resume");
+  // The captured session is live but through a surface that cannot honour the constraint,
+  // or in another cwd: never handed the envelope, and never resumed beside the open session.
+  for (const unsuitable of [{ attentionProtocol: 0 }, { cwd: "/elsewhere" }]) {
+    const registry = new LiveIngressRegistry();
+    liveEntry(registry, "thread-captured", unsuitable);
+    const { adapter, broker } = await runPinned(sub, registry, pinnedTarget(sub, cwd));
+    assert.deepEqual(adapter.calls, []);
+    assert.equal(broker.finishes[0]!.result.status, "undeliverable");
+    assert.equal(broker.finishes[0]!.result.reasons[0]!.code, "attention_live_surface_incompatible");
+  }
+});
 
-  // A surface reporting a different cwd for the same session id is not the captured context.
-  const moved = new LiveIngressRegistry();
-  liveEntry(moved, "thread-captured", { cwd: "/elsewhere" });
-  assert.equal((await runPinned(sub, moved, pinnedTarget(sub, cwd))).adapter.calls[0]!.route, "resume");
+test("a delivery from a broker that predates the continuation field routes ordinarily", async () => {
+  const legacy = delivery(71) as Partial<Delivery>;
+  delete legacy.continuationTarget;
+  delete legacy.requiredEdgeProtocol;
+  const broker = new FakeBroker([legacy as Delivery]);
+  const adapter = new RouteRecorder();
+  const store = new EdgeStore(":memory:");
+  await new EdgeService(asBrokerClient(broker), store, new LiveIngressRegistry(), [adapter]).processOne();
+  store.close();
+  assert.deepEqual(adapter.calls.map((call) => call.route), ["resume"]);
+  assert.equal(broker.finishes[0]!.result.status, "processed");
 });
 
 test("A27 live_only stays live-only, a lost cwd fails visibly, and a pinned return never spawns", async () => {

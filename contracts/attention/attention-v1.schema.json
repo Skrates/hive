@@ -423,7 +423,7 @@
         "kind": { "type": "string", "const": "dispatch" },
         "source_delivery_id": { "type": "integer", "minimum": 1 },
         "generation": { "type": "integer", "minimum": 1 },
-        "route": { "type": "string", "enum": ["live", "resume", "spawn"] },
+        "route": { "type": "string", "enum": ["live", "resume", "spawn", "pinned_resume"] },
         "session_id": { "anyOf": [{ "type": "string", "minLength": 1, "maxLength": 200 }, { "type": "null" }] },
         "cwd": { "anyOf": [{ "type": "string", "minLength": 1, "maxLength": 4096 }, { "type": "null" }] }
       }

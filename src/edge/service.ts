@@ -26,7 +26,8 @@ export interface MintSource {
  */
 export interface DispatchEvidence extends MintSource {
   actor: string;
-  route: "resume" | "spawn";
+  /** `pinned_resume`: an exact-session attention return resumed the captured session. */
+  route: "resume" | "spawn" | "pinned_resume";
   sessionId: string | null;
   cwd: string;
 }
@@ -209,10 +210,15 @@ export class EdgeService {
     if (route.kind !== "pinned" || entry === null) return entry;
     // ADR-0004: a pinned return goes live only into exactly the captured session, through a
     // surface that will itself re-check that session before accepting. An actor name alone
-    // is not an exact-session address; anything else falls to resume or fails visibly.
+    // is not an exact-session address: another session's registration falls to resume.
     if (entry.sessionId !== route.sessionId) return null;
-    if (entry.attentionProtocol < ATTENTION_EDGE_PROTOCOL) return null;
-    if (entry.cwd !== null && entry.cwd !== route.cwd) return null;
+    // The captured session IS live, but through a surface that cannot honour the constraint
+    // (it predates the receiver-side check) or in a different working directory. Resuming it
+    // headlessly would put a second process on a session that is still open, so this is a
+    // visible route failure — the operator retries or reroutes.
+    if (entry.attentionProtocol < ATTENTION_EDGE_PROTOCOL || (entry.cwd !== null && entry.cwd !== route.cwd)) {
+      throw new PreDispatchError("attention_live_surface_incompatible");
+    }
     return entry;
   }
 
@@ -540,7 +546,7 @@ export class EdgeService {
     if (!isDirectory(route.cwd)) throw new PreDispatchError("attention_cwd_missing");
     const token = randomUUID();
     this.dispatchTokens.set(token, {
-      deliveryId: delivery.id, generation, actor: delivery.actor, route: "resume", sessionId: route.sessionId, cwd: route.cwd,
+      deliveryId: delivery.id, generation, actor: delivery.actor, route: "pinned_resume", sessionId: route.sessionId, cwd: route.cwd,
     });
     try {
       await onProviderStart();
@@ -565,6 +571,7 @@ function isDirectory(path: string): boolean {
 }
 
 type PreDispatchErrorCode =
+  | "attention_live_surface_incompatible"
   | "attention_route_drift"
   | "attention_session_unavailable"
   | "attention_cwd_missing"
@@ -602,6 +609,7 @@ function classifyDeliveryFailure(error: unknown, providerStarted: boolean): Reas
 
 function preDispatchDetail(code: string): string {
   switch (code) {
+    case "attention_live_surface_incompatible": return "the captured session is live, but its surface cannot accept an exact-session envelope (older surface or different cwd); it is not resumed concurrently";
     case "attention_route_drift": return "the attention return's captured route no longer matches the actor's enrollment";
     case "attention_session_unavailable": return "the captured session is not live and the actor's policy does not permit resume";
     case "attention_cwd_missing": return "the captured session's working directory no longer exists on this edge";
@@ -624,6 +632,7 @@ function safeEdgeErrorCode(error: unknown): string {
   if (error instanceof PreDispatchError) return error.code;
   const message = error instanceof Error ? error.message : String(error);
   return [
+    "attention_live_surface_incompatible",
     "attention_route_drift",
     "attention_session_unavailable",
     "attention_cwd_missing",

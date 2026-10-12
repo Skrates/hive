@@ -48,4 +48,7 @@ test("timestamps canonicalize to UTC milliseconds and impossible dates are refus
   assert.equal(canonicalInstant("2026-10-13T11:00:00+02:00"), "2026-10-13T09:00:00.000Z");
   assert.equal(canonicalInstant("2026-10-13T09:00:00.123456Z"), "2026-10-13T09:00:00.123Z");
   assert.equal(canonicalInstant("2026-13-45T09:00:00Z"), null);
+  assert.equal(canonicalInstant("2026-02-31T09:00:00Z"), null, "no silent roll-over into March");
+  assert.equal(canonicalInstant("2026-10-12T24:00:00Z"), null);
+  assert.equal(canonicalInstant("2028-02-29T23:59:59-05:00"), "2028-03-01T04:59:59.000Z");
 });

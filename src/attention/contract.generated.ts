@@ -600,7 +600,7 @@ export interface DispatchEvidence {
   kind: "dispatch";
   source_delivery_id: number;
   generation: number;
-  route: "live" | "resume" | "spawn";
+  route: "live" | "resume" | "spawn" | "pinned_resume";
   session_id: string | null;
   cwd: string | null;
 }
