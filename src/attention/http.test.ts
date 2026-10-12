@@ -212,3 +212,53 @@ test("A17/A20/A36 a headless turn binds and summons through its edge; the human'
     h.close();
   }
 });
+
+test("A18/A19 live and operator bindings resolve through the edge's own registry, never a caller's claim", async () => {
+  const { h, server, baseUrl, edgeToken } = await stack();
+  const root = mkdtempSync(join(tmpdir(), "hive-attention-bind-"));
+  const socketPath = join(root, "edge.sock");
+  const store = new EdgeStore(join(root, "edge.sqlite"));
+  const live = new LiveIngressRegistry();
+  const edge = new EdgeService(new BrokerClient(baseUrl, "edge-a", edgeToken), store, live, []);
+  const control = new EdgeControlServer(edge, { socketPath });
+  await control.start();
+  const bind = (body: Record<string, unknown>) => udsRequest(socketPath, "POST", "/attention/bind", {
+    command_id: randomUUID(), project_id: "hive", work_id: "KRA-1500", thread: THREAD, ...body,
+  });
+  try {
+    // No registration: the actor's name alone proves nothing.
+    const unregistered = await bind({ mode: "live", actor: "fable", session_id: "session-A", return_mode: "pinned_session" });
+    assert.equal(unregistered.status, 404);
+
+    // The surface registers through the same socket a Claude hook uses.
+    await udsRequestJson(socketPath, "POST", "/live/register", {
+      actor: "fable", provider: "claude", socketPath: join(root, "inbox"), sessionId: "session-A", surfaceVersion: "claude-hook",
+      ttlMs: 60_000, cwd: root, attentionProtocol: 1,
+    });
+    const otherSession = await bind({ mode: "live", actor: "fable", session_id: "session-B", return_mode: "pinned_session" });
+    assert.equal(otherSession.status, 404, "an exact session, never the most recent one");
+    const pinned = JSON.parse((await bind({ mode: "live", actor: "fable", session_id: "session-A", return_mode: "pinned_session" })).body) as { receipt: Receipt };
+    assert.equal(pinned.receipt.source!.provenance, "live_registration");
+    assert.equal(pinned.receipt.source!.session_id, "session-A");
+    assert.equal(pinned.receipt.source!.cwd, root, "the observed cwd is recorded");
+
+    // Operator enrollment: refused without the credential, and an unverified session cannot pin.
+    const noCredential = await bind({ mode: "operator", actor: "fable", cwd: root, session_id: null, return_mode: "actor_context" });
+    assert.equal(noCredential.status, 403);
+    const guessed = await bind({ mode: "operator", operator_token: ADMIN, actor: "fable", cwd: root, session_id: "session-Z", return_mode: "pinned_session" });
+    assert.equal(guessed.status, 422);
+    assert.equal((JSON.parse(guessed.body) as { error: string }).error, "pinned_unavailable");
+    const verified = JSON.parse((await bind({ mode: "operator", operator_token: ADMIN, actor: "fable", cwd: root, session_id: "session-A", return_mode: "pinned_session" })).body) as { receipt: Receipt };
+    assert.equal(verified.receipt.source!.provenance, "operator_binding");
+    assert.equal(verified.receipt.source!.session_id, "session-A");
+    const wrongToken = await bind({ mode: "operator", operator_token: "x".repeat(40), actor: "fable", cwd: root, session_id: null, return_mode: "actor_context" });
+    assert.equal(wrongToken.status, 403);
+    const elsewhere = await bind({ mode: "operator", operator_token: ADMIN, actor: "fable", cwd: join(root, "missing"), session_id: null, return_mode: "actor_context" });
+    assert.equal(elsewhere.status, 422, "the cwd must exist on this edge");
+  } finally {
+    await control.stop();
+    store.close();
+    await server.stop();
+    h.close();
+  }
+});

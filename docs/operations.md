@@ -396,6 +396,12 @@ bound to the issuing broker. Sources stay valid after the turn ends — no actor
 the human — until `hive attention source revoke <id> --reason …`. Revocation stops new writes;
 queued work, provenance, receipt recovery and an already-recorded response's return survive it.
 
+Live surfaces report their session cwd when they register: the Claude hook sends the hook
+input's `cwd`; the Codex bridge sends a Desktop attachment's binding cwd, or `HIVE_SESSION_CWD`
+for its dedicated thread (unset means no cwd, so that thread can only take context-restored
+returns). Both announce `attentionProtocol: 1`; a surface that does not is never handed an
+exact-session envelope.
+
 Return modes: `pinned-session` needs a verified session id, an observed cwd, the actor's home edge
 and a single-slot actor; `actor-context` restores context through ordinary routing (including slot
 allocation) and says so in the envelope; `none` records the response with no wake. A returning
