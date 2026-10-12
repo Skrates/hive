@@ -23,6 +23,8 @@ function registration(overrides: Partial<Parameters<LiveIngressRegistry["registe
     // absence rather than omitting the field. This is what `control.ts` mints
     // for a surface that sent no attestation.
     runtimeAttestation: { ok: false, absence: "attestation_unreported" } as const,
+    cwd: null,
+    attentionProtocol: 0,
     ...overrides,
   };
 }

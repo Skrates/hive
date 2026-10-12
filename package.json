@@ -13,7 +13,7 @@
     "build": "tsc -p tsconfig.json",
     "check": "bun run check:mcp-imports && bun run check:contracts && bun run build && bun run test",
     "check:mcp-imports": "node scripts/check-mcp-import-boundary.mjs",
-    "check:contracts": "node scripts/gen-contract-types.mjs && git diff --exit-code -- src/review/contract.generated.ts",
+    "check:contracts": "node scripts/gen-contract-types.mjs && git diff --exit-code -- src/review/contract.generated.ts src/attention/contract.generated.ts",
     "dev": "node --enable-source-maps dist/cli.js",
     "test": "node --test 'dist/**/*.test.js'"
   },

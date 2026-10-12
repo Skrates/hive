@@ -39,6 +39,12 @@ interface Config {
   desktopHome: string;
   desktopIpcSocket: string;
   desktopStateDatabase: string;
+  /**
+   * ADR-0004: the dedicated thread's working directory when the launcher knows it
+   * (`HIVE_SESSION_CWD`); null is a named absence. A Desktop attachment reports its own
+   * binding cwd instead.
+   */
+  sessionCwd: string | null;
 }
 
 const REGISTRATION_TTL_MS = 60_000;
@@ -149,6 +155,10 @@ export async function runCodexLive(config: Config): Promise<void> {
     void handle(request, response, () => bindingStatus(config.actor, target), async (delivery, framed) => {
       const acceptedTarget = target;
       if (!acceptedTarget) throw new Error("Codex explicit foreground attachment is unavailable");
+      // ADR-0004: re-check the exact session against the target captured for THIS request,
+      // so a binding switch between the edge's registry lookup and delivery cannot redirect a
+      // constrained return into another task.
+      assertAttentionSession(delivery, acceptedTarget, config.sessionCwd);
       if (acceptedTarget.kind === "dedicated") {
         return completeCodexDelivery(appClient, acceptedTarget.sessionId, delivery, framed);
       }
@@ -163,7 +173,7 @@ export async function runCodexLive(config: Config): Promise<void> {
       .catch((error: unknown) => {
         const code = error instanceof SurfaceError ? error.code : "live_delivery_failed";
         const body = JSON.stringify({ error: code });
-        response.writeHead(code === "not_found" ? 404 : code === "live_delivery_failed" ? 500 : 400, {
+        response.writeHead(code === "not_found" ? 404 : code === "live_delivery_failed" ? 500 : code === "attention_session_mismatch" ? 409 : 400, {
           "content-type": "application/json",
           "content-length": Buffer.byteLength(body),
         });
@@ -191,6 +201,10 @@ export async function runCodexLive(config: Config): Promise<void> {
       sessionId: current.sessionId,
       surfaceVersion: config.surfaceVersion,
       ttlMs: REGISTRATION_TTL_MS,
+      cwd: current.kind === "desktop" ? current.cwd : config.sessionCwd,
+      // This bridge enforces the exact-session check (assertAttentionSession) on every
+      // constrained envelope it accepts.
+      attentionProtocol: 1,
       // Desktop attachments execute under HIVE_CODEX_DESKTOP_HOME, which
       // need only share auth.json with the pinned profile. Bind the wake
       // to the home the turn actually loaded.
@@ -261,8 +275,25 @@ export async function runCodexLive(config: Config): Promise<void> {
   renewal.unref();
 }
 
+/**
+ * ADR-0004: a constrained attention return is accepted only by the exact captured session
+ * (and its cwd, when this surface knows its own). Ordinary envelopes are unaffected.
+ */
+export function assertAttentionSession(
+  delivery: Delivery,
+  target: { kind: "dedicated"; sessionId: string } | { kind: "desktop"; sessionId: string; cwd: string },
+  dedicatedCwd: string | null,
+): void {
+  const constraint = delivery.continuationTarget;
+  if (!constraint || constraint.mode !== "pinned_session") return;
+  const cwd = target.kind === "desktop" ? target.cwd : dedicatedCwd;
+  if (constraint.pinned.session_id !== target.sessionId || (cwd !== null && cwd !== constraint.pinned.cwd)) {
+    throw new SurfaceError("attention_session_mismatch");
+  }
+}
+
 class SurfaceError extends Error {
-  constructor(readonly code: "not_found" | "live_delivery_invalid" | "live_delivery_failed" | "account_profile_mismatch") {
+  constructor(readonly code: "not_found" | "live_delivery_invalid" | "live_delivery_failed" | "account_profile_mismatch" | "attention_session_mismatch") {
     super(code);
     this.name = "SurfaceError";
   }
@@ -525,6 +556,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     desktopHome,
     desktopIpcSocket: process.env.HIVE_CODEX_DESKTOP_IPC_SOCKET ?? join(desktopHome, "ipc", "ipc.sock"),
     desktopStateDatabase: process.env.HIVE_CODEX_DESKTOP_STATE_DB ?? join(desktopHome, "state_5.sqlite"),
+    sessionCwd: process.env.HIVE_SESSION_CWD ?? null,
     ...(process.env.HIVE_CODEX_APP_SERVER_SOCKET
       ? { appServerSocket: process.env.HIVE_CODEX_APP_SERVER_SOCKET }
       : {}),

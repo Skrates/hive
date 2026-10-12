@@ -30,6 +30,18 @@ export interface LiveIngressRegistration {
    * behind it.
    */
   readonly runtimeAttestation: AttestationRead;
+  /**
+   * ADR-0004: the working directory the surface observed for this session, or null when it
+   * did not report one. Null is a named absence, never evidence: an exact-session return
+   * needs a cwd, so a surface that reports none can only ever take context-restored returns.
+   */
+  readonly cwd: string | null;
+  /**
+   * The attention protocol this surface's receiver enforces (exact-session check before
+   * accepting a constrained envelope). 0 means it predates attention: the edge never hands it
+   * a pinned return, and resumes instead where policy permits.
+   */
+  readonly attentionProtocol: number;
 }
 
 export interface LiveIngress extends LiveIngressRegistration {
@@ -83,6 +95,15 @@ export class LiveIngressRegistry {
       return null;
     }
     return entry;
+  }
+
+  /**
+   * ADR-0004 binding lookup: the unexpired registration for exactly this actor, provider and
+   * session — never "the most recent conversation". A different or lapsed session is null.
+   */
+  getExact(actor: string, provider: Provider, sessionId: string): LiveIngress | null {
+    const entry = this.get(actor, provider);
+    return entry !== null && entry.sessionId === sessionId ? entry : null;
   }
 
   /**

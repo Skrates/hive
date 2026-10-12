@@ -332,6 +332,7 @@ test("the housekeeping tick drains the outbox while a review publication pass is
     sweep: () => {},
     publish: async () => { await hung; published = true; },
     drainOutbox: async () => { drained = true; return 1; },
+    attention: async () => 0,
     log: (what, error) => log.push([what, String(error)]),
   });
 
@@ -350,6 +351,7 @@ test("the housekeeping tick drains the outbox while a review publication pass is
     sweep: () => {},
     publish: async () => { secondPublished = true; },
     drainOutbox: async () => 1,
+    attention: async () => 0,
     log: (what, error) => log.push([what, String(error)]),
   });
   assert.equal(secondPublished, true, "the next tick's publication did not wait on the hung one");
@@ -368,6 +370,7 @@ test("the housekeeping tick reports each job's failure on its own and still runs
     sweep: () => { throw new Error("sweep boom"); },
     publish: () => Promise.reject(new Error("github is down")),
     drainOutbox: async () => { drained = true; return 0; },
+    attention: async () => 0,
     log: (what, error) => log.push([what, error instanceof Error ? error.message : String(error)]),
   });
   assert.equal(drained, true, "a failing publication pass costs no Hive wake");
@@ -380,7 +383,40 @@ test("a job that throws before returning a promise is reported, not thrown out o
     sweep: () => {},
     publish: () => { throw new Error("synchronous defect"); },
     drainOutbox: () => Promise.resolve(0),
+    attention: async () => 0,
     log: (what) => log.push(what),
   });
   assert.deepEqual(log, ["hive review publish failed"]);
+});
+
+// ADR-0004 A34: the attention return drain is a fourth independent job. A hung review
+// publication or Slack drain never holds up attention selection or return minting, and an
+// attention failure costs neither of the others anything.
+test("the attention drain runs beside a hung publisher and outbox, and its failure isolates", async () => {
+  const log: Array<[string, string]> = [];
+  let attended = false;
+  const never = new Promise<void>(() => {});
+  void housekeepingTick({
+    sweep: () => {},
+    publish: () => never,
+    drainOutbox: () => never,
+    attention: async () => { attended = true; },
+    log: (what, error) => log.push([what, String(error)]),
+  });
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(attended, true, "attention ran while publication and the outbox drain were hung");
+
+  let drained = false;
+  let published = false;
+  await housekeepingTick({
+    sweep: () => {},
+    publish: async () => { published = true; },
+    drainOutbox: async () => { drained = true; return 0; },
+    attention: () => Promise.reject(new Error("attention store busy")),
+    log: (what, error) => log.push([what, error instanceof Error ? error.message : String(error)]),
+  });
+  assert.equal(drained, true);
+  assert.equal(published, true);
+  assert.deepEqual(log, [["hive attention return drain failed", "attention store busy"]]);
 });

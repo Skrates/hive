@@ -285,6 +285,8 @@ function delivery(now: number, createdAt: number = now): Delivery {
     coalesceKey: "ariadne:C1:100.1",
     coalescedEventIds: ["Ev35"],
     coalescedMessages: [],
+    continuationTarget: null,
+    requiredEdgeProtocol: 0,
     initialSnapshot: null,
     snapshotTs: null,
     createdAt: new Date(createdAt).toISOString(),

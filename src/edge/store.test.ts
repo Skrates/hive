@@ -26,6 +26,8 @@ function delivery(generation: number, attempts = generation): Delivery {
     coalesceKey: "ariadne:C1:1.0",
     coalescedEventIds: ["Ev1"],
     coalescedMessages: [],
+    continuationTarget: null,
+    requiredEdgeProtocol: 0,
     initialSnapshot: null,
     snapshotTs: null,
     createdAt: "2026-07-12T00:00:00.000Z",

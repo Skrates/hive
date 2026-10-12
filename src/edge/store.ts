@@ -29,6 +29,17 @@ export function bindingFor(read: AttestationRead, actor: string): AttestationBin
   };
 }
 
+export interface AttentionHandleRecord {
+  handleHash: string;
+  brokerUuid: string;
+  sourceId: string;
+  provenance: string;
+  actor: string;
+  projectId: string;
+  workId: string;
+  revokedAt?: string | null;
+}
+
 export type LocalDispatchStatus =
   | "received"
   | "dispatching"
@@ -95,9 +106,54 @@ export class EdgeStore {
     for (const [name, type] of LEDGER_COLUMNS) {
       if (!present.has(name)) this.db.exec(`ALTER TABLE local_deliveries ADD COLUMN ${name} ${type}`);
     }
+    // ADR-0004: local attention source handles. Only a hash of each handle is kept, bound to
+    // the broker that issued its source; this table owns no queue state. A revoked handle's
+    // identity is retained so an already-committed receipt can still be recovered.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS attention_source_handles (
+        handle_hash TEXT PRIMARY KEY,
+        broker_uuid TEXT NOT NULL,
+        source_id TEXT NOT NULL,
+        provenance TEXT NOT NULL,
+        actor TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        work_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        revoked_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS attention_source_handles_source ON attention_source_handles(source_id);
+    `);
   }
 
   close(): void { this.db.close(); }
+
+  putAttentionHandle(record: AttentionHandleRecord): void {
+    this.db.prepare(`
+      INSERT INTO attention_source_handles(handle_hash, broker_uuid, source_id, provenance, actor, project_id, work_id, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(record.handleHash, record.brokerUuid, record.sourceId, record.provenance, record.actor, record.projectId, record.workId, new Date().toISOString());
+  }
+
+  attentionHandle(handleHash: string): AttentionHandleRecord | null {
+    const row = this.db.prepare("SELECT * FROM attention_source_handles WHERE handle_hash=?").get(handleHash) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return {
+      handleHash: String(row.handle_hash),
+      brokerUuid: String(row.broker_uuid),
+      sourceId: String(row.source_id),
+      provenance: String(row.provenance),
+      actor: String(row.actor),
+      projectId: String(row.project_id),
+      workId: String(row.work_id),
+      revokedAt: row.revoked_at === null ? null : String(row.revoked_at),
+    };
+  }
+
+  /** The broker refused a write because the source was revoked: remember it, keep the identity. */
+  markAttentionSourceRevoked(sourceId: string): void {
+    this.db.prepare("UPDATE attention_source_handles SET revoked_at=COALESCE(revoked_at, ?) WHERE source_id=?")
+      .run(new Date().toISOString(), sourceId);
+  }
 
   /**
    * Record a claimed delivery, bound to the attestation of the seat profile it

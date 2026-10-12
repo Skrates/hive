@@ -1244,6 +1244,7 @@ test("bundle-1 #9: a hung GitHub port delays no Hive wake and no Slack board lin
     sweep: () => broker.requeueExpiredLeases(),
     publish: () => publisher.drainOnce(),
     drainOutbox: () => service.drainOutbox(),
+    attention: async () => 0,
     log: () => {},
   }));
   // The publication pass is still inside the hung GitHub call …
@@ -1265,6 +1266,7 @@ test("bundle-1 #9: a hung GitHub port delays no Hive wake and no Slack board lin
     sweep: () => broker.requeueExpiredLeases(),
     publish: () => publisher.drainOnce(),
     drainOutbox: () => service.drainOutbox(),
+    attention: async () => 0,
     log: () => {},
   }));
   await new Promise((resolve) => setImmediate(resolve));

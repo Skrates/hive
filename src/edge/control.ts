@@ -2,6 +2,8 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { ProviderSchema, SeatWakeInputSchema } from "../domain.js";
 import { prepareSocketPath } from "../local/uds.js";
 import { parseAttestationWire } from "./attestation.js";
+import { MAX_ATTENTION_COMMAND_BYTES } from "../attention/contract.js";
+import { attentionAct, attentionBind, attentionRead, type RelayAnswer } from "./attention-relay.js";
 import { BrokerHttpError, type ReviewActForward } from "./broker-client.js";
 import { LiveIngressRegistryError } from "./live-registry.js";
 import type { EdgeService } from "./service.js";
@@ -78,6 +80,11 @@ export class EdgeControlServer {
       // `attestationWire` refuses to let a *surface* claim this one.
       const runtimeAttestation = parseAttestationWire(body.attestation)
         ?? { ok: false, absence: "attestation_unreported" } as const;
+      // ADR-0004: a surface that reports no cwd is recorded as reporting none, and one that
+      // does not announce the attention protocol is protocol 0 — never assumed upgraded.
+      const cwd = body.cwd === undefined || body.cwd === null ? null : requiredString(body.cwd, "cwd");
+      const attentionProtocol = body.attentionProtocol === undefined ? 0 : Number(body.attentionProtocol);
+      if (attentionProtocol !== 0 && attentionProtocol !== 1) throw new Error("invalid attentionProtocol");
       const ingress = this.edge.live.register({
         actor,
         provider: parsedProvider.data,
@@ -85,6 +92,8 @@ export class EdgeControlServer {
         sessionId,
         surfaceVersion,
         runtimeAttestation,
+        cwd,
+        attentionProtocol,
       }, ttlMs);
       return json(response, 200, ingress);
     }
@@ -187,6 +196,20 @@ export class EdgeControlServer {
       }
     }
 
+    // ADR-0004: Hive Attention. Bind resolves a source from this edge's own evidence; act
+    // forwards a seat command under the handle's source; read is a closed set of typed reads.
+    // Human mutations never travel this socket — they go to the broker under the operator
+    // credential directly.
+    if (request.method === "POST" && request.url?.startsWith("/attention/")) {
+      const body = await readBoundedJson(request, MAX_ATTENTION_COMMAND_BYTES + 4_096);
+      if (body === null) return json(response, 413, { error: "payload_too_large", detail: `an attention command is at most ${MAX_ATTENTION_COMMAND_BYTES} bytes` });
+      let answer: RelayAnswer | null = null;
+      if (request.url === "/attention/bind") answer = await attentionBind(this.edge, body);
+      else if (request.url === "/attention/act") answer = await attentionAct(this.edge, body);
+      else if (request.url === "/attention/read") answer = await attentionRead(this.edge, body);
+      if (answer !== null) return json(response, answer.status, answer.body);
+    }
+
     if (request.method === "POST" && request.url === "/outcome") {
       const body = await readJson(request);
       const deliveryId = Number(body.deliveryId);
@@ -207,6 +230,27 @@ export class EdgeControlServer {
       if (error instanceof BrokerHttpError) return json(response, error.status, parseErrorBody(error.responseBody));
       throw error;
     }
+  }
+}
+
+/** Null when the body exceeds `limit`; refused before buffering past it. */
+async function readBoundedJson(request: IncomingMessage, limit: number): Promise<Record<string, unknown> | null> {
+  const chunks: Buffer[] = [];
+  let length = 0;
+  for await (const chunk of request) {
+    const value = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    length += value.length;
+    // Past the bound nothing more is buffered; the rest is read and discarded so the
+    // socket survives to carry the refusal.
+    if (length <= limit) chunks.push(value);
+  }
+  if (length > limit) return null;
+  try {
+    const value = JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown;
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error();
+    return value as Record<string, unknown>;
+  } catch {
+    throw new Error("invalid_json");
   }
 }
 
@@ -245,6 +289,7 @@ function safeControlError(error: unknown): string {
     || message === "invalid_json"
     || message === "invalid provider"
     || message === "invalid ttlMs"
+    || message === "invalid attentionProtocol"
     || message === "invalid deliveryId"
     || message === "invalid expected_revision"
     || message === "invalid custody"

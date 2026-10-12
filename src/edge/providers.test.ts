@@ -51,6 +51,8 @@ function delivery(id: number): Delivery {
     coalesceKey: "ariadne:C1:100.1",
     coalescedEventIds: [],
     coalescedMessages: [],
+    continuationTarget: null,
+    requiredEdgeProtocol: 0,
     initialSnapshot: null,
     snapshotTs: null,
     createdAt: "2026-08-01T00:00:00.000Z",
@@ -350,6 +352,8 @@ test("Codex live delivery travels over the surface's owner-only UDS socket", asy
     surfaceVersion: "test",
     // Required: a registration names its attestation or names its absence.
     runtimeAttestation: { ok: false, absence: "attestation_unreported" },
+    cwd: null,
+    attentionProtocol: 0,
     expiresAt: Date.now() + 60_000,
   };
   const result = await codex.deliverLive(ingress, delivery(11), "framed body");
@@ -382,6 +386,8 @@ test("an oversized live receipt is rejected", async (t) => {
     surfaceVersion: "test",
     // Required: a registration names its attestation or names its absence.
     runtimeAttestation: { ok: false, absence: "attestation_unreported" },
+    cwd: null,
+    attentionProtocol: 0,
     expiresAt: Date.now() + 60_000,
   };
   await assert.rejects(
@@ -411,6 +417,8 @@ test("a missing live outcome is rejected instead of parsing the diagnostic recei
     surfaceVersion: "test",
     // Required: a registration names its attestation or names its absence.
     runtimeAttestation: { ok: false, absence: "attestation_unreported" },
+    cwd: null,
+    attentionProtocol: 0,
     expiresAt: Date.now() + 60_000,
   };
   await assert.rejects(
@@ -440,6 +448,8 @@ test("a structured Desktop account rejection remains a deterministic pre-dispatc
     surfaceVersion: "test",
     // Required: a registration names its attestation or names its absence.
     runtimeAttestation: { ok: false, absence: "attestation_unreported" },
+    cwd: null,
+    attentionProtocol: 0,
     expiresAt: Date.now() + 60_000,
   };
   await assert.rejects(

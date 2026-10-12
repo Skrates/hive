@@ -35,6 +35,9 @@ import {
 import type { BindingStatus } from "./codex/live.js";
 import { installCodexSkill } from "./codex/skill-install.js";
 import { registerReviewCommands } from "./review/cli.js";
+import { registerAttentionCommands } from "./attention/cli.js";
+import { AttentionRuntimeConfigError, bootAttentionRuntime, type AttentionRuntime } from "./attention/runtime.js";
+import { AttentionSchemaError } from "./attention/store.js";
 import { bootReviewRuntime, type ReviewRuntime } from "./review/runtime.js";
 import { LegacyReviewStoreError } from "./review/store.js";
 import { systemClock } from "./time.js";
@@ -54,6 +57,8 @@ program.command("broker")
     // is `hive review reset-store`, which leaves the ledger alone.
     let store: BrokerStore;
     let review: ReviewRuntime;
+    let attention: AttentionRuntime;
+    const slackWeb = new SlackWebTransport(config.HIVE_SLACK_BOT_TOKEN);
     try {
       store = new BrokerStore(config.HIVE_BROKER_DB);
       // The review state machine lives in the broker's own database (module map §8): the
@@ -67,20 +72,34 @@ program.command("broker")
         failureChannelId: policy.channelIds.values().next().value,
         log: (line) => console.error(line),
       });
+      // Attention composes on the same handle with its own additive schema (ADR-0004). Its
+      // generation is checked here too: a newer attention store refuses to boot.
+      attention = bootAttentionRuntime({
+        broker: store,
+        clock: systemClock,
+        adminToken: config.HIVE_ADMIN_TOKEN,
+        env: config,
+        validateThread: async (channelId, threadTs) => { await slackWeb.replay(channelId, threadTs); },
+        log: (line) => console.error(line),
+      });
     } catch (error) {
-      if (error instanceof LegacyDatabaseError || error instanceof LegacyReviewStoreError) {
+      if (
+        error instanceof LegacyDatabaseError || error instanceof LegacyReviewStoreError
+        || error instanceof AttentionSchemaError || error instanceof AttentionRuntimeConfigError
+      ) {
         console.error(`[boot] refusing to start: ${error.message}`);
         process.exit(1);
       }
       throw error;
     }
-    const broker = new BrokerService(store, new SlackWebTransport(config.HIVE_SLACK_BOT_TOKEN));
+    const broker = new BrokerService(store, slackWeb);
     const http = new BrokerHttpServer(broker, {
       host: config.HIVE_BROKER_HOST,
       port: config.HIVE_BROKER_PORT,
       adminToken: config.HIVE_ADMIN_TOKEN,
       ...(config.HIVE_HEALTH_CANVAS_CONFIG ? { healthCanvasConfigPath: config.HIVE_HEALTH_CANVAS_CONFIG } : {}),
       review: review.http,
+      attention: attention.http,
     });
     const slack = new SlackSocketIngress(
       config.HIVE_SLACK_APP_TOKEN,
@@ -102,6 +121,7 @@ program.command("broker")
         sweep: () => store.requeueExpiredLeases(),
         publish: () => review.publisher.drainOnce(),
         drainOutbox: () => broker.drainOutbox(),
+        attention: () => attention.publisher.drainOnce(),
         log: (what, error) => console.error(what, error instanceof Error ? error.message : String(error)),
       });
     }, 5_000);
@@ -347,6 +367,7 @@ program.command("delete-subscription")
   });
 
 registerReviewCommands(program);
+registerAttentionCommands(program);
 
 const BrokerConfig = z.object({
   HIVE_BROKER_DB: z.string().min(1).default("hive-broker.sqlite"),
@@ -372,6 +393,9 @@ const BrokerConfig = z.object({
   HIVE_GITHUB_APP_ID: z.string().min(1).optional(),
   HIVE_GITHUB_APP_KEY_FILE: z.string().min(1).optional(),
   HIVE_GITHUB_SUMMON_TOKEN_FILE: z.string().min(1).optional(),
+  // Hive Attention (ADR-0004): off for the first release; the human id is a queue identity.
+  HIVE_ATTENTION_ENABLED: z.string().optional(),
+  HIVE_ATTENTION_HUMAN_ID: z.string().optional(),
 });
 
 const EdgeConfig = z.object({

@@ -24,11 +24,25 @@ export class UdsHttpError extends Error {
   }
 }
 
+/** A bounded local request that did not answer in time; it proves nothing about commit. */
+export class UdsTimeoutError extends Error {
+  constructor(readonly path: string, readonly timeoutMs: number) {
+    super(`uds ${path} did not answer within ${timeoutMs}ms`);
+    this.name = "UdsTimeoutError";
+  }
+}
+
+export interface UdsRequestOptions {
+  /** Enforced with cancellation: the request is destroyed when it elapses. */
+  timeoutMs?: number;
+}
+
 export function udsRequest(
   socketPath: string,
   method: "GET" | "POST",
   path: string,
   body?: unknown,
+  options: UdsRequestOptions = {},
 ): Promise<UdsResponse> {
   return new Promise((resolve, reject) => {
     const payload = body === undefined ? null : JSON.stringify(body);
@@ -51,6 +65,10 @@ export function udsRequest(
       },
     );
     request.once("error", reject);
+    if (options.timeoutMs !== undefined) {
+      const timeoutMs = options.timeoutMs;
+      request.setTimeout(timeoutMs, () => request.destroy(new UdsTimeoutError(path, timeoutMs)));
+    }
     if (payload !== null) request.write(payload);
     request.end();
   });
@@ -61,8 +79,9 @@ export async function udsRequestJson<T>(
   method: "GET" | "POST",
   path: string,
   body?: unknown,
+  options: UdsRequestOptions = {},
 ): Promise<T> {
-  const response = await udsRequest(socketPath, method, path, body);
+  const response = await udsRequest(socketPath, method, path, body, options);
   if (response.status < 200 || response.status >= 300) {
     throw new UdsHttpError(path, response.status, response.body);
   }

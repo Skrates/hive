@@ -95,6 +95,8 @@ function delivery(id: number, overrides: Partial<Delivery> = {}): Delivery {
     coalesceKey: `ariadne:C1:100.1`,
     coalescedEventIds: [`Ev${id}`],
     coalescedMessages: [],
+    continuationTarget: null,
+    requiredEdgeProtocol: 0,
     initialSnapshot: null,
     snapshotTs: null,
     createdAt: "2026-08-01T00:00:00.000Z",
@@ -339,6 +341,8 @@ test("a completion-tracked Codex live injection commits its final response as th
     surfaceVersion: "test",
     // Required: a registration names its attestation or names its absence.
     runtimeAttestation: { ok: false, absence: "attestation_unreported" },
+    cwd: null,
+    attentionProtocol: 0,
   }, 60_000);
   const edge = new EdgeService(asBrokerClient(broker), store, live, [adapter]);
 
@@ -375,6 +379,8 @@ test("a two-slot actor never takes the live route, even with a live registration
     sessionId: "thread-1",
     surfaceVersion: "test",
     runtimeAttestation: { ok: false, absence: "attestation_unreported" },
+    cwd: null,
+    attentionProtocol: 0,
   }, 60_000);
   const edge = new EdgeService(asBrokerClient(broker), store, live, [adapter]);
 
@@ -414,6 +420,8 @@ test("a live Desktop account rejection terminalizes without an uncertainty retry
     surfaceVersion: "test",
     // Required: a registration names its attestation or names its absence.
     runtimeAttestation: { ok: false, absence: "attestation_unreported" },
+    cwd: null,
+    attentionProtocol: 0,
   }, 60_000);
   const edge = new EdgeService(asBrokerClient(broker), store, live, [adapter]);
 
@@ -623,6 +631,8 @@ test("a live surface that omitted its attestation binds as unreported, not the p
     surfaceVersion: "test",
     // Required: a registration names its attestation or names its absence.
     runtimeAttestation: { ok: false, absence: "attestation_unreported" },
+    cwd: null,
+    attentionProtocol: 0,
   }, 60_000);
   const edge = new EdgeService(asBrokerClient(broker), store, live, [new StubAdapter({ liveResult: { processed: true, receipt: "live", outcome: "done" } })]);
 
@@ -692,6 +702,8 @@ test("a reinstall under a live session records the ambiguity instead of guessing
     socketPath: "/tmp/x.sock",
     sessionId: "thread-1",
     surfaceVersion: "test",
+    cwd: null,
+    attentionProtocol: 0,
     runtimeAttestation: {
       ok: true,
       attestation: {
@@ -707,6 +719,8 @@ test("a reinstall under a live session records the ambiguity instead of guessing
     socketPath: "/tmp/x.sock",
     sessionId: "thread-1",
     surfaceVersion: "test",
+    cwd: null,
+    attentionProtocol: 0,
     runtimeAttestation: {
       ok: true,
       attestation: {
@@ -751,6 +765,8 @@ test("a live Desktop delivery binds to the surface's runtime home, not the pinne
     socketPath: "/tmp/x.sock",
     sessionId: "desktop-task",
     surfaceVersion: "test",
+    cwd: null,
+    attentionProtocol: 0,
     runtimeAttestation: {
       ok: true,
       attestation: {
@@ -820,6 +836,8 @@ test("dispatch keeps the live route captured at claim when the registry is repla
     socketPath: "/tmp/claimed.sock",
     sessionId: "thread-1",
     surfaceVersion: "test",
+    cwd: null,
+    attentionProtocol: 0,
     runtimeAttestation: {
       ok: true,
       attestation: {
@@ -838,6 +856,8 @@ test("dispatch keeps the live route captured at claim when the registry is repla
         actor: "ariadne",
         provider: "codex",
         socketPath: "/tmp/replacement.sock",
+        cwd: null,
+        attentionProtocol: 0,
         sessionId: "thread-2",
         surfaceVersion: "test",
         runtimeAttestation: {
@@ -872,6 +892,8 @@ test("a live route that expires after claim still dispatches to that surface, no
     socketPath: "/tmp/claimed.sock",
     sessionId: "thread-1",
     surfaceVersion: "test",
+    cwd: null,
+    attentionProtocol: 0,
     runtimeAttestation: {
       ok: true,
       attestation: {
@@ -916,6 +938,8 @@ test("a live surface that appears after claim does not steal a headless dispatch
         actor: "ariadne",
         provider: "codex",
         socketPath: "/tmp/late.sock",
+        cwd: null,
+        attentionProtocol: 0,
         sessionId: "desktop-task",
         surfaceVersion: "test",
         runtimeAttestation: {
@@ -1005,6 +1029,8 @@ test("a mixed-case live registration is found under the canonical actor key", ()
     sessionId: "s1",
     surfaceVersion: "test",
     runtimeAttestation: { ok: false, absence: "attestation_unreported" },
+    cwd: null,
+    attentionProtocol: 0,
   }, 60_000);
   assert.ok(live.get("gnomon", "claude"), "canonical lookup finds the mixed-case registration");
   live.deregister("GNOMON", "claude");
@@ -1087,6 +1113,8 @@ test("a live delivery that carries an Effort overlay publishes that it did not a
     sessionId: "thread-1",
     surfaceVersion: "test",
     runtimeAttestation: { ok: false, absence: "attestation_unreported" },
+    cwd: null,
+    attentionProtocol: 0,
   }, 60_000);
   const edge = new EdgeService(asBrokerClient(broker), store, live, [adapter]);
   assert.equal(await edge.processOne(), true);
@@ -1151,6 +1179,8 @@ test("a live delivery with a conflicting Effort overlay publishes the conflict, 
     sessionId: "thread-1",
     surfaceVersion: "test",
     runtimeAttestation: { ok: false, absence: "attestation_unreported" },
+    cwd: null,
+    attentionProtocol: 0,
   }, 60_000);
   const edge = new EdgeService(asBrokerClient(broker), store, live, [adapter]);
   assert.equal(await edge.processOne(), true);
