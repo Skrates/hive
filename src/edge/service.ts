@@ -206,12 +206,14 @@ export class EdgeService {
    */
   private liveRouteFor(delivery: Delivery, route: EffectiveRoute): LiveIngress | null {
     if (delivery.subscription.turnSlots > 1) return null;
-    const entry = this.live.get(delivery.actor, delivery.subscription.provider);
-    if (route.kind !== "pinned" || entry === null) return entry;
+    if (route.kind !== "pinned") return this.live.get(delivery.actor, delivery.subscription.provider);
     // ADR-0004: a pinned return goes live only into exactly the captured session, through a
-    // surface that will itself re-check that session before accepting. An actor name alone
-    // is not an exact-session address: another session's registration falls to resume.
-    if (entry.sessionId !== route.sessionId) return null;
+    // surface that will itself re-check that session before accepting. The captured session's
+    // OWN registration decides, not the actor's most recent one: another session registering
+    // since proves nothing about whether the captured one stopped. Only when the captured
+    // session holds no unexpired registration may it be resumed.
+    const entry = this.live.getExact(delivery.actor, delivery.subscription.provider, route.sessionId);
+    if (entry === null) return null;
     // The captured session IS live, but through a surface that cannot honour the constraint
     // (it predates the receiver-side check) or in a working directory it does not positively
     // match — an unreported cwd is missing evidence, not agreement. Resuming it headlessly

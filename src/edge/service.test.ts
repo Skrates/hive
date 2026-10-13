@@ -1271,6 +1271,24 @@ test("A25 a pinned return goes live only into the captured session through a pro
   }
 });
 
+test("A25 a newer session of the actor never hides that the captured session is still live", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "hive-pinned-"));
+  const sub = subscription({ sessionId: "thread-1", wakePolicy: "resume" });
+  let clock = 1_000_000;
+  const live = new LiveIngressRegistry({ now: () => clock });
+  liveEntry(live, "thread-captured", { cwd, socket: "/tmp/captured.sock" });
+  liveEntry(live, "thread-newer", { cwd, socket: "/tmp/newer.sock" });
+  const both = (await runPinned(sub, live, pinnedTarget(sub, cwd))).adapter.calls;
+  assert.deepEqual(both.map((call) => [call.route, call.socket]), [["live", "/tmp/captured.sock"]],
+    "into the captured session's own surface — never a resume beside it");
+
+  // Only the captured session's own lapsed heartbeat lets it be resumed.
+  clock += 60_001;
+  liveEntry(live, "thread-newer", { cwd, socket: "/tmp/newer.sock" });
+  const lapsed = (await runPinned(sub, live, pinnedTarget(sub, cwd))).adapter.calls;
+  assert.deepEqual(lapsed, [{ route: "resume", sessionId: "thread-captured", cwd }]);
+});
+
 test("a delivery from a broker that predates the continuation field routes ordinarily", async () => {
   const legacy = delivery(71) as Partial<Delivery>;
   delete legacy.continuationTarget;

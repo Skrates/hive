@@ -27,7 +27,7 @@ test("the brief fits one screen and names action, context, artifacts, unblock an
   assert.match(brief, /^Do: Select candidate A, B, C or D/mu);
   assert.match(brief, /Contact sheet — \/srv\/renders\/sheet\.png @ r2 \[on edge pop-os\]/u, "a local path names the edge that owns it");
   assert.match(brief, /Unblocks: The next video-generation batch\. Estimated human time: 8 minutes\./u);
-  assert.match(brief, /Return: originating seat fable, saved session s-1 on pop-os; queued 14 minutes ago\./u);
+  assert.match(brief, /Return: originating seat fable, saved session s-1 on pop-os; summoned 14 minutes ago\./u);
   assert.match(brief, /Queue: 2 more waiting \(advisory; the queue moves\)\./u);
 });
 

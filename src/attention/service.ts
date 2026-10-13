@@ -97,8 +97,13 @@ export class AttentionService {
     if (thread !== null && options.recoverOnly !== true && this.store.committedReceipt(command.command_id, { kind: "operator" }) === null) {
       try {
         await this.validateThread(thread.channel_id, thread.thread_ts);
-      } catch {
-        throw new AttentionRefusal(422, "invalid_thread", `${thread.channel_id}/${thread.thread_ts} is not a readable Slack thread`);
+      } catch (error) {
+        if (slackSaidUnreadable(error)) {
+          throw new AttentionRefusal(422, "invalid_thread", `${thread.channel_id}/${thread.thread_ts} is not a readable Slack thread`);
+        }
+        // Rate limits, transport failures and Slack's own outages say nothing about the
+        // thread; nothing was written, so the same bind is simply retried.
+        throw new AttentionRefusal(503, "slack_unavailable", "Slack could not be asked about the return thread; nothing was bound — retry the same bind");
       }
     }
     return this.store.bindSource({ edgeId: caller.edgeId, operator: caller.operator }, command, options);
@@ -170,4 +175,15 @@ export class AttentionService {
     if (caller.kind !== "edge") throw new AttentionRefusal(403, "edge_required", "the return guard validates an edge's own claimed delivery");
     return this.store.returnGuard(caller.edgeId, resolutionCommandId, generation, deliveryId);
   }
+}
+
+/** Slack platform errors that are its own transient trouble, not a verdict on the thread. */
+const TRANSIENT_SLACK_PLATFORM_ERRORS = new Set(["internal_error", "fatal_error", "service_unavailable", "request_timeout", "ratelimited"]);
+
+/** Only Slack's definitive platform answer (thread_not_found, channel_not_found, …) refuses the thread. */
+export function slackSaidUnreadable(error: unknown): boolean {
+  const failure = error as { code?: unknown; data?: { error?: unknown } } | null;
+  return failure?.code === "slack_webapi_platform_error"
+    && typeof failure.data?.error === "string"
+    && !TRANSIENT_SLACK_PLATFORM_ERRORS.has(failure.data.error);
 }

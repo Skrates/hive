@@ -77,7 +77,8 @@ export function renderBrief(item: ItemView, now: Date, waitingBehind: number | n
   const estimate = packet.estimate_minutes === null ? "" : ` Estimated human time: ${packet.estimate_minutes} minutes.`;
   const deadline = packet.deadline_at === null ? "" : ` Deadline: ${packet.deadline_at} (display only).`;
   lines.push(`Unblocks: ${inert(packet.unblocks)}${estimate}${deadline}`);
-  lines.push(`Return: ${returnDescription(item.source, item.return_mode)}; queued ${ago(item.created_at, now)}.`);
+  // Creation age, named as such: a deferral that rejoined the tail was not queued all along.
+  lines.push(`Return: ${returnDescription(item.source, item.return_mode)}; summoned ${ago(item.created_at, now)}.`);
   if (packet.predecessor_item_id !== null) lines.push(`Follows: ${itemLabel(packet.predecessor_item_id)}`);
   if (waitingBehind !== null) lines.push(`Queue: ${waitingBehind} more waiting (advisory; the queue moves).`);
   lines.push(`Resolve: hive attention resolve ${item.item_id} --expected-revision ${item.revision} --outcome <outcome> --response "<decision>" [--next]`);

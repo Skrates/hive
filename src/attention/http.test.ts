@@ -25,12 +25,12 @@ const slack: SlackTransport = {
   react: async () => {},
 };
 
-async function stack(options: { attention?: boolean } = {}) {
+async function stack(options: { attention?: boolean; validateThread?: (channelId: string, threadTs: string) => Promise<void> } = {}) {
   const h = harness({ seats: [seat("fable", { edgeWorkspaces: [{ edgeId: "edge-a", cwd: tmpdir(), worktree: null }] })] });
   const edgeToken = h.broker.createEdge("edge-a");
   const runtime = bootAttentionRuntime({
     broker: h.broker, clock: h.clock, adminToken: ADMIN, env: { HIVE_ATTENTION_ENABLED: "true" },
-    validateThread: async () => {}, log: () => {},
+    validateThread: options.validateThread ?? (async () => {}), log: () => {},
   });
   const service = new BrokerService(h.broker, slack);
   const server = new BrokerHttpServer(service, { host: "127.0.0.1", port: 0, adminToken: ADMIN, review: null, attention: options.attention === false ? null : runtime.http });
@@ -379,6 +379,41 @@ test("a committed dispatch bind is recovered after its response, its turn and th
   } finally {
     await control.stop();
     edgeStore.close();
+    await server.stop();
+    h.close();
+  }
+});
+
+test("only Slack's definitive answer refuses a return thread; its transient trouble is retryable", async () => {
+  let failure: unknown = null;
+  const { h, server, baseUrl, edgeToken } = await stack({ validateThread: async () => { if (failure !== null) throw failure; } });
+  const edge = { authorization: `Bearer ${edgeToken}`, "x-hive-edge": "edge-a" };
+  const bind = () => call(baseUrl, "POST", "/v1/attention/sources", edge, {
+    schema_version: 1, command_id: randomUUID(), action: "source_bind",
+    payload: {
+      project_id: "hive", work_id: "KRA-1500", return_mode: "actor_context", thread: THREAD,
+      evidence: { kind: "live_registration", actor: "fable", provider: "claude", session_id: "s-1", cwd: "/work", surface_version: "claude-hook" },
+    },
+  });
+  const platform = (error: string) => Object.assign(new Error(error), { code: "slack_webapi_platform_error", data: { ok: false, error } });
+  try {
+    for (const [thrown, status, code] of [
+      [platform("thread_not_found"), 422, "invalid_thread"],
+      [platform("channel_not_found"), 422, "invalid_thread"],
+      [platform("ratelimited"), 503, "slack_unavailable"],
+      [platform("internal_error"), 503, "slack_unavailable"],
+      [Object.assign(new Error("429"), { code: "slack_webapi_rate_limited_error" }), 503, "slack_unavailable"],
+      [Object.assign(new Error("ECONNRESET"), { code: "slack_webapi_request_error" }), 503, "slack_unavailable"],
+    ] as const) {
+      failure = thrown;
+      const answer = await bind();
+      assert.equal(answer.status, status, String(code));
+      assert.equal(answer.body.error, code);
+    }
+    assert.equal(h.store.sources().length, 0, "nothing was bound");
+    failure = null;
+    assert.equal((await bind()).status, 201);
+  } finally {
     await server.stop();
     h.close();
   }

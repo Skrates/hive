@@ -415,7 +415,9 @@ exact-session envelope. A pinned return needs positive cwd evidence at both ends
 the receiver (Claude hook, Codex bridge) accept it only from the captured session reporting the
 captured cwd. If the captured session is live but on protocol 0, without a cwd, or in another
 cwd, the delivery fails visibly with `attention_live_surface_incompatible` instead of resuming a
-second process beside it. The operator then retries or reroutes.
+second process beside it. The operator then retries or reroutes. The edge keeps every
+session's own registration, so another session of the same actor registering later never makes
+the captured one look stopped; it is resumed only once its own heartbeat has lapsed.
 
 Return modes: `pinned-session` needs a verified session id, an observed cwd, the actor's home edge
 and a single-slot actor; `actor-context` restores context through ordinary routing (including slot

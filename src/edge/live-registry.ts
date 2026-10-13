@@ -57,6 +57,12 @@ export class LiveIngressRegistryError extends Error {
 
 export class LiveIngressRegistry {
   private readonly entries = new Map<string, LiveIngress>();
+  /**
+   * ADR-0004: the latest registration of every session, not only the actor's most recent one.
+   * Two sessions of one actor can be open at once; a newer registration says nothing about
+   * whether the older session stopped, and only its own lapsed heartbeat does.
+   */
+  private readonly sessions = new Map<string, LiveIngress>();
   private readonly now: () => number;
 
   constructor(dependencies: { now?: () => number } = {}) {
@@ -83,6 +89,12 @@ export class LiveIngressRegistry {
       expiresAt: this.now() + ttlMs,
     });
     this.entries.set(bindingKey, entry);
+    if (entry.sessionId !== null) {
+      for (const [sessionKey, held] of this.sessions) {
+        if (held.expiresAt <= this.now()) this.sessions.delete(sessionKey);
+      }
+      this.sessions.set(`${bindingKey}:${entry.sessionId}`, entry);
+    }
     return entry;
   }
 
@@ -98,12 +110,19 @@ export class LiveIngressRegistry {
   }
 
   /**
-   * ADR-0004 binding lookup: the unexpired registration for exactly this actor, provider and
-   * session — never "the most recent conversation". A different or lapsed session is null.
+   * ADR-0004 lookup: the unexpired registration for exactly this actor, provider and session,
+   * whether or not another session of the actor registered since — never "the most recent
+   * conversation". A lapsed or withdrawn session is null.
    */
   getExact(actor: string, provider: Provider, sessionId: string): LiveIngress | null {
-    const entry = this.get(actor, provider);
-    return entry !== null && entry.sessionId === sessionId ? entry : null;
+    const sessionKey = `${key(actor, provider)}:${sessionId}`;
+    const entry = this.sessions.get(sessionKey);
+    if (!entry) return null;
+    if (entry.expiresAt <= this.now()) {
+      this.sessions.delete(sessionKey);
+      return null;
+    }
+    return entry;
   }
 
   /**
@@ -112,7 +131,10 @@ export class LiveIngressRegistry {
    * that will never come. Idempotent: deregistering an absent binding is fine.
    */
   deregister(actor: string, provider: Provider): void {
-    this.entries.delete(key(actor, provider));
+    const bindingKey = key(actor, provider);
+    const current = this.entries.get(bindingKey);
+    if (current?.sessionId) this.sessions.delete(`${bindingKey}:${current.sessionId}`);
+    this.entries.delete(bindingKey);
   }
 }
 
