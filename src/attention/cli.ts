@@ -642,7 +642,16 @@ export function registerAttentionCommands(
       const code = exitCodeFor(answer.status);
       if (code !== 0) settle(answer, options, () => "");
       const result = answer.body as { receipt: Receipt; source_file: SourceFile };
-      writeOwnerOnly(out, `${JSON.stringify(result.source_file, null, 2)}\n`);
+      try {
+        writeOwnerOnly(out, `${JSON.stringify(result.source_file, null, 2)}\n`);
+      } catch (error) {
+        // The source is committed; only this handle is lost. The command id is the way back.
+        throw new CliFailure(EXIT_UNKNOWN_OUTCOME,
+          `bind ${commandId} committed source ${result.receipt.source?.source_id ?? "?"} but writing ${out} failed `
+          + `(${error instanceof Error ? error.message : String(error)}); rerun the same bind with --command-id ${commandId} `
+          + "and a new --out to recover a fresh handle for the same source",
+          { error: "source_file_write_failed", command_id: commandId, source_id: result.receipt.source?.source_id ?? null });
+      }
       const source = result.receipt.source!;
       io.out(options.json
         ? JSON.stringify({ receipt: result.receipt, source_file: out })
@@ -706,8 +715,10 @@ export function registerAttentionCommands(
       if (options.sourceFile) {
         try {
           const loaded = loadSourceFile(options.sourceFile);
-          const answer = await transport.edge("/attention/read", { op: "source", source_id: loaded.file.source_id });
-          const view = answer.status === 200 ? answer.body as SourceView : null;
+          // The handle itself is checked against this edge's table, not just the broker's
+          // source: a reset edge database or a corrupted file cannot pass as usable.
+          const answer = await transport.edge("/attention/read", { op: "source_handle", handle: loaded.file.handle });
+          const view = answer.status === 200 && (answer.body as SourceView).source_id === loaded.file.source_id ? answer.body as SourceView : null;
           const brokerUuid = (report.broker as { broker_uuid?: string }).broker_uuid;
           const valid = view !== null && view.revoked_at === null && (brokerUuid === undefined || brokerUuid === loaded.file.broker_uuid);
           healthy &&= valid;

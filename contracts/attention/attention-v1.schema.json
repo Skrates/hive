@@ -736,7 +736,7 @@
       "additionalProperties": false,
       "required": [
         "human_id", "active_item", "eligible_count", "deferred_count", "oldest_eligible_at", "next_deferred_at",
-        "returns_pending", "returns_blocked", "returns_failed", "route_warnings", "observed_at"
+        "returns_pending", "returns_minted", "returns_blocked", "returns_failed", "route_warnings", "observed_at"
       ],
       "properties": {
         "human_id": { "$ref": "#/$defs/HumanId" },
@@ -746,6 +746,7 @@
         "oldest_eligible_at": { "anyOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] },
         "next_deferred_at": { "anyOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] },
         "returns_pending": { "type": "integer", "minimum": 0 },
+        "returns_minted": { "type": "integer", "minimum": 0, "description": "Continuations whose core delivery is in flight; a rollback waits for zero." },
         "returns_blocked": { "type": "integer", "minimum": 0 },
         "returns_failed": { "type": "integer", "minimum": 0 },
         "route_warnings": {

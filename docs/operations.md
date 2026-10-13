@@ -469,7 +469,7 @@ contents.
    `HIVE_ATTENTION_ENABLED=true` and restart the broker.
 
 Rolling back: disable first (no new mutations or publication), let every minted attention delivery
-reach a recorded terminal phase (`hive attention queue` shows none minted), then downgrade. An old
+reach a recorded terminal phase (`hive attention queue` shows `0 in flight`, `returns_minted: 0` in JSON), then downgrade. An old
 edge never claims a protocol-1 delivery, so a partially downgraded fleet leaves continuations
 pending rather than ignoring their constraints — and, because only a claim terminalizes an expired
 delivery, they stay `minted` until an upgraded edge polls again; inspect them with

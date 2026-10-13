@@ -38,6 +38,9 @@ test("A21 resolving while Slack is unreachable commits the response and next cla
   const view = h.store.item(itemId)!;
   assert.equal(view.return!.phase, "minted");
   assert.equal(view.return!.transport_status, "pending");
+  const status = h.store.status("hakon");
+  assert.equal(status.returns_minted, 1, "an in-flight continuation is visible — a rollback waits for it");
+  assert.equal(status.returns_pending, 0);
   h.close();
 });
 

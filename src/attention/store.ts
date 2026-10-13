@@ -1251,7 +1251,7 @@ export class AttentionStore {
     `).get(humanId) as Row;
     const phases = this.db.prepare(`
       SELECT r.phase, COUNT(*) AS count FROM attention_returns r JOIN attention_items i ON i.item_id=r.item_id
-      WHERE i.human_id=? AND r.phase IN ('pending', 'blocked', 'failed') GROUP BY r.phase
+      WHERE i.human_id=? AND r.phase IN ('pending', 'minted', 'blocked', 'failed') GROUP BY r.phase
     `).all(humanId) as Array<{ phase: string; count: number }>;
     const count = (phase: string): number => phases.find((row) => row.phase === phase)?.count ?? 0;
     const warnings = (this.db.prepare(`
@@ -1267,6 +1267,7 @@ export class AttentionStore {
       oldest_eligible_at: oldest.oldest === null ? null : String(oldest.oldest),
       next_deferred_at: deferred.next,
       returns_pending: count("pending"),
+      returns_minted: count("minted"),
       returns_blocked: count("blocked"),
       returns_failed: count("failed"),
       route_warnings: warnings,

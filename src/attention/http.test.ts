@@ -197,6 +197,11 @@ test("A17/A20/A36 a headless turn binds and summons through its edge; the human'
     assert.equal(amended.item!.revision, 2);
     const forged = await udsRequest(socketPath, "POST", "/attention/act", { handle: "ahs_" + "A".repeat(43), command: {} });
     assert.equal(forged.status, 403);
+    // doctor's source check resolves the handle on this edge, not only the broker's source.
+    const healthy = await udsRequestJson<{ source_id: string }>(socketPath, "POST", "/attention/read", { op: "source_handle", handle: file.handle });
+    assert.equal(healthy.source_id, file.source_id);
+    const unusable = await udsRequest(socketPath, "POST", "/attention/read", { op: "source_handle", handle: "ahs_" + "A".repeat(43) });
+    assert.equal(unusable.status, 403);
 
     // The human takes it and resolves with --next.
     const taken = await call(baseUrl, "POST", "/v1/attention/commands", operator,

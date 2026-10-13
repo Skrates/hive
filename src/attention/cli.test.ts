@@ -167,6 +167,21 @@ test("doctor is unhealthy when the edge is down, and healthy for an intentionall
   assert.equal(down.healthy, false);
   assert.equal(down.edge.reachable, false);
 
+  // A source file whose handle this edge no longer knows is unusable, whatever the broker says.
+  const dir = mkdtempSync(join(tmpdir(), "hive-cli-doctor-"));
+  const sourcePath = join(dir, "source.json");
+  writeFileSync(sourcePath, JSON.stringify({
+    schema_version: 1, broker_uuid: "00000000-0000-4000-8000-000000000000", edge_id: "edge-a", source_id: `src_${"c".repeat(32)}`,
+    handle: `ahs_${"C".repeat(43)}`, actor: "fable", project_id: "p", work_id: "w", return_mode: "actor_context", provenance: "dispatch",
+  }));
+  const reset = await runCli(["doctor", "--json", "--source-file", sourcePath], {
+    edgeUp: true,
+    answer: (path) => path === "/attention/read" ? { status: 403, body: { error: "unknown_source_handle", detail: "x" } } : capabilities(),
+  });
+  assert.equal(reset.code, 7);
+  assert.deepEqual(reset.calls.find((call) => call.path === "/attention/read")!.body, { op: "source_handle", handle: `ahs_${"C".repeat(43)}` });
+  assert.equal((JSON.parse(reset.out[0]!) as { source: { valid: boolean } }).source.valid, false);
+
   const preEnable = await runCli(["doctor", "--json"], { answer: capabilities, edgeUp: true });
   assert.equal(preEnable.code, 0);
   const ready = JSON.parse(preEnable.out[0]!) as { healthy: boolean; broker: { enabled: boolean } };
@@ -200,6 +215,21 @@ test("bind refuses to guess identity, writes the source file owner-only, and nev
   const again = await runCli(["bind", "--project", "p", "--work", "w", "--return", "actor-context", "--out", out], { env: { HIVE_DELIVERY_TOKEN: "turn-token" } });
   assert.equal(again.code, 2);
   assert.equal(again.calls.length, 0);
+
+  // The broker committed but the source file cannot be written: the command id is the way back.
+  const raced = join(dir, "raced.json");
+  const lost = await runCli(["bind", "--project", "p", "--work", "w", "--return", "actor-context", "--out", raced, "--json"], {
+    env: { HIVE_DELIVERY_TOKEN: "turn-token" },
+    answer: () => {
+      writeFileSync(raced, "someone else's file");
+      return { status: 201, body: { receipt: receipt("source_bind", "source_bound", { source: { source_id: sourceFile.source_id, actor: "fable", project_id: "p", work_id: "w", return_mode: "actor_context", provenance: "dispatch" } }), source_file: sourceFile } };
+    },
+  });
+  assert.equal(lost.code, 6);
+  const lostId = (lost.calls[0]!.body as { command_id: string }).command_id;
+  assert.equal(JSON.parse(lost.out[0]!).command_id, lostId);
+  assert.match(lost.err[0]!, new RegExp(`--command-id ${lostId}`, "u"));
+  assert.equal(readFileSync(raced, "utf8"), "someone else's file", "never overwritten");
 
   // After the turn: a command id alone is no proof for a seat; the operator recovers by id.
   const commandId = randomUUID();

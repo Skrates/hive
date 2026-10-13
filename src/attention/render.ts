@@ -94,7 +94,7 @@ export function renderQueue(page: QueuePage, now: Date): string {
     `Eligible: ${status.eligible_count} · Deferred: ${status.deferred_count}`
       + (status.next_deferred_at === null ? "" : ` (next due ${status.next_deferred_at})`)
       + (status.oldest_eligible_at === null ? "" : ` · oldest eligible ${ago(status.oldest_eligible_at, now)}`),
-    `Returns: ${status.returns_pending} pending · ${status.returns_blocked} blocked · ${status.returns_failed} failed`,
+    `Returns: ${status.returns_pending} pending · ${status.returns_minted} in flight · ${status.returns_blocked} blocked · ${status.returns_failed} failed`,
   ];
   for (const warning of status.route_warnings) {
     head.push(`  ⚠ ${itemLabel(warning.item_id)} return generation ${warning.generation} ${warning.phase}: ${inert(warning.reason, false)}`);

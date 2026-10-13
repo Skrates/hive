@@ -842,6 +842,10 @@ export interface QueueStatus {
   oldest_eligible_at: Timestamp | null;
   next_deferred_at: Timestamp | null;
   returns_pending: number;
+  /**
+   * Continuations whose core delivery is in flight; a rollback waits for zero.
+   */
+  returns_minted: number;
   returns_blocked: number;
   returns_failed: number;
   route_warnings: {

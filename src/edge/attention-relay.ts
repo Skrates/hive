@@ -266,8 +266,16 @@ const READS: Record<string, (args: Record<string, unknown>) => string | null> = 
 
 export async function attentionRead(edge: EdgeService, body: Record<string, unknown>): Promise<RelayAnswer> {
   const op = typeof body.op === "string" ? body.op : "";
+  if (op === "source_handle") {
+    // A health check of a source file: the handle must resolve on THIS edge, then the source
+    // it names is read from the broker it was issued by.
+    const handle = typeof body.handle === "string" ? body.handle : "";
+    const record = handle.startsWith(HANDLE_PREFIX) ? edge.store.attentionHandle(hashHandle(handle)) : null;
+    if (record === null) return refuse(403, "unknown_source_handle", "this edge issued no such attention source handle");
+    return relay(edge, "GET", `/v1/attention/sources/${record.sourceId}`);
+  }
   const route = READS[op];
-  if (!route) return refuse(400, "unknown_read_op", `read ops: ${Object.keys(READS).join(", ")}`);
+  if (!route) return refuse(400, "unknown_read_op", `read ops: ${[...Object.keys(READS), "source_handle"].join(", ")}`);
   const path = route(body);
   if (path === null) return refuse(400, "invalid_read_arguments", `invalid arguments for ${op}`);
   return relay(edge, "GET", path);
