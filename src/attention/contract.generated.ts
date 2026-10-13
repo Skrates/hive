@@ -619,7 +619,7 @@ export interface LiveEvidence {
   surface_version: string;
 }
 /**
- * An explicit operator enrollment on the source edge. A session counts as verified only when this edge's live registry holds it exactly.
+ * An explicit operator enrollment on the source edge. A session counts as verified only when this edge's live registry holds it exactly; provider names the registry that verified it, and is null otherwise.
  *
  * This interface was referenced by `AttentionContract`'s JSON-Schema
  * via the `definition` "OperatorEvidence".
@@ -629,6 +629,7 @@ export interface OperatorEvidence {
   actor: ActorId;
   session_id: string | null;
   session_verified: "live_registry" | "none";
+  provider: Provider | null;
   cwd: string;
 }
 /**

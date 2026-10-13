@@ -1,18 +1,20 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { createServer, type IncomingMessage } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { Command } from "commander";
-import { AttentionTransportError, exitCodeFor, registerAttentionCommands, type AttentionTransport, type HttpAnswer } from "./cli.js";
+import { AttentionTransportError, defaultAttentionTransport, exitCodeFor, registerAttentionCommands, type AttentionTransport, type HttpAnswer } from "./cli.js";
 import { packet } from "./fixtures.js";
 
 interface Run { out: string[]; err: string[]; code: number; calls: Array<{ kind: string; path: string; body: unknown; journalled: boolean }> }
 
 function runCli(
   argv: string[],
-  options: { env?: NodeJS.ProcessEnv; answer?: (path: string, body: unknown) => HttpAnswer | Promise<HttpAnswer>; home?: string } = {},
+  options: { env?: NodeJS.ProcessEnv; answer?: (path: string, body: unknown) => HttpAnswer | Promise<HttpAnswer>; home?: string; edgeUp?: boolean } = {},
 ): Promise<Run> {
   const home = options.home ?? mkdtempSync(join(tmpdir(), "hive-cli-home-"));
   const env: NodeJS.ProcessEnv = { HIVE_HOME: home, HIVE_BROKER_URL: "http://broker.invalid", HIVE_ADMIN_TOKEN: "t".repeat(40), ...options.env };
@@ -32,7 +34,7 @@ function runCli(
       run.calls.push({ kind: "edge", path, body, journalled: journalled(body) });
       return answer(path, body);
     },
-    async edgeHealth() { return true; },
+    async edgeHealth() { return options.edgeUp ?? true; },
   };
   const program = new Command().exitOverride();
   registerAttentionCommands(program, transport, env, {
@@ -105,6 +107,73 @@ test("a timeout is an unknown outcome with a reconciliation command, and retry-c
   assert.match(retry.out[0]!, /replayed/u);
 });
 
+test("a receipt body that stalls after the broker's headers is the same unknown outcome as no answer", async () => {
+  const home = mkdtempSync(join(tmpdir(), "hive-cli-home-"));
+  const bodies: string[] = [];
+  const read = async (request: IncomingMessage): Promise<string> => {
+    let text = "";
+    for await (const chunk of request) text += String(chunk);
+    return text;
+  };
+  const server = createServer((request, response) => {
+    void read(request).then((text) => {
+      bodies.push(text);
+      if (bodies.length === 1) {
+        // Committed: the headers and half a receipt leave, then the connection stalls.
+        response.writeHead(201, { "content-type": "application/json", "content-length": "4096" });
+        response.write('{"schema_version":1,"result":"can');
+        return;
+      }
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(receipt("cancel", "cancelled", { replayed: true })));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const env: NodeJS.ProcessEnv = { HIVE_HOME: home, HIVE_BROKER_URL: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, HIVE_ADMIN_TOKEN: "t".repeat(40) };
+  const cli = async (argv: string[]) => {
+    const run = { out: [] as string[], err: [] as string[], code: 0 };
+    const program = new Command().exitOverride();
+    registerAttentionCommands(program, defaultAttentionTransport(env, 300), env, {
+      out: (text) => run.out.push(text), err: (text) => run.err.push(text), exit: (code) => { run.code = code; }, now: () => new Date(),
+    });
+    await program.parseAsync(["node", "hive", "attention", ...argv]);
+    return run;
+  };
+  try {
+    const first = await cli(["cancel", "7", "--expected-revision", "2", "--reason", "obsolete", "--json"]);
+    assert.equal(first.code, 6);
+    const commandId = (JSON.parse(bodies[0]!) as { command_id: string }).command_id;
+    assert.equal(JSON.parse(first.out[0]!).command_id, commandId, "the envelope names the original command id");
+    assert.match(first.err[0]!, new RegExp(`hive attention receipt ${commandId}`, "u"));
+    assert.ok(existsSync(join(home, "attention", "requests", `${commandId}.json`)), "the saved request survives");
+
+    const retry = await cli(["retry-command", commandId]);
+    assert.equal(retry.code, 0);
+    assert.equal(bodies[1], bodies[0], "the retry resends the saved bytes");
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test("doctor is unhealthy when the edge is down, and healthy for an intentionally disabled broker", async () => {
+  const capabilities = () => ({
+    status: 200,
+    body: { broker_uuid: "00000000-0000-4000-8000-000000000000", enabled: false, schema_version: 1, store_schema_version: 1, return_modes: ["pinned_session", "actor_context", "none"], disabled_note: "HIVE_ATTENTION_ENABLED=false" },
+  });
+  const edgeDown = await runCli(["doctor", "--json"], { answer: capabilities, edgeUp: false });
+  assert.equal(edgeDown.code, 7);
+  const down = JSON.parse(edgeDown.out[0]!) as { healthy: boolean; edge: { reachable: boolean } };
+  assert.equal(down.healthy, false);
+  assert.equal(down.edge.reachable, false);
+
+  const preEnable = await runCli(["doctor", "--json"], { answer: capabilities, edgeUp: true });
+  assert.equal(preEnable.code, 0);
+  const ready = JSON.parse(preEnable.out[0]!) as { healthy: boolean; broker: { enabled: boolean } };
+  assert.equal(ready.healthy, true);
+  assert.equal(ready.broker.enabled, false, "disabled is reported, not treated as broken");
+});
+
 test("bind refuses to guess identity, writes the source file owner-only, and never overwrites one", async () => {
   const dir = mkdtempSync(join(tmpdir(), "hive-cli-bind-"));
   const out = join(dir, "nested", "attention-source.json");
@@ -131,6 +200,14 @@ test("bind refuses to guess identity, writes the source file owner-only, and nev
   const again = await runCli(["bind", "--project", "p", "--work", "w", "--return", "actor-context", "--out", out], { env: { HIVE_DELIVERY_TOKEN: "turn-token" } });
   assert.equal(again.code, 2);
   assert.equal(again.calls.length, 0);
+
+  // After the turn: a command id with no evidence of its own asks the edge to recover that bind.
+  const commandId = randomUUID();
+  const recovered = await runCli(["bind", "--project", "p", "--work", "w", "--return", "actor-context", "--out", join(dir, "recovered.json"), "--command-id", commandId], {
+    answer: () => ({ status: 201, body: { receipt: receipt("source_bind", "source_bound", { replayed: true, source: { source_id: sourceFile.source_id, actor: "fable", project_id: "p", work_id: "w", return_mode: "actor_context", provenance: "dispatch" } }), source_file: sourceFile } }),
+  });
+  assert.equal(recovered.code, 0);
+  assert.deepEqual(recovered.calls[0]!.body, { command_id: commandId, project_id: "p", work_id: "w", return_mode: "actor_context", thread: null, mode: "recover" });
 });
 
 test("summon takes a complete saved envelope through the edge with the source handle", async () => {

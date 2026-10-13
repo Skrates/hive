@@ -1259,8 +1259,9 @@ test("A25 a pinned return goes live only into the captured session through a pro
   assert.deepEqual(resumed, [{ route: "resume", sessionId: "thread-captured", cwd }]);
 
   // The captured session is live but through a surface that cannot honour the constraint,
-  // or in another cwd: never handed the envelope, and never resumed beside the open session.
-  for (const unsuitable of [{ attentionProtocol: 0 }, { cwd: "/elsewhere" }]) {
+  // in another cwd, or without reporting its cwd at all: never handed the envelope, and never
+  // resumed beside the open session.
+  for (const unsuitable of [{ attentionProtocol: 0, cwd }, { cwd: "/elsewhere" }, { cwd: null }]) {
     const registry = new LiveIngressRegistry();
     liveEntry(registry, "thread-captured", unsuitable);
     const { adapter, broker } = await runPinned(sub, registry, pinnedTarget(sub, cwd));

@@ -389,6 +389,7 @@ export class ClaudeProvider implements ProviderAdapter {
         ? {
           attention: {
             expectedSessionId: target.pinned.session_id,
+            expectedCwd: target.pinned.cwd,
             resolutionCommandId: target.resolution_command_id,
             generation: target.generation,
             deliveryId: delivery.id,

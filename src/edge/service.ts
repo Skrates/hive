@@ -213,10 +213,11 @@ export class EdgeService {
     // is not an exact-session address: another session's registration falls to resume.
     if (entry.sessionId !== route.sessionId) return null;
     // The captured session IS live, but through a surface that cannot honour the constraint
-    // (it predates the receiver-side check) or in a different working directory. Resuming it
-    // headlessly would put a second process on a session that is still open, so this is a
-    // visible route failure — the operator retries or reroutes.
-    if (entry.attentionProtocol < ATTENTION_EDGE_PROTOCOL || (entry.cwd !== null && entry.cwd !== route.cwd)) {
+    // (it predates the receiver-side check) or in a working directory it does not positively
+    // match — an unreported cwd is missing evidence, not agreement. Resuming it headlessly
+    // would put a second process on a session that is still open, so this is a visible route
+    // failure — the operator retries or reroutes.
+    if (entry.attentionProtocol < ATTENTION_EDGE_PROTOCOL || entry.cwd === null || entry.cwd !== route.cwd) {
       throw new PreDispatchError("attention_live_surface_incompatible");
     }
     return entry;

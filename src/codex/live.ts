@@ -276,8 +276,9 @@ export async function runCodexLive(config: Config): Promise<void> {
 }
 
 /**
- * ADR-0004: a constrained attention return is accepted only by the exact captured session
- * (and its cwd, when this surface knows its own). Ordinary envelopes are unaffected.
+ * ADR-0004: a constrained attention return is accepted only by the exact captured session in
+ * its captured cwd. A surface that does not know its own cwd (a dedicated bridge without
+ * `HIVE_SESSION_CWD`) has no evidence and refuses. Ordinary envelopes are unaffected.
  */
 export function assertAttentionSession(
   delivery: Delivery,
@@ -287,7 +288,7 @@ export function assertAttentionSession(
   const constraint = delivery.continuationTarget;
   if (!constraint || constraint.mode !== "pinned_session") return;
   const cwd = target.kind === "desktop" ? target.cwd : dedicatedCwd;
-  if (constraint.pinned.session_id !== target.sessionId || (cwd !== null && cwd !== constraint.pinned.cwd)) {
+  if (constraint.pinned.session_id !== target.sessionId || cwd === null || cwd !== constraint.pinned.cwd) {
     throw new SurfaceError("attention_session_mismatch");
   }
 }

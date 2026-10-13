@@ -318,7 +318,9 @@ test("A25 the bridge accepts a constrained return only into the exact captured s
   };
   const constrained = { ...base, continuationTarget: target };
   assert.doesNotThrow(() => assertAttentionSession(constrained, { kind: "desktop", sessionId: "task-1", cwd: "/work/hive" }, null));
-  assert.doesNotThrow(() => assertAttentionSession(constrained, { kind: "dedicated", sessionId: "task-1" }, null), "an unknown dedicated cwd defers to the session match");
+  assert.doesNotThrow(() => assertAttentionSession(constrained, { kind: "dedicated", sessionId: "task-1" }, "/work/hive"));
+  assert.throws(() => assertAttentionSession(constrained, { kind: "dedicated", sessionId: "task-1" }, null), /attention_session_mismatch/u,
+    "an unknown dedicated cwd is missing evidence, never agreement");
   assert.throws(() => assertAttentionSession(constrained, { kind: "desktop", sessionId: "task-2", cwd: "/work/hive" }, null), /attention_session_mismatch/u);
   assert.throws(() => assertAttentionSession(constrained, { kind: "desktop", sessionId: "task-1", cwd: "/work/other" }, null), /attention_session_mismatch/u);
   assert.throws(() => assertAttentionSession(constrained, { kind: "dedicated", sessionId: "task-1" }, "/work/other"), /attention_session_mismatch/u);

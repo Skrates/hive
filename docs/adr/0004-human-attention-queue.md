@@ -54,8 +54,12 @@ enrolled from evidence its own edge observed — a running dispatch token (fence
 `assertLease`), an exact unexpired live registration, or an explicit operator enrollment on
 the source edge. The caller never names an actor, principal or delivery to establish
 attribution. The edge issues a random local handle, stores only its hash bound to the issuing
-broker's UUID, and forwards the source id under its machine credential. A source authorizes
-producing requests only: never selecting, resolving, waking or the operator credential.
+broker's UUID, and forwards the source id under its machine credential. The edge retains the
+evidence it sent under the bind's command id, so a committed bind is recovered after its
+dispatch ended; the broker answers such a recovery only by replay and never enrolls from it.
+Live-registry verification counts only through the provider the actor is enrolled on. A source
+authorizes producing requests only: never selecting, resolving, waking or the operator
+credential.
 
 **A-7 — Return modes.** `pinned_session` (exactly the captured session, live through a
 receiver that re-checks the session, or resumed on its home edge where policy permits),
@@ -74,16 +78,18 @@ exact identity.
 **A-9 — Constraints at both ends.** One pure rule, `effectiveDeliveryRoute(subscription,
 target)`, decides claim eligibility at the broker and live-versus-resume at the edge. Edges
 declare `attention_protocol=1` per claim request; an edge that does not is never handed an
-attention continuation. Receivers re-check the exact session immediately before accepting:
-the Claude hook drains a constrained inbox file only in the named session and only after the
-edge's return guard confirms the current generation; the Codex bridge refuses a mismatched
-task with `attention_session_mismatch`.
+attention continuation. Receivers re-check the exact session and its captured cwd immediately
+before accepting; an unreported cwd is missing evidence, never agreement. The Claude hook drains
+a constrained inbox file only in the named session and cwd, and only after the edge's return
+guard confirms the current generation; the Codex bridge refuses a mismatched task or cwd with
+`attention_session_mismatch`.
 
 **A-10 — Failure is visible.** Return phases are `pending`, `blocked`, `minted`,
 `processed`, `failed`, `superseded`. `processed` means the ordinary Hive continuation
 reported an outcome — never a verified business result. A transport row deleted without a
 snapshot is `transport_record_missing`, never inferred processed. Retry and reroute are
-explicit operator acts fenced on item revision and return generation.
+explicit operator acts fenced on item revision and return generation; a reroute stays within
+the item's project and work.
 
 ## Consequences
 

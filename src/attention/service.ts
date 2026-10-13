@@ -84,7 +84,7 @@ export class AttentionService {
     return this.store.execute(principal, validated.value);
   }
 
-  async bind(caller: AttentionCaller, body: unknown): Promise<CommandOutcome> {
+  async bind(caller: AttentionCaller, body: unknown, options: { recoverOnly?: boolean } = {}): Promise<CommandOutcome> {
     if (caller.kind !== "edge") {
       throw new AttentionRefusal(403, "edge_required", "a source is enrolled through its own edge, which supplies the local evidence");
     }
@@ -94,14 +94,14 @@ export class AttentionService {
     const thread = command.payload.thread;
     // A replay is answered from the ledger without touching Slack; only a fresh enrollment
     // naming an explicit thread proves that thread first, outside any transaction.
-    if (thread !== null && this.store.committedReceipt(command.command_id, { kind: "operator" }) === null) {
+    if (thread !== null && options.recoverOnly !== true && this.store.committedReceipt(command.command_id, { kind: "operator" }) === null) {
       try {
         await this.validateThread(thread.channel_id, thread.thread_ts);
       } catch {
         throw new AttentionRefusal(422, "invalid_thread", `${thread.channel_id}/${thread.thread_ts} is not a readable Slack thread`);
       }
     }
-    return this.store.bindSource({ edgeId: caller.edgeId, operator: caller.operator }, command);
+    return this.store.bindSource({ edgeId: caller.edgeId, operator: caller.operator }, command, options);
   }
 
   /**

@@ -30,3 +30,22 @@ test("the brief fits one screen and names action, context, artifacts, unblock an
   assert.match(brief, /Return: originating seat fable, saved session s-1 on pop-os; queued 14 minutes ago\./u);
   assert.match(brief, /Queue: 2 more waiting \(advisory; the queue moves\)\./u);
 });
+
+test("A31 optional artifact metadata and the surface-reported session render inert too", () => {
+  const hostile = packet({
+    artifacts: [{ label: "Sheet", uri: "https://example.invalid/sheet.png", version: "r2\u001b[2J\u001b[H\u202eevil", edge_id: "pop-os" }],
+  });
+  const stored = structuredClone(hostile);
+  const view = {
+    item_id: 43, human_id: "hakon", owner_principal: "seat:fable", origin: "seat", state: "active", revision: 1, ready_sequence: 9,
+    deferred_until: null, packet: hostile,
+    source: { actor: "fable", session_id: "s-1\u001b]0;pwned\u0007", edge_id: "pop-os" }, return_mode: "pinned_session",
+    created_at: "2026-10-12T08:46:00.000Z", updated_at: "2026-10-12T08:46:00.000Z", claimed_at: null, resolved_at: null,
+    outcome: null, response: null, terminal_reason: null, return: null,
+  } as unknown as ItemView;
+  const brief = renderBrief(view, new Date("2026-10-12T09:00:00.000Z"));
+  assert.doesNotMatch(brief, /[\u001b\u0007\u202e]/u, "no raw control or bidi override survives");
+  assert.match(brief, /Sheet — https:\/\/example\.invalid\/sheet\.png @ r2\\u\{1b\}\[2J\\u\{1b\}\[H\\u\{202e\}evil \[on edge pop-os\]/u);
+  assert.match(brief, /saved session s-1\\u\{1b\}\]0;pwned\\u\{7\} on pop-os/u);
+  assert.deepEqual(hostile, stored, "the stored packet is presentation-only, never rewritten");
+});

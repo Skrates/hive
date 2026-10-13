@@ -388,12 +388,18 @@ export class AttentionStore {
    * Source enrollment under the same UUID/receipt discipline. The edge supplied the evidence it
    * verified locally; this resolves it against the broker's own ledger and enrollment.
    */
-  bindSource(caller: { edgeId: string; operator: boolean }, command: SourceBindCommand): CommandOutcome {
+  bindSource(caller: { edgeId: string; operator: boolean }, command: SourceBindCommand, options: { recoverOnly?: boolean } = {}): CommandOutcome {
     const principal: AttentionPrincipal = caller.operator ? { kind: "operator" } : { kind: "edge", edgeId: caller.edgeId };
     const hash = contentHash(command);
     const run = this.db.transaction((): CommandOutcome => {
       const replay = this.replay(command.command_id, principal, hash);
       if (replay) return replay;
+      // Recovery replays an edge's own retained evidence after the dispatch or registration it
+      // came from has ended. That evidence is no longer live, so it may only find a committed
+      // receipt — never enroll a new source.
+      if (options.recoverOnly === true) {
+        throw new AttentionRefusal(404, "bind_not_committed", `no committed source binding ${command.command_id} to recover`);
+      }
       if (!this.enabled) throw disabled();
       const now = this.clock.now();
       const source = this.resolveBinding(caller, command, now);
@@ -694,6 +700,12 @@ export class AttentionStore {
       if (!next) throw new AttentionRefusal(404, "source_not_found", `no attention source ${reroute.sourceId}`);
       if (next.revoked_at !== null) throw new AttentionRefusal(403, "source_revoked", `source ${reroute.sourceId} was revoked`);
       if (next.return_mode === "none") throw new AttentionRefusal(422, "source_has_no_return", `source ${reroute.sourceId} has return mode none`);
+      // A reroute moves the return to another seat or session for the SAME work, never into
+      // another work context: the add path's scope rule holds here too.
+      if (next.project_id !== item.project_id || next.work_id !== item.work_id) {
+        throw new AttentionRefusal(403, "source_scope_mismatch",
+          `source ${reroute.sourceId} is bound to ${next.project_id}/${next.work_id}, not ${item.project_id}/${item.work_id}; bind a source for this work on the target seat`);
+      }
       source = next;
     }
     this.db.prepare("UPDATE attention_returns SET phase='superseded', updated_at=? WHERE return_id=?").run(now.toISOString(), current.return_id);
@@ -875,6 +887,13 @@ export class AttentionStore {
       subscription = this.requireSubscription(actor);
       if (!subscription.edgeWorkspaces.some((workspace) => workspace.edgeId === caller.edgeId)) {
         throw new AttentionRefusal(403, "edge_not_mapped", `${actor} has no workspace on edge ${caller.edgeId}; run the binding on the source edge`);
+      }
+      // A live-registry verification counts only through the provider the actor is enrolled
+      // on: another provider's registration (a seat mid-migration) never vouches for a session
+      // that would then be resumed under this one.
+      if (evidence.session_verified === "live_registry" && evidence.provider !== subscription.provider) {
+        throw new AttentionRefusal(403, "source_evidence_rejected",
+          `${actor} is enrolled on ${subscription.provider}; session ${String(evidence.session_id)} was verified by a ${String(evidence.provider)} registration`);
       }
       cwd = evidence.cwd;
       const verified = evidence.session_id !== null && (
@@ -1209,7 +1228,12 @@ export class AttentionStore {
 
   status(humanId: string): QueueStatus {
     const deferred = this.deferredCounts(humanId);
-    const oldest = this.db.prepare("SELECT MIN(created_at) AS oldest FROM attention_items WHERE human_id=? AND state='queued'").get(humanId) as Row;
+    // Eligible since the event that last made the item ready — a deferral that came due has
+    // waited since its promotion, not since it was first summoned.
+    const oldest = this.db.prepare(`
+      SELECT MIN(e.created_at) AS oldest FROM attention_items i JOIN attention_events e ON e.event_id=i.ready_sequence
+      WHERE i.human_id=? AND i.state='queued'
+    `).get(humanId) as Row;
     const phases = this.db.prepare(`
       SELECT r.phase, COUNT(*) AS count FROM attention_returns r JOIN attention_items i ON i.item_id=r.item_id
       WHERE i.human_id=? AND r.phase IN ('pending', 'blocked', 'failed') GROUP BY r.phase

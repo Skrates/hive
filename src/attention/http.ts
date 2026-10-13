@@ -74,7 +74,8 @@ async function dispatch(request: IncomingMessage, response: ServerResponse, url:
 
   if (path === "/v1/attention/sources") {
     if (method === "POST") {
-      const outcome = await service.bind(caller, await readBoundedJson(request));
+      const recoverOnly = header(request, "x-hive-attention-recover") === "committed";
+      const outcome = await service.bind(caller, await readBoundedJson(request), { recoverOnly });
       return json(response, outcome.status, outcome.receipt);
     }
     if (method === "GET") {

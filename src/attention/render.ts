@@ -44,17 +44,19 @@ export function ago(fromIso: string, now: Date): string {
   return `${Math.round(hours / 24)} days ago`;
 }
 
+/** One inert line per artifact: every interpolated field, optional metadata included. */
 export function artifactLine(artifact: Artifact): string {
   const version = artifact.version === undefined ? "" : ` @ ${artifact.version}`;
   // A local path is always shown with the edge that owns it; it is not a file on this machine.
   const edge = artifact.edge_id === undefined ? "" : ` [on edge ${artifact.edge_id}]`;
-  return `${inert(artifact.label, false)} — ${inert(artifact.uri, false)}${version}${edge}`;
+  return inert(`${artifact.label} — ${artifact.uri}${version}${edge}`, false);
 }
 
 export function returnDescription(source: SourceView | null, mode: ItemView["return_mode"]): string {
   if (source === null || mode === "none") return "none — resolving records the response; no agent is woken";
   if (mode === "pinned_session") {
-    return `originating seat ${source.actor}, saved session ${source.session_id ?? "?"} on ${source.edge_id}`;
+    // The session id is the surface's own report, not a broker-shaped identifier.
+    return inert(`originating seat ${source.actor}, saved session ${source.session_id ?? "?"} on ${source.edge_id}`, false);
   }
   return `originating seat ${source.actor}, context restored (not the original session or checkout)`;
 }

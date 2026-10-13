@@ -29,6 +29,9 @@ export function bindingFor(read: AttestationRead, actor: string): AttestationBin
   };
 }
 
+/** How long a bind's retained evidence can recover its committed receipt. */
+export const BIND_INTENT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+
 export interface AttentionHandleRecord {
   handleHash: string;
   brokerUuid: string;
@@ -122,6 +125,12 @@ export class EdgeStore {
         revoked_at TEXT
       );
       CREATE INDEX IF NOT EXISTS attention_source_handles_source ON attention_source_handles(source_id);
+      CREATE TABLE IF NOT EXISTS attention_bind_intents (
+        command_id TEXT NOT NULL,
+        evidence_json TEXT NOT NULL,
+        recorded_at TEXT NOT NULL,
+        PRIMARY KEY (command_id, evidence_json)
+      );
     `);
   }
 
@@ -147,6 +156,28 @@ export class EdgeStore {
       workId: String(row.work_id),
       revokedAt: row.revoked_at === null ? null : String(row.revoked_at),
     };
+  }
+
+  /**
+   * The evidence this edge resolved for a bind, retained under its command id BEFORE the bind
+   * is sent: the dispatch token or live registration it came from ends with the turn, and a
+   * retry after a lost response or an edge restart must present byte-identical evidence for
+   * the broker to replay the committed receipt. Retained for {@link BIND_INTENT_RETENTION_MS}.
+   */
+  recordAttentionBindIntent(commandId: string, evidenceJson: string): void {
+    const now = new Date();
+    this.db.prepare("DELETE FROM attention_bind_intents WHERE recorded_at < ?")
+      .run(new Date(now.getTime() - BIND_INTENT_RETENTION_MS).toISOString());
+    this.db.prepare(`
+      INSERT INTO attention_bind_intents(command_id, evidence_json, recorded_at) VALUES (?, ?, ?)
+      ON CONFLICT(command_id, evidence_json) DO UPDATE SET recorded_at=excluded.recorded_at
+    `).run(commandId, evidenceJson, now.toISOString());
+  }
+
+  /** Every evidence variant sent under a command id, newest first. */
+  attentionBindIntents(commandId: string): string[] {
+    return (this.db.prepare("SELECT evidence_json FROM attention_bind_intents WHERE command_id=? ORDER BY recorded_at DESC, rowid DESC")
+      .all(commandId) as Array<{ evidence_json: string }>).map((row) => row.evidence_json);
   }
 
   /** The broker refused a write because the source was revoked: remember it, keep the identity. */

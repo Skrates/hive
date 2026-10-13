@@ -117,19 +117,20 @@ export function defaultAttentionTransport(env: NodeJS.ProcessEnv = process.env, 
       const baseUrl = env.HIVE_BROKER_URL;
       const token = env.HIVE_ADMIN_TOKEN;
       if (!baseUrl || !token) throw new CliFailure(EXIT_AUTH, "operator commands need HIVE_BROKER_URL and HIVE_ADMIN_TOKEN");
-      let response: Response;
+      // The whole exchange, receipt body included, is one transport boundary: headers can
+      // arrive and the body stall or break after the broker committed, which is exactly as
+      // unknown an outcome as no answer at all.
       try {
-        response = await fetch(`${baseUrl}${path}`, {
+        const response = await fetch(`${baseUrl}${path}`, {
           method,
           headers: { authorization: `Bearer ${token}`, ...(body === undefined ? {} : { "content-type": "application/json" }) },
           ...(body === undefined ? {} : { body: JSON.stringify(body) }),
           signal: AbortSignal.timeout(timeoutMs),
         });
+        return { status: response.status, body: parseBody(await response.text()) };
       } catch (error) {
         throw new AttentionTransportError(error instanceof Error ? error.message : String(error));
       }
-      const text = await response.text();
-      return { status: response.status, body: parseBody(text) };
     },
     async edge(path, body) {
       try {
@@ -573,7 +574,7 @@ export function registerAttentionCommands(
     .option("--provider <provider>", "live binding: codex or claude when ambiguous")
     .option("--operator", "explicit operator enrollment on this (source) edge")
     .option("--cwd <path>", "operator binding: the work context directory", process.cwd())
-    .option("--command-id <uuid>", "reuse the command id of a bind whose outcome was unknown (a replay returns the same source)")
+    .option("--command-id <uuid>", "reuse the command id of a bind whose outcome was unknown (a committed bind is recovered with the same source)")
     .option("--channel <id>", "Slack channel of the return thread")
     .option("--thread <ts>", "Slack thread ts of the return thread")
     .option("--json", "one JSON object")
@@ -617,6 +618,10 @@ export function registerAttentionCommands(
         body = { ...base, mode: "live", actor, session_id: session, provider: provider ?? null };
       } else if (env.HIVE_DELIVERY_TOKEN) {
         body = { ...base, mode: "dispatch", token: env.HIVE_DELIVERY_TOKEN };
+      } else if (options.commandId !== undefined) {
+        // No evidence of its own, but a command id: the edge recovers that bind only if it
+        // committed, from the evidence it retained when the bind was first sent.
+        body = { ...base, mode: "recover" };
       } else {
         throw new CliFailure(EXIT_AUTH,
           "no source can be resolved: this is neither a running headless turn (HIVE_DELIVERY_TOKEN), nor a live session named by "
@@ -629,7 +634,7 @@ export function registerAttentionCommands(
         if (!(error instanceof AttentionTransportError)) throw error;
         throw new CliFailure(EXIT_UNKNOWN_OUTCOME,
           `bind ${commandId} has an unknown outcome (${error.message}); rerun the same bind with --command-id ${commandId} — `
-          + "a replay returns the same source (a dispatch bind must still be inside its turn)",
+          + "a committed bind is recovered with the same source, even after its turn ended",
           { error: "outcome_unknown", command_id: commandId });
       }
       const code = exitCodeFor(answer.status);
@@ -690,7 +695,12 @@ export function registerAttentionCommands(
         healthy = false;
         report.broker = { reachable: false, detail: error instanceof Error ? error.message : String(error) };
       }
-      report.edge = { socket: resolveEdgeSocketPath(env), reachable: await transport.edgeHealth() };
+      // Health is the prerequisites — broker, contract, edge, source. A broker that is reachable
+      // but intentionally disabled is still healthy (`broker.enabled` says which), so the same
+      // check gates a staged, pre-enable deployment.
+      const edgeReachable = await transport.edgeHealth();
+      healthy &&= edgeReachable;
+      report.edge = { socket: resolveEdgeSocketPath(env), reachable: edgeReachable };
       if (options.sourceFile) {
         try {
           const loaded = loadSourceFile(options.sourceFile);
@@ -717,7 +727,7 @@ export function registerAttentionCommands(
 }
 
 function describeSource(view: SourceView): string {
-  return `${view.source_id} · ${view.actor} (${view.provider}) on ${view.edge_id} · ${view.project_id}/${view.work_id} · `
+  return inert(`${view.source_id} · ${view.actor} (${view.provider}) on ${view.edge_id} · ${view.project_id}/${view.work_id} · `
     + `${view.return_mode}${view.session_id ? ` session ${view.session_id}` : ` (${view.session_absence ?? "no session"})`} · `
-    + `${view.provenance}${view.revoked_at ? ` · revoked ${view.revoked_at}: ${inert(view.revoked_reason ?? "")}` : ""}`;
+    + `${view.provenance}${view.revoked_at ? ` · revoked ${view.revoked_at}: ${view.revoked_reason ?? ""}` : ""}`, false);
 }

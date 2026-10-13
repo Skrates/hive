@@ -16,7 +16,8 @@ import type { EdgeService } from "./service.js";
  *
  * - `bind` resolves a source from what this edge itself observed — a running dispatch token,
  *   an exact live registration, or an explicit operator enrollment with local cwd evidence —
- *   enrolls it with the broker, and only then issues a local random handle. The handle is
+ *   enrolls it with the broker, and only then issues a local random handle. A retry recovers
+ *   a committed bind from the evidence retained when it was first sent. The handle is
  *   stored hashed, bound to the issuing broker, and never leaves this machine except in the
  *   owner-only source file the CLI writes.
  * - `act` resolves a handle to its source and forwards the seat's command under this edge's
@@ -38,10 +39,51 @@ export function hashHandle(handle: string): string {
 }
 
 export async function attentionBind(edge: EdgeService, body: Record<string, unknown>): Promise<RelayAnswer> {
-  const mode = body.mode;
-  const commandId = body.command_id;
   const operatorToken = typeof body.operator_token === "string" && body.operator_token.length > 0 ? body.operator_token : null;
-  let evidence: SourceEvidence;
+  if (body.mode === "operator" && operatorToken === null) return refuse(403, "operator_required", "an operator binding presents the operator credential");
+  const headers: Record<string, string> = operatorToken === null ? {} : { "x-hive-operator-token": operatorToken };
+
+  // A retry of a bind this edge already sent is recovered first, from the evidence it retained
+  // when it sent it: the dispatch or registration behind that evidence may have ended since (a
+  // lost response, a finished turn, an edge restart), and the broker answers an exact replay
+  // before any liveness check. Recovery can only find a committed receipt — the broker refuses
+  // to enroll anything from it — so a bind that never committed falls through to fresh evidence.
+  if (typeof body.command_id === "string") {
+    let conflict: RelayAnswer | null = null;
+    for (const retained of edge.store.attentionBindIntents(body.command_id)) {
+      const validated = validateSourceBindCommand(bindCommand(body, JSON.parse(retained) as SourceEvidence));
+      if (!validated.ok) return refuse(422, validated.code, validated.detail);
+      const answer = await relay(edge, "POST", "/v1/attention/sources", validated.value, { ...headers, "x-hive-attention-recover": "committed" });
+      if (answer.status === 200 || answer.status === 201) return issueHandle(edge, answer);
+      const error = errorCode(answer);
+      if (error === "bind_not_committed") break;
+      // Committed with other content: another retained variant may be the committed one.
+      if (error === "command_id_conflict") {
+        conflict = answer;
+        continue;
+      }
+      return answer;
+    }
+    if (conflict !== null) return conflict;
+  }
+  if (body.mode === "recover") {
+    return refuse(404, "bind_not_committed", "this edge holds no committed binding under that command id; bind again with fresh evidence");
+  }
+
+  const evidence = resolveEvidence(edge, body);
+  if ("status" in evidence) return evidence;
+  const validated = validateSourceBindCommand(bindCommand(body, evidence));
+  if (!validated.ok) return refuse(422, validated.code, validated.detail);
+  // Retained before it is sent: the response — or this process — may not survive the request.
+  edge.store.recordAttentionBindIntent(validated.value.command_id, JSON.stringify(validated.value.payload.evidence));
+  const answer = await relay(edge, "POST", "/v1/attention/sources", validated.value, headers);
+  if (answer.status !== 200 && answer.status !== 201) return answer;
+  return issueHandle(edge, answer);
+}
+
+/** The evidence this edge itself observes for a fresh bind, or the refusal when it observes none. */
+function resolveEvidence(edge: EdgeService, body: Record<string, unknown>): SourceEvidence | RelayAnswer {
+  const mode = body.mode;
   if (mode === "dispatch") {
     const token = typeof body.token === "string" ? body.token : "";
     const dispatch = edge.dispatchEvidence(token);
@@ -49,7 +91,7 @@ export async function attentionBind(edge: EdgeService, body: Record<string, unkn
       return refuse(403, "unknown_dispatch_token",
         "no running dispatch on this edge holds that token — bind while the turn runs; a live session binds with --actor/--session");
     }
-    evidence = {
+    return {
       kind: "dispatch",
       source_delivery_id: dispatch.deliveryId,
       generation: dispatch.generation,
@@ -57,19 +99,16 @@ export async function attentionBind(edge: EdgeService, body: Record<string, unkn
       session_id: dispatch.sessionId,
       cwd: dispatch.cwd,
     };
-  } else if (mode === "live") {
+  }
+  if (mode === "live") {
     const actor = typeof body.actor === "string" ? canonicalActor(body.actor) : "";
     const sessionId = typeof body.session_id === "string" ? body.session_id : "";
-    const providers: Provider[] = body.provider === undefined || body.provider === null
-      ? ["codex", "claude"]
-      : [ProviderSchema.parse(body.provider)];
-    const entries = providers.map((provider) => edge.live.getExact(actor, provider, sessionId)).filter((entry) => entry !== null);
-    if (entries.length !== 1) {
+    const entry = exactLiveEntry(edge, actor, sessionId, body.provider);
+    if (entry === null) {
       return refuse(404, "live_session_not_registered",
         `no single unexpired live registration for ${actor} session ${sessionId} on this edge; the operator can enroll it with --operator`);
     }
-    const entry = entries[0]!;
-    evidence = {
+    return {
       kind: "live_registration",
       actor,
       provider: entry.provider,
@@ -77,24 +116,35 @@ export async function attentionBind(edge: EdgeService, body: Record<string, unkn
       cwd: entry.cwd,
       surface_version: entry.surfaceVersion,
     };
-  } else if (mode === "operator") {
-    if (operatorToken === null) return refuse(403, "operator_required", "an operator binding presents the operator credential");
+  }
+  if (mode === "operator") {
     const actor = typeof body.actor === "string" ? canonicalActor(body.actor) : "";
     const cwd = typeof body.cwd === "string" ? body.cwd : "";
     if (!isAbsolute(cwd) || !isDirectory(cwd)) {
       return refuse(422, "cwd_not_local", `${cwd || "(none)"} is not an existing absolute directory on this edge; run the binding on the source edge`);
     }
     const sessionId = typeof body.session_id === "string" && body.session_id.length > 0 ? body.session_id : null;
-    const verified = sessionId !== null
-      && (edge.live.getExact(actor, "codex", sessionId) !== null || edge.live.getExact(actor, "claude", sessionId) !== null);
-    evidence = { kind: "operator_binding", actor, session_id: sessionId, session_verified: verified ? "live_registry" : "none", cwd };
-  } else {
-    return refuse(400, "invalid_bind_mode", "mode is dispatch, live or operator");
+    // The provider whose live registry verified the session is evidence too: the broker
+    // accepts it only when it is the provider the actor is enrolled on.
+    const entry = sessionId === null ? null : exactLiveEntry(edge, actor, sessionId, null);
+    return entry === null
+      ? { kind: "operator_binding", actor, session_id: sessionId, session_verified: "none", provider: null, cwd }
+      : { kind: "operator_binding", actor, session_id: sessionId, session_verified: "live_registry", provider: entry.provider, cwd };
   }
+  return refuse(400, "invalid_bind_mode", "mode is dispatch, live, operator or recover");
+}
 
-  const command = {
+/** The single unexpired live registration for exactly this actor and session, or null. */
+function exactLiveEntry(edge: EdgeService, actor: string, sessionId: string, provider: unknown) {
+  const providers: Provider[] = provider === undefined || provider === null ? ["codex", "claude"] : [ProviderSchema.parse(provider)];
+  const entries = providers.map((candidate) => edge.live.getExact(actor, candidate, sessionId)).filter((entry) => entry !== null);
+  return entries.length === 1 ? entries[0]! : null;
+}
+
+function bindCommand(body: Record<string, unknown>, evidence: SourceEvidence): unknown {
+  return {
     schema_version: 1,
-    command_id: commandId,
+    command_id: body.command_id,
     action: "source_bind",
     payload: {
       project_id: body.project_id,
@@ -104,15 +154,16 @@ export async function attentionBind(edge: EdgeService, body: Record<string, unkn
       evidence,
     },
   };
-  const validated = validateSourceBindCommand(command);
-  if (!validated.ok) return refuse(422, validated.code, validated.detail);
-  const answer = await relay(edge, "POST", "/v1/attention/sources", validated.value, operatorToken === null ? {} : { "x-hive-operator-token": operatorToken });
-  if (answer.status !== 200 && answer.status !== 201) return answer;
+}
+
+/**
+ * The handle is minted only after the broker committed the source. A replayed or recovered
+ * bind yields a fresh handle for the same source; every earlier handle stays valid.
+ */
+function issueHandle(edge: EdgeService, answer: RelayAnswer): RelayAnswer {
   const receipt = answer.body as Receipt;
   const source = receipt.source;
   if (source === null) return refuse(502, "broker_relay_failed", "the broker committed a binding without a source view");
-  // The handle is minted only after the broker committed the source. A replayed bind (lost
-  // response) yields a fresh handle for the same source; every earlier handle stays valid.
   const handle = `${HANDLE_PREFIX}${randomBytes(32).toString("base64url")}`;
   edge.store.putAttentionHandle({
     handleHash: hashHandle(handle),
@@ -138,6 +189,10 @@ export async function attentionBind(edge: EdgeService, body: Record<string, unkn
   return { status: answer.status, body: { receipt, source_file: sourceFile } };
 }
 
+function errorCode(answer: RelayAnswer): unknown {
+  return answer.body !== null && typeof answer.body === "object" ? (answer.body as { error?: unknown }).error : undefined;
+}
+
 export async function attentionAct(edge: EdgeService, body: Record<string, unknown>): Promise<RelayAnswer> {
   const handle = typeof body.handle === "string" ? body.handle : "";
   const record = handle.startsWith(HANDLE_PREFIX) ? edge.store.attentionHandle(hashHandle(handle)) : null;
@@ -155,7 +210,7 @@ export async function attentionAct(edge: EdgeService, body: Record<string, unkno
     "x-hive-attention-source": record.sourceId,
     "x-hive-broker-uuid": record.brokerUuid,
   });
-  if (answer.status === 403 && (answer.body as { error?: unknown }).error === "source_revoked") {
+  if (answer.status === 403 && errorCode(answer) === "source_revoked") {
     edge.store.markAttentionSourceRevoked(record.sourceId);
   }
   return answer;

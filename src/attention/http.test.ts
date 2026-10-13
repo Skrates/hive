@@ -84,7 +84,7 @@ test("the broker surface authenticates its own callers and refuses malformed or 
     const bound = h.store.bindSource({ edgeId: "edge-a", operator: true }, {
       schema_version: 1, command_id: randomUUID(), action: "source_bind",
       payload: { project_id: "p", work_id: "w", return_mode: "none", thread: null,
-        evidence: { kind: "operator_binding", actor: "fable", session_id: null, session_verified: "none", cwd: "/work" } },
+        evidence: { kind: "operator_binding", actor: "fable", session_id: null, session_verified: "none", provider: null, cwd: "/work" } },
     }).receipt.source!;
     assert.equal((await call(baseUrl, "GET", `/v1/attention/sources/${bound.source_id}`, edge)).status, 200, "an edge reads its own source");
     const otherToken = h.broker.createEdge("edge-z");
@@ -266,6 +266,15 @@ test("A18/A19 live and operator bindings resolve through the edge's own registry
     const verified = JSON.parse((await bind({ mode: "operator", operator_token: ADMIN, actor: "fable", cwd: root, session_id: "session-A", return_mode: "pinned_session" })).body) as { receipt: Receipt };
     assert.equal(verified.receipt.source!.provenance, "operator_binding");
     assert.equal(verified.receipt.source!.session_id, "session-A");
+    // Mid-migration: an old Codex registration is still live, but fable is enrolled on Claude.
+    // It never vouches for a session that a pinned return would resume through Claude.
+    await udsRequestJson(socketPath, "POST", "/live/register", {
+      actor: "fable", provider: "codex", socketPath: join(root, "codex.sock"), sessionId: "thread-M", surfaceVersion: "codex-live",
+      ttlMs: 60_000, cwd: root, attentionProtocol: 1,
+    });
+    const migrated = await bind({ mode: "operator", operator_token: ADMIN, actor: "fable", cwd: root, session_id: "thread-M", return_mode: "pinned_session" });
+    assert.equal(migrated.status, 403);
+    assert.equal((JSON.parse(migrated.body) as { error: string }).error, "source_evidence_rejected");
     const wrongToken = await bind({ mode: "operator", operator_token: "x".repeat(40), actor: "fable", cwd: root, session_id: null, return_mode: "actor_context" });
     assert.equal(wrongToken.status, 403);
     const elsewhere = await bind({ mode: "operator", operator_token: ADMIN, actor: "fable", cwd: join(root, "missing"), session_id: null, return_mode: "actor_context" });
@@ -273,6 +282,87 @@ test("A18/A19 live and operator bindings resolve through the edge's own registry
   } finally {
     await control.stop();
     store.close();
+    await server.stop();
+    h.close();
+  }
+});
+
+test("a committed dispatch bind is recovered after its response, its turn and the edge itself are gone", async () => {
+  const { h, server, baseUrl, edgeToken, service } = await stack();
+  const root = mkdtempSync(join(tmpdir(), "hive-attention-recover-"));
+  const socketPath = join(root, "edge.sock");
+  const edgeDb = join(root, "edge.sqlite");
+  const client = new BrokerClient(baseUrl, "edge-a", edgeToken);
+  const committedId = randomUUID();
+  const refusedId = randomUUID();
+  const work = { project_id: "birthday-film", work_id: "parents-likeness-round-2", thread: null };
+  let token = "";
+  const adapter: ProviderAdapter = {
+    provider: "claude",
+    async deliverLive() { throw new Error("no live surface in this test"); },
+    async resume() { throw new Error("no session to resume"); },
+    async spawn(_subscription, _cwd, _framed, context) {
+      token = context.token;
+      // The broker commits this bind; its answer never reaches the caller.
+      await udsRequest(socketPath, "POST", "/attention/bind", { mode: "dispatch", token, command_id: committedId, return_mode: "actor_context", ...work });
+      // This one reaches the broker but never commits: a spawned turn has no session to pin.
+      const pinned = await udsRequest(socketPath, "POST", "/attention/bind", { mode: "dispatch", token, command_id: refusedId, return_mode: "pinned_session", ...work });
+      assert.equal(pinned.status, 422);
+      return { receipt: "{}", outcome: "Bound, then the response was lost.", processed: true };
+    },
+  };
+  let edgeStore = new EdgeStore(edgeDb);
+  const edge = new EdgeService(client, edgeStore, new LiveIngressRegistry(), [adapter]);
+  let control = new EdgeControlServer(edge, { socketPath });
+  await control.start();
+  try {
+    service.ingest({
+      eventId: "EvRecover", workspaceId: "T1", channelId: THREAD.channel_id, threadTs: THREAD.thread_ts, messageTs: "1760259601.000300",
+      senderId: "U1", senderKind: "user", actor: "fable", text: "WAKE: fable bind and summon", raw: {}, receivedAt: h.clock.now().toISOString(),
+    });
+    assert.equal(await edge.processOne(), true);
+    assert.equal(h.broker.getDelivery(1).status, "processed", "the turn is over and its token with it");
+
+    // The edge restarts: nothing in memory survives.
+    await control.stop();
+    edgeStore.close();
+    edgeStore = new EdgeStore(edgeDb);
+    control = new EdgeControlServer(new EdgeService(client, edgeStore, new LiveIngressRegistry(), [adapter]), { socketPath });
+    await control.start();
+    const bind = (body: Record<string, unknown>) => udsRequest(socketPath, "POST", "/attention/bind", { return_mode: "actor_context", ...work, ...body });
+
+    const recovered = await bind({ mode: "dispatch", token, command_id: committedId });
+    assert.equal(recovered.status, 201);
+    const { receipt, source_file: file } = JSON.parse(recovered.body) as { receipt: Receipt; source_file: SourceFile };
+    assert.equal(receipt.replayed, true);
+    const sources = h.store.sources();
+    assert.equal(sources.length, 1, "recovery never enrolls a second source");
+    assert.equal(file.source_id, sources[0]!.source_id);
+    const summoned = await udsRequestJson<Receipt>(socketPath, "POST", "/attention/act", {
+      handle: file.handle, command: { schema_version: 1, command_id: randomUUID(), action: "summon", payload: packet() },
+    });
+    assert.equal(summoned.result, "created", "the recovered handle is usable");
+
+    // Without any token — e.g. from the seat's next turn or an operator shell — the command id recovers it.
+    const byId = await bind({ mode: "recover", command_id: committedId });
+    assert.equal((JSON.parse(byId.body) as { source_file: SourceFile }).source_file.source_id, file.source_id);
+
+    // Changed content under the same command id is a conflict, never a second source.
+    const changed = await bind({ mode: "dispatch", token, command_id: committedId, work_id: "another-work" });
+    assert.equal(changed.status, 409);
+    assert.equal((JSON.parse(changed.body) as { error: string }).error, "command_id_conflict");
+
+    // A bind that never committed is not recoverable, and its expired token proves nothing.
+    const stale = await bind({ mode: "dispatch", token, command_id: refusedId });
+    assert.equal(stale.status, 403);
+    assert.equal((JSON.parse(stale.body) as { error: string }).error, "unknown_dispatch_token");
+    const unknown = await bind({ mode: "recover", command_id: randomUUID() });
+    assert.equal(unknown.status, 404);
+    assert.equal((JSON.parse(unknown.body) as { error: string }).error, "bind_not_committed");
+    assert.equal(h.store.sources().length, 1);
+  } finally {
+    await control.stop();
+    edgeStore.close();
     await server.stop();
     h.close();
   }

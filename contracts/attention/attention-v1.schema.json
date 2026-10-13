@@ -445,15 +445,19 @@
     },
     "OperatorEvidence": {
       "title": "OperatorEvidence",
-      "description": "An explicit operator enrollment on the source edge. A session counts as verified only when this edge's live registry holds it exactly.",
+      "description": "An explicit operator enrollment on the source edge. A session counts as verified only when this edge's live registry holds it exactly; provider names the registry that verified it, and is null otherwise.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["kind", "actor", "session_id", "session_verified", "cwd"],
+      "required": ["kind", "actor", "session_id", "session_verified", "provider", "cwd"],
+      "if": { "type": "object", "required": ["session_verified"], "properties": { "session_verified": { "const": "live_registry" } } },
+      "then": { "type": "object", "properties": { "provider": { "$ref": "#/$defs/Provider" } } },
+      "else": { "type": "object", "properties": { "provider": { "type": "null" } } },
       "properties": {
         "kind": { "type": "string", "const": "operator_binding" },
         "actor": { "$ref": "#/$defs/ActorId" },
         "session_id": { "anyOf": [{ "type": "string", "minLength": 1, "maxLength": 200 }, { "type": "null" }] },
         "session_verified": { "type": "string", "enum": ["live_registry", "none"] },
+        "provider": { "anyOf": [{ "$ref": "#/$defs/Provider" }, { "type": "null" }] },
         "cwd": { "type": "string", "minLength": 1, "maxLength": 4096 }
       }
     },

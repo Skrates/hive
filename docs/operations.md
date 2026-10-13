@@ -396,11 +396,21 @@ bound to the issuing broker. Sources stay valid after the turn ends — no actor
 the human — until `hive attention source revoke <id> --reason …`. Revocation stops new writes;
 queued work, provenance, receipt recovery and an already-recorded response's return survive it.
 
+A bind whose outcome was unknown (exit 6) is rerun with `--command-id <id>`. The edge retains
+the evidence it sent under that id for 30 days, so a bind the broker committed is recovered —
+same source, fresh handle — after its turn ended or the edge restarted; with no token or session
+in reach, `--command-id` alone asks for that recovery. Recovery never enrolls: a bind that never
+committed needs fresh evidence, and changed content under the same id is `command_id_conflict`.
+
 Live surfaces report their session cwd when they register: the Claude hook sends the hook
 input's `cwd`; the Codex bridge sends a Desktop attachment's binding cwd, or `HIVE_SESSION_CWD`
 for its dedicated thread (unset means no cwd, so that thread can only take context-restored
 returns). Both announce `attentionProtocol: 1`; a surface that does not is never handed an
-exact-session envelope.
+exact-session envelope. A pinned return needs positive cwd evidence at both ends: the edge and
+the receiver (Claude hook, Codex bridge) accept it only from the captured session reporting the
+captured cwd. If the captured session is live but on protocol 0, without a cwd, or in another
+cwd, the delivery fails visibly with `attention_live_surface_incompatible` instead of resuming a
+second process beside it. The operator then retries or reroutes.
 
 Return modes: `pinned-session` needs a verified session id, an observed cwd, the actor's home edge
 and a single-slot actor; `actor-context` restores context through ordinary routing (including slot
@@ -425,13 +435,17 @@ hive attention reroute-return 42 --expected-revision 4 --return-generation 1 \
 
 Retry is idempotent while a delivery is in flight and refuses a processed return; a failed
 generation is superseded by a new one with a new dedupe key. Reroute is allowed only before
-minting or after the previous delivery ended — it cannot retract a running turn.
+minting or after the previous delivery ended — it cannot retract a running turn. The replacement
+source must be bound to the item's own project and work (`source_scope_mismatch` otherwise): to
+move the work to another seat, bind a source for the same work on that seat first.
 
 ### Doctor, status and logs
 
 `hive attention doctor --json [--source-file …]` reports broker reachability/UUID, enabled state,
 schema and store versions, CLI compatibility, edge reachability and source validity; it never
-prints secrets. `hive attention queue` shows the active item, eligible/deferred counts, oldest
+prints secrets. `healthy` (exit 0, else 7) covers the prerequisites — broker, contract, local edge,
+source. An intentionally disabled broker is still healthy and reports `broker.enabled: false`, so
+the same check gates a staged pre-enable deployment. `hive attention queue` shows the active item, eligible/deferred counts, oldest
 eligible age, next due deferral, and pending/blocked/failed returns with route warnings. Logs name
 command/item/source ids, generations and delivery ids — never response bodies, handles or artifact
 contents.

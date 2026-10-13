@@ -179,6 +179,18 @@ test("A29 drift detected before minting fails the generation; the operator retri
   const revision = h.store.item(itemId)!.revision;
 
   assert.throws(() => act(h.store, OPERATOR, "retry_return", { item_id: itemId, expected_revision: revision, return_generation: 2 }), refused("return_generation_conflict"));
+  // A reroute never carries the decision into another work context: a source for another
+  // project, or for another work in the same project, is refused and changes nothing.
+  const otherProject = liveSource(h.store, { edgeId: "edge-b", returnMode: "actor_context", session: "s-p", project: "krepis" });
+  const otherWork = liveSource(h.store, { edgeId: "edge-b", returnMode: "actor_context", session: "s-w", work: "parents-likeness-round-3" });
+  for (const wrong of [otherProject, otherWork]) {
+    assert.throws(() => act(h.store, OPERATOR, "reroute_return", {
+      item_id: itemId, expected_revision: revision, return_generation: 1, source_id: wrong.sourceId, reason: "typo",
+    }), refused("source_scope_mismatch"));
+  }
+  assert.equal(h.store.item(itemId)!.return!.generation, 1);
+  assert.equal(h.store.item(itemId)!.return!.phase, "failed");
+  assert.equal(h.broker.listDeliveries().length, 0, "a refused reroute mints nothing");
   const context = liveSource(h.store, { edgeId: "edge-b", returnMode: "actor_context", session: "session-fable-2" });
   const rerouted = act(h.store, OPERATOR, "reroute_return", {
     item_id: itemId, expected_revision: revision, return_generation: 1, source_id: context.sourceId, reason: "moved to edge-b",

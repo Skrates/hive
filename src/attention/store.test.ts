@@ -247,6 +247,7 @@ test("A08 a deferral is absent before it is due, joins the FIFO tail when due, a
   h.clock.advance(60 * 60_000);
   const due = next(h.store);
   assert.equal(due.item!.item_id, c.item_id, "c was ready before a's deferral came due");
+  assert.equal(h.store.status("hakon").oldest_eligible_at, h.clock.now().toISOString(), "a has been eligible since its promotion, not its summons");
   resolve(h.store, c.item_id, due.item!.revision);
   assert.equal(next(h.store).item!.item_id, a.item_id);
 
@@ -388,19 +389,19 @@ test("an exact-session binding is refused when the session or cwd is unknown, or
   assert.throws(() => h.store.bindSource({ edgeId: "edge-a", operator: true }, {
     schema_version: 1, command_id: randomUUID(), action: "source_bind",
     payload: { project_id: "p", work_id: "w", return_mode: "pinned_session", thread: THREAD,
-      evidence: { kind: "operator_binding", actor: "fable", session_id: "guessed", session_verified: "none", cwd: "/work" } },
+      evidence: { kind: "operator_binding", actor: "fable", session_id: "guessed", session_verified: "none", provider: null, cwd: "/work" } },
   }), refused("pinned_unavailable", 422), "an unverified session cannot claim pinned return");
   const operatorBound = h.store.bindSource({ edgeId: "edge-a", operator: true }, {
     schema_version: 1, command_id: randomUUID(), action: "source_bind",
     payload: { project_id: "p", work_id: "w", return_mode: "actor_context", thread: THREAD,
-      evidence: { kind: "operator_binding", actor: "talos", session_id: null, session_verified: "none", cwd: "/work/1" } },
+      evidence: { kind: "operator_binding", actor: "talos", session_id: null, session_verified: "none", provider: null, cwd: "/work/1" } },
   });
   assert.equal(operatorBound.receipt.source!.return_mode, "actor_context");
   assert.equal(operatorBound.receipt.source!.session_absence, "no_session_named");
   assert.throws(() => h.store.bindSource({ edgeId: "edge-a", operator: false }, {
     schema_version: 1, command_id: randomUUID(), action: "source_bind",
     payload: { project_id: "p", work_id: "w", return_mode: "actor_context", thread: THREAD,
-      evidence: { kind: "operator_binding", actor: "talos", session_id: null, session_verified: "none", cwd: "/work/1" } },
+      evidence: { kind: "operator_binding", actor: "talos", session_id: null, session_verified: "none", provider: null, cwd: "/work/1" } },
   }), refused("operator_required", 403));
   h.close();
 });

@@ -52,6 +52,7 @@ interface HookInput {
  */
 export interface AttentionConstraint {
   expectedSessionId: string;
+  expectedCwd: string;
   resolutionCommandId: string;
   generation: number;
   deliveryId: number;
@@ -99,11 +100,13 @@ function parseConstraint(value: unknown): AttentionConstraint | null {
   const record = value as Record<string, unknown>;
   if (
     typeof record.expectedSessionId !== "string" || record.expectedSessionId.length === 0
+    || typeof record.expectedCwd !== "string" || record.expectedCwd.length === 0
     || typeof record.resolutionCommandId !== "string"
     || !Number.isSafeInteger(record.generation) || !Number.isSafeInteger(record.deliveryId)
   ) return null;
   return {
     expectedSessionId: record.expectedSessionId,
+    expectedCwd: record.expectedCwd,
     resolutionCommandId: record.resolutionCommandId,
     generation: Number(record.generation),
     deliveryId: Number(record.deliveryId),
@@ -112,14 +115,15 @@ function parseConstraint(value: unknown): AttentionConstraint | null {
 
 /**
  * ADR-0004 receiver-side check, immediately before emission. Ordinary envelopes pass through
- * untouched. A constrained one is left in place unless this exact session is the one it
- * names (an unknown session never drains it); then the edge's guard decides: eligible emits,
+ * untouched. A constrained one is left in place unless this exact session, in the captured
+ * working directory, is the one it names (an unknown session or cwd is never proof and never
+ * drains it); then the edge's guard decides: eligible emits,
  * a superseded or terminal generation is quarantined, and an unreachable guard leaves the
  * file for a later boundary — never emitted on the strength of the session match alone.
  */
 export async function selectDeliverable(
   messages: InboxMessage[],
-  sessionId: string | null,
+  session: { id: string | null; cwd: string | null },
   guard: (constraint: AttentionConstraint) => Promise<GuardVerdict>,
 ): Promise<{ emit: InboxMessage[]; quarantine: InboxMessage[] }> {
   const emit: InboxMessage[] = [];
@@ -129,7 +133,8 @@ export async function selectDeliverable(
       emit.push(message);
       continue;
     }
-    if (sessionId === null || sessionId !== message.attention.expectedSessionId) continue;
+    if (session.id === null || session.id !== message.attention.expectedSessionId) continue;
+    if (session.cwd === null || session.cwd !== message.attention.expectedCwd) continue;
     const verdict = await guard(message.attention);
     if (verdict === "eligible") emit.push(message);
     else if (verdict === "ineligible") quarantine.push(message);
@@ -215,7 +220,7 @@ async function main(): Promise<void> {
   const eventName = input.hook_event_name ?? "Stop";
   const sessionId = input.session_id ?? null;
   const cwd = input.cwd ?? process.cwd();
-  const { emit: messages, quarantine } = await selectDeliverable(drainInbox(inboxDirectory), sessionId, async (constraint) => {
+  const { emit: messages, quarantine } = await selectDeliverable(drainInbox(inboxDirectory), { id: sessionId, cwd }, async (constraint) => {
     try {
       const verdict = await udsRequestJson<{ eligible?: unknown }>(edgeSocket, "POST", "/attention/read", {
         op: "return_guard",
