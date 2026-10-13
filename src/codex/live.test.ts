@@ -10,6 +10,7 @@ import {
   completeDesktopDelivery,
   assertAttentionSession,
   DesktopFollowerRetirement,
+  EdgeLiveRegistration,
   desktopDeliveryKey,
   liveRuntimeHome,
 } from "./live.js";
@@ -326,4 +327,20 @@ test("A25 the bridge accepts a constrained return only into the exact captured s
   assert.throws(() => assertAttentionSession(constrained, { kind: "dedicated", sessionId: "task-1" }, "/work/other"), /attention_session_mismatch/u);
   assert.doesNotThrow(() => assertAttentionSession(base, { kind: "desktop", sessionId: "anything", cwd: "/x" }, null), "ordinary envelopes are unchanged");
   assert.doesNotThrow(() => assertAttentionSession({ ...base, continuationTarget: { ...target, mode: "actor_context", pinned: null } }, { kind: "dedicated", sessionId: "x" }, null));
+});
+
+test("switching sessions withdraws the previous one by name once the new one is registered", async () => {
+  const sent: Array<[string, Record<string, unknown>]> = [];
+  const registration = new EdgeLiveRegistration("ariadne", async (path, body) => { sent.push([path, body]); });
+  await registration.sync({ actor: "ariadne", provider: "codex", sessionId: "task-A" });
+  await registration.sync({ actor: "ariadne", provider: "codex", sessionId: "task-A" });
+  await registration.sync({ actor: "ariadne", provider: "codex", sessionId: "task-B" });
+  await registration.sync(null);
+  assert.deepEqual(sent.map(([path, body]) => `${path} ${String(body.sessionId)}`), [
+    "/live/register task-A",
+    "/live/register task-A",
+    "/live/register task-B",
+    "/live/deregister task-A",
+    "/live/deregister task-B",
+  ]);
 });

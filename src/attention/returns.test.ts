@@ -267,20 +267,23 @@ test("the return guard admits only the current generation's own dispatching deli
   const { itemId, commandId } = resolvedItem(h);
   await publisher(h).drainOnce();
   const deliveryId = h.store.item(itemId)!.return!.delivery_id!;
-  assert.equal(h.store.returnGuard("edge-a", commandId, 1, deliveryId).reason, "delivery_pending");
+  assert.equal(h.store.returnGuard("edge-a", commandId, 1, deliveryId, 1).reason, "delivery_pending");
   const claimed = h.broker.claimNext("edge-a", 0, [], 1)!;
   h.broker.transition(claimed.id, "edge-a", claimed.leaseGeneration!, "claimed", "accepted_local");
   h.broker.transition(claimed.id, "edge-a", claimed.leaseGeneration!, "accepted_local", "dispatching");
-  assert.deepEqual(h.store.returnGuard("edge-a", commandId, 1, deliveryId), { eligible: true, reason: "current_generation", as_of: h.clock.now().toISOString() });
-  assert.equal(h.store.returnGuard("edge-b", commandId, 1, deliveryId).reason, "claimed_by_other_edge");
-  assert.equal(h.store.returnGuard("edge-a", commandId, 1, deliveryId + 1).reason, "delivery_mismatch");
-  assert.equal(h.store.returnGuard("edge-a", commandId, 2, deliveryId).reason, "return_unknown");
+  const lease = claimed.leaseGeneration!;
+  assert.deepEqual(h.store.returnGuard("edge-a", commandId, 1, deliveryId, lease), { eligible: true, reason: "current_generation", as_of: h.clock.now().toISOString() });
+  assert.equal(h.store.returnGuard("edge-b", commandId, 1, deliveryId, lease).reason, "claimed_by_other_edge");
+  assert.equal(h.store.returnGuard("edge-a", commandId, 1, deliveryId, lease + 1).reason, "attempt_superseded",
+    "a file another attempt of the same delivery wrote is stale, even on the claiming edge");
+  assert.equal(h.store.returnGuard("edge-a", commandId, 1, deliveryId + 1, lease).reason, "delivery_mismatch");
+  assert.equal(h.store.returnGuard("edge-a", commandId, 2, deliveryId, lease).reason, "return_unknown");
   h.broker.finish(claimed.id, "edge-a", claimed.leaseGeneration!, "undeliverable", [{ code: "attention_session_mismatch", detail: "x" }]);
-  assert.equal(h.store.returnGuard("edge-a", commandId, 1, deliveryId).reason, "delivery_undeliverable");
+  assert.equal(h.store.returnGuard("edge-a", commandId, 1, deliveryId, lease).reason, "delivery_undeliverable");
   await publisher(h).drainOnce();
   const revision = h.store.item(itemId)!.revision;
   act(h.store, OPERATOR, "retry_return", { item_id: itemId, expected_revision: revision, return_generation: 1 });
-  assert.equal(h.store.returnGuard("edge-a", commandId, 1, deliveryId).reason, "generation_superseded");
+  assert.equal(h.store.returnGuard("edge-a", commandId, 1, deliveryId, lease).reason, "generation_superseded");
   h.close();
 });
 

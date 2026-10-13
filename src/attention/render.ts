@@ -32,7 +32,8 @@ export function inert(text: string, keepNewlines = true): string {
 
 /** Slack mrkdwn-inert text for the commons render: no mention, link or markup can be forged. */
 export function slackInert(text: string): string {
-  return inert(text).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+  // Single-line: a newline in a scalar field could forge extra lines in the broker's post.
+  return inert(text, false).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 }
 
 export function ago(fromIso: string, now: Date): string {

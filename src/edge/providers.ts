@@ -393,6 +393,8 @@ export class ClaudeProvider implements ProviderAdapter {
             resolutionCommandId: target.resolution_command_id,
             generation: target.generation,
             deliveryId: delivery.id,
+            // The claim that wrote this file: a later attempt's guard refuses it.
+            leaseGeneration: delivery.leaseGeneration,
           },
         }
         : {}),

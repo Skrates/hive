@@ -259,8 +259,9 @@ const READS: Record<string, (args: Record<string, unknown>) => string | null> = 
   source: (args) => typeof args.source_id === "string" && /^src_[0-9a-f]{32}$/.test(args.source_id)
     ? `/v1/attention/sources/${args.source_id}` : null,
   return_guard: (args) => typeof args.resolution_command_id === "string" && /^[0-9a-f-]{36}$/.test(args.resolution_command_id)
-    && positive(args.generation) && positive(args.delivery_id)
-    ? `/v1/attention/returns/${args.resolution_command_id}/guard?generation=${String(args.generation)}&delivery_id=${String(args.delivery_id)}`
+    && positive(args.generation) && positive(args.delivery_id) && positive(args.lease_generation)
+    ? `/v1/attention/returns/${args.resolution_command_id}/guard?generation=${String(args.generation)}`
+      + `&delivery_id=${String(args.delivery_id)}&lease_generation=${String(args.lease_generation)}`
     : null,
 };
 

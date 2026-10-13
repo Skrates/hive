@@ -56,6 +56,7 @@ export interface AttentionConstraint {
   resolutionCommandId: string;
   generation: number;
   deliveryId: number;
+  leaseGeneration: number;
 }
 
 export interface InboxMessage {
@@ -103,6 +104,7 @@ function parseConstraint(value: unknown): AttentionConstraint | null {
     || typeof record.expectedCwd !== "string" || record.expectedCwd.length === 0
     || typeof record.resolutionCommandId !== "string"
     || !Number.isSafeInteger(record.generation) || !Number.isSafeInteger(record.deliveryId)
+    || !Number.isSafeInteger(record.leaseGeneration)
   ) return null;
   return {
     expectedSessionId: record.expectedSessionId,
@@ -110,6 +112,7 @@ function parseConstraint(value: unknown): AttentionConstraint | null {
     resolutionCommandId: record.resolutionCommandId,
     generation: Number(record.generation),
     deliveryId: Number(record.deliveryId),
+    leaseGeneration: Number(record.leaseGeneration),
   };
 }
 
@@ -227,6 +230,7 @@ async function main(): Promise<void> {
         resolution_command_id: constraint.resolutionCommandId,
         generation: constraint.generation,
         delivery_id: constraint.deliveryId,
+        lease_generation: constraint.leaseGeneration,
       });
       return verdict.eligible === true ? "eligible" : "ineligible";
     } catch {

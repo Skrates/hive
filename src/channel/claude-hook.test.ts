@@ -94,7 +94,7 @@ test("A26 only the named session drains a constrained envelope, and only while t
   const inbox = mkdtempSync(join(tmpdir(), "hive-hook-attention-"));
   const write = (name: string, payload: Record<string, unknown>) => writeFileSync(join(inbox, name), JSON.stringify(payload));
   const constraint = (generation: number, deliveryId: number) => ({
-    expectedSessionId: "session-A", expectedCwd: "/work/hive", resolutionCommandId: "5c0f2c1e-8b8e-4c55-a3a6-0e5c8f8f2d10", generation, deliveryId,
+    expectedSessionId: "session-A", expectedCwd: "/work/hive", resolutionCommandId: "5c0f2c1e-8b8e-4c55-a3a6-0e5c8f8f2d10", generation, deliveryId, leaseGeneration: 1,
   });
   write("delivery-1-attempt-1.json", { framed: "ordinary wake" });
   write("delivery-2-attempt-1.json", { framed: "current return", attention: constraint(2, 2) });

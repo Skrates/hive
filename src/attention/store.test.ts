@@ -245,6 +245,11 @@ test("A08 a deferral is absent before it is due, joins the FIFO tail when due, a
 
   const c = summon(h.store, source, { intervention_key: "c" }).item!;
   h.clock.advance(60 * 60_000);
+  // Due but not yet promoted (no `next` since): the queue already shows it as available work.
+  const before = h.store.status("hakon");
+  assert.equal(before.eligible_count, 2, "c and the due deferral a");
+  assert.equal(before.deferred_count, 1, "only the indefinite hold");
+  assert.equal(before.oldest_eligible_at, "2026-10-12T09:00:00.000Z", "c, ready before a came due at 10:00");
   const due = next(h.store);
   assert.equal(due.item!.item_id, c.item_id, "c was ready before a's deferral came due");
   assert.equal(h.store.status("hakon").oldest_eligible_at, h.clock.now().toISOString(), "a has been eligible since its promotion, not its summons");

@@ -171,9 +171,9 @@ export class AttentionService {
     return this.store.sources();
   }
 
-  returnGuard(caller: AttentionCaller, resolutionCommandId: string, generation: number, deliveryId: number): ReturnGuard {
+  returnGuard(caller: AttentionCaller, resolutionCommandId: string, generation: number, deliveryId: number, leaseGeneration: number): ReturnGuard {
     if (caller.kind !== "edge") throw new AttentionRefusal(403, "edge_required", "the return guard validates an edge's own claimed delivery");
-    return this.store.returnGuard(caller.edgeId, resolutionCommandId, generation, deliveryId);
+    return this.store.returnGuard(caller.edgeId, resolutionCommandId, generation, deliveryId, leaseGeneration);
   }
 }
 

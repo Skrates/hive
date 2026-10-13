@@ -185,20 +185,14 @@ export async function runCodexLive(config: Config): Promise<void> {
     http.listen({ path: config.surfaceSocket }, () => resolve());
   });
 
-  // The session this bridge last registered: a withdrawal names it, so another session
-  // of the same actor stays registered.
-  let registeredSession: string | null = null;
+  const registration = new EdgeLiveRegistration(config.actor, (path, body) => udsRequestJson(config.edgeSocket, "POST", path, body));
   const register = async (): Promise<void> => {
     const current = target;
     if (!current) {
-      await udsRequestJson(config.edgeSocket, "POST", "/live/deregister", {
-        actor: config.actor,
-        provider: "codex",
-        sessionId: registeredSession,
-      });
+      await registration.sync(null);
       return;
     }
-    await udsRequestJson(config.edgeSocket, "POST", "/live/register", {
+    await registration.sync({
       actor: config.actor,
       provider: "codex",
       socketPath: config.surfaceSocket,
@@ -214,7 +208,6 @@ export async function runCodexLive(config: Config): Promise<void> {
       // to the home the turn actually loaded.
       attestation: attestationWire(await readWakeAttestation(liveRuntimeHome(current.kind, config.desktopHome))),
     });
-    registeredSession = current.sessionId;
   };
   await register();
   const retireReplacedDesktop = (previous: LiveTarget | null, next: LiveTarget | null): void => {
@@ -278,6 +271,34 @@ export async function runCodexLive(config: Config): Promise<void> {
     });
   }, RENEWAL_INTERVAL_MS);
   renewal.unref();
+}
+
+/**
+ * Keeps the edge's view of this bridge exact per session (ADR-0004): a withdrawal names the
+ * session it withdraws, and switching to another session withdraws the previous one once the
+ * new one is registered — the socket no longer serves it, so it must not look live for its TTL.
+ */
+export class EdgeLiveRegistration {
+  private registered: string | null = null;
+
+  constructor(
+    private readonly actor: string,
+    private readonly send: (path: "/live/register" | "/live/deregister", body: Record<string, unknown>) => Promise<unknown>,
+  ) {}
+
+  async sync(registration: (Record<string, unknown> & { sessionId: string }) | null): Promise<void> {
+    if (registration === null) {
+      await this.send("/live/deregister", { actor: this.actor, provider: "codex", sessionId: this.registered });
+      this.registered = null;
+      return;
+    }
+    await this.send("/live/register", registration);
+    const previous = this.registered;
+    this.registered = registration.sessionId;
+    if (previous !== null && previous !== registration.sessionId) {
+      await this.send("/live/deregister", { actor: this.actor, provider: "codex", sessionId: previous });
+    }
+  }
 }
 
 /**

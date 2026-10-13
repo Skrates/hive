@@ -109,10 +109,11 @@ async function dispatch(request: IncomingMessage, response: ServerResponse, url:
   if (guard?.[1] && method === "GET") {
     const generation = Number(url.searchParams.get("generation"));
     const deliveryId = Number(url.searchParams.get("delivery_id"));
-    if (!Number.isInteger(generation) || generation < 1 || !Number.isInteger(deliveryId) || deliveryId < 1) {
-      throw new AttentionRefusal(400, "invalid_guard_query", "generation and delivery_id are positive integers");
+    const leaseGeneration = Number(url.searchParams.get("lease_generation"));
+    if ([generation, deliveryId, leaseGeneration].some((value) => !Number.isInteger(value) || value < 1)) {
+      throw new AttentionRefusal(400, "invalid_guard_query", "generation, delivery_id and lease_generation are positive integers");
     }
-    return json(response, 200, service.returnGuard(caller, guard[1], generation, deliveryId));
+    return json(response, 200, service.returnGuard(caller, guard[1], generation, deliveryId, leaseGeneration));
   }
 
   json(response, 404, { error: "not_found" });

@@ -828,15 +828,23 @@ export class AttentionStore {
     return { selection_reason: "empty", item: null, brief: null, eligible_count: 0, deferred_count: counts.count, next_deferred_at: counts.next };
   }
 
+  /**
+   * Still-deferred items. A deferral whose time has come is promoted only by the next `next`,
+   * but it is already eligible: the counts say so without a read writing promotion events.
+   */
   private deferredCounts(humanId: string): { count: number; next: string | null } {
     const row = this.db.prepare(`
-      SELECT COUNT(*) AS count, MIN(deferred_until) AS next FROM attention_items WHERE human_id=? AND state='deferred'
-    `).get(humanId) as Row;
+      SELECT COUNT(*) AS count, MIN(deferred_until) AS next FROM attention_items
+      WHERE human_id=? AND state='deferred' AND (deferred_until IS NULL OR deferred_until > ?)
+    `).get(humanId, this.nowIso()) as Row;
     return { count: Number(row.count), next: row.next === null ? null : String(row.next) };
   }
 
   private eligibleCount(humanId: string): number {
-    return Number((this.db.prepare("SELECT COUNT(*) AS count FROM attention_items WHERE human_id=? AND state='queued'").get(humanId) as Row).count);
+    return Number((this.db.prepare(`
+      SELECT COUNT(*) AS count FROM attention_items
+      WHERE human_id=? AND (state='queued' OR (state='deferred' AND deferred_until IS NOT NULL AND deferred_until <= ?))
+    `).get(humanId, this.nowIso()) as Row).count);
   }
 
   // ───────────────────────────── sources ─────────────────────────────
@@ -1149,7 +1157,12 @@ export class AttentionStore {
    * its delivery is the one recorded, that delivery is being dispatched, and the calling edge
    * holds it. Lease expiry alone does not disqualify an outcome-waiting `dispatched` message.
    */
-  returnGuard(edgeId: string, resolutionCommandId: string, generation: number, deliveryId: number): ReturnGuard {
+  /**
+   * Whether a constrained inbox envelope may be emitted now. Fenced to the exact claim that
+   * wrote it (delivery and lease generation): a file left by an earlier attempt of the same
+   * delivery is stale even on the same edge, so it can never run beside a later resume.
+   */
+  returnGuard(edgeId: string, resolutionCommandId: string, generation: number, deliveryId: number, leaseGeneration: number): ReturnGuard {
     const asOf = this.nowIso();
     const answer = (eligible: boolean, reason: string): ReturnGuard => ({ eligible, reason, as_of: asOf });
     const row = this.db.prepare("SELECT * FROM attention_returns WHERE resolution_command_id=? AND generation=?")
@@ -1158,10 +1171,11 @@ export class AttentionStore {
     const current = this.currentReturn(row.item_id);
     if (row.phase === "superseded" || current === null || current.return_id !== row.return_id) return answer(false, "generation_superseded");
     if (row.delivery_id !== deliveryId) return answer(false, "delivery_mismatch");
-    const delivery = this.db.prepare("SELECT status, claimed_by FROM deliveries WHERE delivery_id=?").get(deliveryId) as Row | undefined;
+    const delivery = this.db.prepare("SELECT status, claimed_by, lease_generation FROM deliveries WHERE delivery_id=?").get(deliveryId) as Row | undefined;
     if (!delivery) return answer(false, "transport_record_missing");
     if (delivery.status !== "dispatching" && delivery.status !== "dispatched") return answer(false, `delivery_${String(delivery.status)}`);
     if (delivery.claimed_by !== edgeId) return answer(false, "claimed_by_other_edge");
+    if (delivery.lease_generation !== leaseGeneration) return answer(false, "attempt_superseded");
     return answer(true, "current_generation");
   }
 
@@ -1248,10 +1262,15 @@ export class AttentionStore {
     const deferred = this.deferredCounts(humanId);
     // Eligible since the event that last made the item ready — a deferral that came due has
     // waited since its promotion, not since it was first summoned.
+    // A due deferral has been eligible since its due time.
     const oldest = this.db.prepare(`
-      SELECT MIN(e.created_at) AS oldest FROM attention_items i JOIN attention_events e ON e.event_id=i.ready_sequence
-      WHERE i.human_id=? AND i.state='queued'
-    `).get(humanId) as Row;
+      SELECT MIN(ready_at) AS oldest FROM (
+        SELECT e.created_at AS ready_at FROM attention_items i JOIN attention_events e ON e.event_id=i.ready_sequence
+        WHERE i.human_id=? AND i.state='queued'
+        UNION ALL
+        SELECT deferred_until FROM attention_items WHERE human_id=? AND state='deferred' AND deferred_until IS NOT NULL AND deferred_until <= ?
+      )
+    `).get(humanId, humanId, this.nowIso()) as Row;
     const phases = this.db.prepare(`
       SELECT r.phase, COUNT(*) AS count FROM attention_returns r JOIN attention_items i ON i.item_id=r.item_id
       WHERE i.human_id=? AND r.phase IN ('pending', 'minted', 'blocked', 'failed') GROUP BY r.phase

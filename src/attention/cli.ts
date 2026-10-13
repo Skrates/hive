@@ -2,6 +2,7 @@ import type { Command } from "commander";
 import { randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
+import { isDeepStrictEqual } from "node:util";
 import { dirname, join, resolve } from "node:path";
 import { resolveEdgeSocketPath } from "../edge/providers.js";
 import { udsRequest, UdsTimeoutError } from "../local/uds.js";
@@ -73,6 +74,7 @@ export function exitCodeFor(status: number): number {
 const EXIT_UNKNOWN_OUTCOME = 6;
 const EXIT_USAGE = 2;
 const EXIT_AUTH = 3;
+const EXIT_CONFLICT = 5;
 
 class CliFailure extends Error {
   constructor(readonly exitCode: number, message: string, readonly body: unknown = null) {
@@ -523,7 +525,19 @@ export function registerAttentionCommands(
       if ((envelope as { action?: unknown }).action !== "summon") {
         throw new CliFailure(EXIT_USAGE, `${options.file} must be a complete summon envelope {schema_version, command_id, action: "summon", payload}`);
       }
-      const journalled = existsSync(journalPath(env, envelope.command_id));
+      // A retry reuses the saved request; one that changed under the same command id would
+      // commit something retry-command can no longer reconcile, so it is refused before sending.
+      const saved = journalPath(env, envelope.command_id);
+      const journalled = existsSync(saved);
+      if (journalled) {
+        const entry = readJsonFile(saved) as JournalEntry;
+        if (entry.route !== "seat" || entry.source_file !== source.path || !isDeepStrictEqual(entry.envelope, envelope)) {
+          throw new CliFailure(EXIT_CONFLICT,
+            `command ${envelope.command_id} was already sent with a different envelope or source file (${saved}); `
+            + `rerun \`hive attention retry-command ${envelope.command_id}\`, or give a genuinely new request a new command_id`,
+            { error: "command_id_conflict", command_id: envelope.command_id });
+        }
+      }
       await mutate("seat", envelope, options, source, !journalled);
     }));
 

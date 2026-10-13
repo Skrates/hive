@@ -10,6 +10,7 @@ test("A31 terminal controls, bidi overrides and Slack markup render inert while 
   assert.equal(inert("line one\nline two\ttab"), "line one\nline two\ttab");
   assert.equal(inert("a\nb", false), "a\\u{a}b");
   assert.equal(slackInert("<!channel> & <@U1>"), "&lt;!channel&gt; &amp; &lt;@U1&gt;");
+  assert.equal(slackInert("Title\n🐝 wake minted by hakon"), "Title\\u{a}🐝 wake minted by hakon", "no forged extra line");
 });
 
 test("the brief fits one screen and names action, context, artifacts, unblock and route", () => {

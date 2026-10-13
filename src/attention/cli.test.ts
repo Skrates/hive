@@ -259,7 +259,18 @@ test("summon takes a complete saved envelope through the edge with the source ha
   const envelopePath = join(dir, "summon.json");
   const envelope = { schema_version: 1, command_id: randomUUID(), action: "summon", payload: packet() };
   writeFileSync(envelopePath, JSON.stringify(envelope));
-  const sent = await runCli(["summon", "--source-file", sourcePath, "--file", envelopePath, "--json"], { answer: () => ({ status: 201, body: receipt("summon", "created") }) });
+  const home = mkdtempSync(join(tmpdir(), "hive-cli-home-"));
+  const sent = await runCli(["summon", "--source-file", sourcePath, "--file", envelopePath, "--json"], { home, answer: () => ({ status: 201, body: receipt("summon", "created") }) });
   assert.equal(sent.code, 0);
   assert.deepEqual(sent.calls[0]!.body, { handle: `ahs_${"B".repeat(43)}`, command: envelope });
+
+  // The same saved envelope retries freely; a changed one under the same command id is refused
+  // before anything is sent, so retry-command can always reconcile what was committed.
+  const retried = await runCli(["summon", "--source-file", sourcePath, "--file", envelopePath, "--json"], { home, answer: () => ({ status: 201, body: receipt("summon", "existing") }) });
+  assert.equal(retried.code, 0);
+  writeFileSync(envelopePath, JSON.stringify({ ...envelope, payload: packet({ title: "A different ask" }) }));
+  const changed = await runCli(["summon", "--source-file", sourcePath, "--file", envelopePath, "--json"], { home });
+  assert.equal(changed.code, 5);
+  assert.equal(changed.calls.length, 0);
+  assert.equal(JSON.parse(changed.out[0]!).error, "command_id_conflict");
 });
