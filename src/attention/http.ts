@@ -125,7 +125,12 @@ function authenticate(request: IncomingMessage, deps: AttentionHttpDeps): Attent
   if (edgeId !== null) {
     if (!deps.broker.authenticateEdge(edgeId, token)) return null;
     const operatorToken = header(request, "x-hive-operator-token");
-    return { kind: "edge", edgeId, operator: operatorToken !== null && constantTimeEqual(operatorToken, deps.adminToken), sourceId: null };
+    // A presented operator credential that does not verify is refused, never downgraded to a
+    // plain edge caller: the request asked for operator authority and did not prove it.
+    if (operatorToken !== null && !constantTimeEqual(operatorToken, deps.adminToken)) {
+      throw new AttentionRefusal(403, "operator_credential_invalid", "the operator credential relayed by the edge does not verify");
+    }
+    return { kind: "edge", edgeId, operator: operatorToken !== null, sourceId: null };
   }
   return constantTimeEqual(token, deps.adminToken) ? { kind: "operator" } : null;
 }

@@ -48,9 +48,16 @@ export async function attentionBind(edge: EdgeService, body: Record<string, unkn
   // lost response, a finished turn, an edge restart), and the broker answers an exact replay
   // before any liveness check. Recovery can only find a committed receipt — the broker refuses
   // to enroll anything from it — so a bind that never committed falls through to fresh evidence.
-  if (typeof body.command_id === "string") {
+  // A command id is not a secret, so it never suffices: the retry presents the original
+  // requester's own proof (the same dispatch token, the same still-registered live session) or
+  // the operator credential, exactly as a peer on this socket could not.
+  if (body.mode === "recover" && operatorToken === null) {
+    return refuse(403, "operator_required", "recovering a bind by command id alone needs the operator credential");
+  }
+  const proof = operatorToken !== null ? null : requesterProof(edge, body);
+  if (typeof body.command_id === "string" && proof !== undefined) {
     let conflict: RelayAnswer | null = null;
-    for (const retained of edge.store.attentionBindIntents(body.command_id)) {
+    for (const retained of edge.store.attentionBindIntents(body.command_id, proof)) {
       const validated = validateSourceBindCommand(bindCommand(body, JSON.parse(retained) as SourceEvidence));
       if (!validated.ok) return refuse(422, validated.code, validated.detail);
       const answer = await relay(edge, "POST", "/v1/attention/sources", validated.value, { ...headers, "x-hive-attention-recover": "committed" });
@@ -75,10 +82,28 @@ export async function attentionBind(edge: EdgeService, body: Record<string, unkn
   const validated = validateSourceBindCommand(bindCommand(body, evidence));
   if (!validated.ok) return refuse(422, validated.code, validated.detail);
   // Retained before it is sent: the response — or this process — may not survive the request.
-  edge.store.recordAttentionBindIntent(validated.value.command_id, JSON.stringify(validated.value.payload.evidence));
+  edge.store.recordAttentionBindIntent(validated.value.command_id, requesterProof(edge, body) ?? "operator", JSON.stringify(validated.value.payload.evidence));
   const answer = await relay(edge, "POST", "/v1/attention/sources", validated.value, headers);
   if (answer.status !== 200 && answer.status !== 201) return answer;
   return issueHandle(edge, answer);
+}
+
+/**
+ * A digest of what this requester presents that a peer on the socket cannot: the dispatch
+ * token it was handed (an expired one still proves it was that turn), or an exact live session
+ * this edge still has registered. Undefined when it presents neither — no retained evidence is
+ * then usable. Never the token itself.
+ */
+function requesterProof(edge: EdgeService, body: Record<string, unknown>): string | undefined {
+  if (body.mode === "dispatch" && typeof body.token === "string" && body.token.length > 0) {
+    return `dispatch:${createHash("sha256").update(body.token).digest("hex")}`;
+  }
+  if (body.mode === "live" && typeof body.actor === "string" && typeof body.session_id === "string") {
+    const actor = canonicalActor(body.actor);
+    if (exactLiveEntry(edge, actor, body.session_id, body.provider) === null) return undefined;
+    return `live:${createHash("sha256").update(`${actor}\0${body.session_id}`).digest("hex")}`;
+  }
+  return undefined;
 }
 
 /** The evidence this edge itself observes for a fresh bind, or the refusal when it observes none. */

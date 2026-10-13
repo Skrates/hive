@@ -127,9 +127,10 @@ export class EdgeStore {
       CREATE INDEX IF NOT EXISTS attention_source_handles_source ON attention_source_handles(source_id);
       CREATE TABLE IF NOT EXISTS attention_bind_intents (
         command_id TEXT NOT NULL,
+        proof TEXT NOT NULL,
         evidence_json TEXT NOT NULL,
         recorded_at TEXT NOT NULL,
-        PRIMARY KEY (command_id, evidence_json)
+        PRIMARY KEY (command_id, proof, evidence_json)
       );
     `);
   }
@@ -162,22 +163,26 @@ export class EdgeStore {
    * The evidence this edge resolved for a bind, retained under its command id BEFORE the bind
    * is sent: the dispatch token or live registration it came from ends with the turn, and a
    * retry after a lost response or an edge restart must present byte-identical evidence for
-   * the broker to replay the committed receipt. Retained for {@link BIND_INTENT_RETENTION_MS}.
+   * the broker to replay the committed receipt. `proof` is a digest of what the original
+   * requester presented (never the token itself); only a retry presenting the same proof — or
+   * the operator — may use the retained evidence. Retained for {@link BIND_INTENT_RETENTION_MS}.
    */
-  recordAttentionBindIntent(commandId: string, evidenceJson: string): void {
+  recordAttentionBindIntent(commandId: string, proof: string, evidenceJson: string): void {
     const now = new Date();
     this.db.prepare("DELETE FROM attention_bind_intents WHERE recorded_at < ?")
       .run(new Date(now.getTime() - BIND_INTENT_RETENTION_MS).toISOString());
     this.db.prepare(`
-      INSERT INTO attention_bind_intents(command_id, evidence_json, recorded_at) VALUES (?, ?, ?)
-      ON CONFLICT(command_id, evidence_json) DO UPDATE SET recorded_at=excluded.recorded_at
-    `).run(commandId, evidenceJson, now.toISOString());
+      INSERT INTO attention_bind_intents(command_id, proof, evidence_json, recorded_at) VALUES (?, ?, ?, ?)
+      ON CONFLICT(command_id, proof, evidence_json) DO UPDATE SET recorded_at=excluded.recorded_at
+    `).run(commandId, proof, evidenceJson, now.toISOString());
   }
 
-  /** Every evidence variant sent under a command id, newest first. */
-  attentionBindIntents(commandId: string): string[] {
-    return (this.db.prepare("SELECT evidence_json FROM attention_bind_intents WHERE command_id=? ORDER BY recorded_at DESC, rowid DESC")
-      .all(commandId) as Array<{ evidence_json: string }>).map((row) => row.evidence_json);
+  /** The evidence variants sent under a command id — with that proof, or any when null — newest first. */
+  attentionBindIntents(commandId: string, proof: string | null): string[] {
+    const rows = proof === null
+      ? this.db.prepare("SELECT evidence_json FROM attention_bind_intents WHERE command_id=? ORDER BY recorded_at DESC, rowid DESC").all(commandId)
+      : this.db.prepare("SELECT evidence_json FROM attention_bind_intents WHERE command_id=? AND proof=? ORDER BY recorded_at DESC, rowid DESC").all(commandId, proof);
+    return (rows as Array<{ evidence_json: string }>).map((row) => row.evidence_json);
   }
 
   /** The broker refused a write because the source was revoked: remember it, keep the identity. */

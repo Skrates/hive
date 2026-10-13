@@ -343,9 +343,20 @@ test("a committed dispatch bind is recovered after its response, its turn and th
     });
     assert.equal(summoned.result, "created", "the recovered handle is usable");
 
-    // Without any token — e.g. from the seat's next turn or an operator shell — the command id recovers it.
-    const byId = await bind({ mode: "recover", command_id: committedId });
-    assert.equal((JSON.parse(byId.body) as { source_file: SourceFile }).source_file.source_id, file.source_id);
+    // A command id is not a secret: a peer that learned it, with its own token or none, gets nothing.
+    const peer = await bind({ mode: "dispatch", token: "peer-turn-token", command_id: committedId });
+    assert.equal(peer.status, 403);
+    assert.equal((JSON.parse(peer.body) as { error: string }).error, "unknown_dispatch_token");
+    const bare = await bind({ mode: "recover", command_id: committedId });
+    assert.equal(bare.status, 403);
+    assert.equal((JSON.parse(bare.body) as { error: string }).error, "operator_required");
+    const forgedOperator = await bind({ mode: "recover", command_id: committedId, operator_token: "x".repeat(40) });
+    assert.equal(forgedOperator.status, 403, "the broker checks the operator credential");
+
+    // The operator recovers the seat's committed bind by id alone, after the turn is gone.
+    const byOperator = await bind({ mode: "recover", command_id: committedId, operator_token: ADMIN });
+    assert.equal(byOperator.status, 201);
+    assert.equal((JSON.parse(byOperator.body) as { source_file: SourceFile }).source_file.source_id, file.source_id);
 
     // Changed content under the same command id is a conflict, never a second source.
     const changed = await bind({ mode: "dispatch", token, command_id: committedId, work_id: "another-work" });
@@ -356,7 +367,7 @@ test("a committed dispatch bind is recovered after its response, its turn and th
     const stale = await bind({ mode: "dispatch", token, command_id: refusedId });
     assert.equal(stale.status, 403);
     assert.equal((JSON.parse(stale.body) as { error: string }).error, "unknown_dispatch_token");
-    const unknown = await bind({ mode: "recover", command_id: randomUUID() });
+    const unknown = await bind({ mode: "recover", command_id: randomUUID(), operator_token: ADMIN });
     assert.equal(unknown.status, 404);
     assert.equal((JSON.parse(unknown.body) as { error: string }).error, "bind_not_committed");
     assert.equal(h.store.sources().length, 1);

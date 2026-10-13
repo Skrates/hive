@@ -574,7 +574,7 @@ export function registerAttentionCommands(
     .option("--provider <provider>", "live binding: codex or claude when ambiguous")
     .option("--operator", "explicit operator enrollment on this (source) edge")
     .option("--cwd <path>", "operator binding: the work context directory", process.cwd())
-    .option("--command-id <uuid>", "reuse the command id of a bind whose outcome was unknown (a committed bind is recovered with the same source)")
+    .option("--command-id <uuid>", "reuse the command id of a bind whose outcome was unknown (a committed bind is recovered with the same source; with --operator alone, recover it by id)")
     .option("--channel <id>", "Slack channel of the return thread")
     .option("--thread <ts>", "Slack thread ts of the return thread")
     .option("--json", "one JSON object")
@@ -600,9 +600,14 @@ export function registerAttentionCommands(
         thread: options.channel && options.thread ? { channel_id: options.channel, thread_ts: options.thread } : null,
       };
       let body: Record<string, unknown>;
-      if (options.operator) {
+      if (options.operator && !options.actor && options.commandId !== undefined) {
+        // No evidence, only a command id: the operator recovers a bind this edge committed (a
+        // seat's, after its turn ended) from the evidence the edge retained when it was sent.
         assertOperatorContext();
-        if (!options.actor) throw new CliFailure(EXIT_USAGE, "--operator needs --actor");
+        body = { ...base, mode: "recover", operator_token: env.HIVE_ADMIN_TOKEN };
+      } else if (options.operator) {
+        assertOperatorContext();
+        if (!options.actor) throw new CliFailure(EXIT_USAGE, "--operator needs --actor (or --command-id alone to recover a committed bind)");
         body = { ...base, mode: "operator", actor: options.actor, session_id: options.session ?? null, cwd: resolve(options.cwd), operator_token: env.HIVE_ADMIN_TOKEN };
       } else if (options.sessionFile || options.actor || options.session) {
         let actor = options.actor;
@@ -618,10 +623,6 @@ export function registerAttentionCommands(
         body = { ...base, mode: "live", actor, session_id: session, provider: provider ?? null };
       } else if (env.HIVE_DELIVERY_TOKEN) {
         body = { ...base, mode: "dispatch", token: env.HIVE_DELIVERY_TOKEN };
-      } else if (options.commandId !== undefined) {
-        // No evidence of its own, but a command id: the edge recovers that bind only if it
-        // committed, from the evidence it retained when the bind was first sent.
-        body = { ...base, mode: "recover" };
       } else {
         throw new CliFailure(EXIT_AUTH,
           "no source can be resolved: this is neither a running headless turn (HIVE_DELIVERY_TOKEN), nor a live session named by "
@@ -634,7 +635,8 @@ export function registerAttentionCommands(
         if (!(error instanceof AttentionTransportError)) throw error;
         throw new CliFailure(EXIT_UNKNOWN_OUTCOME,
           `bind ${commandId} has an unknown outcome (${error.message}); rerun the same bind with --command-id ${commandId} — `
-          + "a committed bind is recovered with the same source, even after its turn ended",
+          + "a committed bind is recovered with the same source, even after its turn ended; without this turn's token, "
+          + `the operator recovers it with \`hive attention bind --operator --command-id ${commandId}\``,
           { error: "outcome_unknown", command_id: commandId });
       }
       const code = exitCodeFor(answer.status);

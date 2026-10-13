@@ -56,7 +56,9 @@ the source edge. The caller never names an actor, principal or delivery to estab
 attribution. The edge issues a random local handle, stores only its hash bound to the issuing
 broker's UUID, and forwards the source id under its machine credential. The edge retains the
 evidence it sent under the bind's command id, so a committed bind is recovered after its
-dispatch ended; the broker answers such a recovery only by replay and never enrolls from it.
+dispatch ended — by a retry presenting the original requester's proof (its dispatch token, its
+still-registered session) or by the operator, never by the command id alone; the broker answers
+such a recovery only by replay and never enrolls from it.
 Live-registry verification counts only through the provider the actor is enrolled on. A source
 authorizes producing requests only: never selecting, resolving, waking or the operator
 credential.

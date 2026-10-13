@@ -201,13 +201,18 @@ test("bind refuses to guess identity, writes the source file owner-only, and nev
   assert.equal(again.code, 2);
   assert.equal(again.calls.length, 0);
 
-  // After the turn: a command id with no evidence of its own asks the edge to recover that bind.
+  // After the turn: a command id alone is no proof for a seat; the operator recovers by id.
   const commandId = randomUUID();
-  const recovered = await runCli(["bind", "--project", "p", "--work", "w", "--return", "actor-context", "--out", join(dir, "recovered.json"), "--command-id", commandId], {
+  const seatOnly = await runCli(["bind", "--project", "p", "--work", "w", "--return", "actor-context", "--out", join(dir, "seat.json"), "--command-id", commandId]);
+  assert.equal(seatOnly.code, 3);
+  assert.equal(seatOnly.calls.length, 0);
+  const recovered = await runCli(["bind", "--operator", "--project", "p", "--work", "w", "--return", "actor-context", "--out", join(dir, "recovered.json"), "--command-id", commandId], {
     answer: () => ({ status: 201, body: { receipt: receipt("source_bind", "source_bound", { replayed: true, source: { source_id: sourceFile.source_id, actor: "fable", project_id: "p", work_id: "w", return_mode: "actor_context", provenance: "dispatch" } }), source_file: sourceFile } }),
   });
   assert.equal(recovered.code, 0);
-  assert.deepEqual(recovered.calls[0]!.body, { command_id: commandId, project_id: "p", work_id: "w", return_mode: "actor_context", thread: null, mode: "recover" });
+  assert.deepEqual(recovered.calls[0]!.body, {
+    command_id: commandId, project_id: "p", work_id: "w", return_mode: "actor_context", thread: null, mode: "recover", operator_token: "t".repeat(40),
+  });
 });
 
 test("summon takes a complete saved envelope through the edge with the source handle", async () => {

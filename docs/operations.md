@@ -398,9 +398,14 @@ queued work, provenance, receipt recovery and an already-recorded response's ret
 
 A bind whose outcome was unknown (exit 6) is rerun with `--command-id <id>`. The edge retains
 the evidence it sent under that id for 30 days, so a bind the broker committed is recovered —
-same source, fresh handle — after its turn ended or the edge restarted; with no token or session
-in reach, `--command-id` alone asks for that recovery. Recovery never enrolls: a bind that never
-committed needs fresh evidence, and changed content under the same id is `command_id_conflict`.
+same source, fresh handle — after its turn ended or the edge restarted. A command id is not a
+secret, so a retry must also present the original requester's proof: the same dispatch token
+(an expired one still proves it was that turn) or the same still-registered live session. Once
+that is out of reach, the operator recovers it on the source edge with
+`hive attention bind --operator --command-id <id> --project … --work … --return … --out …`.
+Recovery never enrolls: a bind that never committed needs fresh evidence, and changed content
+under the same id is `command_id_conflict`. An edge-relayed operator credential that does not
+verify is refused (`operator_credential_invalid`), never downgraded to a plain edge request.
 
 Live surfaces report their session cwd when they register: the Claude hook sends the hook
 input's `cwd`; the Codex bridge sends a Desktop attachment's binding cwd, or `HIVE_SESSION_CWD`

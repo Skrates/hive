@@ -392,7 +392,10 @@ export class AttentionStore {
     const principal: AttentionPrincipal = caller.operator ? { kind: "operator" } : { kind: "edge", edgeId: caller.edgeId };
     const hash = contentHash(command);
     const run = this.db.transaction((): CommandOutcome => {
-      const replay = this.replay(command.command_id, principal, hash);
+      // The operator may recover any bind this same edge committed, its own or a seat's.
+      const replay = options.recoverOnly === true && caller.operator
+        ? this.recoverForOperator(command.command_id, caller.edgeId, hash)
+        : this.replay(command.command_id, principal, hash);
       if (replay) return replay;
       // Recovery replays an edge's own retained evidence after the dispatch or registration it
       // came from has ended. That evidence is no longer live, so it may only find a committed
@@ -440,6 +443,18 @@ export class AttentionStore {
     if (!prior) return null;
     if (prior.principal !== principalKey(principal) || prior.payload_hash !== hash) {
       throw new AttentionRefusal(409, "command_id_conflict", `command ${commandId} was already committed with different content or by a different principal`);
+    }
+    const receipt = JSON.parse(String(prior.receipt_json)) as Receipt;
+    return { status: Number(prior.status) as 200 | 201, receipt: { ...receipt, replayed: true } };
+  }
+
+  private recoverForOperator(commandId: string, edgeId: string, hash: string): CommandOutcome | null {
+    const prior = this.db.prepare("SELECT principal, issuer_edge, payload_hash, status, receipt_json FROM attention_commands WHERE command_id=?")
+      .get(commandId) as Row | undefined;
+    if (!prior) return null;
+    const ownEdge = prior.issuer_edge === edgeId && (prior.principal === "operator" || prior.principal === `edge:${edgeId}`);
+    if (!ownEdge || prior.payload_hash !== hash) {
+      throw new AttentionRefusal(409, "command_id_conflict", `command ${commandId} was already committed with different content or on another edge`);
     }
     const receipt = JSON.parse(String(prior.receipt_json)) as Receipt;
     return { status: Number(prior.status) as 200 | 201, receipt: { ...receipt, replayed: true } };
