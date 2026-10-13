@@ -395,7 +395,7 @@ export class AttentionStore {
       // The operator may recover any bind this same edge committed, its own or a seat's.
       const replay = options.recoverOnly === true && caller.operator
         ? this.recoverForOperator(command.command_id, caller.edgeId, hash)
-        : this.replay(command.command_id, principal, hash);
+        : this.replay(command.command_id, principal, hash, caller.edgeId);
       if (replay) return replay;
       // Recovery replays an edge's own retained evidence after the dispatch or registration it
       // came from has ended. That evidence is no longer live, so it may only find a committed
@@ -437,11 +437,16 @@ export class AttentionStore {
     return run.immediate();
   }
 
-  private replay(commandId: string, principal: AttentionPrincipal, hash: string): CommandOutcome | null {
-    const prior = this.db.prepare("SELECT principal, payload_hash, status, receipt_json FROM attention_commands WHERE command_id=?")
+  /**
+   * The committed receipt for an exact retry. A source bind also names the edge it is replayed
+   * on: an operator bind is the operator's on every edge, but its source (and handle) belongs
+   * to the edge that issued it, so a replay elsewhere is a conflict, never a foreign handle.
+   */
+  private replay(commandId: string, principal: AttentionPrincipal, hash: string, bindEdge: string | null = null): CommandOutcome | null {
+    const prior = this.db.prepare("SELECT principal, issuer_edge, payload_hash, status, receipt_json FROM attention_commands WHERE command_id=?")
       .get(commandId) as Row | undefined;
     if (!prior) return null;
-    if (prior.principal !== principalKey(principal) || prior.payload_hash !== hash) {
+    if (prior.principal !== principalKey(principal) || prior.payload_hash !== hash || (bindEdge !== null && prior.issuer_edge !== bindEdge)) {
       throw new AttentionRefusal(409, "command_id_conflict", `command ${commandId} was already committed with different content or by a different principal`);
     }
     const receipt = JSON.parse(String(prior.receipt_json)) as Receipt;

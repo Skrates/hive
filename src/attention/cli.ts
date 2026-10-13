@@ -1,5 +1,5 @@
 import type { Command } from "commander";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isDeepStrictEqual } from "node:util";
@@ -95,7 +95,13 @@ interface JournalEntry {
   route: "operator" | "seat";
   envelope: AttentionCommand;
   source_file: string | null;
+  /** The source the original send used — its id and a digest of its handle, never the handle. */
+  source: { source_id: string; handle_sha256: string } | null;
   saved_at: string;
+}
+
+function sourceIdentity(file: SourceFile): { source_id: string; handle_sha256: string } {
+  return { source_id: file.source_id, handle_sha256: createHash("sha256").update(file.handle).digest("hex") };
 }
 
 function hiveHome(env: NodeJS.ProcessEnv): string {
@@ -226,7 +232,10 @@ export function registerAttentionCommands(
     const validated = validateAttentionCommand(envelope);
     if (!validated.ok) throw new CliFailure(EXIT_USAGE, validated.detail, { error: validated.code, detail: validated.detail });
     if (journal) {
-      const entry: JournalEntry = { schema: "hive-attention-request/v1", route, envelope, source_file: sourceFile?.path ?? null, saved_at: io.now().toISOString() };
+      const entry: JournalEntry = {
+        schema: "hive-attention-request/v1", route, envelope, source_file: sourceFile?.path ?? null,
+        source: sourceFile === null ? null : sourceIdentity(sourceFile.file), saved_at: io.now().toISOString(),
+      };
       writeOwnerOnly(journalPath(env, envelope.command_id), `${JSON.stringify(entry, null, 2)}\n`);
     }
     let answer: HttpAnswer;
@@ -509,6 +518,11 @@ export function registerAttentionCommands(
       const entry = JSON.parse(readFileSync(path, "utf8")) as JournalEntry;
       if (entry.route === "operator") assertOperatorContext();
       const source = entry.route === "seat" ? loadSourceFile(entry.source_file ?? "") : null;
+      if (source !== null && !isDeepStrictEqual(entry.source, sourceIdentity(source.file))) {
+        throw new CliFailure(EXIT_CONFLICT,
+          `${entry.source_file} no longer holds the source request ${commandId} was sent with; restore that source file to retry`,
+          { error: "source_changed", command_id: commandId });
+      }
       await mutate(entry.route, entry.envelope, options, source, false);
     })(options));
 
@@ -531,7 +545,8 @@ export function registerAttentionCommands(
       const journalled = existsSync(saved);
       if (journalled) {
         const entry = readJsonFile(saved) as JournalEntry;
-        if (entry.route !== "seat" || entry.source_file !== source.path || !isDeepStrictEqual(entry.envelope, envelope)) {
+        if (entry.route !== "seat" || entry.source_file !== source.path || !isDeepStrictEqual(entry.source, sourceIdentity(source.file))
+          || !isDeepStrictEqual(entry.envelope, envelope)) {
           throw new CliFailure(EXIT_CONFLICT,
             `command ${envelope.command_id} was already sent with a different envelope or source file (${saved}); `
             + `rerun \`hive attention retry-command ${envelope.command_id}\`, or give a genuinely new request a new command_id`,
@@ -726,6 +741,21 @@ export function registerAttentionCommands(
       const edgeReachable = await transport.edgeHealth();
       healthy &&= edgeReachable;
       report.edge = { socket: resolveEdgeSocketPath(env), reachable: edgeReachable };
+      // Operator commands go to HIVE_BROKER_URL, binds and seat writes through the edge: both
+      // must be the same broker, or the check would certify a split deployment.
+      const directUuid = (report.broker as { broker_uuid?: string }).broker_uuid;
+      if (edgeReachable && directUuid !== undefined) {
+        try {
+          const viaEdge = await transport.edge("/attention/read", { op: "capabilities" });
+          const edgeUuid = viaEdge.status === 200 ? (viaEdge.body as Capabilities).broker_uuid : null;
+          const agrees = edgeUuid === directUuid;
+          healthy &&= agrees;
+          report.edge = { ...(report.edge as object), broker_uuid: edgeUuid, broker_matches: agrees };
+        } catch (error) {
+          healthy = false;
+          report.edge = { ...(report.edge as object), broker_uuid: null, broker_matches: false, detail: error instanceof Error ? error.message : String(error) };
+        }
+      }
       if (options.sourceFile) {
         try {
           const loaded = loadSourceFile(options.sourceFile);

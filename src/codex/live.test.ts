@@ -344,3 +344,19 @@ test("switching sessions withdraws the previous one by name once the new one is 
     "/live/deregister task-B",
   ]);
 });
+
+test("a failed withdrawal of the previous session is retried on the next renewal", async () => {
+  const sent: string[] = [];
+  let failNextWithdrawal = true;
+  const registration = new EdgeLiveRegistration("ariadne", async (path, body) => {
+    if (path === "/live/deregister" && failNextWithdrawal) {
+      failNextWithdrawal = false;
+      throw new Error("edge socket busy");
+    }
+    sent.push(`${path} ${String(body.sessionId)}`);
+  });
+  await registration.sync({ sessionId: "task-A" });
+  await assert.rejects(registration.sync({ sessionId: "task-B" }));
+  await registration.sync({ sessionId: "task-B" });
+  assert.deepEqual(sent, ["/live/register task-A", "/live/register task-B", "/live/register task-B", "/live/deregister task-A"]);
+});

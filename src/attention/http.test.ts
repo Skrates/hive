@@ -418,3 +418,16 @@ test("only Slack's definitive answer refuses a return thread; its transient trou
     h.close();
   }
 });
+
+test("the queue's human cannot also be an enrolled actor", () => {
+  const h = harness({ seats: [seat("fable"), seat("hakon")] });
+  try {
+    const boot = (enabled: string) => bootAttentionRuntime({
+      broker: h.broker, clock: h.clock, adminToken: ADMIN, env: { HIVE_ATTENTION_ENABLED: enabled, HIVE_ATTENTION_HUMAN_ID: "hakon" },
+      validateThread: async () => {}, log: () => {},
+    });
+    assert.throws(() => boot("true"), /also an enrolled actor/u);
+  } finally {
+    h.close();
+  }
+});

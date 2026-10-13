@@ -179,8 +179,18 @@ test("doctor is unhealthy when the edge is down, and healthy for an intentionall
     answer: (path) => path === "/attention/read" ? { status: 403, body: { error: "unknown_source_handle", detail: "x" } } : capabilities(),
   });
   assert.equal(reset.code, 7);
-  assert.deepEqual(reset.calls.find((call) => call.path === "/attention/read")!.body, { op: "source_handle", handle: `ahs_${"C".repeat(43)}` });
+  assert.deepEqual(reset.calls.find((call) => (call.body as { op?: string } | undefined)?.op === "source_handle")!.body, { op: "source_handle", handle: `ahs_${"C".repeat(43)}` });
   assert.equal((JSON.parse(reset.out[0]!) as { source: { valid: boolean } }).source.valid, false);
+
+  // The edge talks to another broker than the operator shell: a split deployment is unhealthy.
+  const split = await runCli(["doctor", "--json"], {
+    edgeUp: true,
+    answer: (path) => path === "/attention/read"
+      ? { status: 200, body: { ...capabilities().body, broker_uuid: "11111111-1111-4111-8111-111111111111" } }
+      : capabilities(),
+  });
+  assert.equal(split.code, 7);
+  assert.equal((JSON.parse(split.out[0]!) as { edge: { broker_matches: boolean } }).edge.broker_matches, false);
 
   const preEnable = await runCli(["doctor", "--json"], { answer: capabilities, edgeUp: true });
   assert.equal(preEnable.code, 0);
@@ -273,4 +283,15 @@ test("summon takes a complete saved envelope through the edge with the source ha
   assert.equal(changed.code, 5);
   assert.equal(changed.calls.length, 0);
   assert.equal(JSON.parse(changed.out[0]!).error, "command_id_conflict");
+
+  // The source file is replaced under the same path: neither summon nor retry-command sends.
+  writeFileSync(envelopePath, JSON.stringify(envelope));
+  writeFileSync(sourcePath, JSON.stringify({ ...JSON.parse(readFileSync(sourcePath, "utf8")) as object, handle: `ahs_${"D".repeat(43)}` }));
+  const rebound = await runCli(["summon", "--source-file", sourcePath, "--file", envelopePath, "--json"], { home });
+  assert.equal(rebound.code, 5);
+  assert.equal(rebound.calls.length, 0);
+  const retried2 = await runCli(["retry-command", envelope.command_id, "--json"], { home });
+  assert.equal(retried2.code, 5);
+  assert.equal(retried2.calls.length, 0);
+  assert.equal(JSON.parse(retried2.out[0]!).error, "source_changed");
 });

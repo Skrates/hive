@@ -47,6 +47,10 @@ export function bootAttentionRuntime(input: AttentionRuntimeInput): AttentionRun
   const enabled = attentionEnabled(input.env.HIVE_ATTENTION_ENABLED);
   const humanId = input.env.HIVE_ATTENTION_HUMAN_ID || "hakon";
   if (!HUMAN_ID.test(humanId)) throw new AttentionRuntimeConfigError(`HIVE_ATTENTION_HUMAN_ID ${JSON.stringify(humanId)} is not a queue identity`);
+  // ADR-0004 A-4: the human is not an actor — never leased, never in WAKE: everyone.
+  if (enabled && input.broker.getSubscription(humanId) !== null) {
+    throw new AttentionRuntimeConfigError(`HIVE_ATTENTION_HUMAN_ID ${humanId} is also an enrolled actor; the queue's human must not be a Hive actor`);
+  }
   const store = new AttentionStore({ broker: input.broker, clock: input.clock, humanId, enabled });
   const service = new AttentionService(store, input.broker, input.validateThread);
   const publisher = new AttentionReturnPublisher(store, input.broker, input.clock, input.log);

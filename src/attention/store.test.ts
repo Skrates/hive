@@ -410,6 +410,14 @@ test("an exact-session binding is refused when the session or cwd is unknown, or
   });
   assert.equal(operatorBound.receipt.source!.return_mode, "actor_context");
   assert.equal(operatorBound.receipt.source!.session_absence, "no_session_named");
+  // The same operator bind retried on another edge is a conflict, never a foreign handle there.
+  const sameBind = {
+    schema_version: 1 as const, command_id: operatorBound.receipt.command_id, action: "source_bind" as const,
+    payload: { project_id: "p", work_id: "w", return_mode: "actor_context" as const, thread: THREAD,
+      evidence: { kind: "operator_binding" as const, actor: "talos", session_id: null, session_verified: "none" as const, provider: null, cwd: "/work/1" } },
+  };
+  assert.equal(h.store.bindSource({ edgeId: "edge-a", operator: true }, sameBind).receipt.replayed, true);
+  assert.throws(() => h.store.bindSource({ edgeId: "edge-b", operator: true }, sameBind), refused("command_id_conflict", 409));
   assert.throws(() => h.store.bindSource({ edgeId: "edge-a", operator: false }, {
     schema_version: 1, command_id: randomUUID(), action: "source_bind",
     payload: { project_id: "p", work_id: "w", return_mode: "actor_context", thread: THREAD,

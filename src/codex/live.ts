@@ -280,6 +280,8 @@ export async function runCodexLive(config: Config): Promise<void> {
  */
 export class EdgeLiveRegistration {
   private registered: string | null = null;
+  /** Sessions this socket stopped serving whose withdrawal has not yet succeeded. */
+  private readonly withdrawals = new Set<string>();
 
   constructor(
     private readonly actor: string,
@@ -295,8 +297,13 @@ export class EdgeLiveRegistration {
     await this.send("/live/register", registration);
     const previous = this.registered;
     this.registered = registration.sessionId;
-    if (previous !== null && previous !== registration.sessionId) {
-      await this.send("/live/deregister", { actor: this.actor, provider: "codex", sessionId: previous });
+    if (previous !== null && previous !== registration.sessionId) this.withdrawals.add(previous);
+    this.withdrawals.delete(registration.sessionId);
+    // Retried on every renewal until the edge confirms: a failed withdrawal must not leave
+    // the old session looking live behind this socket for its whole TTL.
+    for (const sessionId of [...this.withdrawals]) {
+      await this.send("/live/deregister", { actor: this.actor, provider: "codex", sessionId });
+      this.withdrawals.delete(sessionId);
     }
   }
 }
