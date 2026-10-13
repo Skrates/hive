@@ -505,6 +505,9 @@ export class AttentionStore {
       if (source.project_id !== packet.project_id || source.work_id !== packet.work_id) {
         throw new AttentionRefusal(403, "source_scope_mismatch", `return source is bound to ${source.project_id}/${source.work_id}`);
       }
+      // A return source is where the response goes; one that returns nowhere would
+      // silently swallow it.
+      if (source.return_mode === "none") throw new AttentionRefusal(422, "source_has_no_return", `source ${returnSourceId} has return mode none`);
     }
     return this.create(commandId, action, packet, {
       owner: `human:${packet.human_id}`, origin: "human", sourceId: returnSourceId, startActive: action === "start",

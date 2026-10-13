@@ -74,7 +74,11 @@ export class LiveIngressRegistry {
       throw new LiveIngressRegistryError("live_binding_invalid_ttl");
     }
     const bindingKey = key(input.actor, input.provider);
-    const previous = this.entries.get(bindingKey);
+    // The prior report of THIS session, even when another session of the actor
+    // registered in between; a session-less surface has only the actor's entry.
+    const previous = input.sessionId === null
+      ? this.entries.get(bindingKey)
+      : this.sessions.get(`${bindingKey}:${input.sessionId}`);
     // A new sessionId, or a lapsed heartbeat, is a different claim entirely and
     // takes whatever the surface just sent. Within one unexpired sessionId the
     // reports are reconciled, not overwritten — see retainedAttestation.
@@ -129,12 +133,24 @@ export class LiveIngressRegistry {
    * A surface that knows it is going away withdraws its claim immediately —
    * a terminal Claude Stop must not leave a heartbeat promising a boundary
    * that will never come. Idempotent: deregistering an absent binding is fine.
+   *
+   * Only the session that stopped is withdrawn: another session of the same
+   * actor stays registered, and when the stopped one was the actor's current
+   * route, ordinary routing falls back to the most recently renewed session
+   * still live.
    */
-  deregister(actor: string, provider: Provider): void {
+  deregister(actor: string, provider: Provider, sessionId: string | null): void {
     const bindingKey = key(actor, provider);
+    if (sessionId !== null) this.sessions.delete(`${bindingKey}:${sessionId}`);
     const current = this.entries.get(bindingKey);
-    if (current?.sessionId) this.sessions.delete(`${bindingKey}:${current.sessionId}`);
+    if (current === undefined || current.sessionId !== sessionId) return;
     this.entries.delete(bindingKey);
+    let fallback: LiveIngress | undefined;
+    for (const [sessionKey, held] of this.sessions) {
+      if (!sessionKey.startsWith(`${bindingKey}:`) || held.expiresAt <= this.now()) continue;
+      if (fallback === undefined || held.expiresAt > fallback.expiresAt) fallback = held;
+    }
+    if (fallback !== undefined) this.entries.set(bindingKey, fallback);
   }
 }
 

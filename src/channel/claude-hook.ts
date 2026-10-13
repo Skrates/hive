@@ -258,6 +258,7 @@ async function main(): Promise<void> {
       await udsRequestJson(edgeSocket, "POST", "/live/deregister", {
         actor,
         provider: "claude",
+        sessionId,
       });
     }
   } catch {

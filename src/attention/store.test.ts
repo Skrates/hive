@@ -383,6 +383,13 @@ test("I11 attention history cannot be deleted and a source's identity cannot cha
   h.close();
 });
 
+test("a human item's return source must return somewhere", () => {
+  const h = harness();
+  const silent = liveSource(h.store, { returnMode: "none" });
+  assert.throws(() => act(h.store, OPERATOR, "add", { packet: packet(), return_source_id: silent.sourceId }), refused("source_has_no_return", 422));
+  h.close();
+});
+
 test("an exact-session binding is refused when the session or cwd is unknown, or the actor runs slots", () => {
   const h = harness({ seats: [seat("fable"), seat("talos", { provider: "grok", wakePolicy: "spawn", turnSlots: 4, edgeWorkspaces: [{ edgeId: "edge-a", cwd: "/work/{slot}", worktree: null }] })] });
   assert.throws(() => liveSource(h.store, { cwd: null }), refused("pinned_unavailable", 422));

@@ -103,7 +103,10 @@ export class EdgeControlServer {
       const actor = requiredString(body.actor, "actor");
       const parsedProvider = ProviderSchema.safeParse(body.provider);
       if (!parsedProvider.success) throw new Error("invalid provider");
-      this.edge.live.deregister(actor, parsedProvider.data);
+      // The stopping session names itself (null for a session-less surface): another
+      // session of the same actor may still be open and must stay registered.
+      const sessionId = body.sessionId === null ? null : requiredString(body.sessionId, "sessionId");
+      this.edge.live.deregister(actor, parsedProvider.data, sessionId);
       return json(response, 200, { ok: true });
     }
 

@@ -185,12 +185,16 @@ export async function runCodexLive(config: Config): Promise<void> {
     http.listen({ path: config.surfaceSocket }, () => resolve());
   });
 
+  // The session this bridge last registered: a withdrawal names it, so another session
+  // of the same actor stays registered.
+  let registeredSession: string | null = null;
   const register = async (): Promise<void> => {
     const current = target;
     if (!current) {
       await udsRequestJson(config.edgeSocket, "POST", "/live/deregister", {
         actor: config.actor,
         provider: "codex",
+        sessionId: registeredSession,
       });
       return;
     }
@@ -210,6 +214,7 @@ export async function runCodexLive(config: Config): Promise<void> {
       // to the home the turn actually loaded.
       attestation: attestationWire(await readWakeAttestation(liveRuntimeHome(current.kind, config.desktopHome))),
     });
+    registeredSession = current.sessionId;
   };
   await register();
   const retireReplacedDesktop = (previous: LiveTarget | null, next: LiveTarget | null): void => {

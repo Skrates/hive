@@ -223,11 +223,14 @@ test("a terminal-session deregister withdraws liveness immediately and is idempo
   });
   assert.ok(live.get("claude-1", "claude"));
 
-  await udsRequestJson(socketPath, "POST", "/live/deregister", { actor: "claude-1", provider: "claude" });
+  await udsRequestJson(socketPath, "POST", "/live/deregister", { actor: "claude-1", provider: "claude", sessionId: "session-9" });
   assert.equal(live.get("claude-1", "claude"), null);
   // Idempotent: a second withdrawal of an absent binding succeeds.
-  const again = await udsRequestJson<{ ok: boolean }>(socketPath, "POST", "/live/deregister", { actor: "claude-1", provider: "claude" });
+  const again = await udsRequestJson<{ ok: boolean }>(socketPath, "POST", "/live/deregister", { actor: "claude-1", provider: "claude", sessionId: "session-9" });
   assert.equal(again.ok, true);
+  // The stopping session must name itself (null for a session-less surface).
+  const unnamed = await udsRequest(socketPath, "POST", "/live/deregister", { actor: "claude-1", provider: "claude" });
+  assert.notEqual(unnamed.status, 200);
 });
 
 test("the control plane relays a seat's wake mint to the broker", async (t) => {

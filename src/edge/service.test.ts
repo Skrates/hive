@@ -853,7 +853,7 @@ test("dispatch keeps the live route captured at claim when the registry is repla
   const broker = new MutatingAcceptBroker(
     [delivery(1, { subscription: subscription({ wakePolicy: "live_only" }) })],
     () => {
-      live.deregister("ariadne", "codex");
+      live.deregister("ariadne", "codex", "thread-1");
       live.register({
         actor: "ariadne",
         provider: "codex",
@@ -908,7 +908,7 @@ test("a live route that expires after claim still dispatches to that surface, no
 
   const broker = new MutatingAcceptBroker(
     [delivery(1)],
-    () => { live.deregister("ariadne", "codex"); },
+    () => { live.deregister("ariadne", "codex", "thread-1"); },
   );
   const store = new EdgeStore(":memory:");
   const adapter = new StubAdapter({
@@ -1035,7 +1035,7 @@ test("a mixed-case live registration is found under the canonical actor key", ()
     attentionProtocol: 0,
   }, 60_000);
   assert.ok(live.get("gnomon", "claude"), "canonical lookup finds the mixed-case registration");
-  live.deregister("GNOMON", "claude");
+  live.deregister("GNOMON", "claude", "s1");
   assert.equal(live.get("gnomon", "claude"), null);
 });
 
