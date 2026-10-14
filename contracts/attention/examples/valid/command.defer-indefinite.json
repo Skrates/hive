@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "command_id": "6d1e3a2f-9c9f-4d66-b4b7-1f6d9a9a3e21",
+  "action": "defer",
+  "payload": { "item_id": 51, "expected_revision": 1, "reason": "Needs tomorrow's input", "until": null, "select_next": false }
+}

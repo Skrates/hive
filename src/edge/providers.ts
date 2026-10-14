@@ -34,6 +34,7 @@ export type ProviderDispatch = ProviderDispatchBase & (
 );
 
 export type ProviderPreDispatchErrorCode =
+  | "attention_session_mismatch"
   | "live_ingress_rejected"
   | "provider_permission_profile_invalid"
   | "account_profile_missing"
@@ -116,6 +117,11 @@ export class CodexProvider implements ProviderAdapter {
     } catch (error) {
       if (error instanceof UdsHttpError && surfaceErrorCode(error.responseBody) === "account_profile_mismatch") {
         throw new ProviderPreDispatchError("account_profile_mismatch");
+      }
+      // ADR-0004: the bridge refused a constrained envelope before starting any turn, because
+      // its session is not the captured one. Deterministic: no provider effect occurred.
+      if (error instanceof UdsHttpError && surfaceErrorCode(error.responseBody) === "attention_session_mismatch") {
+        throw new ProviderPreDispatchError("attention_session_mismatch");
       }
       throw error;
     }
@@ -369,12 +375,29 @@ export class ClaudeProvider implements ProviderAdapter {
     mkdirSync(directory, { recursive: true, mode: 0o700 });
     const finalPath = join(directory, `delivery-${delivery.id}-attempt-${delivery.attempts}.json`);
     const temporaryPath = `${finalPath}.tmp`;
+    const target = delivery.continuationTarget;
     const payload = JSON.stringify({
       deliveryId: delivery.id,
       attempt: delivery.attempts,
       dedupe: `${delivery.event.messageTs}:${delivery.id}`,
       framed,
       writtenAt: new Date().toISOString(),
+      // ADR-0004: a constrained (exact-session) envelope names the session that may drain it
+      // and the return coordinates the hook revalidates before emission. Ordinary envelopes
+      // carry neither and drain exactly as before.
+      ...(target?.mode === "pinned_session"
+        ? {
+          attention: {
+            expectedSessionId: target.pinned.session_id,
+            expectedCwd: target.pinned.cwd,
+            resolutionCommandId: target.resolution_command_id,
+            generation: target.generation,
+            deliveryId: delivery.id,
+            // The claim that wrote this file: a later attempt's guard refuses it.
+            leaseGeneration: delivery.leaseGeneration,
+          },
+        }
+        : {}),
     });
     writeFileSync(temporaryPath, payload, { mode: 0o600 });
     const descriptor = openSync(temporaryPath, "r+");

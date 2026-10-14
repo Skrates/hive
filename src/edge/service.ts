@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { statSync } from "node:fs";
+import { ATTENTION_EDGE_PROTOCOL, effectiveDeliveryRoute, type EffectiveRoute } from "../attention/route.js";
 import { busySlotKey, frameWakeInstruction, workspaceCwd, type BusySlot, type Delivery, type Provider, type Reason, type ReplaySnapshot } from "../domain.js";
 import { disposeDeliveryEffort, parseDeliveryEffort, type WakeEffort } from "./effort.js";
 import { BrokerClient } from "./broker-client.js";
@@ -15,6 +17,19 @@ import { EdgeStore, bindingFor } from "./store.js";
 export interface MintSource {
   deliveryId: number;
   generation: number;
+}
+
+/**
+ * ADR-0004: what the edge actually chose for a running headless turn — the route it took, the
+ * session it resumed (none for a spawn: a fresh session's id is not captured) and the cwd the
+ * provider runs in. Attention source binding records this, never a caller's claim.
+ */
+export interface DispatchEvidence extends MintSource {
+  actor: string;
+  /** `pinned_resume`: an exact-session attention return resumed the captured session. */
+  route: "resume" | "spawn" | "pinned_resume";
+  sessionId: string | null;
+  cwd: string;
 }
 
 export interface EdgeTimers {
@@ -71,7 +86,7 @@ export class EdgeService {
    * In memory, deliberately: an edge restart releases every dispatch it was
    * running, so a token that outlived the process must not survive either.
    */
-  private readonly dispatchTokens = new Map<string, MintSource>();
+  private readonly dispatchTokens = new Map<string, DispatchEvidence>();
 
   constructor(
     readonly broker: BrokerClient,
@@ -161,7 +176,7 @@ export class EdgeService {
    * rejects — every failure path inside dispatch records a disposition.
    */
   private async claimNext(waitMs: number): Promise<{ done: Promise<void> } | null> {
-    const delivery = await this.broker.claim(this.after, waitMs, [...this.busySlots.values()]);
+    const delivery = await this.broker.claim(this.after, waitMs, [...this.busySlots.values()], ATTENTION_EDGE_PROTOCOL);
     if (!delivery) return null;
     this.after = Math.max(this.after, delivery.id);
     const generation = delivery.leaseGeneration;
@@ -189,9 +204,25 @@ export class EdgeService {
    * carries no subscription — so route selection is the one site that owns
    * the rule; a registration such an actor makes is simply never consulted.
    */
-  private liveRouteFor(delivery: Delivery): LiveIngress | null {
+  private liveRouteFor(delivery: Delivery, route: EffectiveRoute): LiveIngress | null {
     if (delivery.subscription.turnSlots > 1) return null;
-    return this.live.get(delivery.actor, delivery.subscription.provider);
+    if (route.kind !== "pinned") return this.live.get(delivery.actor, delivery.subscription.provider);
+    // ADR-0004: a pinned return goes live only into exactly the captured session, through a
+    // surface that will itself re-check that session before accepting. The captured session's
+    // OWN registration decides, not the actor's most recent one: another session registering
+    // since proves nothing about whether the captured one stopped. Only when the captured
+    // session holds no unexpired registration may it be resumed.
+    const entry = this.live.getExact(delivery.actor, delivery.subscription.provider, route.sessionId);
+    if (entry === null) return null;
+    // The captured session IS live, but through a surface that cannot honour the constraint
+    // (it predates the receiver-side check) or in a working directory it does not positively
+    // match — an unreported cwd is missing evidence, not agreement. Resuming it headlessly
+    // would put a second process on a session that is still open, so this is a visible route
+    // failure — the operator retries or reroutes.
+    if (entry.attentionProtocol < ATTENTION_EDGE_PROTOCOL || entry.cwd === null || entry.cwd !== route.cwd) {
+      throw new PreDispatchError("attention_live_surface_incompatible");
+    }
+    return entry;
   }
 
   /** The full post-claim delivery lifecycle; never throws — all failures land in recordDeliveryFailure. */
@@ -210,13 +241,17 @@ export class EdgeService {
     // the next delivery gets the new one.
     const asClaimed = (value: Delivery): Delivery => ({ ...value, subscription: delivery.subscription });
     try {
+      // ADR-0004: the same pure rule the broker's claim used, on the same snapshot, decides
+      // where an attention return may run. A refusal here is an explicit route failure.
+      const route = effectiveDeliveryRoute(delivery.subscription, delivery.continuationTarget);
+      if (route.kind === "refused") throw new PreDispatchError("attention_route_drift");
       // Bind the wake to the seat attestation BEFORE dispatch: a delivery's
       // outcome must resolve to the artifacts installed when the turn started
       // (KRA-1077). Reading the record can never fail the wake — an absent or
       // unreadable one is stored as a named absence, never as silence.
       // Capture the live route once so attestation and dispatch name the same
       // surface. A later expiry, deregister, or replacement must not re-select.
-      const live = this.liveRouteFor(delivery);
+      const live = this.liveRouteFor(delivery, route);
       // This read is now awaited, so `receive` — and with it the redelivery
       // dedupe below — no longer runs in the same synchronous turn as the
       // claim. That window is safe by three existing guards, and the
@@ -255,7 +290,7 @@ export class EdgeService {
 
       const dispatch = await this.withLeaseHeartbeat(
         current,
-        () => this.dispatch(current, replay, live, generation, slot, overlay.effort, async () => {
+        () => this.dispatch(current, replay, live, route, generation, slot, overlay.effort, async () => {
           providerStarted = true;
           // The last uncovered cell of {live, headless} × {claim, provider-start}:
           // a headless child reads its profile when it spawns, which is several
@@ -419,6 +454,12 @@ export class EdgeService {
    * delivery.
    */
   resolveMintSource(token: string): MintSource | null {
+    const evidence = this.dispatchTokens.get(token);
+    return evidence === undefined ? null : { deliveryId: evidence.deliveryId, generation: evidence.generation };
+  }
+
+  /** ADR-0004: the running turn's actual dispatch state, for attention source binding. */
+  dispatchEvidence(token: string): DispatchEvidence | null {
     return this.dispatchTokens.get(token) ?? null;
   }
 
@@ -426,6 +467,7 @@ export class EdgeService {
     delivery: Delivery,
     replay: ReplaySnapshot | null,
     live: LiveIngress | null,
+    route: EffectiveRoute,
     generation: number,
     slot: number,
     // KRA-1414: the route-aware fold of the delivery's `Effort:` overlay, taken
@@ -451,6 +493,7 @@ export class EdgeService {
       const outcomeReporter = subscription.provider === "codex" ? "edge" : "agent";
       return adapter.deliverLive(live, delivery, frameWakeInstruction(delivery, replay, outcomeReporter));
     }
+    if (route.kind === "pinned") return this.dispatchPinned(adapter, delivery, replay, route, generation, effort, onProviderStart);
     if (subscription.wakePolicy === "live_only") throw new PreDispatchError("live_ingress_unavailable");
 
     const workspace = subscription.edgeWorkspaces.find((item) => item.edgeId === this.broker.edgeId);
@@ -463,10 +506,18 @@ export class EdgeService {
     // moment it ends — a child that outlives its dispatch cannot mint from a
     // delivery the edge no longer holds.
     const token = randomUUID();
-    this.dispatchTokens.set(token, { deliveryId: delivery.id, generation });
+    const resumes = subscription.sessionId !== null && this.broker.edgeId === subscription.homeEdge;
+    this.dispatchTokens.set(token, {
+      deliveryId: delivery.id,
+      generation,
+      actor: delivery.actor,
+      route: resumes ? "resume" : "spawn",
+      sessionId: resumes ? subscription.sessionId : null,
+      cwd,
+    });
     const context = { deliveryId: delivery.id, token, effort };
     try {
-      if (subscription.sessionId && this.broker.edgeId === subscription.homeEdge) {
+      if (resumes) {
         await onProviderStart();
         return await adapter.resume(subscription, cwd, framed, context);
       }
@@ -478,9 +529,55 @@ export class EdgeService {
       this.dispatchTokens.delete(token);
     }
   }
+
+  /**
+   * ADR-0004: an exact-session return whose session is not live is resumed — that session, in
+   * its captured cwd, on this (home) edge — only where the actor's policy permits resume. It
+   * never spawns, and never substitutes another session. The subscription snapshot is kept;
+   * only the per-delivery session and cwd are derived from the target.
+   */
+  private async dispatchPinned(
+    adapter: ProviderAdapter,
+    delivery: Delivery,
+    replay: ReplaySnapshot | null,
+    route: Extract<EffectiveRoute, { kind: "pinned" }>,
+    generation: number,
+    effort: WakeEffort | null,
+    onProviderStart: () => Promise<void>,
+  ): Promise<ProviderDispatch> {
+    if (!route.mayResume) throw new PreDispatchError("attention_session_unavailable");
+    if (!isDirectory(route.cwd)) throw new PreDispatchError("attention_cwd_missing");
+    const token = randomUUID();
+    this.dispatchTokens.set(token, {
+      deliveryId: delivery.id, generation, actor: delivery.actor, route: "pinned_resume", sessionId: route.sessionId, cwd: route.cwd,
+    });
+    try {
+      await onProviderStart();
+      return await adapter.resume(
+        { ...delivery.subscription, sessionId: route.sessionId },
+        route.cwd,
+        frameWakeInstruction(delivery, replay, "edge"),
+        { deliveryId: delivery.id, token, effort },
+      );
+    } finally {
+      this.dispatchTokens.delete(token);
+    }
+  }
+}
+
+function isDirectory(path: string): boolean {
+  try {
+    return statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 type PreDispatchErrorCode =
+  | "attention_live_surface_incompatible"
+  | "attention_route_drift"
+  | "attention_session_unavailable"
+  | "attention_cwd_missing"
   | "live_ingress_unavailable"
   | "resume_target_missing"
   | "workspace_not_mapped"
@@ -515,6 +612,11 @@ function classifyDeliveryFailure(error: unknown, providerStarted: boolean): Reas
 
 function preDispatchDetail(code: string): string {
   switch (code) {
+    case "attention_live_surface_incompatible": return "the captured session is live, but its surface cannot accept an exact-session envelope (older surface or different cwd); it is not resumed concurrently";
+    case "attention_route_drift": return "the attention return's captured route no longer matches the actor's enrollment";
+    case "attention_session_unavailable": return "the captured session is not live and the actor's policy does not permit resume";
+    case "attention_cwd_missing": return "the captured session's working directory no longer exists on this edge";
+    case "attention_session_mismatch": return "the live surface's session is not the captured one; the constrained envelope was refused";
     case "live_ingress_unavailable": return "no admitted live ingress was available";
     case "resume_target_missing": return "the subscription had no resumable provider session";
     case "workspace_not_mapped": return "the claiming edge had no declared workspace mapping";
@@ -533,6 +635,11 @@ function safeEdgeErrorCode(error: unknown): string {
   if (error instanceof PreDispatchError) return error.code;
   const message = error instanceof Error ? error.message : String(error);
   return [
+    "attention_live_surface_incompatible",
+    "attention_route_drift",
+    "attention_session_unavailable",
+    "attention_cwd_missing",
+    "attention_session_mismatch",
     "live_ingress_unavailable",
     "resume_target_missing",
     "workspace_not_mapped",

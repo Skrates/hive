@@ -23,6 +23,8 @@ function registration(overrides: Partial<Parameters<LiveIngressRegistry["registe
     // absence rather than omitting the field. This is what `control.ts` mints
     // for a surface that sent no attestation.
     runtimeAttestation: { ok: false, absence: "attestation_unreported" } as const,
+    cwd: null,
+    attentionProtocol: 0,
     ...overrides,
   };
 }
@@ -129,4 +131,36 @@ test("a lapsed live registration does not keep a stale snapshot", () => {
   now = 3_000;
   const next = live.register(registration({ runtimeAttestation: second }), 1_000);
   assert.deepEqual(next.runtimeAttestation, second);
+});
+
+test("ADR-0004 a stopping session withdraws only itself; routing falls back to a session still live", () => {
+  let clock = 1_000_000;
+  const live = new LiveIngressRegistry({ now: () => clock });
+  live.register(registration({ sessionId: "A", socketPath: "/tmp/a.sock" }), 60_000);
+  clock += 1_000;
+  live.register(registration({ sessionId: "B", socketPath: "/tmp/b.sock" }), 60_000);
+
+  // A stops while B is the actor's current route: B is untouched.
+  live.deregister("ariadne", "codex", "A");
+  assert.equal(live.getExact("ariadne", "codex", "A"), null, "the stopped session is no longer live");
+  assert.equal(live.get("ariadne", "codex")?.sessionId, "B");
+  assert.equal(live.getExact("ariadne", "codex", "B")?.socketPath, "/tmp/b.sock");
+
+  // B stops while A is still open: ordinary routing falls back to A.
+  live.register(registration({ sessionId: "A", socketPath: "/tmp/a.sock" }), 60_000);
+  clock += 1_000;
+  live.register(registration({ sessionId: "B", socketPath: "/tmp/b.sock" }), 60_000);
+  live.deregister("ariadne", "codex", "B");
+  assert.equal(live.get("ariadne", "codex")?.sessionId, "A");
+  assert.equal(live.getExact("ariadne", "codex", "B"), null);
+});
+
+test("ADR-0004 interleaved sessions reconcile each heartbeat against its own session", () => {
+  const live = new LiveIngressRegistry();
+  live.register(registration({ sessionId: "A", runtimeAttestation: first }), 60_000);
+  live.register(registration({ sessionId: "B", runtimeAttestation: second }), 60_000);
+  // A reinstall under A's still-running process: A's next report disagrees with A's own first.
+  const renewed = live.register(registration({ sessionId: "A", runtimeAttestation: second }), 60_000);
+  assert.deepEqual(renewed.runtimeAttestation, { ok: false, absence: "attestation_ambiguous" });
+  assert.deepEqual(live.getExact("ariadne", "codex", "B")?.runtimeAttestation, second);
 });

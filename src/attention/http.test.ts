@@ -1,0 +1,433 @@
+import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
+import { BrokerHttpServer } from "../broker/http.js";
+import { BrokerService, type SlackTransport } from "../broker/service.js";
+import { BrokerClient } from "../edge/broker-client.js";
+import { EdgeControlServer } from "../edge/control.js";
+import { LiveIngressRegistry } from "../edge/live-registry.js";
+import type { HeadlessDispatch, ProviderAdapter } from "../edge/providers.js";
+import { EdgeService } from "../edge/service.js";
+import { EdgeStore } from "../edge/store.js";
+import { udsRequest, udsRequestJson } from "../local/uds.js";
+import type { Receipt, SourceFile } from "./contract.js";
+import { harness, packet, seat, THREAD } from "./fixtures.js";
+import { bootAttentionRuntime } from "./runtime.js";
+
+const ADMIN = "a".repeat(40);
+
+const slack: SlackTransport = {
+  replay: async (channelId, threadTs) => ({ channelId, threadTs, fetchedAt: new Date().toISOString(), cursor: null, messages: [] }),
+  reply: async () => `${Date.now() / 1000}`,
+  react: async () => {},
+};
+
+async function stack(options: { attention?: boolean; validateThread?: (channelId: string, threadTs: string) => Promise<void> } = {}) {
+  const h = harness({ seats: [seat("fable", { edgeWorkspaces: [{ edgeId: "edge-a", cwd: tmpdir(), worktree: null }] })] });
+  const edgeToken = h.broker.createEdge("edge-a");
+  const runtime = bootAttentionRuntime({
+    broker: h.broker, clock: h.clock, adminToken: ADMIN, env: { HIVE_ATTENTION_ENABLED: "true" },
+    validateThread: options.validateThread ?? (async () => {}), log: () => {},
+  });
+  const service = new BrokerService(h.broker, slack);
+  const server = new BrokerHttpServer(service, { host: "127.0.0.1", port: 0, adminToken: ADMIN, review: null, attention: options.attention === false ? null : runtime.http });
+  const { port } = await server.start();
+  const baseUrl = `http://127.0.0.1:${port}`;
+  return { h, runtime, service, server, baseUrl, edgeToken };
+}
+
+async function call(baseUrl: string, method: string, path: string, headers: Record<string, string>, body?: unknown) {
+  const response = await fetch(`${baseUrl}${path}`, {
+    method,
+    headers: { ...headers, ...(body === undefined ? {} : { "content-type": "application/json" }) },
+    ...(body === undefined ? {} : { body: typeof body === "string" ? body : JSON.stringify(body) }),
+  });
+  return { status: response.status, body: await response.json() as Record<string, unknown> };
+}
+
+const operator = { authorization: `Bearer ${ADMIN}` };
+
+test("the broker surface authenticates its own callers and refuses malformed or oversized commands", async () => {
+  const { h, server, baseUrl, edgeToken } = await stack();
+  const edge = { authorization: `Bearer ${edgeToken}`, "x-hive-edge": "edge-a" };
+  try {
+    assert.equal((await call(baseUrl, "GET", "/v1/attention/capabilities", {})).status, 401);
+    assert.equal((await call(baseUrl, "GET", "/v1/attention/capabilities", { authorization: "Bearer wrong" })).status, 401);
+    const caps = await call(baseUrl, "GET", "/v1/attention/capabilities", edge);
+    assert.equal(caps.status, 200);
+    assert.equal(caps.body.enabled, true);
+    assert.equal(caps.body.broker_uuid, h.broker.brokerUuid);
+
+    const next = { schema_version: 1, command_id: randomUUID(), action: "next", payload: { human_id: "hakon", item_id: null } };
+    assert.equal((await call(baseUrl, "POST", "/v1/attention/commands", edge, next)).body.error, "source_required", "the edge socket alone cannot act for the human");
+    const empty = await call(baseUrl, "POST", "/v1/attention/commands", operator, next);
+    assert.equal(empty.status, 200);
+    assert.equal(empty.body.result, "empty");
+
+    const unknownField = await call(baseUrl, "POST", "/v1/attention/commands", operator, { ...next, command_id: randomUUID(), principal: "operator" });
+    assert.equal(unknownField.status, 422);
+    assert.equal(unknownField.body.error, "schema_rejected");
+    assert.equal((await call(baseUrl, "POST", "/v1/attention/commands", operator, "{not json")).status, 400);
+    const huge = { schema_version: 1, command_id: randomUUID(), action: "add", payload: { packet: { ...packet(), context: "x".repeat(70_000) }, return_source_id: null } };
+    assert.equal((await call(baseUrl, "POST", "/v1/attention/commands", operator, huge)).status, 413);
+
+    const seatCall = await call(baseUrl, "POST", "/v1/attention/commands",
+      { ...edge, "x-hive-attention-source": `src_${"0".repeat(32)}`, "x-hive-broker-uuid": randomUUID() },
+      { schema_version: 1, command_id: randomUUID(), action: "summon", payload: packet() });
+    assert.equal(seatCall.status, 409);
+    assert.equal(seatCall.body.error, "broker_mismatch", "a handle issued by another broker never writes here");
+
+    assert.equal((await call(baseUrl, "GET", "/v1/attention/sources", edge)).status, 403);
+    const bound = h.store.bindSource({ edgeId: "edge-a", operator: true }, {
+      schema_version: 1, command_id: randomUUID(), action: "source_bind",
+      payload: { project_id: "p", work_id: "w", return_mode: "none", thread: null,
+        evidence: { kind: "operator_binding", actor: "fable", session_id: null, session_verified: "none", provider: null, cwd: "/work" } },
+    }).receipt.source!;
+    assert.equal((await call(baseUrl, "GET", `/v1/attention/sources/${bound.source_id}`, edge)).status, 200, "an edge reads its own source");
+    const otherToken = h.broker.createEdge("edge-z");
+    assert.equal((await call(baseUrl, "GET", `/v1/attention/sources/${bound.source_id}`, { authorization: `Bearer ${otherToken}`, "x-hive-edge": "edge-z" })).status, 404,
+      "another edge's source answers as unknown");
+    assert.equal((await call(baseUrl, "GET", `/v1/attention/sources/${bound.source_id}`, operator)).status, 200);
+    // Shared item reads redact another edge's session, cwd and delivery.
+    const live = h.store.bindSource({ edgeId: "edge-a", operator: false }, {
+      schema_version: 1, command_id: randomUUID(), action: "source_bind",
+      payload: { project_id: "birthday-film", work_id: "parents-likeness-round-2", return_mode: "pinned_session", thread: THREAD,
+        evidence: { kind: "live_registration", actor: "fable", provider: "claude", session_id: "session-secret", cwd: "/home/fable/secret", surface_version: "t" } },
+    }).receipt.source!;
+    const rung = h.store.execute({ kind: "source", edgeId: "edge-a", sourceId: live.source_id }, { schema_version: 1, command_id: randomUUID(), action: "summon", payload: packet() }).receipt;
+    const path = `/v1/attention/items/${rung.item!.item_id}`;
+    const foreign = (await call(baseUrl, "GET", path, { authorization: `Bearer ${otherToken}`, "x-hive-edge": "edge-z" })).body as { source: { session_id: unknown; cwd: unknown } };
+    assert.equal(foreign.source.session_id, null);
+    assert.equal(foreign.source.cwd, null);
+    const own = (await call(baseUrl, "GET", path, edge)).body as { source: { session_id: unknown } };
+    assert.equal(own.source.session_id, "session-secret");
+    const queue = (await call(baseUrl, "GET", "/v1/attention/queue", { authorization: `Bearer ${otherToken}`, "x-hive-edge": "edge-z" })).body as { items: Array<{ source: { cwd: unknown } | null }> };
+    assert.ok(queue.items.every((item) => item.source === null || item.source.cwd === null));
+    assert.equal((await call(baseUrl, "GET", "/v1/attention/sources", operator)).status, 200);
+    assert.equal((await call(baseUrl, "GET", "/v1/attention/items/99", operator)).status, 404);
+    assert.equal((await call(baseUrl, "GET", `/v1/attention/commands/${randomUUID()}`, edge)).status, 404);
+  } finally {
+    await server.stop();
+    h.close();
+  }
+});
+
+test("an older broker without the attention surface answers 404 to an edge, never a fallback", async () => {
+  const { h, server, baseUrl, edgeToken } = await stack({ attention: false });
+  try {
+    const answer = await call(baseUrl, "GET", "/v1/attention/capabilities", { authorization: `Bearer ${edgeToken}`, "x-hive-edge": "edge-a" });
+    assert.equal(answer.status, 404);
+  } finally {
+    await server.stop();
+    h.close();
+  }
+});
+
+test("A17/A20/A36 a headless turn binds and summons through its edge; the human's response returns to the seat", async () => {
+  const { h, runtime, service, server, baseUrl, edgeToken } = await stack();
+  const root = mkdtempSync(join(tmpdir(), "hive-attention-e2e-"));
+  const socketPath = join(root, "edge.sock");
+  const edgeDb = join(root, "edge.sqlite");
+  const client = new BrokerClient(baseUrl, "edge-a", edgeToken);
+  let edgeStore = new EdgeStore(edgeDb);
+  const turns: Array<{ framed: string; context: HeadlessDispatch }> = [];
+  let sourceFile: SourceFile | null = null;
+  let summonReceipt: Receipt | null = null;
+  const adapter: ProviderAdapter = {
+    provider: "claude",
+    async deliverLive() { throw new Error("no live surface in this test"); },
+    async resume() { throw new Error("no session to resume"); },
+    async spawn(_subscription, _cwd, framed, context) {
+      turns.push({ framed, context });
+      if (turns.length === 1) {
+        // Inside the running turn: bind while the dispatch token is valid, then ring the bell.
+        const bound = await udsRequestJson<{ receipt: Receipt; source_file: SourceFile }>(socketPath, "POST", "/attention/bind", {
+          mode: "dispatch", token: context.token, command_id: randomUUID(), project_id: "birthday-film",
+          work_id: "parents-likeness-round-2", return_mode: "actor_context", thread: null,
+        });
+        sourceFile = bound.source_file;
+        // A caller can never name an actor or delivery to establish attribution.
+        const spoof = await udsRequest(socketPath, "POST", "/attention/act", {
+          handle: sourceFile.handle,
+          command: { schema_version: 1, command_id: randomUUID(), action: "summon", actor: "ariadne", payload: packet() },
+        });
+        assert.equal(spoof.status, 422);
+        summonReceipt = await udsRequestJson<Receipt>(socketPath, "POST", "/attention/act", {
+          handle: sourceFile.handle,
+          command: { schema_version: 1, command_id: randomUUID(), action: "summon", payload: packet() },
+        });
+      }
+      return { receipt: "{}", outcome: turns.length === 1 ? "Summoned the human for render selection." : "Rendering candidate C.", processed: true };
+    },
+  };
+  let edge = new EdgeService(client, edgeStore, new LiveIngressRegistry(), [adapter]);
+  let control = new EdgeControlServer(edge, { socketPath });
+  await control.start();
+  try {
+    service.ingest({
+      eventId: "EvWake", workspaceId: "T1", channelId: THREAD.channel_id, threadTs: THREAD.thread_ts, messageTs: "1760259601.000200",
+      senderId: "U1", senderKind: "user", actor: "fable", text: "WAKE: fable render round 2", raw: {}, receivedAt: h.clock.now().toISOString(),
+    });
+    assert.equal(await edge.processOne(), true);
+    assert.ok(sourceFile && summonReceipt);
+    const file = sourceFile as SourceFile;
+    const rung = summonReceipt as Receipt;
+    assert.equal(rung.result, "created");
+    assert.equal(file.actor, "fable");
+    assert.equal(file.broker_uuid, h.broker.brokerUuid);
+    assert.equal(h.broker.getDelivery(1).status, "processed", "the summons did not hold the turn open");
+    const stored = edgeStore.db.prepare("SELECT handle_hash FROM attention_source_handles").all() as Array<{ handle_hash: string }>;
+    assert.equal(stored.length, 1);
+    assert.notEqual(stored[0]!.handle_hash, file.handle, "only the hash is stored");
+
+    // The edge restarts; the persisted handle still resolves (A20).
+    await control.stop();
+    edgeStore.close();
+    edgeStore = new EdgeStore(edgeDb);
+    edge = new EdgeService(client, edgeStore, new LiveIngressRegistry(), [adapter]);
+    control = new EdgeControlServer(edge, { socketPath });
+    await control.start();
+    const amended = await udsRequestJson<Receipt>(socketPath, "POST", "/attention/act", {
+      handle: file.handle,
+      command: { schema_version: 1, command_id: randomUUID(), action: "amend", payload: { item_id: rung.item!.item_id, expected_revision: 1, fields: { estimate_minutes: 6 } } },
+    });
+    assert.equal(amended.item!.revision, 2);
+    const forged = await udsRequest(socketPath, "POST", "/attention/act", { handle: "ahs_" + "A".repeat(43), command: {} });
+    assert.equal(forged.status, 403);
+    // doctor's source check resolves the handle on this edge, not only the broker's source.
+    const healthy = await udsRequestJson<{ source_id: string }>(socketPath, "POST", "/attention/read", { op: "source_handle", handle: file.handle });
+    assert.equal(healthy.source_id, file.source_id);
+    const unusable = await udsRequest(socketPath, "POST", "/attention/read", { op: "source_handle", handle: "ahs_" + "A".repeat(43) });
+    assert.equal(unusable.status, 403);
+
+    // The human takes it and resolves with --next.
+    const taken = await call(baseUrl, "POST", "/v1/attention/commands", operator,
+      { schema_version: 1, command_id: randomUUID(), action: "next", payload: { human_id: "hakon", item_id: null } });
+    assert.equal(taken.body.result, "claimed");
+    assert.match(String((taken.body.selection as { brief: string }).brief), /Do: Select candidate A, B, C or D/u);
+    const resolved = await call(baseUrl, "POST", "/v1/attention/commands", operator, {
+      schema_version: 1, command_id: randomUUID(), action: "resolve",
+      payload: { item_id: rung.item!.item_id, expected_revision: 3, outcome: "selected", response: "Use candidate C; retain the current lighting.", select_next: true },
+    });
+    assert.equal(resolved.status, 200);
+    assert.equal((resolved.body.selection as { selection_reason: string }).selection_reason, "empty");
+
+    await runtime.publisher.drainOnce();
+    assert.equal(await edge.processOne(), true, "the protocol-1 edge claims the continuation");
+    assert.equal(turns.length, 2);
+    assert.match(turns[1]!.framed, /Message from hive-attention/u);
+    assert.match(turns[1]!.framed, /Human response \(verbatim\):\n<<<\nUse candidate C; retain the current lighting\.\n>>>/u);
+    assert.match(turns[1]!.framed, /context restored/u);
+    await runtime.publisher.drainOnce();
+    const shown = await udsRequestJson<{ return: { phase: string; transport_status: string } }>(socketPath, "POST", "/attention/read", { op: "item", item_id: rung.item!.item_id });
+    assert.equal(shown.return.phase, "processed");
+    assert.equal(shown.return.transport_status, "processed");
+  } finally {
+    await control.stop();
+    edgeStore.close();
+    await server.stop();
+    h.close();
+  }
+});
+
+test("A18/A19 live and operator bindings resolve through the edge's own registry, never a caller's claim", async () => {
+  const { h, server, baseUrl, edgeToken } = await stack();
+  const root = mkdtempSync(join(tmpdir(), "hive-attention-bind-"));
+  const socketPath = join(root, "edge.sock");
+  const store = new EdgeStore(join(root, "edge.sqlite"));
+  const live = new LiveIngressRegistry();
+  const edge = new EdgeService(new BrokerClient(baseUrl, "edge-a", edgeToken), store, live, []);
+  const control = new EdgeControlServer(edge, { socketPath });
+  await control.start();
+  const bind = (body: Record<string, unknown>) => udsRequest(socketPath, "POST", "/attention/bind", {
+    command_id: randomUUID(), project_id: "hive", work_id: "KRA-1500", thread: THREAD, ...body,
+  });
+  try {
+    // No registration: the actor's name alone proves nothing.
+    const unregistered = await bind({ mode: "live", actor: "fable", session_id: "session-A", return_mode: "pinned_session" });
+    assert.equal(unregistered.status, 404);
+
+    // The surface registers through the same socket a Claude hook uses.
+    await udsRequestJson(socketPath, "POST", "/live/register", {
+      actor: "fable", provider: "claude", socketPath: join(root, "inbox"), sessionId: "session-A", surfaceVersion: "claude-hook",
+      ttlMs: 60_000, cwd: root, attentionProtocol: 1,
+    });
+    const otherSession = await bind({ mode: "live", actor: "fable", session_id: "session-B", return_mode: "pinned_session" });
+    assert.equal(otherSession.status, 404, "an exact session, never the most recent one");
+    const pinned = JSON.parse((await bind({ mode: "live", actor: "fable", session_id: "session-A", return_mode: "pinned_session" })).body) as { receipt: Receipt };
+    assert.equal(pinned.receipt.source!.provenance, "live_registration");
+    assert.equal(pinned.receipt.source!.session_id, "session-A");
+    assert.equal(pinned.receipt.source!.cwd, root, "the observed cwd is recorded");
+
+    // Operator enrollment: refused without the credential, and an unverified session cannot pin.
+    const noCredential = await bind({ mode: "operator", actor: "fable", cwd: root, session_id: null, return_mode: "actor_context" });
+    assert.equal(noCredential.status, 403);
+    const guessed = await bind({ mode: "operator", operator_token: ADMIN, actor: "fable", cwd: root, session_id: "session-Z", return_mode: "pinned_session" });
+    assert.equal(guessed.status, 422);
+    assert.equal((JSON.parse(guessed.body) as { error: string }).error, "pinned_unavailable");
+    const verified = JSON.parse((await bind({ mode: "operator", operator_token: ADMIN, actor: "fable", cwd: root, session_id: "session-A", return_mode: "pinned_session" })).body) as { receipt: Receipt };
+    assert.equal(verified.receipt.source!.provenance, "operator_binding");
+    assert.equal(verified.receipt.source!.session_id, "session-A");
+    // Mid-migration: an old Codex registration is still live, but fable is enrolled on Claude.
+    // It never vouches for a session that a pinned return would resume through Claude.
+    await udsRequestJson(socketPath, "POST", "/live/register", {
+      actor: "fable", provider: "codex", socketPath: join(root, "codex.sock"), sessionId: "thread-M", surfaceVersion: "codex-live",
+      ttlMs: 60_000, cwd: root, attentionProtocol: 1,
+    });
+    const migrated = await bind({ mode: "operator", operator_token: ADMIN, actor: "fable", cwd: root, session_id: "thread-M", return_mode: "pinned_session" });
+    assert.equal(migrated.status, 403);
+    assert.equal((JSON.parse(migrated.body) as { error: string }).error, "source_evidence_rejected");
+    const wrongToken = await bind({ mode: "operator", operator_token: "x".repeat(40), actor: "fable", cwd: root, session_id: null, return_mode: "actor_context" });
+    assert.equal(wrongToken.status, 403);
+    const elsewhere = await bind({ mode: "operator", operator_token: ADMIN, actor: "fable", cwd: join(root, "missing"), session_id: null, return_mode: "actor_context" });
+    assert.equal(elsewhere.status, 422, "the cwd must exist on this edge");
+  } finally {
+    await control.stop();
+    store.close();
+    await server.stop();
+    h.close();
+  }
+});
+
+test("a committed dispatch bind is recovered after its response, its turn and the edge itself are gone", async () => {
+  const { h, server, baseUrl, edgeToken, service } = await stack();
+  const root = mkdtempSync(join(tmpdir(), "hive-attention-recover-"));
+  const socketPath = join(root, "edge.sock");
+  const edgeDb = join(root, "edge.sqlite");
+  const client = new BrokerClient(baseUrl, "edge-a", edgeToken);
+  const committedId = randomUUID();
+  const refusedId = randomUUID();
+  const work = { project_id: "birthday-film", work_id: "parents-likeness-round-2", thread: null };
+  let token = "";
+  const adapter: ProviderAdapter = {
+    provider: "claude",
+    async deliverLive() { throw new Error("no live surface in this test"); },
+    async resume() { throw new Error("no session to resume"); },
+    async spawn(_subscription, _cwd, _framed, context) {
+      token = context.token;
+      // The broker commits this bind; its answer never reaches the caller.
+      await udsRequest(socketPath, "POST", "/attention/bind", { mode: "dispatch", token, command_id: committedId, return_mode: "actor_context", ...work });
+      // This one reaches the broker but never commits: a spawned turn has no session to pin.
+      const pinned = await udsRequest(socketPath, "POST", "/attention/bind", { mode: "dispatch", token, command_id: refusedId, return_mode: "pinned_session", ...work });
+      assert.equal(pinned.status, 422);
+      return { receipt: "{}", outcome: "Bound, then the response was lost.", processed: true };
+    },
+  };
+  let edgeStore = new EdgeStore(edgeDb);
+  const edge = new EdgeService(client, edgeStore, new LiveIngressRegistry(), [adapter]);
+  let control = new EdgeControlServer(edge, { socketPath });
+  await control.start();
+  try {
+    service.ingest({
+      eventId: "EvRecover", workspaceId: "T1", channelId: THREAD.channel_id, threadTs: THREAD.thread_ts, messageTs: "1760259601.000300",
+      senderId: "U1", senderKind: "user", actor: "fable", text: "WAKE: fable bind and summon", raw: {}, receivedAt: h.clock.now().toISOString(),
+    });
+    assert.equal(await edge.processOne(), true);
+    assert.equal(h.broker.getDelivery(1).status, "processed", "the turn is over and its token with it");
+
+    // The edge restarts: nothing in memory survives.
+    await control.stop();
+    edgeStore.close();
+    edgeStore = new EdgeStore(edgeDb);
+    control = new EdgeControlServer(new EdgeService(client, edgeStore, new LiveIngressRegistry(), [adapter]), { socketPath });
+    await control.start();
+    const bind = (body: Record<string, unknown>) => udsRequest(socketPath, "POST", "/attention/bind", { return_mode: "actor_context", ...work, ...body });
+
+    const recovered = await bind({ mode: "dispatch", token, command_id: committedId });
+    assert.equal(recovered.status, 201);
+    const { receipt, source_file: file } = JSON.parse(recovered.body) as { receipt: Receipt; source_file: SourceFile };
+    assert.equal(receipt.replayed, true);
+    const sources = h.store.sources();
+    assert.equal(sources.length, 1, "recovery never enrolls a second source");
+    assert.equal(file.source_id, sources[0]!.source_id);
+    const summoned = await udsRequestJson<Receipt>(socketPath, "POST", "/attention/act", {
+      handle: file.handle, command: { schema_version: 1, command_id: randomUUID(), action: "summon", payload: packet() },
+    });
+    assert.equal(summoned.result, "created", "the recovered handle is usable");
+
+    // A command id is not a secret: a peer that learned it, with its own token or none, gets nothing.
+    const peer = await bind({ mode: "dispatch", token: "peer-turn-token", command_id: committedId });
+    assert.equal(peer.status, 403);
+    assert.equal((JSON.parse(peer.body) as { error: string }).error, "unknown_dispatch_token");
+    const bare = await bind({ mode: "recover", command_id: committedId });
+    assert.equal(bare.status, 403);
+    assert.equal((JSON.parse(bare.body) as { error: string }).error, "operator_required");
+    const forgedOperator = await bind({ mode: "recover", command_id: committedId, operator_token: "x".repeat(40) });
+    assert.equal(forgedOperator.status, 403, "the broker checks the operator credential");
+
+    // The operator recovers the seat's committed bind by id alone, after the turn is gone.
+    const byOperator = await bind({ mode: "recover", command_id: committedId, operator_token: ADMIN });
+    assert.equal(byOperator.status, 201);
+    assert.equal((JSON.parse(byOperator.body) as { source_file: SourceFile }).source_file.source_id, file.source_id);
+
+    // Changed content under the same command id is a conflict, never a second source.
+    const changed = await bind({ mode: "dispatch", token, command_id: committedId, work_id: "another-work" });
+    assert.equal(changed.status, 409);
+    assert.equal((JSON.parse(changed.body) as { error: string }).error, "command_id_conflict");
+
+    // A bind that never committed is not recoverable, and its expired token proves nothing.
+    const stale = await bind({ mode: "dispatch", token, command_id: refusedId });
+    assert.equal(stale.status, 403);
+    assert.equal((JSON.parse(stale.body) as { error: string }).error, "unknown_dispatch_token");
+    const unknown = await bind({ mode: "recover", command_id: randomUUID(), operator_token: ADMIN });
+    assert.equal(unknown.status, 404);
+    assert.equal((JSON.parse(unknown.body) as { error: string }).error, "bind_not_committed");
+    assert.equal(h.store.sources().length, 1);
+  } finally {
+    await control.stop();
+    edgeStore.close();
+    await server.stop();
+    h.close();
+  }
+});
+
+test("only Slack's definitive answer refuses a return thread; its transient trouble is retryable", async () => {
+  let failure: unknown = null;
+  const { h, server, baseUrl, edgeToken } = await stack({ validateThread: async () => { if (failure !== null) throw failure; } });
+  const edge = { authorization: `Bearer ${edgeToken}`, "x-hive-edge": "edge-a" };
+  const bind = () => call(baseUrl, "POST", "/v1/attention/sources", edge, {
+    schema_version: 1, command_id: randomUUID(), action: "source_bind",
+    payload: {
+      project_id: "hive", work_id: "KRA-1500", return_mode: "actor_context", thread: THREAD,
+      evidence: { kind: "live_registration", actor: "fable", provider: "claude", session_id: "s-1", cwd: "/work", surface_version: "claude-hook" },
+    },
+  });
+  const platform = (error: string) => Object.assign(new Error(error), { code: "slack_webapi_platform_error", data: { ok: false, error } });
+  try {
+    for (const [thrown, status, code] of [
+      [platform("thread_not_found"), 422, "invalid_thread"],
+      [platform("channel_not_found"), 422, "invalid_thread"],
+      [platform("ratelimited"), 503, "slack_unavailable"],
+      [platform("internal_error"), 503, "slack_unavailable"],
+      [Object.assign(new Error("429"), { code: "slack_webapi_rate_limited_error" }), 503, "slack_unavailable"],
+      [Object.assign(new Error("ECONNRESET"), { code: "slack_webapi_request_error" }), 503, "slack_unavailable"],
+    ] as const) {
+      failure = thrown;
+      const answer = await bind();
+      assert.equal(answer.status, status, String(code));
+      assert.equal(answer.body.error, code);
+    }
+    assert.equal(h.store.sources().length, 0, "nothing was bound");
+    failure = null;
+    assert.equal((await bind()).status, 201);
+  } finally {
+    await server.stop();
+    h.close();
+  }
+});
+
+test("the queue's human cannot also be an enrolled actor", () => {
+  const h = harness({ seats: [seat("fable"), seat("hakon")] });
+  try {
+    const boot = (enabled: string) => bootAttentionRuntime({
+      broker: h.broker, clock: h.clock, adminToken: ADMIN, env: { HIVE_ATTENTION_ENABLED: enabled, HIVE_ATTENTION_HUMAN_ID: "hakon" },
+      validateThread: async () => {}, log: () => {},
+    });
+    assert.throws(() => boot("true"), /also an enrolled actor/u);
+  } finally {
+    h.close();
+  }
+});

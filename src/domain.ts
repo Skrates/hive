@@ -1,5 +1,6 @@
 import { isAbsolute } from "node:path";
 import { z } from "zod";
+import type { AttentionContinuationTarget } from "./attention/contract.generated.js";
 
 export const WakePolicySchema = z.enum(["live_only", "resume", "spawn"]);
 export type WakePolicy = z.infer<typeof WakePolicySchema>;
@@ -339,6 +340,15 @@ export interface Delivery {
   updatedAt: string;
   subscription: Subscription;
   event: SlackEventInput;
+  /**
+   * ADR-0004: the broker-derived route of an attention return, written on the delivery in the
+   * mint transaction and read on every transition. Null on every ordinary delivery. The
+   * subscription snapshot above stays intact; a target derives a per-delivery session/cwd from
+   * it (`effectiveDeliveryRoute`) and never replaces its permission profile.
+   */
+  continuationTarget: AttentionContinuationTarget | null;
+  /** The attention edge protocol a claim must declare to receive this delivery; 0 for ordinary rows. */
+  requiredEdgeProtocol: number;
 }
 
 export const DeliveryResultInputSchema = z.object({

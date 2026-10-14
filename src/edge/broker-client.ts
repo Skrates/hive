@@ -46,9 +46,15 @@ export class BrokerClient {
     await this.json(await this.request("/v1/health", { method: "POST", body: JSON.stringify(report), signal: AbortSignal.any([AbortSignal.timeout(15_000), ...(signal ? [signal] : [])]) }));
   }
 
-  async claim(after: number, waitMs = 25_000, busySlots: readonly BusySlot[] = []): Promise<Delivery | null> {
+  /**
+   * `attentionProtocol` is declared on every claim this edge makes (ADR-0004): an upgraded edge
+   * that enforces attention route constraints says so per request, so a rolled-back build that
+   * stops saying it can never receive a constrained continuation.
+   */
+  async claim(after: number, waitMs = 25_000, busySlots: readonly BusySlot[] = [], attentionProtocol = 0): Promise<Delivery | null> {
     const busy = busySlots.length > 0 ? `&busy=${encodeURIComponent(formatBusySlots(busySlots))}` : "";
-    const response = await this.request(`/v1/deliveries?after=${after}&wait_ms=${waitMs}${busy}`, { method: "GET" });
+    const protocol = attentionProtocol > 0 ? `&attention_protocol=${attentionProtocol}` : "";
+    const response = await this.request(`/v1/deliveries?after=${after}&wait_ms=${waitMs}${busy}${protocol}`, { method: "GET" });
     if (response.status === 204) return null;
     return this.json<Delivery>(response);
   }
@@ -197,13 +203,33 @@ export class BrokerClient {
     return this.json<Delivery>(response);
   }
 
-  private request(path: string, init: RequestInit): Promise<Response> {
+  /**
+   * ADR-0004: one attention request under this edge's machine credential, answered as status +
+   * raw body so the control plane relays the broker's own answer unchanged. Bounded by an
+   * enforced timeout with cancellation; a timeout proves nothing about commit, so the caller
+   * reconciles with the command id it already holds.
+   */
+  async attention(
+    method: "GET" | "POST",
+    path: string,
+    options: { body?: unknown; headers?: Record<string, string>; timeoutMs?: number } = {},
+  ): Promise<{ status: number; body: string }> {
+    const response = await this.request(path, {
+      method,
+      ...(options.body === undefined ? {} : { body: JSON.stringify(options.body) }),
+      signal: AbortSignal.timeout(options.timeoutMs ?? 10_000),
+    }, options.headers ?? {});
+    return { status: response.status, body: await response.text() };
+  }
+
+  private request(path: string, init: RequestInit, extraHeaders: Record<string, string> = {}): Promise<Response> {
     return fetch(`${this.baseUrl}${path}`, {
       ...init,
       headers: {
         authorization: `Bearer ${this.token}`,
         "x-hive-edge": this.edgeId,
         ...(init.body ? { "content-type": "application/json" } : {}),
+        ...extraHeaders,
       },
     });
   }

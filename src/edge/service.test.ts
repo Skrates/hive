@@ -17,6 +17,8 @@ import {
 import { headlessAcknowledgement, type HeadlessDispatch } from "./providers.js";
 import { EdgeService } from "./service.js";
 import { EdgeStore, type AttestationBinding } from "./store.js";
+import type { AttentionContinuationTarget } from "../attention/contract.js";
+import { profileFingerprint } from "../attention/route.js";
 
 /** These tests exercise generation/attempt fencing, not attestation binding. */
 const unbound: AttestationBinding = { attestationId: null, doctrineCommit: null, absence: "no_attestation_file" };
@@ -95,6 +97,8 @@ function delivery(id: number, overrides: Partial<Delivery> = {}): Delivery {
     coalesceKey: `ariadne:C1:100.1`,
     coalescedEventIds: [`Ev${id}`],
     coalescedMessages: [],
+    continuationTarget: null,
+    requiredEdgeProtocol: 0,
     initialSnapshot: null,
     snapshotTs: null,
     createdAt: "2026-08-01T00:00:00.000Z",
@@ -339,6 +343,8 @@ test("a completion-tracked Codex live injection commits its final response as th
     surfaceVersion: "test",
     // Required: a registration names its attestation or names its absence.
     runtimeAttestation: { ok: false, absence: "attestation_unreported" },
+    cwd: null,
+    attentionProtocol: 0,
   }, 60_000);
   const edge = new EdgeService(asBrokerClient(broker), store, live, [adapter]);
 
@@ -375,6 +381,8 @@ test("a two-slot actor never takes the live route, even with a live registration
     sessionId: "thread-1",
     surfaceVersion: "test",
     runtimeAttestation: { ok: false, absence: "attestation_unreported" },
+    cwd: null,
+    attentionProtocol: 0,
   }, 60_000);
   const edge = new EdgeService(asBrokerClient(broker), store, live, [adapter]);
 
@@ -414,6 +422,8 @@ test("a live Desktop account rejection terminalizes without an uncertainty retry
     surfaceVersion: "test",
     // Required: a registration names its attestation or names its absence.
     runtimeAttestation: { ok: false, absence: "attestation_unreported" },
+    cwd: null,
+    attentionProtocol: 0,
   }, 60_000);
   const edge = new EdgeService(asBrokerClient(broker), store, live, [adapter]);
 
@@ -623,6 +633,8 @@ test("a live surface that omitted its attestation binds as unreported, not the p
     surfaceVersion: "test",
     // Required: a registration names its attestation or names its absence.
     runtimeAttestation: { ok: false, absence: "attestation_unreported" },
+    cwd: null,
+    attentionProtocol: 0,
   }, 60_000);
   const edge = new EdgeService(asBrokerClient(broker), store, live, [new StubAdapter({ liveResult: { processed: true, receipt: "live", outcome: "done" } })]);
 
@@ -692,6 +704,8 @@ test("a reinstall under a live session records the ambiguity instead of guessing
     socketPath: "/tmp/x.sock",
     sessionId: "thread-1",
     surfaceVersion: "test",
+    cwd: null,
+    attentionProtocol: 0,
     runtimeAttestation: {
       ok: true,
       attestation: {
@@ -707,6 +721,8 @@ test("a reinstall under a live session records the ambiguity instead of guessing
     socketPath: "/tmp/x.sock",
     sessionId: "thread-1",
     surfaceVersion: "test",
+    cwd: null,
+    attentionProtocol: 0,
     runtimeAttestation: {
       ok: true,
       attestation: {
@@ -751,6 +767,8 @@ test("a live Desktop delivery binds to the surface's runtime home, not the pinne
     socketPath: "/tmp/x.sock",
     sessionId: "desktop-task",
     surfaceVersion: "test",
+    cwd: null,
+    attentionProtocol: 0,
     runtimeAttestation: {
       ok: true,
       attestation: {
@@ -820,6 +838,8 @@ test("dispatch keeps the live route captured at claim when the registry is repla
     socketPath: "/tmp/claimed.sock",
     sessionId: "thread-1",
     surfaceVersion: "test",
+    cwd: null,
+    attentionProtocol: 0,
     runtimeAttestation: {
       ok: true,
       attestation: {
@@ -833,11 +853,13 @@ test("dispatch keeps the live route captured at claim when the registry is repla
   const broker = new MutatingAcceptBroker(
     [delivery(1, { subscription: subscription({ wakePolicy: "live_only" }) })],
     () => {
-      live.deregister("ariadne", "codex");
+      live.deregister("ariadne", "codex", "thread-1");
       live.register({
         actor: "ariadne",
         provider: "codex",
         socketPath: "/tmp/replacement.sock",
+        cwd: null,
+        attentionProtocol: 0,
         sessionId: "thread-2",
         surfaceVersion: "test",
         runtimeAttestation: {
@@ -872,6 +894,8 @@ test("a live route that expires after claim still dispatches to that surface, no
     socketPath: "/tmp/claimed.sock",
     sessionId: "thread-1",
     surfaceVersion: "test",
+    cwd: null,
+    attentionProtocol: 0,
     runtimeAttestation: {
       ok: true,
       attestation: {
@@ -884,7 +908,7 @@ test("a live route that expires after claim still dispatches to that surface, no
 
   const broker = new MutatingAcceptBroker(
     [delivery(1)],
-    () => { live.deregister("ariadne", "codex"); },
+    () => { live.deregister("ariadne", "codex", "thread-1"); },
   );
   const store = new EdgeStore(":memory:");
   const adapter = new StubAdapter({
@@ -916,6 +940,8 @@ test("a live surface that appears after claim does not steal a headless dispatch
         actor: "ariadne",
         provider: "codex",
         socketPath: "/tmp/late.sock",
+        cwd: null,
+        attentionProtocol: 0,
         sessionId: "desktop-task",
         surfaceVersion: "test",
         runtimeAttestation: {
@@ -1005,9 +1031,11 @@ test("a mixed-case live registration is found under the canonical actor key", ()
     sessionId: "s1",
     surfaceVersion: "test",
     runtimeAttestation: { ok: false, absence: "attestation_unreported" },
+    cwd: null,
+    attentionProtocol: 0,
   }, 60_000);
   assert.ok(live.get("gnomon", "claude"), "canonical lookup finds the mixed-case registration");
-  live.deregister("GNOMON", "claude");
+  live.deregister("GNOMON", "claude", "s1");
   assert.equal(live.get("gnomon", "claude"), null);
 });
 
@@ -1087,6 +1115,8 @@ test("a live delivery that carries an Effort overlay publishes that it did not a
     sessionId: "thread-1",
     surfaceVersion: "test",
     runtimeAttestation: { ok: false, absence: "attestation_unreported" },
+    cwd: null,
+    attentionProtocol: 0,
   }, 60_000);
   const edge = new EdgeService(asBrokerClient(broker), store, live, [adapter]);
   assert.equal(await edge.processOne(), true);
@@ -1151,6 +1181,8 @@ test("a live delivery with a conflicting Effort overlay publishes the conflict, 
     sessionId: "thread-1",
     surfaceVersion: "test",
     runtimeAttestation: { ok: false, absence: "attestation_unreported" },
+    cwd: null,
+    attentionProtocol: 0,
   }, 60_000);
   const edge = new EdgeService(asBrokerClient(broker), store, live, [adapter]);
   assert.equal(await edge.processOne(), true);
@@ -1163,3 +1195,152 @@ test("a live delivery with a conflicting Effort overlay publishes the conflict, 
   store.close();
 });
 
+
+// ADR-0004: exact-session attention returns at the edge.
+function pinnedTarget(sub: Subscription, cwd: string, sessionId = "thread-captured"): AttentionContinuationTarget {
+  return {
+    kind: "attention_return",
+    protocol: 1,
+    source_id: `src_${"a".repeat(32)}`,
+    resolution_command_id: "5c0f2c1e-8b8e-4c55-a3a6-0e5c8f8f2d10",
+    generation: 1,
+    actor: sub.actor,
+    mode: "pinned_session",
+    pinned: { provider: sub.provider, home_edge: sub.homeEdge, account_profile_fingerprint: profileFingerprint(sub), session_id: sessionId, cwd },
+  };
+}
+
+class RouteRecorder implements ProviderAdapter {
+  readonly provider = "codex" as const;
+  readonly calls: Array<{ route: "live" | "resume" | "spawn"; sessionId: string | null; cwd: string | null; socket?: string }> = [];
+  async deliverLive(ingress: LiveIngress): Promise<ProviderDispatch> {
+    this.calls.push({ route: "live", sessionId: ingress.sessionId, cwd: ingress.cwd, socket: ingress.socketPath });
+    return { receipt: "live", outcome: "done", processed: true };
+  }
+  async resume(sub: Subscription, cwd: string): Promise<ProviderDispatch> {
+    this.calls.push({ route: "resume", sessionId: sub.sessionId, cwd });
+    return { receipt: "resume", outcome: "done", processed: true };
+  }
+  async spawn(sub: Subscription, cwd: string): Promise<ProviderDispatch> {
+    this.calls.push({ route: "spawn", sessionId: sub.sessionId, cwd });
+    return { receipt: "spawn", outcome: "done", processed: true };
+  }
+}
+
+function liveEntry(live: LiveIngressRegistry, sessionId: string, options: { attentionProtocol?: number; cwd?: string | null; socket?: string } = {}): void {
+  live.register({
+    actor: "ariadne", provider: "codex", socketPath: options.socket ?? "/tmp/live.sock", sessionId, surfaceVersion: "test",
+    runtimeAttestation: { ok: false, absence: "attestation_unreported" },
+    cwd: options.cwd === undefined ? null : options.cwd, attentionProtocol: options.attentionProtocol ?? 1,
+  }, 60_000);
+}
+
+async function runPinned(sub: Subscription, live: LiveIngressRegistry, target: AttentionContinuationTarget) {
+  const broker = new FakeBroker([delivery(70, { subscription: sub, continuationTarget: target, requiredEdgeProtocol: 1 })]);
+  const adapter = new RouteRecorder();
+  const store = new EdgeStore(":memory:");
+  await new EdgeService(asBrokerClient(broker), store, live, [adapter]).processOne();
+  store.close();
+  return { broker, adapter };
+}
+
+test("A25 a pinned return goes live only into the captured session through a protocol-1 surface", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "hive-pinned-"));
+  const sub = subscription({ sessionId: "thread-1", wakePolicy: "resume" });
+  const exact = new LiveIngressRegistry();
+  liveEntry(exact, "thread-captured", { cwd });
+  assert.deepEqual((await runPinned(sub, exact, pinnedTarget(sub, cwd))).adapter.calls.map((call) => call.route), ["live"]);
+
+  // The actor's live surface is another session: the captured one is resumed instead — the
+  // per-delivery session and cwd, never the subscription's own pinned thread, never a spawn.
+  const other = new LiveIngressRegistry();
+  liveEntry(other, "thread-someone-else");
+  const resumed = (await runPinned(sub, other, pinnedTarget(sub, cwd))).adapter.calls;
+  assert.deepEqual(resumed, [{ route: "resume", sessionId: "thread-captured", cwd }]);
+
+  // The captured session is live but through a surface that cannot honour the constraint,
+  // in another cwd, or without reporting its cwd at all: never handed the envelope, and never
+  // resumed beside the open session.
+  for (const unsuitable of [{ attentionProtocol: 0, cwd }, { cwd: "/elsewhere" }, { cwd: null }]) {
+    const registry = new LiveIngressRegistry();
+    liveEntry(registry, "thread-captured", unsuitable);
+    const { adapter, broker } = await runPinned(sub, registry, pinnedTarget(sub, cwd));
+    assert.deepEqual(adapter.calls, []);
+    assert.equal(broker.finishes[0]!.result.status, "undeliverable");
+    assert.equal(broker.finishes[0]!.result.reasons[0]!.code, "attention_live_surface_incompatible");
+  }
+});
+
+test("A25 a newer session of the actor never hides that the captured session is still live", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "hive-pinned-"));
+  const sub = subscription({ sessionId: "thread-1", wakePolicy: "resume" });
+  let clock = 1_000_000;
+  const live = new LiveIngressRegistry({ now: () => clock });
+  liveEntry(live, "thread-captured", { cwd, socket: "/tmp/captured.sock" });
+  liveEntry(live, "thread-newer", { cwd, socket: "/tmp/newer.sock" });
+  const both = (await runPinned(sub, live, pinnedTarget(sub, cwd))).adapter.calls;
+  assert.deepEqual(both.map((call) => [call.route, call.socket]), [["live", "/tmp/captured.sock"]],
+    "into the captured session's own surface — never a resume beside it");
+
+  // Only the captured session's own lapsed heartbeat lets it be resumed.
+  clock += 60_001;
+  liveEntry(live, "thread-newer", { cwd, socket: "/tmp/newer.sock" });
+  const lapsed = (await runPinned(sub, live, pinnedTarget(sub, cwd))).adapter.calls;
+  assert.deepEqual(lapsed, [{ route: "resume", sessionId: "thread-captured", cwd }]);
+});
+
+test("a delivery from a broker that predates the continuation field routes ordinarily", async () => {
+  const legacy = delivery(71) as Partial<Delivery>;
+  delete legacy.continuationTarget;
+  delete legacy.requiredEdgeProtocol;
+  const broker = new FakeBroker([legacy as Delivery]);
+  const adapter = new RouteRecorder();
+  const store = new EdgeStore(":memory:");
+  await new EdgeService(asBrokerClient(broker), store, new LiveIngressRegistry(), [adapter]).processOne();
+  store.close();
+  assert.deepEqual(adapter.calls.map((call) => call.route), ["resume"]);
+  assert.equal(broker.finishes[0]!.result.status, "processed");
+});
+
+test("A27 live_only stays live-only, a lost cwd fails visibly, and a pinned return never spawns", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "hive-pinned-"));
+  const liveOnly = subscription({ wakePolicy: "live_only", sessionId: null });
+  const refused = await runPinned(liveOnly, new LiveIngressRegistry(), pinnedTarget(liveOnly, cwd));
+  assert.deepEqual(refused.adapter.calls, []);
+  assert.equal(refused.broker.finishes[0]!.result.status, "undeliverable");
+  assert.equal(refused.broker.finishes[0]!.result.reasons[0]!.code, "attention_session_unavailable");
+
+  const spawnPolicy = subscription({ wakePolicy: "spawn", sessionId: null });
+  const missing = await runPinned(spawnPolicy, new LiveIngressRegistry(), pinnedTarget(spawnPolicy, join(cwd, "gone")));
+  assert.deepEqual(missing.adapter.calls, []);
+  assert.equal(missing.broker.finishes[0]!.result.reasons[0]!.code, "attention_cwd_missing");
+
+  const resumed = await runPinned(spawnPolicy, new LiveIngressRegistry(), pinnedTarget(spawnPolicy, cwd));
+  assert.deepEqual(resumed.adapter.calls.map((call) => call.route), ["resume"]);
+
+  // Profile drift between mint and dispatch is an explicit route failure, not a reroute.
+  const drifted = await runPinned({ ...spawnPolicy, accountProfile: "/profiles/other" }, new LiveIngressRegistry(), pinnedTarget(spawnPolicy, cwd));
+  assert.deepEqual(drifted.adapter.calls, []);
+  assert.equal(drifted.broker.finishes[0]!.result.reasons[0]!.code, "attention_route_drift");
+});
+
+test("A28 a context-restored return to a multi-slot actor uses normal slot allocation and cwd", async () => {
+  const sub = subscription({ turnSlots: 2, sessionId: null, edgeWorkspaces: [{ edgeId: "mac", cwd: "/work/slot-{slot}", worktree: null }] });
+  const target: AttentionContinuationTarget = { ...pinnedTarget(sub, "/old/worktree"), mode: "actor_context", pinned: null };
+  const live = new LiveIngressRegistry();
+  liveEntry(live, "thread-captured", { cwd: "/old/worktree" });
+  const { adapter } = await runPinned(sub, live, target);
+  assert.deepEqual(adapter.calls, [{ route: "spawn", sessionId: null, cwd: "/work/slot-1" }], "no old worktree is resumed behind the scheduler");
+});
+
+test("the edge declares attention protocol 1 on every claim", async () => {
+  const seen: number[] = [];
+  const broker = {
+    edgeId: "mac",
+    async claim(_after: number, _wait: number, _busy: readonly BusySlot[], protocol: number) { seen.push(protocol); return null; },
+  };
+  const store = new EdgeStore(":memory:");
+  await new EdgeService(broker as unknown as BrokerClient, store, new LiveIngressRegistry(), []).processOne();
+  assert.deepEqual(seen, [1]);
+  store.close();
+});

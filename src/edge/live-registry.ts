@@ -30,6 +30,18 @@ export interface LiveIngressRegistration {
    * behind it.
    */
   readonly runtimeAttestation: AttestationRead;
+  /**
+   * ADR-0004: the working directory the surface observed for this session, or null when it
+   * did not report one. Null is a named absence, never evidence: an exact-session return
+   * needs a cwd, so a surface that reports none can only ever take context-restored returns.
+   */
+  readonly cwd: string | null;
+  /**
+   * The attention protocol this surface's receiver enforces (exact-session check before
+   * accepting a constrained envelope). 0 means it predates attention: the edge never hands it
+   * a pinned return, and resumes instead where policy permits.
+   */
+  readonly attentionProtocol: number;
 }
 
 export interface LiveIngress extends LiveIngressRegistration {
@@ -45,6 +57,12 @@ export class LiveIngressRegistryError extends Error {
 
 export class LiveIngressRegistry {
   private readonly entries = new Map<string, LiveIngress>();
+  /**
+   * ADR-0004: the latest registration of every session, not only the actor's most recent one.
+   * Two sessions of one actor can be open at once; a newer registration says nothing about
+   * whether the older session stopped, and only its own lapsed heartbeat does.
+   */
+  private readonly sessions = new Map<string, LiveIngress>();
   private readonly now: () => number;
 
   constructor(dependencies: { now?: () => number } = {}) {
@@ -56,7 +74,11 @@ export class LiveIngressRegistry {
       throw new LiveIngressRegistryError("live_binding_invalid_ttl");
     }
     const bindingKey = key(input.actor, input.provider);
-    const previous = this.entries.get(bindingKey);
+    // The prior report of THIS session, even when another session of the actor
+    // registered in between; a session-less surface has only the actor's entry.
+    const previous = input.sessionId === null
+      ? this.entries.get(bindingKey)
+      : this.sessions.get(`${bindingKey}:${input.sessionId}`);
     // A new sessionId, or a lapsed heartbeat, is a different claim entirely and
     // takes whatever the surface just sent. Within one unexpired sessionId the
     // reports are reconciled, not overwritten — see retainedAttestation.
@@ -71,6 +93,12 @@ export class LiveIngressRegistry {
       expiresAt: this.now() + ttlMs,
     });
     this.entries.set(bindingKey, entry);
+    if (entry.sessionId !== null) {
+      for (const [sessionKey, held] of this.sessions) {
+        if (held.expiresAt <= this.now()) this.sessions.delete(sessionKey);
+      }
+      this.sessions.set(`${bindingKey}:${entry.sessionId}`, entry);
+    }
     return entry;
   }
 
@@ -86,12 +114,43 @@ export class LiveIngressRegistry {
   }
 
   /**
+   * ADR-0004 lookup: the unexpired registration for exactly this actor, provider and session,
+   * whether or not another session of the actor registered since — never "the most recent
+   * conversation". A lapsed or withdrawn session is null.
+   */
+  getExact(actor: string, provider: Provider, sessionId: string): LiveIngress | null {
+    const sessionKey = `${key(actor, provider)}:${sessionId}`;
+    const entry = this.sessions.get(sessionKey);
+    if (!entry) return null;
+    if (entry.expiresAt <= this.now()) {
+      this.sessions.delete(sessionKey);
+      return null;
+    }
+    return entry;
+  }
+
+  /**
    * A surface that knows it is going away withdraws its claim immediately —
    * a terminal Claude Stop must not leave a heartbeat promising a boundary
    * that will never come. Idempotent: deregistering an absent binding is fine.
+   *
+   * Only the session that stopped is withdrawn: another session of the same
+   * actor stays registered, and when the stopped one was the actor's current
+   * route, ordinary routing falls back to the most recently renewed session
+   * still live.
    */
-  deregister(actor: string, provider: Provider): void {
-    this.entries.delete(key(actor, provider));
+  deregister(actor: string, provider: Provider, sessionId: string | null): void {
+    const bindingKey = key(actor, provider);
+    if (sessionId !== null) this.sessions.delete(`${bindingKey}:${sessionId}`);
+    const current = this.entries.get(bindingKey);
+    if (current === undefined || current.sessionId !== sessionId) return;
+    this.entries.delete(bindingKey);
+    let fallback: LiveIngress | undefined;
+    for (const [sessionKey, held] of this.sessions) {
+      if (!sessionKey.startsWith(`${bindingKey}:`) || held.expiresAt <= this.now()) continue;
+      if (fallback === undefined || held.expiresAt > fallback.expiresAt) fallback = held;
+    }
+    if (fallback !== undefined) this.entries.set(bindingKey, fallback);
   }
 }
 

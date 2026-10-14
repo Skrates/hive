@@ -17,6 +17,8 @@ import type {
 import { ACTOR_ID_PATTERN, busySlotKey, canonicalActor, EVERYONE, isSlackMessageTs, retryBackoffMs } from "../domain.js";
 import type { Clock } from "../time.js";
 import { iso, systemClock } from "../time.js";
+import type { AttentionContinuationTarget } from "../attention/contract.generated.js";
+import { effectiveDeliveryRoute } from "../attention/route.js";
 
 interface Row { [key: string]: unknown }
 
@@ -115,8 +117,16 @@ function mintCustodyDetail(source: Delivery, edgeId: string, generation: number)
  * Review design §8.1: a system-origin delivery to a seat. `dedupeKey` is the whole of the
  * mint's identity — the review publisher derives it from the effect it is dispatching, so a
  * redelivery of the same effect is a replay, never a second wake.
+ *
+ * ADR-0004 adds an internal origin discriminator. Absent means `review`, and a review mint's
+ * event id, sender, render and coalescing are exactly what they were; an attention return
+ * names its own origin and attribution, so it never impersonates the review machine. Neither
+ * shape is reachable from an edge: this is an in-process broker primitive only.
  */
-export interface SystemWakeMint {
+export type SystemWakeMint = ReviewSystemWakeMint | AttentionSystemWakeMint;
+
+export interface ReviewSystemWakeMint {
+  origin?: "review";
   actor: string;
   channelId: string;
   threadTs: string | null;
@@ -124,8 +134,35 @@ export interface SystemWakeMint {
   dedupeKey: string;
 }
 
+export interface AttentionSystemWakeMint {
+  origin: "attention";
+  actor: string;
+  channelId: string;
+  /** Always the source's real Slack thread; an attention return never posts top-level. */
+  threadTs: string;
+  text: string;
+  /** `<resolution_command_id>:<generation>` — one logical continuation per generation. */
+  dedupeKey: string;
+  /** The commons render; the full continuation lives in the ledger, not in Slack. */
+  render: string;
+  continuationTarget: AttentionContinuationTarget;
+}
+
 /** The sender id every system-origin review wake carries (`senderKind: "app"`). */
 export const SYSTEM_WAKE_SENDER = "hive-review";
+/** The sender id of an attention return (`senderKind: "app"`). */
+export const ATTENTION_WAKE_SENDER = "hive-attention";
+
+/**
+ * Internal ingest options. A coalescing identity, continuation target and edge-protocol floor
+ * are broker-derived only — never parsed from Slack text or a seat packet.
+ */
+export interface IngestOptions {
+  /** Replaces the ordinary `actor:channel:thread` group; only deliveries sharing it coalesce. */
+  coalesceKey?: string;
+  continuationTarget?: AttentionContinuationTarget | null;
+  requiredEdgeProtocol?: number;
+}
 
 export interface OutboxEntry {
   outboxId: number;
@@ -345,6 +382,7 @@ export class BrokerStore {
     `);
     this.ensureOutboxReactionColumns();
     this.ensureTurnSlotSchema();
+    this.ensureAttentionDeliveryColumns();
     this.canonicalizePersistedActors();
     this.refusePersistedActorsOutsideGrammar();
   }
@@ -440,8 +478,11 @@ export class BrokerStore {
           }
         }
         // The coalesce key is `actor:channel:thread` — derived data that would
-        // otherwise keep the pre-canonical name and split the thread in two.
-        for (const row of this.db.prepare("SELECT delivery_id, actor, coalesce_key FROM deliveries").all() as Row[]) {
+        // otherwise keep the pre-canonical name and split the thread in two. An attention
+        // return's key (`attention-return:…`) carries no actor and is left exactly as minted.
+        for (const row of this.db.prepare(
+          "SELECT delivery_id, actor, coalesce_key FROM deliveries WHERE coalesce_key NOT LIKE 'attention-return:%'",
+        ).all() as Row[]) {
           const key = String(row.coalesce_key);
           const rebuilt = [String(row.actor), ...key.split(":").slice(1)].join(":");
           if (rebuilt === key) continue;
@@ -529,6 +570,21 @@ export class BrokerStore {
         `);
       }
     })();
+  }
+
+  /**
+   * Forward-only, additive (ADR-0004): delivery routing metadata for attention returns.
+   * Ordinary rows keep null / 0 and route exactly as before; only the internal attention mint
+   * writes a target and protocol 1. Attention queue state never lives here.
+   */
+  private ensureAttentionDeliveryColumns(): void {
+    const columns = (this.db.pragma("table_info(deliveries)") as { name: string }[]).map((c) => c.name);
+    if (!columns.includes("continuation_target_json")) {
+      this.db.exec("ALTER TABLE deliveries ADD COLUMN continuation_target_json TEXT");
+    }
+    if (!columns.includes("required_edge_protocol")) {
+      this.db.exec("ALTER TABLE deliveries ADD COLUMN required_edge_protocol INTEGER NOT NULL DEFAULT 0");
+    }
   }
 
   private loadOrCreateBrokerUuid(): string {
@@ -784,7 +840,11 @@ export class BrokerStore {
     })();
   }
 
-  ingestEvent(event: SlackEventInput, initialSnapshot: unknown | null = null): { created: boolean; deliveryId: number | null } {
+  ingestEvent(
+    event: SlackEventInput,
+    initialSnapshot: unknown | null = null,
+    options: IngestOptions = {},
+  ): { created: boolean; deliveryId: number | null } {
     return this.db.transaction(() => {
       const inserted = this.db.prepare(`
         INSERT OR IGNORE INTO slack_events(
@@ -811,7 +871,7 @@ export class BrokerStore {
         return { created: true, deliveryId: null };
       }
       const now = iso(this.clock);
-      const coalesceKey = `${event.actor}:${event.channelId}:${event.threadTs}`;
+      const coalesceKey = options.coalesceKey ?? `${event.actor}:${event.channelId}:${event.threadTs}`;
       const pending = this.db.prepare(`
         SELECT delivery_id FROM deliveries
         WHERE coalesce_key=? AND status='pending'
@@ -827,14 +887,16 @@ export class BrokerStore {
       const result = this.db.prepare(`
         INSERT INTO deliveries(
           event_id, actor, status, coalesce_key, initial_snapshot_json, snapshot_ts,
-          created_at, updated_at
-        ) VALUES (?, ?, 'pending', ?, ?, ?, ?, ?)
+          continuation_target_json, required_edge_protocol, created_at, updated_at
+        ) VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)
       `).run(
         event.eventId,
         event.actor,
         coalesceKey,
         initialSnapshot === null ? null : JSON.stringify(initialSnapshot),
         initialSnapshot === null ? null : now,
+        options.continuationTarget ? JSON.stringify(options.continuationTarget) : null,
+        options.requiredEdgeProtocol ?? 0,
         now,
         now,
       );
@@ -1048,7 +1110,11 @@ export class BrokerStore {
           "`everyone` is a human-only broadcast target; a review request names one seat",
         );
       }
-      const eventId = `review:${input.dedupeKey}`;
+      const attention = input.origin === "attention" ? input : null;
+      // The origin prefixes the event identity, so a review key and an attention key can
+      // never collide, and a review mint's identity is byte-for-byte what it always was.
+      const prefix = attention ? "attention" : "review";
+      const eventId = `${prefix}:${input.dedupeKey}`;
       const replayed = this.deliveryIdForEvent(eventId);
       if (replayed !== null) return { deliveryId: replayed };
 
@@ -1056,7 +1122,7 @@ export class BrokerStore {
       if (!subscription || isExpired(subscription.expiresAt, this.clock.now())) {
         throw new SeatWakeRefusedError(
           "unroutable_actor",
-          `no live subscription for actor \`${target}\` — this review request would reach no one`,
+          `no live subscription for actor \`${target}\` — this ${attention ? "attention return" : "review request"} would reach no one`,
         );
       }
       const digest = createHash("sha256").update(input.dedupeKey).digest("hex").slice(0, 16);
@@ -1068,14 +1134,31 @@ export class BrokerStore {
         // coordinate, which the Slack sender must translate to "no thread_ts".
         threadTs: input.threadTs ?? "",
         // No Slack message exists yet — the render is enqueued below (see isSlackMessageTs).
-        messageTs: `review:${digest}`,
-        senderId: SYSTEM_WAKE_SENDER,
+        messageTs: `${prefix}:${digest}`,
+        senderId: attention ? ATTENTION_WAKE_SENDER : SYSTEM_WAKE_SENDER,
         senderKind: "app",
         actor: target,
         text: input.text,
-        raw: { type: "system_wake", source: "system", dedupeKey: input.dedupeKey },
+        raw: attention
+          ? {
+            type: "system_wake",
+            source: "attention",
+            dedupeKey: input.dedupeKey,
+            resolutionCommandId: attention.continuationTarget.resolution_command_id,
+            generation: attention.continuationTarget.generation,
+            sourceId: attention.continuationTarget.source_id,
+          }
+          : { type: "system_wake", source: "system", dedupeKey: input.dedupeKey },
         receivedAt: iso(this.clock),
-      });
+      }, null, attention
+        ? {
+          // Its own coalescing group: an attention response never merges with an unrelated
+          // pending wake in the same thread, nor with another response.
+          coalesceKey: `attention-return:${attention.continuationTarget.resolution_command_id}:${attention.continuationTarget.generation}`,
+          continuationTarget: attention.continuationTarget,
+          requiredEdgeProtocol: attention.continuationTarget.protocol,
+        }
+        : {});
       const deliveryId = ingest.deliveryId ?? this.deliveryIdForEvent(eventId);
       if (deliveryId === null) {
         // The subscription check above proved the actor routable; the ledger disagreeing with
@@ -1086,7 +1169,12 @@ export class BrokerStore {
         );
       }
       if (ingest.created) {
-        this.enqueueOutbox(this.getDelivery(deliveryId), systemWakeRender(target, deliveryId, input.text));
+        this.enqueueOutbox(
+          this.getDelivery(deliveryId),
+          attention
+            ? attentionWakeRender(target, deliveryId, attention.render)
+            : systemWakeRender(target, deliveryId, input.text),
+        );
       }
       return { deliveryId };
     })();
@@ -1129,7 +1217,13 @@ export class BrokerStore {
     return row ? Number(row.delivery_id) : null;
   }
 
-  claimNext(edgeId: string, _after: number, busy: readonly BusySlot[] = []): Delivery | null {
+  /**
+   * `attentionProtocol` is the claiming edge's per-request declaration (ADR-0004). A delivery
+   * requiring a higher protocol is skipped, never handed to an edge that would ignore its
+   * route constraints; absence means protocol 0. It is not cached: an edge rolled back to an
+   * older build simply stops declaring it.
+   */
+  claimNext(edgeId: string, _after: number, busy: readonly BusySlot[] = [], attentionProtocol = 0): Delivery | null {
     // The claiming edge declares the (actor, slot) turns it is still running.
     // acquireLease cannot serialize these: a same-edge claim on a live lease
     // shares the generation by design (a sequential edge's next claim after a
@@ -1141,11 +1235,11 @@ export class BrokerStore {
       // `after` remains a v1 compatibility hint only: broker-side eligibility
       // can change over time, so every pending delivery must remain visible.
       const rows = this.db.prepare(`
-        SELECT d.delivery_id, d.actor, d.created_at, d.next_attempt_at
+        SELECT d.delivery_id, d.actor, d.created_at, d.next_attempt_at, d.continuation_target_json
         FROM deliveries d
-        WHERE d.status = 'pending'
+        WHERE d.status = 'pending' AND d.required_edge_protocol <= ?
         ORDER BY d.delivery_id
-      `).all() as Row[];
+      `).all(attentionProtocol) as Row[];
 
       for (const row of rows) {
         const actor = String(row.actor);
@@ -1164,7 +1258,19 @@ export class BrokerStore {
           }]);
           continue;
         }
-        const eligible = this.edgeEligibility(subscription, edgeId, String(row.created_at));
+        const target = row.continuation_target_json === null
+          ? null
+          : JSON.parse(String(row.continuation_target_json)) as AttentionContinuationTarget;
+        const route = effectiveDeliveryRoute(subscription, target);
+        if (route.kind === "refused") {
+          // A captured route that no longer agrees with the enrollment is an explicit,
+          // thread-visible route failure — never a silent reroute to some other session.
+          this.terminalizeUnclaimed(Number(row.delivery_id), "undeliverable", [{ code: route.code, detail: route.detail }]);
+          continue;
+        }
+        const eligible = route.kind === "pinned"
+          ? (edgeId === route.homeEdge ? "eligible" : { disposition: "skip" as const, code: "pinned_home_edge_only" })
+          : this.edgeEligibility(subscription, edgeId, String(row.created_at));
         if (eligible !== "eligible") {
           if (eligible.disposition === "terminal") {
             this.terminalizeUnclaimed(Number(row.delivery_id), "undeliverable", [{ code: eligible.code, detail: eligibilityDetail(eligible.code) }]);
@@ -1689,6 +1795,11 @@ function systemWakeRender(target: string, deliveryId: number, text: string): str
   return `🐝 review wake ${SYSTEM_WAKE_SENDER} → ${target} (delivery ${deliveryId})\n\n${text}`;
 }
 
+/** The commons render of an attention return: traceability, not the human's response body. */
+function attentionWakeRender(target: string, deliveryId: number, render: string): string {
+  return `🐝 attention return ${ATTENTION_WAKE_SENDER} → ${target} (delivery ${deliveryId})\n\n${render}`;
+}
+
 function dispatchedNotice(delivery: Delivery, notices: Reason[]): string {
   const head = `→ delivered to ${delivery.actor} (delivery ${delivery.id}, attempt ${delivery.attempts}/${delivery.subscription.maxAttempts})`;
   return [head, ...notices.map((notice) => `⚠ ${notice.code} — ${notice.detail}`)].join("\n");
@@ -1773,6 +1884,10 @@ function deliveryFromRow(row: Row): Delivery {
     updatedAt: String(row.updated_at),
     subscription,
     event,
+    continuationTarget: row.continuation_target_json === null || row.continuation_target_json === undefined
+      ? null
+      : JSON.parse(String(row.continuation_target_json)) as AttentionContinuationTarget,
+    requiredEdgeProtocol: Number(row.required_edge_protocol ?? 0),
   };
 }
 

@@ -1,4 +1,5 @@
-import type { ServerResponse } from "node:http";
+import { timingSafeEqual } from "node:crypto";
+import type { IncomingMessage, ServerResponse } from "node:http";
 
 export interface HttpErrorEnvelope {
   error: string;
@@ -25,4 +26,17 @@ export function parseHttpErrorEnvelope(body: string): HttpErrorEnvelope | null {
 
 export function formatHttpErrorEnvelope(envelope: HttpErrorEnvelope): string {
   return typeof envelope.detail === "string" ? `${envelope.error} — ${envelope.detail}` : envelope.error;
+}
+
+/** The `Authorization: Bearer <token>` credential, or null. */
+export function bearerToken(request: IncomingMessage): string | null {
+  const header = request.headers.authorization;
+  return header?.startsWith("Bearer ") ? header.slice("Bearer ".length) : null;
+}
+
+/** Credential comparison that does not leak the matching prefix length through timing. */
+export function constantTimeEqual(left: string, right: string): boolean {
+  const a = Buffer.from(left, "utf8");
+  const b = Buffer.from(right, "utf8");
+  return a.length === b.length && timingSafeEqual(a, b);
 }

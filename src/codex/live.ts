@@ -39,6 +39,12 @@ interface Config {
   desktopHome: string;
   desktopIpcSocket: string;
   desktopStateDatabase: string;
+  /**
+   * ADR-0004: the dedicated thread's working directory when the launcher knows it
+   * (`HIVE_SESSION_CWD`); null is a named absence. A Desktop attachment reports its own
+   * binding cwd instead.
+   */
+  sessionCwd: string | null;
 }
 
 const REGISTRATION_TTL_MS = 60_000;
@@ -149,6 +155,10 @@ export async function runCodexLive(config: Config): Promise<void> {
     void handle(request, response, () => bindingStatus(config.actor, target), async (delivery, framed) => {
       const acceptedTarget = target;
       if (!acceptedTarget) throw new Error("Codex explicit foreground attachment is unavailable");
+      // ADR-0004: re-check the exact session against the target captured for THIS request,
+      // so a binding switch between the edge's registry lookup and delivery cannot redirect a
+      // constrained return into another task.
+      assertAttentionSession(delivery, acceptedTarget, config.sessionCwd);
       if (acceptedTarget.kind === "dedicated") {
         return completeCodexDelivery(appClient, acceptedTarget.sessionId, delivery, framed);
       }
@@ -163,7 +173,7 @@ export async function runCodexLive(config: Config): Promise<void> {
       .catch((error: unknown) => {
         const code = error instanceof SurfaceError ? error.code : "live_delivery_failed";
         const body = JSON.stringify({ error: code });
-        response.writeHead(code === "not_found" ? 404 : code === "live_delivery_failed" ? 500 : 400, {
+        response.writeHead(code === "not_found" ? 404 : code === "live_delivery_failed" ? 500 : code === "attention_session_mismatch" ? 409 : 400, {
           "content-type": "application/json",
           "content-length": Buffer.byteLength(body),
         });
@@ -175,22 +185,24 @@ export async function runCodexLive(config: Config): Promise<void> {
     http.listen({ path: config.surfaceSocket }, () => resolve());
   });
 
+  const registration = new EdgeLiveRegistration(config.actor, (path, body) => udsRequestJson(config.edgeSocket, "POST", path, body));
   const register = async (): Promise<void> => {
     const current = target;
     if (!current) {
-      await udsRequestJson(config.edgeSocket, "POST", "/live/deregister", {
-        actor: config.actor,
-        provider: "codex",
-      });
+      await registration.sync(null);
       return;
     }
-    await udsRequestJson(config.edgeSocket, "POST", "/live/register", {
+    await registration.sync({
       actor: config.actor,
       provider: "codex",
       socketPath: config.surfaceSocket,
       sessionId: current.sessionId,
       surfaceVersion: config.surfaceVersion,
       ttlMs: REGISTRATION_TTL_MS,
+      cwd: current.kind === "desktop" ? current.cwd : config.sessionCwd,
+      // This bridge enforces the exact-session check (assertAttentionSession) on every
+      // constrained envelope it accepts.
+      attentionProtocol: 1,
       // Desktop attachments execute under HIVE_CODEX_DESKTOP_HOME, which
       // need only share auth.json with the pinned profile. Bind the wake
       // to the home the turn actually loaded.
@@ -261,8 +273,61 @@ export async function runCodexLive(config: Config): Promise<void> {
   renewal.unref();
 }
 
+/**
+ * Keeps the edge's view of this bridge exact per session (ADR-0004): a withdrawal names the
+ * session it withdraws, and switching to another session withdraws the previous one once the
+ * new one is registered — the socket no longer serves it, so it must not look live for its TTL.
+ */
+export class EdgeLiveRegistration {
+  private registered: string | null = null;
+  /** Sessions this socket stopped serving whose withdrawal has not yet succeeded. */
+  private readonly withdrawals = new Set<string>();
+
+  constructor(
+    private readonly actor: string,
+    private readonly send: (path: "/live/register" | "/live/deregister", body: Record<string, unknown>) => Promise<unknown>,
+  ) {}
+
+  async sync(registration: (Record<string, unknown> & { sessionId: string }) | null): Promise<void> {
+    if (registration === null) {
+      await this.send("/live/deregister", { actor: this.actor, provider: "codex", sessionId: this.registered });
+      this.registered = null;
+      return;
+    }
+    await this.send("/live/register", registration);
+    const previous = this.registered;
+    this.registered = registration.sessionId;
+    if (previous !== null && previous !== registration.sessionId) this.withdrawals.add(previous);
+    this.withdrawals.delete(registration.sessionId);
+    // Retried on every renewal until the edge confirms: a failed withdrawal must not leave
+    // the old session looking live behind this socket for its whole TTL.
+    for (const sessionId of [...this.withdrawals]) {
+      await this.send("/live/deregister", { actor: this.actor, provider: "codex", sessionId });
+      this.withdrawals.delete(sessionId);
+    }
+  }
+}
+
+/**
+ * ADR-0004: a constrained attention return is accepted only by the exact captured session in
+ * its captured cwd. A surface that does not know its own cwd (a dedicated bridge without
+ * `HIVE_SESSION_CWD`) has no evidence and refuses. Ordinary envelopes are unaffected.
+ */
+export function assertAttentionSession(
+  delivery: Delivery,
+  target: { kind: "dedicated"; sessionId: string } | { kind: "desktop"; sessionId: string; cwd: string },
+  dedicatedCwd: string | null,
+): void {
+  const constraint = delivery.continuationTarget;
+  if (!constraint || constraint.mode !== "pinned_session") return;
+  const cwd = target.kind === "desktop" ? target.cwd : dedicatedCwd;
+  if (constraint.pinned.session_id !== target.sessionId || cwd === null || cwd !== constraint.pinned.cwd) {
+    throw new SurfaceError("attention_session_mismatch");
+  }
+}
+
 class SurfaceError extends Error {
-  constructor(readonly code: "not_found" | "live_delivery_invalid" | "live_delivery_failed" | "account_profile_mismatch") {
+  constructor(readonly code: "not_found" | "live_delivery_invalid" | "live_delivery_failed" | "account_profile_mismatch" | "attention_session_mismatch") {
     super(code);
     this.name = "SurfaceError";
   }
@@ -525,6 +590,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     desktopHome,
     desktopIpcSocket: process.env.HIVE_CODEX_DESKTOP_IPC_SOCKET ?? join(desktopHome, "ipc", "ipc.sock"),
     desktopStateDatabase: process.env.HIVE_CODEX_DESKTOP_STATE_DB ?? join(desktopHome, "state_5.sqlite"),
+    sessionCwd: process.env.HIVE_SESSION_CWD ?? null,
     ...(process.env.HIVE_CODEX_APP_SERVER_SOCKET
       ? { appServerSocket: process.env.HIVE_CODEX_APP_SERVER_SOCKET }
       : {}),

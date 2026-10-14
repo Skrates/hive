@@ -29,6 +29,20 @@ export function bindingFor(read: AttestationRead, actor: string): AttestationBin
   };
 }
 
+/** How long a bind's retained evidence can recover its committed receipt. */
+export const BIND_INTENT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+
+export interface AttentionHandleRecord {
+  handleHash: string;
+  brokerUuid: string;
+  sourceId: string;
+  provenance: string;
+  actor: string;
+  projectId: string;
+  workId: string;
+  revokedAt?: string | null;
+}
+
 export type LocalDispatchStatus =
   | "received"
   | "dispatching"
@@ -95,9 +109,87 @@ export class EdgeStore {
     for (const [name, type] of LEDGER_COLUMNS) {
       if (!present.has(name)) this.db.exec(`ALTER TABLE local_deliveries ADD COLUMN ${name} ${type}`);
     }
+    // ADR-0004: local attention source handles. Only a hash of each handle is kept, bound to
+    // the broker that issued its source; this table owns no queue state. A revoked handle's
+    // identity is retained so an already-committed receipt can still be recovered.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS attention_source_handles (
+        handle_hash TEXT PRIMARY KEY,
+        broker_uuid TEXT NOT NULL,
+        source_id TEXT NOT NULL,
+        provenance TEXT NOT NULL,
+        actor TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        work_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        revoked_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS attention_source_handles_source ON attention_source_handles(source_id);
+      CREATE TABLE IF NOT EXISTS attention_bind_intents (
+        command_id TEXT NOT NULL,
+        proof TEXT NOT NULL,
+        evidence_json TEXT NOT NULL,
+        recorded_at TEXT NOT NULL,
+        PRIMARY KEY (command_id, proof, evidence_json)
+      );
+    `);
   }
 
   close(): void { this.db.close(); }
+
+  putAttentionHandle(record: AttentionHandleRecord): void {
+    this.db.prepare(`
+      INSERT INTO attention_source_handles(handle_hash, broker_uuid, source_id, provenance, actor, project_id, work_id, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(record.handleHash, record.brokerUuid, record.sourceId, record.provenance, record.actor, record.projectId, record.workId, new Date().toISOString());
+  }
+
+  attentionHandle(handleHash: string): AttentionHandleRecord | null {
+    const row = this.db.prepare("SELECT * FROM attention_source_handles WHERE handle_hash=?").get(handleHash) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return {
+      handleHash: String(row.handle_hash),
+      brokerUuid: String(row.broker_uuid),
+      sourceId: String(row.source_id),
+      provenance: String(row.provenance),
+      actor: String(row.actor),
+      projectId: String(row.project_id),
+      workId: String(row.work_id),
+      revokedAt: row.revoked_at === null ? null : String(row.revoked_at),
+    };
+  }
+
+  /**
+   * The evidence this edge resolved for a bind, retained under its command id BEFORE the bind
+   * is sent: the dispatch token or live registration it came from ends with the turn, and a
+   * retry after a lost response or an edge restart must present byte-identical evidence for
+   * the broker to replay the committed receipt. `proof` is a digest of what the original
+   * requester presented (never the token itself); only a retry presenting the same proof — or
+   * the operator — may use the retained evidence. Retained for {@link BIND_INTENT_RETENTION_MS}.
+   */
+  recordAttentionBindIntent(commandId: string, proof: string, evidenceJson: string): void {
+    const now = new Date();
+    this.db.prepare("DELETE FROM attention_bind_intents WHERE recorded_at < ?")
+      .run(new Date(now.getTime() - BIND_INTENT_RETENTION_MS).toISOString());
+    this.db.prepare(`
+      INSERT INTO attention_bind_intents(command_id, proof, evidence_json, recorded_at) VALUES (?, ?, ?, ?)
+      ON CONFLICT(command_id, proof, evidence_json) DO UPDATE SET recorded_at=excluded.recorded_at
+    `).run(commandId, proof, evidenceJson, now.toISOString());
+  }
+
+  /** The evidence variants sent under a command id — with that proof, or any when null — newest first. */
+  attentionBindIntents(commandId: string, proof: string | null): string[] {
+    const rows = proof === null
+      ? this.db.prepare("SELECT evidence_json FROM attention_bind_intents WHERE command_id=? ORDER BY recorded_at DESC, rowid DESC").all(commandId)
+      : this.db.prepare("SELECT evidence_json FROM attention_bind_intents WHERE command_id=? AND proof=? ORDER BY recorded_at DESC, rowid DESC").all(commandId, proof);
+    return (rows as Array<{ evidence_json: string }>).map((row) => row.evidence_json);
+  }
+
+  /** The broker refused a write because the source was revoked: remember it, keep the identity. */
+  markAttentionSourceRevoked(sourceId: string): void {
+    this.db.prepare("UPDATE attention_source_handles SET revoked_at=COALESCE(revoked_at, ?) WHERE source_id=?")
+      .run(new Date().toISOString(), sourceId);
+  }
 
   /**
    * Record a claimed delivery, bound to the attestation of the seat profile it

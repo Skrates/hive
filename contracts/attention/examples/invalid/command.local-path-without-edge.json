@@ -1,0 +1,9 @@
+{
+  "schema_version": 1, "command_id": "8ba99410-c894-4632-aea6-b33a06a6b015", "action": "summon",
+  "payload": {
+    "human_id": "hakon", "project_id": "birthday-film", "work_id": "w", "intervention_key": "k", "kind": "selection",
+    "title": "t", "requested_action": "a", "context": "c", "unblocks": "u",
+    "artifacts": [{ "label": "x", "uri": "/srv/renders/contact-sheet.png" }],
+    "estimate_minutes": null, "deadline_at": null, "predecessor_item_id": null
+  }
+}

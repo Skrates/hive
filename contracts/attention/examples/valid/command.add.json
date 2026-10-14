@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "command_id": "0b6f0a51-6a7e-4f0e-9d0e-3f1f4b3a2c11",
+  "action": "add",
+  "payload": {
+    "packet": {
+      "human_id": "hakon",
+      "project_id": "rannis",
+      "work_id": "grant-2027",
+      "intervention_key": "draft-argument",
+      "kind": "human_work",
+      "title": "Draft the Rannís grant argument",
+      "requested_action": "Write the two-page argument section.",
+      "context": "Human-first work: no agent has begun this; the template is in the shared drive.",
+      "unblocks": "Submission review next week.",
+      "artifacts": [
+        { "label": "Template", "uri": "https://example.invalid/rannis-template", "version": "v3" },
+        { "label": "Notes", "uri": "/home/hakon/notes/rannis.md", "edge_id": "pop-os" }
+      ],
+      "estimate_minutes": 90,
+      "deadline_at": "2026-10-20T12:00:00Z",
+      "predecessor_item_id": null
+    },
+    "return_source_id": null
+  }
+}

@@ -8,7 +8,9 @@ import {
   assertPinnedDesktopAccount,
   completeCodexDelivery,
   completeDesktopDelivery,
+  assertAttentionSession,
   DesktopFollowerRetirement,
+  EdgeLiveRegistration,
   desktopDeliveryKey,
   liveRuntimeHome,
 } from "./live.js";
@@ -285,6 +287,8 @@ function delivery(now: number, createdAt: number = now): Delivery {
     coalesceKey: "ariadne:C1:100.1",
     coalescedEventIds: ["Ev35"],
     coalescedMessages: [],
+    continuationTarget: null,
+    requiredEdgeProtocol: 0,
     initialSnapshot: null,
     snapshotTs: null,
     createdAt: new Date(createdAt).toISOString(),
@@ -305,3 +309,54 @@ function delivery(now: number, createdAt: number = now): Delivery {
     },
   };
 }
+
+test("A25 the bridge accepts a constrained return only into the exact captured session and cwd", () => {
+  const base = delivery(Date.now());
+  const target = {
+    kind: "attention_return" as const, protocol: 1 as const, source_id: `src_${"b".repeat(32)}`,
+    resolution_command_id: "5c0f2c1e-8b8e-4c55-a3a6-0e5c8f8f2d10", generation: 1, actor: base.actor, mode: "pinned_session" as const,
+    pinned: { provider: "codex" as const, home_edge: "mac", account_profile_fingerprint: "f".repeat(64), session_id: "task-1", cwd: "/work/hive" },
+  };
+  const constrained = { ...base, continuationTarget: target };
+  assert.doesNotThrow(() => assertAttentionSession(constrained, { kind: "desktop", sessionId: "task-1", cwd: "/work/hive" }, null));
+  assert.doesNotThrow(() => assertAttentionSession(constrained, { kind: "dedicated", sessionId: "task-1" }, "/work/hive"));
+  assert.throws(() => assertAttentionSession(constrained, { kind: "dedicated", sessionId: "task-1" }, null), /attention_session_mismatch/u,
+    "an unknown dedicated cwd is missing evidence, never agreement");
+  assert.throws(() => assertAttentionSession(constrained, { kind: "desktop", sessionId: "task-2", cwd: "/work/hive" }, null), /attention_session_mismatch/u);
+  assert.throws(() => assertAttentionSession(constrained, { kind: "desktop", sessionId: "task-1", cwd: "/work/other" }, null), /attention_session_mismatch/u);
+  assert.throws(() => assertAttentionSession(constrained, { kind: "dedicated", sessionId: "task-1" }, "/work/other"), /attention_session_mismatch/u);
+  assert.doesNotThrow(() => assertAttentionSession(base, { kind: "desktop", sessionId: "anything", cwd: "/x" }, null), "ordinary envelopes are unchanged");
+  assert.doesNotThrow(() => assertAttentionSession({ ...base, continuationTarget: { ...target, mode: "actor_context", pinned: null } }, { kind: "dedicated", sessionId: "x" }, null));
+});
+
+test("switching sessions withdraws the previous one by name once the new one is registered", async () => {
+  const sent: Array<[string, Record<string, unknown>]> = [];
+  const registration = new EdgeLiveRegistration("ariadne", async (path, body) => { sent.push([path, body]); });
+  await registration.sync({ actor: "ariadne", provider: "codex", sessionId: "task-A" });
+  await registration.sync({ actor: "ariadne", provider: "codex", sessionId: "task-A" });
+  await registration.sync({ actor: "ariadne", provider: "codex", sessionId: "task-B" });
+  await registration.sync(null);
+  assert.deepEqual(sent.map(([path, body]) => `${path} ${String(body.sessionId)}`), [
+    "/live/register task-A",
+    "/live/register task-A",
+    "/live/register task-B",
+    "/live/deregister task-A",
+    "/live/deregister task-B",
+  ]);
+});
+
+test("a failed withdrawal of the previous session is retried on the next renewal", async () => {
+  const sent: string[] = [];
+  let failNextWithdrawal = true;
+  const registration = new EdgeLiveRegistration("ariadne", async (path, body) => {
+    if (path === "/live/deregister" && failNextWithdrawal) {
+      failNextWithdrawal = false;
+      throw new Error("edge socket busy");
+    }
+    sent.push(`${path} ${String(body.sessionId)}`);
+  });
+  await registration.sync({ sessionId: "task-A" });
+  await assert.rejects(registration.sync({ sessionId: "task-B" }));
+  await registration.sync({ sessionId: "task-B" });
+  assert.deepEqual(sent, ["/live/register task-A", "/live/register task-B", "/live/register task-B", "/live/deregister task-A"]);
+});

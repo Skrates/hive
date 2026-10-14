@@ -1,0 +1,16 @@
+{
+  "kind": "attention_return",
+  "protocol": 1,
+  "source_id": "src_0123456789abcdef0123456789abcdef",
+  "resolution_command_id": "5c0f2c1e-8b8e-4c55-a3a6-0e5c8f8f2d10",
+  "generation": 1,
+  "actor": "fable",
+  "mode": "pinned_session",
+  "pinned": {
+    "provider": "claude",
+    "home_edge": "pop-os",
+    "account_profile_fingerprint": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+    "session_id": "0f0e0d0c-session",
+    "cwd": "/home/fable/work/hive"
+  }
+}

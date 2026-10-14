@@ -89,7 +89,7 @@ async function fixture(t: test.TestContext, overrides: Partial<ReviewHttpDeps> =
     },
     ...overrides,
   };
-  const server = new BrokerHttpServer(new BrokerService(broker, slack), { host: "127.0.0.1", port: 0, adminToken: ADMIN_TOKEN, review: deps });
+  const server = new BrokerHttpServer(new BrokerService(broker, slack), { host: "127.0.0.1", port: 0, adminToken: ADMIN_TOKEN, review: deps, attention: null });
   const { port } = await server.start();
   t.after(() => server.stop());
 
@@ -347,7 +347,7 @@ test("admin: PUT review-policies validates the Policy; POST operators returns th
 test("a broker with no review surface leaves the paths to the ordinary router", async (t) => {
   const broker = new BrokerStore(":memory:");
   t.after(() => broker.close());
-  const server = new BrokerHttpServer(new BrokerService(broker, slack), { host: "127.0.0.1", port: 0, adminToken: ADMIN_TOKEN, review: null });
+  const server = new BrokerHttpServer(new BrokerService(broker, slack), { host: "127.0.0.1", port: 0, adminToken: ADMIN_TOKEN, review: null, attention: null });
   const { port } = await server.start();
   t.after(() => server.stop());
   const status = await new Promise<number>((resolve, reject) => {

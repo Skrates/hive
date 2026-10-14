@@ -110,12 +110,18 @@ export class BrokerService {
     return this.store.freezeAffinityTargets(rawEventId, channelId, threadTs);
   }
 
-  async claim(edgeId: string, after: number, waitMs: number, busy: readonly BusySlot[] = []): Promise<Delivery | null> {
+  async claim(
+    edgeId: string,
+    after: number,
+    waitMs: number,
+    busy: readonly BusySlot[] = [],
+    attentionProtocol = 0,
+  ): Promise<Delivery | null> {
     const deadline = Date.now() + Math.min(Math.max(waitMs, 0), 30_000);
     do {
       this.store.requeueExpiredLeases();
       await this.drainOutbox();
-      const delivery = this.store.claimNext(edgeId, after, busy);
+      const delivery = this.store.claimNext(edgeId, after, busy, attentionProtocol);
       if (delivery) return delivery;
       if (Date.now() >= deadline) return null;
       await delay(Math.min(250, deadline - Date.now()));
@@ -228,21 +234,23 @@ function delay(ms: number): Promise<void> {
 
 /**
  * The broker's periodic housekeeping, as one testable unit (module map §8). `publish` is the
- * review publisher's pass; everything else is core broker work that has nothing to do with
- * review.
+ * review publisher's pass and `attention` the attention return drain (ADR-0004 §10);
+ * everything else is core broker work that has nothing to do with either.
  */
 export interface HousekeepingTickDeps {
   /** R-3: return expired leases so loss stays visible. */
   sweep(): void;
   /** §8.1: one review publication pass. */
   publish(): Promise<unknown>;
+  /** ADR-0004: one attention return drain — mint due continuations, settle finished ones. */
+  attention(): Promise<unknown>;
   /** R-6: deliver every unsent outbox row — every Hive wake, review or not. */
   drainOutbox(): Promise<unknown>;
   log(what: string, error: unknown): void;
 }
 
 /**
- * Run the three jobs of one tick with no job waiting on another. Publication used to run
+ * Run the jobs of one tick with no job waiting on another. Publication used to run
  * first and the outbox drain only after it, which made GitHub availability a prerequisite for
  * unrelated Hive delivery: a publisher pass held up by a slow or hung GitHub port delayed
  * every wake in the outbox for as long as it was held. They are independent concerns, so they
@@ -262,10 +270,12 @@ export function housekeepingTick(deps: HousekeepingTickDeps): Promise<void> {
   } catch (error) {
     deps.log("hive broker sweep failed", error);
   }
-  // Both are started here, synchronously, so neither is even scheduled behind the other.
+  // All are started here, synchronously, so none is even scheduled behind another: a slow
+  // review publisher or Slack drain cannot hold up attention, nor attention either of them.
   const publication = launch(() => deps.publish(), "hive review publish failed", deps.log);
   const outbox = launch(() => deps.drainOutbox(), "hive broker outbox drain failed", deps.log);
-  return Promise.all([publication, outbox]).then(() => undefined);
+  const attention = launch(() => deps.attention(), "hive attention return drain failed", deps.log);
+  return Promise.all([publication, outbox, attention]).then(() => undefined);
 }
 
 function launch(run: () => Promise<unknown>, what: string, log: (what: string, error: unknown) => void): Promise<void> {

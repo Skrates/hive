@@ -2,12 +2,13 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { URL } from "node:url";
 import { canonicalActor, DeliveryResultInputSchema, DispatchNoticesSchema, ReasonSchema, SeatWakeMintSchema, SubscriptionInputSchema, BusySlotFormatError, parseBusySlots, type BusySlot } from "../domain.js";
 import { routeReview, type ReviewHttpDeps } from "../review/http.js";
+import { routeAttention, type AttentionHttpDeps } from "../attention/http.js";
 import { BrokerService } from "./service.js";
 import { InvalidTransitionError, SeatWakeRefusedError, StaleLeaseError, TurnSlotReductionError } from "./store.js";
 import { ProfileReport } from "../health/report.js";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { writeJsonResponse } from "../http.js";
+import { bearerToken, constantTimeEqual, writeJsonResponse } from "../http.js";
 
 export interface BrokerHttpConfig {
   host: string;
@@ -19,6 +20,8 @@ export interface BrokerHttpConfig {
    * it — the state a broker is in before the integrator wires a `ReviewStore`.
    */
   review: ReviewHttpDeps | null;
+  /** The attention surface (ADR-0004); null mounts none of it, and its paths 404 as on an older broker. */
+  attention: AttentionHttpDeps | null;
 }
 
 export class BrokerHttpServer {
@@ -73,6 +76,8 @@ export class BrokerHttpServer {
     // The review surface authenticates its own callers (edge, operator, admin,
     // or the webhook's HMAC), so it is consulted before the edge gate below.
     if (this.config.review && await routeReview(request, response, url, this.config.review)) return;
+    // Attention likewise authenticates its own callers (edge, source-bound edge, operator).
+    if (this.config.attention && await routeAttention(request, response, url, this.config.attention)) return;
 
     if (url.pathname.startsWith("/v1/admin/")) {
       this.requireAdmin(request);
@@ -129,7 +134,10 @@ export class BrokerHttpServer {
         }
         throw error;
       }
-      const delivery = await this.broker.claim(edgeId, after, waitMs, busy);
+      // ADR-0004: the claim's own attention-protocol declaration; absent is protocol 0.
+      const attentionProtocol = integerParam(url.searchParams.get("attention_protocol"), 0);
+      if (attentionProtocol > 1) return json(response, 400, { error: "attention_protocol_unsupported", detail: `protocol ${attentionProtocol} is unknown to this broker` });
+      const delivery = await this.broker.claim(edgeId, after, waitMs, busy, attentionProtocol);
       return delivery ? json(response, 200, delivery) : json(response, 204, null);
     }
 
@@ -191,13 +199,13 @@ export class BrokerHttpServer {
   }
 
   private requireAdmin(request: IncomingMessage): void {
-    const token = bearer(request);
+    const token = bearerToken(request);
     if (!token || !constantTimeEqual(token, this.config.adminToken)) throw new HttpError(401, "unauthorized");
   }
 
   private requireEdge(request: IncomingMessage): string {
     const edgeId = request.headers["x-hive-edge"];
-    const token = bearer(request);
+    const token = bearerToken(request);
     if (typeof edgeId !== "string" || !token || !this.broker.store.authenticateEdge(edgeId, token)) {
       throw new HttpError(401, "unauthorized");
     }
@@ -239,10 +247,6 @@ async function readJson(request: IncomingMessage): Promise<Record<string, unknow
   return JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
 }
 
-function bearer(request: IncomingMessage): string | null {
-  const header = request.headers.authorization;
-  return header?.startsWith("Bearer ") ? header.slice("Bearer ".length) : null;
-}
 
 function requiredString(value: unknown, name: string): string {
   if (typeof value !== "string" || value.length === 0) throw new HttpError(400, `missing_${name}`);
@@ -261,12 +265,6 @@ function integerParam(value: string | null, fallback: number): number {
   return parsed;
 }
 
-function constantTimeEqual(left: string, right: string): boolean {
-  if (left.length !== right.length) return false;
-  let result = 0;
-  for (let i = 0; i < left.length; i += 1) result |= left.charCodeAt(i) ^ right.charCodeAt(i);
-  return result === 0;
-}
 
 function json(response: ServerResponse, status: number, value: unknown): void {
   if (status === 204) {
