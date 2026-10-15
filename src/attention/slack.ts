@@ -286,6 +286,8 @@ export class AttentionSlackFrontEnd {
   private homeDirty = true;
   /** Earliest future deferral time in the last published Home; passing it makes Home stale by time alone. */
   private homeStaleAt: string | null = null;
+  /** The store's Home signature at the last publication; any queue change makes Home stale, card or no card. */
+  private homeSignature: string | null = null;
 
   constructor(
     private readonly store: AttentionStore,
@@ -341,7 +343,8 @@ export class AttentionSlackFrontEnd {
     }
     // Home is also stale by the clock alone: a deferral that has come due is eligible without any write.
     const timeStale = this.homeStaleAt !== null && this.homeStaleAt <= this.clock.now().toISOString();
-    if (changed > 0 || this.homeDirty || timeStale) await this.refreshHome();
+    const queueMoved = this.store.homeSignature() !== this.homeSignature;
+    if (changed > 0 || this.homeDirty || timeStale || queueMoved) await this.refreshHome();
     return changed;
   }
 
@@ -352,10 +355,13 @@ export class AttentionSlackFrontEnd {
 
   async refreshHome(): Promise<void> {
     try {
+      // Read before the page: a change landing mid-publication leaves the signature stale for the next pass.
+      const signature = this.store.homeSignature();
       const page = this.store.queue(this.store.humanId, { states: ["active", "queued", "deferred"], limit: 100 });
       const now = this.clock.now();
       await this.api.publishHome(this.humanSlackUserId, homeView(page, now));
       this.homeDirty = false;
+      this.homeSignature = signature;
       const nowIso = now.toISOString();
       this.homeStaleAt = page.items
         .map((item) => (item.state === "deferred" ? item.deferred_until : null))

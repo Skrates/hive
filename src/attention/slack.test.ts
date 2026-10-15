@@ -405,6 +405,31 @@ test("S-1 a card whose message is gone for good is retired durably: no replaceme
   h.close();
 });
 
+test("S-7 a queue change refreshes Home even when the item's DM card was retired", async () => {
+  const h = harness();
+  const source = liveSource(h.store);
+  const item = summon(h.store, source).item!;
+  const slack = new FakeSlack();
+  const { front } = frontEnd(h, HUMAN, slack);
+  await front.drainOnce();
+  slack.update = async (channel: string, ts: string, text: string, blocks: unknown[]) => {
+    slack.calls.push({ op: "update", args: [channel, ts, text, blocks] });
+    throw Object.assign(new Error("x"), { data: { error: "message_not_found" } });
+  };
+  act(h.store, source, "amend", { item_id: item.item_id, expected_revision: 1, fields: { title: "Retitled" } });
+  await front.drainOnce(); // retires the card
+  const restarted = frontEnd(h, HUMAN, slack);
+  await restarted.front.drainOnce(); // settles startup Home
+  slack.clear();
+  await restarted.front.drainOnce();
+  assert.deepEqual(slack.ops(), [], "a settled Home with no change publishes nothing");
+  act(h.store, source, "withdraw", { item_id: item.item_id, expected_revision: 2, reason: "moot" });
+  await restarted.front.drainOnce();
+  assert.deepEqual(slack.ops(), ["publishHome"], "the withdrawal reaches Home with no post or update (S-1)");
+  assert.match(JSON.stringify(slack.calls[0]!.args[1]), /nothing waiting/u);
+  h.close();
+});
+
 test("S-7 Home is published at startup, so a deferral already in the store is refreshed when it comes due without any write", async () => {
   const h = harness();
   const first = frontEnd(h);

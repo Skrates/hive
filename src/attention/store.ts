@@ -1288,6 +1288,23 @@ export class AttentionStore {
     }));
   }
 
+  /**
+   * Changes whenever anything the Home tab renders changes: an item added or mutated (every
+   * mutation bumps its revision and stamp) or a return moving phase. Independent of DM cards, so a
+   * retired card can never hold Home stale (S-1 with S-7).
+   */
+  homeSignature(): string {
+    const items = this.db.prepare(`
+      SELECT COUNT(*) AS n, COALESCE(SUM(revision), 0) AS revisions, COALESCE(MAX(updated_at), '') AS stamp
+      FROM attention_items WHERE human_id=?
+    `).get(this.humanId) as Row;
+    const returns = this.db.prepare(`
+      SELECT COUNT(*) AS n, COALESCE(MAX(r.updated_at), '') AS stamp
+      FROM attention_returns r JOIN attention_items i ON i.item_id=r.item_id WHERE i.human_id=?
+    `).get(this.humanId) as Row;
+    return [items.n, items.revisions, items.stamp, returns.n, returns.stamp].join("|");
+  }
+
   /** The card's Slack message is gone for good: stop updating it and never re-post (S-1). */
   markCardGone(itemId: number, slackUserId: string): void {
     this.db.prepare("INSERT OR IGNORE INTO attention_slack_gone(item_id, slack_user_id) VALUES (?, ?)").run(itemId, slackUserId);
