@@ -9,6 +9,7 @@ import { AdmissionPolicySchema } from "./addressing.js";
 import { BrokerHttpServer } from "./broker/http.js";
 import { SlackLinkProbe } from "./broker/probe.js";
 import { BrokerService, housekeepingTick } from "./broker/service.js";
+import { WebClient } from "@slack/web-api";
 import { SlackCanaryPoster, SlackSocketIngress, SlackWebTransport } from "./broker/slack.js";
 import { BrokerStore, LegacyDatabaseError } from "./broker/store.js";
 import { SlackDeafnessWatchdog } from "./broker/watchdog.js";
@@ -37,6 +38,7 @@ import { installCodexSkill } from "./codex/skill-install.js";
 import { registerReviewCommands } from "./review/cli.js";
 import { registerAttentionCommands } from "./attention/cli.js";
 import { AttentionRuntimeConfigError, bootAttentionRuntime, type AttentionRuntime } from "./attention/runtime.js";
+import { webClientSlackApi } from "./attention/slack.js";
 import { AttentionSchemaError } from "./attention/store.js";
 import { bootReviewRuntime, type ReviewRuntime } from "./review/runtime.js";
 import { LegacyReviewStoreError } from "./review/store.js";
@@ -81,6 +83,7 @@ program.command("broker")
         env: config,
         validateThread: async (channelId, threadTs) => { await slackWeb.replay(channelId, threadTs); },
         log: (line) => console.error(line),
+        slackApi: webClientSlackApi(new WebClient(config.HIVE_SLACK_BOT_TOKEN)),
       });
     } catch (error) {
       if (
@@ -108,6 +111,7 @@ program.command("broker")
       broker,
       (message) => console.error(message),
     );
+    if (attention.slack) slack.attachInteractions(attention.slack);
     await http.start();
     await slack.start();
     review.start();
@@ -122,6 +126,7 @@ program.command("broker")
         publish: () => review.publisher.drainOnce(),
         drainOutbox: () => broker.drainOutbox(),
         attention: () => attention.publisher.drainOnce(),
+        ...(attention.slack ? { attentionSlack: () => attention.slack!.drainOnce() } : {}),
         log: (what, error) => console.error(what, error instanceof Error ? error.message : String(error)),
       });
     }, 5_000);
@@ -396,6 +401,7 @@ const BrokerConfig = z.object({
   // Hive Attention (ADR-0004): off for the first release; the human id is a queue identity.
   HIVE_ATTENTION_ENABLED: z.string().optional(),
   HIVE_ATTENTION_HUMAN_ID: z.string().optional(),
+  HIVE_ATTENTION_SLACK_USER_ID: z.string().optional(),
 });
 
 const EdgeConfig = z.object({

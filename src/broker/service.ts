@@ -253,6 +253,8 @@ export interface HousekeepingTickDeps {
   attention(): Promise<unknown>;
   /** R-6: deliver every unsent outbox row — every Hive wake, review or not. */
   drainOutbox(): Promise<unknown>;
+  /** ADR-0004 Amendment 1: bring the human's Slack cards up to date; absent when the front end is off. */
+  attentionSlack?: () => Promise<unknown>;
   log(what: string, error: unknown): void;
 }
 
@@ -282,7 +284,11 @@ export function housekeepingTick(deps: HousekeepingTickDeps): Promise<void> {
   const publication = launch(() => deps.publish(), "hive review publish failed", deps.log);
   const outbox = launch(() => deps.drainOutbox(), "hive broker outbox drain failed", deps.log);
   const attention = launch(() => deps.attention(), "hive attention return drain failed", deps.log);
-  return Promise.all([publication, outbox, attention]).then(() => undefined);
+  // The Slack card projection is its own job: a slow Slack never delays a return being minted.
+  const cards = deps.attentionSlack
+    ? launch(deps.attentionSlack, "hive attention slack sync failed", deps.log)
+    : Promise.resolve();
+  return Promise.all([publication, outbox, attention, cards]).then(() => undefined);
 }
 
 function launch(run: () => Promise<unknown>, what: string, log: (what: string, error: unknown) => void): Promise<void> {

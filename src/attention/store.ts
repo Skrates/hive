@@ -37,7 +37,7 @@ import { duePromotions, selectNext } from "./selector.js";
  * `PRAGMA user_version` (which stays at 5). A database written by a newer attention module
  * is refused at boot rather than guessed at.
  */
-export const ATTENTION_STORE_VERSION = 1;
+export const ATTENTION_STORE_VERSION = 2;
 export const ATTENTION_PAGE_DEFAULT = 25;
 export const ATTENTION_PAGE_MAX = 100;
 /** Bounded drain batches (ADR-0004 §10). */
@@ -59,6 +59,15 @@ export class AttentionRefusal extends Error {
     super(detail);
     this.name = "AttentionRefusal";
   }
+}
+
+/** What a posted Slack card last rendered (ADR-0004 Amendment 1, S-7). */
+export interface SlackCardRow {
+  channelId: string;
+  messageTs: string;
+  renderedRevision: number;
+  renderedState: string;
+  renderedReturnPhase: string | null;
 }
 
 /** Who is acting, as the HTTP adapter authenticated it. Never read from a body. */
@@ -348,8 +357,37 @@ export class AttentionStore {
           OR NEW.created_at IS NOT OLD.created_at
         BEGIN SELECT RAISE(ABORT, 'attention_source_immutable'); END;
       `);
+      // Version 2 (ADR-0004 Amendment 1): the Slack card projection. A projection, not history —
+      // rows are rewritten as cards are posted and updated, and losing one costs a re-post.
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS attention_slack_cards (
+          item_id INTEGER PRIMARY KEY,
+          slack_user_id TEXT NOT NULL,
+          channel_id TEXT NOT NULL,
+          message_ts TEXT NOT NULL,
+          rendered_revision INTEGER NOT NULL,
+          rendered_state TEXT NOT NULL,
+          rendered_return_phase TEXT,
+          updated_at TEXT NOT NULL
+        );
+        -- When the front end first ran: an item created since then gets its card even if it
+        -- closed before the first sync; nothing older is ever announced after the fact.
+        CREATE TABLE IF NOT EXISTS attention_slack_meta (
+          singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+          cards_since TEXT NOT NULL
+        );
+        -- A card whose Slack message is gone for good (S-1: never a second notification). Durable, so
+        -- no later mutation or restart posts a replacement or retries the update; Home and the CLI remain.
+        CREATE TABLE IF NOT EXISTS attention_slack_gone (
+          item_id INTEGER NOT NULL,
+          slack_user_id TEXT NOT NULL,
+          PRIMARY KEY (item_id, slack_user_id)
+        );
+      `);
       this.db.prepare("INSERT OR IGNORE INTO attention_schema(singleton, version, created_at) VALUES (1, ?, ?)")
         .run(ATTENTION_STORE_VERSION, this.nowIso());
+      this.db.prepare("UPDATE attention_schema SET version=? WHERE singleton=1 AND version < ?")
+        .run(ATTENTION_STORE_VERSION, ATTENTION_STORE_VERSION);
     // Immediate: a deferred migration that reads the schema and then writes cannot wait out a
     // concurrent writer (SQLITE_BUSY_SNAPSHOT); taking the write lock first lets the busy
     // timeout do its job.
@@ -1207,6 +1245,81 @@ export class AttentionStore {
   }
 
   // ───────────────────────────── reads ─────────────────────────────
+
+  // ───────────────────────────── slack cards (Amendment 1) ─────────────────────────────
+
+  /** The instant the front end first ran (recorded once, durably). */
+  slackCardsSince(nowIso: string): string {
+    this.db.prepare("INSERT OR IGNORE INTO attention_slack_meta(singleton, cards_since) VALUES (1, ?)").run(nowIso);
+    return String((this.db.prepare("SELECT cards_since FROM attention_slack_meta WHERE singleton=1").get() as Row).cards_since);
+  }
+
+  /**
+   * Items whose Slack card for `slackUserId` is missing or out of date. Every summons created since
+   * the front end first ran gets its one card — even one already closed before the first sync, then
+   * rendered in its closed state — and an older item gets one only while still open. A card posted
+   * to a different Slack user (the configured human changed) counts as missing: the new human gets
+   * a card, and the old one stops receiving updates.
+   */
+  cardsDue(slackUserId: string, since: string, limit: number): Array<{ item: ItemView; card: SlackCardRow | null }> {
+    const rows = this.db.prepare(`
+      SELECT i.item_id, c.channel_id, c.message_ts, c.rendered_revision, c.rendered_state, c.rendered_return_phase,
+             (SELECT r.phase FROM attention_returns r WHERE r.item_id=i.item_id AND r.phase!='superseded'
+              ORDER BY r.generation DESC LIMIT 1) AS return_phase
+      FROM attention_items i LEFT JOIN attention_slack_cards c ON c.item_id=i.item_id AND c.slack_user_id=?
+      WHERE i.human_id=? AND NOT EXISTS (SELECT 1 FROM attention_slack_gone g WHERE g.item_id=i.item_id AND g.slack_user_id=?) AND (
+        (c.item_id IS NULL AND (i.state IN ('queued', 'active', 'deferred') OR i.created_at >= ?))
+        OR (c.item_id IS NOT NULL AND (
+          c.rendered_revision != i.revision OR c.rendered_state != i.state
+          OR COALESCE(c.rendered_return_phase, '') != COALESCE(return_phase, '')))
+      )
+      ORDER BY i.item_id LIMIT ?
+    `).all(slackUserId, this.humanId, slackUserId, since, limit) as Array<Row & { item_id: number; channel_id: string | null; message_ts: string | null }>;
+    const now = this.clock.now();
+    return rows.map((row) => ({
+      item: this.view(this.itemRow(row.item_id)!, now),
+      card: row.channel_id === null ? null : {
+        channelId: String(row.channel_id),
+        messageTs: String(row.message_ts),
+        renderedRevision: Number(row.rendered_revision),
+        renderedState: String(row.rendered_state),
+        renderedReturnPhase: row.rendered_return_phase === null ? null : String(row.rendered_return_phase),
+      },
+    }));
+  }
+
+  /**
+   * Changes whenever anything the Home tab renders changes: an item added or mutated (every
+   * mutation bumps its revision and stamp) or a return moving phase. Independent of DM cards, so a
+   * retired card can never hold Home stale (S-1 with S-7).
+   */
+  homeSignature(): string {
+    const items = this.db.prepare(`
+      SELECT COUNT(*) AS n, COALESCE(SUM(revision), 0) AS revisions, COALESCE(MAX(updated_at), '') AS stamp
+      FROM attention_items WHERE human_id=?
+    `).get(this.humanId) as Row;
+    const returns = this.db.prepare(`
+      SELECT COUNT(*) AS n, COALESCE(MAX(r.updated_at), '') AS stamp
+      FROM attention_returns r JOIN attention_items i ON i.item_id=r.item_id WHERE i.human_id=?
+    `).get(this.humanId) as Row;
+    return [items.n, items.revisions, items.stamp, returns.n, returns.stamp].join("|");
+  }
+
+  /** The card's Slack message is gone for good: stop updating it and never re-post (S-1). */
+  markCardGone(itemId: number, slackUserId: string): void {
+    this.db.prepare("INSERT OR IGNORE INTO attention_slack_gone(item_id, slack_user_id) VALUES (?, ?)").run(itemId, slackUserId);
+  }
+
+  /** Record what a card now shows (after a successful post or update). */
+  recordCard(itemId: number, slackUserId: string, channelId: string, messageTs: string, item: ItemView): void {
+    this.db.prepare(`
+      INSERT INTO attention_slack_cards(item_id, slack_user_id, channel_id, message_ts, rendered_revision, rendered_state, rendered_return_phase, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(item_id) DO UPDATE SET slack_user_id=excluded.slack_user_id, channel_id=excluded.channel_id, message_ts=excluded.message_ts,
+        rendered_revision=excluded.rendered_revision, rendered_state=excluded.rendered_state,
+        rendered_return_phase=excluded.rendered_return_phase, updated_at=excluded.updated_at
+    `).run(itemId, slackUserId, channelId, messageTs, item.revision, item.state, item.return?.phase ?? null, this.nowIso());
+  }
 
   item(itemId: number): ItemView | null {
     const row = this.itemRow(itemId);

@@ -446,6 +446,26 @@ minting or after the previous delivery ended — it cannot retract a running tur
 source must be bound to the item's own project and work (`source_scope_mismatch` otherwise): to
 move the work to another seat, bind a source for the same work on that seat first.
 
+### Slack front end (ADR-0004 Amendment 1)
+
+Optional; the CLI stays a full equal. On when attention is enabled **and** the broker env sets
+`HIVE_ATTENTION_SLACK_USER_ID=<Hákon's Slack user id>` (`U…`; a malformed id refuses to boot).
+
+One-time Slack app settings (the broker's existing app; Socket Mode carries all of it, no URL):
+- **Interactivity & Shortcuts**: on.
+- **App Home**: Home Tab on; subscribe the bot event `app_home_opened`.
+- **Bot scopes**: `chat:write` (already present) and `im:write` (to open the DM). Reinstall the app
+  after adding a scope.
+
+What it does: each new open item posts **one** DM card (Slack's pop-up is the only notification);
+amend, withdraw, resolve and the return's progress update that same card silently. **Take next**
+claims what `next` would and opens the decision modal (resolve / defer / cancel, optionally
+"take next" again); **Answer this one** is the recorded explicit pick, for rare use. Only that
+Slack user's clicks act, and only as the operator for next, resolve, defer and cancel. Card sync is
+its own housekeeping job (`hive attention slack sync failed` in the log when Slack is down — the
+queue is unaffected and the card catches up). A broker log line
+`[attention] Slack front end on for U…` confirms it at boot.
+
 ### Doctor, status and logs
 
 `hive attention doctor --json [--source-file … | --operator-host]` reports broker reachability/UUID, enabled state,

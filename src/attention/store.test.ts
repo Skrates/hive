@@ -16,7 +16,7 @@ import {
   summon,
   THREAD,
 } from "./fixtures.js";
-import { AttentionRefusal, AttentionSchemaError, AttentionStore } from "./store.js";
+import { ATTENTION_STORE_VERSION, AttentionRefusal, AttentionSchemaError, AttentionStore } from "./store.js";
 
 function refused(code: string, status?: number) {
   return (error: unknown): boolean => {
@@ -491,10 +491,16 @@ test("A33 the additive migration keeps the broker generation, existing rows, and
   const deliveriesBefore = legacy.listDeliveries().length;
   assert.equal(legacy.db.pragma("user_version", { simple: true }), 5);
   const tables = (legacy.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'attention_%' ORDER BY name").all() as Array<{ name: string }>).map((row) => row.name);
-  assert.deepEqual(tables, ["attention_commands", "attention_events", "attention_items", "attention_returns", "attention_schema", "attention_sources"]);
+  assert.deepEqual(tables, ["attention_commands", "attention_events", "attention_items", "attention_returns", "attention_schema", "attention_slack_cards", "attention_slack_gone", "attention_slack_meta", "attention_sources"]);
   assert.ok(legacy.getSubscription("fable"));
   assert.equal(legacy.listDeliveries().length, deliveriesBefore);
-  legacy.db.prepare("UPDATE attention_schema SET version=2").run();
+  // A version-1 store (before Amendment 1) upgrades in place: the card table appears, nothing else moves.
+  legacy.db.exec("DROP TABLE attention_slack_cards; UPDATE attention_schema SET version=1");
+  new AttentionStore({ broker: legacy, clock: { now: () => new Date() }, humanId: "hakon", enabled: true });
+  assert.equal((legacy.db.prepare("SELECT version FROM attention_schema").get() as { version: number }).version, ATTENTION_STORE_VERSION);
+  assert.ok(legacy.db.prepare("SELECT name FROM sqlite_master WHERE name='attention_slack_cards'").get());
+  assert.equal(legacy.db.pragma("user_version", { simple: true }), 5);
+  legacy.db.prepare("UPDATE attention_schema SET version=?").run(ATTENTION_STORE_VERSION + 1);
   assert.throws(() => new AttentionStore({ broker: legacy, clock: { now: () => new Date() }, humanId: "hakon", enabled: true }), AttentionSchemaError);
   legacy.close();
 });
