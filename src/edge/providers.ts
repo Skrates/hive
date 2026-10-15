@@ -567,7 +567,7 @@ async function runHeadless(
  * stream-json and Grok streaming-messages-json share it), Codex's
  * `item.completed`/`agent_message`, and the last `assistant` message as the
  * fallback when a disturbed run emits no usable `result`. Runs on the FULL
- * stream — never on a truncated receipt.
+ * stream — never on a truncated receipt — and returns the text whole.
  */
 export function headlessAcknowledgement(output: string): string {
   let resultText: string | null = null;
@@ -591,8 +591,7 @@ export function headlessAcknowledgement(output: string): string {
       // Provider outputs are JSONL on supported surfaces; non-JSON diagnostics are ignored.
     }
   }
-  const best = resultText ?? agentMessageText ?? lastAssistantText ?? "Headless provider turn completed successfully.";
-  return best.length <= 2_500 ? best : `${best.slice(0, 2_497)}…`;
+  return resultText ?? agentMessageText ?? lastAssistantText ?? "Headless provider turn completed successfully.";
 }
 
 /** Concatenate the text blocks of an `assistant` wire message (Claude/Grok shape). */

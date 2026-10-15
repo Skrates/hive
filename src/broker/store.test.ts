@@ -12,10 +12,11 @@ import {
   DISPATCHED_OUTCOME_GRACE_MS,
   InvalidTransitionError,
   LegacyDatabaseError,
+  OUTCOME_POST_CHARS,
   SeatWakeRefusedError,
   StaleLeaseError,
 } from "./store.js";
-import { BusySlotFormatError, formatBusySlots, frameWakeInstruction, parseBusySlots, retryBackoffMs, SubscriptionInputSchema, workspaceCwd, type SlackEventInput, type SubscriptionInput } from "../domain.js";
+import { BusySlotFormatError, formatBusySlots, frameWakeInstruction, parseBusySlots, retryBackoffMs, splitText, SubscriptionInputSchema, workspaceCwd, type SlackEventInput, type SubscriptionInput } from "../domain.js";
 import type { Clock } from "../time.js";
 
 class FakeClock implements Clock {
@@ -651,6 +652,73 @@ test("lifecycle reactions ride the outbox: eyes on dispatched, check on outcome,
   // The reaction targets the wake message, never the thread root.
   assert.ok(outbox.every((entry) => !entry.reactionTargets.includes("100.1")));
   store.close();
+});
+
+function dispatchedDelivery() {
+  const { store } = fixture();
+  store.ingestEvent(event());
+  const claimed = store.claimNext("mac", 0)!;
+  store.transition(claimed.id, "mac", 1, "claimed", "accepted_local");
+  store.transition(claimed.id, "mac", 1, "accepted_local", "dispatching");
+  store.markDispatched(claimed.id, "mac", 1);
+  for (const entry of store.listUnsentOutbox()) store.markOutboxSent(entry.outboxId, "200.1");
+  return { store, id: claimed.id };
+}
+
+test("an outcome longer than one Slack message posts whole as ordered, self-identifying parts", () => {
+  const { store, id } = dispatchedDelivery();
+  const text = Array.from({ length: 2_000 }, (_, line) => `line ${line} ${"y".repeat(40)}`).join("\n");
+  assert.ok(text.length > 2 * OUTCOME_POST_CHARS);
+  store.finish(id, "mac", 1, "processed", [], text);
+
+  const posted: string[] = [];
+  for (let first = store.listUnsentOutbox(); first.length > 0; first = store.listUnsentOutbox()) {
+    // A later part waits for the one before it, so the thread reads in order.
+    assert.equal(first.length, 1);
+    const [entry] = first;
+    assert.ok(entry!.text.length < 40_000);
+    posted.push(entry!.text);
+    store.markOutboxSent(entry!.outboxId, `300.${posted.length}`);
+  }
+  assert.ok(posted.length >= 3);
+  const footer = /\n\n\[delivery (\d+) · part (\d+)\/(\d+) · dedupe [^\]]+\]$/;
+  posted.forEach((post, index) => {
+    const match = footer.exec(post);
+    assert.ok(match, post.slice(-120));
+    assert.deepEqual(match!.slice(1).map(Number), [id, index + 1, posted.length]);
+  });
+  assert.equal(posted.map((post) => post.replace(footer, "")).join(""), text);
+  store.close();
+});
+
+test("only the last outcome part stamps the wake processed", () => {
+  const { store, id } = dispatchedDelivery();
+  store.finish(id, "mac", 1, "processed", [], "z".repeat(OUTCOME_POST_CHARS + 1));
+  const first = store.listUnsentOutbox();
+  assert.equal(first[0]!.reaction, null);
+  store.markOutboxSent(first[0]!.outboxId, "300.1");
+  assert.equal(store.listUnsentOutbox()[0]!.reaction, "white_check_mark");
+  store.close();
+});
+
+test("staged outcome parts join the final part inside the terminal transition", () => {
+  const { store, id } = dispatchedDelivery();
+  store.stageOutcomePart(id, "mac", 1, 1, "middle-");
+  store.stageOutcomePart(id, "mac", 1, 0, "stale");
+  store.stageOutcomePart(id, "mac", 1, 0, "first-");
+  // A finish naming more parts than were staged is refused and leaves the delivery open.
+  assert.throws(() => store.finish(id, "mac", 1, "processed", [], "last", 3), InvalidTransitionError);
+  assert.equal(store.getDelivery(id).status, "dispatched");
+  store.finish(id, "mac", 1, "processed", [], "last", 2);
+  const outcome = store.listUnsentOutbox().find((entry) => entry.text.startsWith("first-"))!;
+  assert.match(outcome.text, /^first-middle-last\n\n\[delivery /);
+  store.close();
+});
+
+test("splitText never cuts a surrogate pair and prefers a line break when asked", () => {
+  assert.deepEqual(splitText("ab😀cd", 3), ["ab", "😀c", "d"]);
+  assert.deepEqual(splitText("aaaa\nbbbbbb", 8, true), ["aaaa\n", "bbbbbb"]);
+  assert.deepEqual(splitText("short", 10), ["short"]);
 });
 
 test("KRA-1414 falsifier: a dispatch notice reaches the requester's thread and leaves the outcome alone", () => {

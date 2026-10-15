@@ -8,7 +8,7 @@ import type {
   SeatWakeReceipt,
   SubscriptionInput,
 } from "../domain.js";
-import { formatBusySlots } from "../domain.js";
+import { formatBusySlots, OUTCOME_TRANSPORT_PART_CHARS, splitText } from "../domain.js";
 import type { Action, Receipt, ReviewState } from "../review/contract.js";
 
 /** A seat's review act as the edge forwards it: custody resolved, actor never named (§5.A1). */
@@ -144,10 +144,25 @@ export class BrokerClient {
     return this.json<Delivery>(response);
   }
 
-  async finish(delivery: Delivery, result: DeliveryResultInput): Promise<Delivery> {
+  /**
+   * An outcome longer than one request part is staged under the lease first,
+   * then the terminal transition carries the final part and the staged count:
+   * the broker joins them atomically, so a long outcome is neither cut nor
+   * refused as an oversized body (which would release and rerun the turn).
+   */
+  async finish(delivery: Delivery, result: Omit<DeliveryResultInput, "stagedOutcomeParts">): Promise<Delivery> {
+    const parts = result.outcome === null ? [null] : splitText(result.outcome, OUTCOME_TRANSPORT_PART_CHARS);
+    const staged = parts.slice(0, -1) as string[];
+    for (const [index, text] of staged.entries()) {
+      const answer = await this.request(`/v1/deliveries/${delivery.id}/outcome-part`, {
+        method: "POST",
+        body: JSON.stringify({ generation: result.generation, index, text }),
+      });
+      await this.json<{ staged: true }>(answer);
+    }
     const response = await this.request(`/v1/deliveries/${delivery.id}/result`, {
       method: "POST",
-      body: JSON.stringify(result),
+      body: JSON.stringify({ ...result, outcome: parts.at(-1) ?? null, stagedOutcomeParts: staged.length }),
     });
     return this.json<Delivery>(response);
   }

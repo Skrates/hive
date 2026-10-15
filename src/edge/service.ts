@@ -311,25 +311,30 @@ export class EdgeService {
           }
         }),
       );
-      current = asClaimed(await this.broker.markDispatched(current, overlay.unused ? [overlay.unused] : []));
-      this.store.setStatus(current.id, generation, "dispatched", dispatch.receipt);
-      if (dispatch.processed) {
-        // A completed provider turn (headless, or a completion-tracked Codex
-        // live turn) carries the agent's final text in `outcome`; `receipt` is
-        // bounded diagnostic evidence only. The outcome travels inside the
-        // terminal transition so the broker commits `processed` and the
-        // durable thread post together — a Slack outage can neither lose the
-        // outcome nor cause this trusted instruction to rerun.
-        await this.broker.finish(current, {
-          generation,
-          status: "processed",
-          reasons: [],
-          providerReceipt: dispatch.receipt,
-          outcome: dispatch.outcome,
-        });
-        this.store.setStatus(current.id, generation, "processed", dispatch.receipt);
-        return;
-      }
+      // The lease stays owned through the terminal commit: a long outcome uploads
+      // in sequential parts, and a lapse mid-upload would stale-reject the finish
+      // and requeue a turn that already ran. The generation fence is unchanged.
+      await this.withLeaseHeartbeat(current, async () => {
+        current = asClaimed(await this.broker.markDispatched(current, overlay.unused ? [overlay.unused] : []));
+        this.store.setStatus(current.id, generation, "dispatched", dispatch.receipt);
+        if (dispatch.processed) {
+          // A completed provider turn (headless, or a completion-tracked Codex
+          // live turn) carries the agent's final text in `outcome`; `receipt` is
+          // bounded diagnostic evidence only. The outcome travels inside the
+          // terminal transition so the broker commits `processed` and the
+          // durable thread post together — a Slack outage can neither lose the
+          // outcome nor cause this trusted instruction to rerun.
+          await this.broker.finish(current, {
+            generation,
+            status: "processed",
+            reasons: [],
+            providerReceipt: dispatch.receipt,
+            outcome: dispatch.outcome,
+          });
+          this.store.setStatus(current.id, generation, "processed", dispatch.receipt);
+          return;
+        }
+      });
       // A non-completion-tracked live delivery (currently Claude inbox write)
       // is durable but the agent has not answered yet. The delivery stays
       // `dispatched` until the agent's `hive reply` closes it (R-6); if no

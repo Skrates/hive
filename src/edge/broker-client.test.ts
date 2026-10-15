@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createServer, type Server } from "node:http";
 import { AddressInfo } from "node:net";
 import test from "node:test";
-import type { Delivery } from "../domain.js";
+import { OUTCOME_TRANSPORT_PART_CHARS, type Delivery } from "../domain.js";
 import { BrokerClient } from "./broker-client.js";
 
 interface Captured { path: string; body: Record<string, unknown> }
@@ -59,5 +59,29 @@ test("a transition's generation is the client's own and cannot be displaced by a
     assert.deepEqual(captured[1]?.body, { generation: 7 });
     await client.renew(delivery);
     assert.deepEqual(captured[2]?.body, { generation: 7 });
+  });
+});
+
+test("an outcome longer than one request part is staged under the lease, then finished with the last part", async () => {
+  await withBroker({ ...delivery, status: "processed" }, async (client, captured) => {
+    const outcome = `${"a".repeat(OUTCOME_TRANSPORT_PART_CHARS)}${"b".repeat(OUTCOME_TRANSPORT_PART_CHARS)}tail`;
+    await client.finish(delivery, { generation: 7, status: "processed", reasons: [], providerReceipt: null, outcome });
+    assert.deepEqual(captured.map((request) => request.path), [
+      "/v1/deliveries/42/outcome-part",
+      "/v1/deliveries/42/outcome-part",
+      "/v1/deliveries/42/result",
+    ]);
+    assert.deepEqual(captured.slice(0, 2).map((request) => [request.body.generation, request.body.index]), [[7, 0], [7, 1]]);
+    assert.equal(captured.map((request, index) => index < 2 ? request.body.text : request.body.outcome).join(""), outcome);
+    assert.equal(captured[2]!.body.stagedOutcomeParts, 2);
+  });
+});
+
+test("a short outcome finishes in one request with nothing staged", async () => {
+  await withBroker({ ...delivery, status: "processed" }, async (client, captured) => {
+    await client.finish(delivery, { generation: 7, status: "processed", reasons: [], providerReceipt: null, outcome: "done" });
+    assert.deepEqual(captured.map((request) => request.path), ["/v1/deliveries/42/result"]);
+    assert.equal(captured[0]!.body.outcome, "done");
+    assert.equal(captured[0]!.body.stagedOutcomeParts, 0);
   });
 });

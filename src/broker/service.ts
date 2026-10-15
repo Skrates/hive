@@ -2,6 +2,7 @@ import type {
   BusySlot,
   Delivery,
   DeliveryResultInput,
+  OutcomePartInput,
   Reason,
   ReplaySnapshot,
   SeatWakeMint,
@@ -153,7 +154,13 @@ export class BrokerService {
   }
 
   finish(deliveryId: number, edgeId: string, result: DeliveryResultInput): Delivery {
-    return this.store.finish(deliveryId, edgeId, result.generation, result.status, result.reasons, result.outcome);
+    return this.store.finish(
+      deliveryId, edgeId, result.generation, result.status, result.reasons, result.outcome, result.stagedOutcomeParts,
+    );
+  }
+
+  stageOutcomePart(deliveryId: number, edgeId: string, part: OutcomePartInput): void {
+    this.store.stageOutcomePart(deliveryId, edgeId, part.generation, part.index, part.text);
   }
 
   /** ADR-0003 R-3: uncertainty releases the delivery for redelivery instead of declaring an outcome. */

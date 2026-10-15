@@ -364,8 +364,48 @@ export const DeliveryResultInputSchema = z.object({
    * the delivery and rerun the whole trusted instruction.
    */
   outcome: z.string().nullable().default(null),
+  /**
+   * An outcome too large for one request body arrives in parts staged under the
+   * same lease (`/outcome-part`, indexes 0..n-1); `outcome` is then the final
+   * part, and the broker joins all of them inside the terminal transition.
+   */
+  stagedOutcomeParts: z.number().int().min(0).default(0),
 });
 export type DeliveryResultInput = z.infer<typeof DeliveryResultInputSchema>;
+
+export const OutcomePartInputSchema = z.object({
+  generation: z.number().int().positive(),
+  index: z.number().int().min(0),
+  text: z.string(),
+});
+export type OutcomePartInput = z.infer<typeof OutcomePartInputSchema>;
+
+/**
+ * Edge-to-broker transport bound for one outcome part, in UTF-16 code units.
+ * JSON escaping expands a unit to at most six bytes, so a part stays well
+ * inside the broker's 1,000,000-byte request body. A bound on one request,
+ * never on the outcome: any length travels whole as more parts.
+ */
+export const OUTCOME_TRANSPORT_PART_CHARS = 100_000;
+
+/** Split text into consecutive pieces of at most `max` code units without cutting a surrogate pair. */
+export function splitText(text: string, max: number, preferNewline = false): string[] {
+  const parts: string[] = [];
+  let rest = text;
+  while (rest.length > max) {
+    let cut = max;
+    if (preferNewline) {
+      const newline = rest.lastIndexOf("\n", max - 1);
+      if (newline >= max / 2) cut = newline + 1;
+    }
+    const code = rest.charCodeAt(cut - 1);
+    if (code >= 0xd800 && code <= 0xdbff) cut -= 1;
+    parts.push(rest.slice(0, cut));
+    rest = rest.slice(cut);
+  }
+  parts.push(rest);
+  return parts;
+}
 
 export interface ReplaySnapshot {
   channelId: string;
