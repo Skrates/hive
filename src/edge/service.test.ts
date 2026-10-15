@@ -302,6 +302,31 @@ test("an Effort line in a coalesced follow-up binds the invocation; a conflict f
   assert.deepEqual(adapter.efforts, ["max", null]);
 });
 
+test("the lease is renewed while a long outcome uploads in the terminal commit", async () => {
+  const broker = new FakeBroker([delivery(1)]);
+  let renews = 0;
+  broker.renew = async (value: Delivery) => { renews += 1; return value; };
+  const ticks: Array<() => void> = [];
+  const timers = { set: (callback: () => void) => { ticks.push(callback); return callback; }, clear: () => {} };
+  let renewsDuringFinish = -1;
+  broker.finish = async (value: Delivery, result: DeliveryResultInput) => {
+    const before = renews;
+    // The upload spans a lease period: the heartbeat interval elapses here.
+    ticks.splice(0).forEach((tick) => tick());
+    await new Promise((resolve) => setImmediate(resolve));
+    renewsDuringFinish = renews - before;
+    broker.finishes.push({ deliveryId: value.id, result });
+    return { ...value, status: result.status };
+  };
+  const store = new EdgeStore(":memory:");
+  const edge = new EdgeService(asBrokerClient(broker), store, new LiveIngressRegistry(), [new StubAdapter()], timers);
+
+  assert.equal(await edge.processOne(), true);
+  assert.equal(broker.finishes[0]?.result.status, "processed");
+  assert.ok(renewsDuringFinish >= 1, "heartbeat must still run while finish uploads");
+  store.close();
+});
+
 test("a headless resume dispatch completes, posts its outcome, and finishes processed", async () => {
   const broker = new FakeBroker([delivery(1)]);
   const store = new EdgeStore(":memory:");
