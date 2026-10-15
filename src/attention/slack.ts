@@ -268,7 +268,8 @@ export const SLACK_CARD_BATCH = 25;
 export class AttentionSlackFrontEnd {
   private running: Promise<number> | null = null;
   private dmChannel: string | null = null;
-  private since: string | null = null;
+  /** Durable activation instant: every summons created while a front end runs is owed a card. */
+  private readonly since: string;
   /** A Home publication that failed is retried on the next pass even if no card changed. */
   private homeDirty = false;
 
@@ -279,7 +280,9 @@ export class AttentionSlackFrontEnd {
     private readonly humanSlackUserId: string,
     private readonly clock: { now(): Date },
     private readonly log: (line: string) => void = () => {},
-  ) {}
+  ) {
+    this.since = store.slackCardsSince(clock.now().toISOString());
+  }
 
   /**
    * One housekeeping pass (S-7): post a card for each open item that has none, update every card
@@ -297,7 +300,6 @@ export class AttentionSlackFrontEnd {
 
   private async drain(): Promise<number> {
     let changed = 0;
-    this.since ??= this.store.slackCardsSince(this.clock.now().toISOString());
     for (const { item, card } of this.store.cardsDue(this.humanSlackUserId, this.since, SLACK_CARD_BATCH)) {
       try {
         const now = this.clock.now();

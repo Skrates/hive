@@ -244,6 +244,23 @@ test("S-1 a summons closed before the first sync still gets its one card; older 
   h.close();
 });
 
+test("S-1 the cutoff is activation: a summons created and closed before the first drain still gets its card", async () => {
+  const h = harness();
+  const source = liveSource(h.store);
+  const old = summon(h.store, source, { intervention_key: "old" }).item!;
+  act(h.store, source, "withdraw", { item_id: old.item_id, expected_revision: 1, reason: "moot" });
+  h.clock.advance(1000);
+  const { slack, front } = frontEnd(h); // no drain yet: HTTP could already be taking commands
+  h.clock.advance(1000);
+  const quick = summon(h.store, source, { intervention_key: "quick" }).item!;
+  h.clock.advance(1000);
+  act(h.store, source, "withdraw", { item_id: quick.item_id, expected_revision: 1, reason: "moot" });
+  h.clock.advance(3000);
+  assert.equal(await front.drainOnce(), 1);
+  assert.equal(slack.calls.filter((call) => call.op === "post").length, 1, "the window before the first drain is covered; older history is not");
+  h.close();
+});
+
 test("the Home tab lists a due deferral with what Take next selects, and shows packet deadlines", () => {
   const h = harness();
   const source = liveSource(h.store);
