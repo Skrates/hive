@@ -491,7 +491,7 @@ test("A33 the additive migration keeps the broker generation, existing rows, and
   const deliveriesBefore = legacy.listDeliveries().length;
   assert.equal(legacy.db.pragma("user_version", { simple: true }), 5);
   const tables = (legacy.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'attention_%' ORDER BY name").all() as Array<{ name: string }>).map((row) => row.name);
-  assert.deepEqual(tables, ["attention_commands", "attention_events", "attention_items", "attention_returns", "attention_schema", "attention_slack_cards", "attention_slack_meta", "attention_sources"]);
+  assert.deepEqual(tables, ["attention_commands", "attention_events", "attention_items", "attention_returns", "attention_schema", "attention_slack_cards", "attention_slack_gone", "attention_slack_meta", "attention_sources"]);
   assert.ok(legacy.getSubscription("fable"));
   assert.equal(legacy.listDeliveries().length, deliveriesBefore);
   // A version-1 store (before Amendment 1) upgrades in place: the card table appears, nothing else moves.

@@ -282,8 +282,8 @@ export class AttentionSlackFrontEnd {
   private dmChannel: string | null = null;
   /** Durable activation instant: every summons created while a front end runs is owed a card. */
   private readonly since: string;
-  /** A Home publication that failed is retried on the next pass even if no card changed. */
-  private homeDirty = false;
+  /** Home is owed a publication: at startup (to recompute the next due time, which the process forgets) and after a failed one. */
+  private homeDirty = true;
   /** Earliest future deferral time in the last published Home; passing it makes Home stale by time alone. */
   private homeStaleAt: string | null = null;
 
@@ -317,21 +317,20 @@ export class AttentionSlackFrontEnd {
     for (const { item, card } of this.store.cardsDue(this.humanSlackUserId, this.since, SLACK_CARD_BATCH)) {
       try {
         const now = this.clock.now();
-        const post = async (): Promise<void> => {
+        if (card === null) {
           const channel = await this.dm();
           const ts = await this.api.post(channel, cardText(item), cardBlocks(item, now));
           this.store.recordCard(item.item_id, this.humanSlackUserId, channel, ts, item);
-        };
-        if (card === null) {
-          await post();
         } else {
           try {
             await this.api.update(card.channelId, card.messageTs, cardText(item), cardBlocks(item, now));
             this.store.recordCard(item.item_id, this.humanSlackUserId, card.channelId, card.messageTs, item);
           } catch (error) {
-            // The card's message is gone for good (deleted): re-post the current projection once.
+            // The message is gone for good (deleted). S-1: never a second notification, so the card
+            // is retired durably; Home and the CLI stay authoritative. Transient errors stay retryable.
             if (slackErrorCode(error) !== "message_not_found") throw error;
-            await post();
+            this.store.markCardGone(item.item_id, this.humanSlackUserId);
+            this.log(`[attention-slack] card for ${itemLabel(item.item_id)} is gone; no longer updated`);
           }
         }
         changed += 1;

@@ -376,6 +376,13 @@ export class AttentionStore {
           singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
           cards_since TEXT NOT NULL
         );
+        -- A card whose Slack message is gone for good (S-1: never a second notification). Durable, so
+        -- no later mutation or restart posts a replacement or retries the update; Home and the CLI remain.
+        CREATE TABLE IF NOT EXISTS attention_slack_gone (
+          item_id INTEGER NOT NULL,
+          slack_user_id TEXT NOT NULL,
+          PRIMARY KEY (item_id, slack_user_id)
+        );
       `);
       this.db.prepare("INSERT OR IGNORE INTO attention_schema(singleton, version, created_at) VALUES (1, ?, ?)")
         .run(ATTENTION_STORE_VERSION, this.nowIso());
@@ -1260,14 +1267,14 @@ export class AttentionStore {
              (SELECT r.phase FROM attention_returns r WHERE r.item_id=i.item_id AND r.phase!='superseded'
               ORDER BY r.generation DESC LIMIT 1) AS return_phase
       FROM attention_items i LEFT JOIN attention_slack_cards c ON c.item_id=i.item_id AND c.slack_user_id=?
-      WHERE i.human_id=? AND (
+      WHERE i.human_id=? AND NOT EXISTS (SELECT 1 FROM attention_slack_gone g WHERE g.item_id=i.item_id AND g.slack_user_id=?) AND (
         (c.item_id IS NULL AND (i.state IN ('queued', 'active', 'deferred') OR i.created_at >= ?))
         OR (c.item_id IS NOT NULL AND (
           c.rendered_revision != i.revision OR c.rendered_state != i.state
           OR COALESCE(c.rendered_return_phase, '') != COALESCE(return_phase, '')))
       )
       ORDER BY i.item_id LIMIT ?
-    `).all(slackUserId, this.humanId, since, limit) as Array<Row & { item_id: number; channel_id: string | null; message_ts: string | null }>;
+    `).all(slackUserId, this.humanId, slackUserId, since, limit) as Array<Row & { item_id: number; channel_id: string | null; message_ts: string | null }>;
     const now = this.clock.now();
     return rows.map((row) => ({
       item: this.view(this.itemRow(row.item_id)!, now),
@@ -1279,6 +1286,11 @@ export class AttentionStore {
         renderedReturnPhase: row.rendered_return_phase === null ? null : String(row.rendered_return_phase),
       },
     }));
+  }
+
+  /** The card's Slack message is gone for good: stop updating it and never re-post (S-1). */
+  markCardGone(itemId: number, slackUserId: string): void {
+    this.db.prepare("INSERT OR IGNORE INTO attention_slack_gone(item_id, slack_user_id) VALUES (?, ?)").run(itemId, slackUserId);
   }
 
   /** Record what a card now shows (after a successful post or update). */

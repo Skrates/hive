@@ -236,7 +236,7 @@ test("S-1 a summons closed before the first sync still gets its one card; older 
   h.clock.advance(1000);
   const { slack, front } = frontEnd(h);
   await front.drainOnce();
-  assert.deepEqual(slack.ops(), [], "nothing older than the front end is announced after the fact");
+  assert.deepEqual(slack.ops(), ["publishHome"], "nothing older than the front end is announced after the fact; only the startup Home publication");
   const quick = summon(h.store, source, { intervention_key: "quick" }).item!;
   act(h.store, source, "withdraw", { item_id: quick.item_id, expected_revision: 1, reason: "moot" });
   await front.drainOnce();
@@ -371,14 +371,13 @@ test("S-6 the notification fallback carries no Slack control characters and the 
   h.close();
 });
 
-test("S-7 a card whose message is gone for good is re-posted once; a transient error is not mistaken for it", async () => {
+test("S-1 a card whose message is gone for good is retired durably: no replacement post, across mutation and restart; a transient error stays retryable", async () => {
   const h = harness();
   const source = liveSource(h.store);
   const item = summon(h.store, source).item!;
   const slack = new FakeSlack();
   const { front } = frontEnd(h, HUMAN, slack);
   await front.drainOnce();
-  const original = slack.calls.find((c) => c.op === "post")!;
   let mode: "gone" | "transient" = "transient";
   slack.update = async (channel: string, ts: string, text: string, blocks: unknown[]) => {
     slack.calls.push({ op: "update", args: [channel, ts, text, blocks] });
@@ -388,15 +387,41 @@ test("S-7 a card whose message is gone for good is re-posted once; a transient e
   slack.clear();
   await front.drainOnce();
   assert.deepEqual(slack.ops().filter((op) => op === "post"), [], "transient failure keeps the card due, no recovery post");
+  slack.clear();
+  await front.drainOnce();
+  assert.equal(slack.ops().filter((op) => op === "update").length, 1, "and it is retried");
   mode = "gone";
   slack.clear();
   await front.drainOnce();
-  assert.equal(slack.ops().filter((op) => op === "post").length, 1);
-  assert.notEqual(slack.calls.find((c) => c.op === "post")!.args[0], undefined);
-  assert.ok(original);
+  assert.deepEqual(slack.ops().filter((op) => op === "post"), [], "S-1: never a replacement notification");
+  assert.equal(slack.ops().filter((op) => op === "update").length, 1);
+  act(h.store, source, "amend", { item_id: item.item_id, expected_revision: 2, fields: { title: "Retitled again" } });
+  const restarted = frontEnd(h, HUMAN, slack);
   slack.clear();
   await front.drainOnce();
-  assert.deepEqual(slack.ops().filter((op) => op === "update" || op === "post"), [], "the recovered card is current: no further retries");
+  await restarted.front.drainOnce();
+  assert.deepEqual(slack.ops().filter((op) => op === "update" || op === "post"), [], "later mutation and restart: no update loop, no post");
+  assert.ok(slack.ops().includes("publishHome"), "Home still shows the item");
+  h.close();
+});
+
+test("S-7 Home is published at startup, so a deferral already in the store is refreshed when it comes due without any write", async () => {
+  const h = harness();
+  const first = frontEnd(h);
+  const item = summon(h.store, liveSource(h.store)).item!;
+  const taken = next(h.store);
+  act(h.store, { kind: "operator" }, "defer", { item_id: item.item_id, expected_revision: taken.item!.revision, reason: "later", until: new Date(h.clock.now().getTime() + 60_000).toISOString(), select_next: false });
+  await first.front.drainOnce();
+  const restarted = frontEnd(h); // new process: forgets the next due time; every card row is already current
+  await restarted.front.drainOnce();
+  assert.deepEqual(restarted.slack.ops(), ["publishHome"], "startup publishes Home once, with no card change");
+  restarted.slack.clear();
+  await restarted.front.drainOnce();
+  assert.deepEqual(restarted.slack.ops(), [], "before it is due nothing repeats");
+  h.clock.advance(120_000);
+  await restarted.front.drainOnce();
+  assert.deepEqual(restarted.slack.ops(), ["publishHome"]);
+  assert.doesNotMatch(JSON.stringify(restarted.slack.calls[0]!.args[1]), /nothing waiting/u);
   h.close();
 });
 
