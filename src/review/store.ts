@@ -827,12 +827,22 @@ export class ReviewStore {
         this.updateEffect(effectId, "UPDATE review_effects SET status = 'pending', attempts = attempts + 1, next_attempt_at = ? WHERE effect_id = ?", nextAttemptAt);
         this.db.prepare("UPDATE review_effects SET status = 'failed', next_attempt_at = NULL WHERE effect_id = ? AND attempts >= ?").run(effectId, REVIEW_EFFECT_MAX_ATTEMPTS);
         const row = this.db.prepare("SELECT review_id, status, target, attempts FROM review_effects WHERE effect_id = ?").get(effectId) as Row;
-        if (row.status === "failed" && this.deps.onEffectExhausted !== undefined) {
-          const state = this.readById(String(row.review_id));
-          const channelId = state === null ? null : this.policy(state.key.repository_id, state.policy_version)?.slack?.channel_id ?? null;
-          this.deps.onEffectExhausted({ channelId, threadTs: state?.projection_handles.slack_thread_ts ?? null,
-            text: `Review publication failed after ${row.attempts} attempts: ${state?.display ?? row.review_id}; target ${row.target}; effect ${effectId}. Operator action is required.` });
-        }
+        if (row.status === "failed") this.noticeEffectFailed(row, effectId, `failed after ${row.attempts} attempts`);
+      })();
+    },
+
+    /**
+     * Terminal `failed` now, without spending the attempt bound: the remote answered and asking
+     * again cannot change the answer (a GitHub authorization or validation refusal). The same
+     * durable failure notice the bound queues carries the refusal, so the row is never silent.
+     */
+    markFailedPermanently: (effectId: string, reason: string): void => {
+      this.db.transaction(() => {
+        const before = this.db.prepare("SELECT status FROM review_effects WHERE effect_id = ?").get(effectId) as Row | undefined;
+        if (before?.status === "failed") return;
+        this.updateEffect(effectId, "UPDATE review_effects SET status = 'failed', attempts = attempts + 1, next_attempt_at = NULL WHERE effect_id = ?");
+        const row = this.db.prepare("SELECT review_id, status, target, attempts FROM review_effects WHERE effect_id = ?").get(effectId) as Row;
+        this.noticeEffectFailed(row, effectId, `was refused permanently on attempt ${row.attempts} (${reason.slice(0, 300)})`);
       })();
     },
 
@@ -886,6 +896,15 @@ export class ReviewStore {
       INSERT INTO review_projection_handles(review_id, handle, key, value, recorded_at) VALUES (?, ?, ?, ?, ?)
       ON CONFLICT(review_id, handle, key) DO UPDATE SET value = excluded.value, recorded_at = excluded.recorded_at
     `).run(reviewId, handle, key, value, iso(this.deps.clock));
+  }
+
+  /** §8.1: a terminal `failed` row queues one durable notice in the Review's Slack thread (or the broker channel). */
+  private noticeEffectFailed(row: Row, effectId: string, what: string): void {
+    if (this.deps.onEffectExhausted === undefined) return;
+    const state = this.readById(String(row.review_id));
+    const channelId = state === null ? null : this.policy(state.key.repository_id, state.policy_version)?.slack?.channel_id ?? null;
+    this.deps.onEffectExhausted({ channelId, threadTs: state?.projection_handles.slack_thread_ts ?? null,
+      text: `Review publication ${what}: ${state?.display ?? String(row.review_id)}; target ${String(row.target)}; effect ${effectId}. Operator action is required.` });
   }
 
   private updateEffect(effectId: string, sql: string, ...params: unknown[]): void {

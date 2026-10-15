@@ -12,6 +12,7 @@ import {
   type SystemWakePort,
 } from "./publisher.js";
 import type { UnknownSourceRecord } from "./store.js";
+import { GitHubApiError } from "./github/port.js";
 
 class FakeClock implements Clock {
   constructor(private current = new Date(AT)) {}
@@ -39,6 +40,7 @@ class FakeReviewStore implements PublisherStore {
   handles: Array<{ reviewId: string; handle: string; key: string; value: string | number }> = [];
   transport: Array<{ reviewId: string; effectId: string; requestId: string; ref: TransportRef }> = [];
   unknownRecords = new Map<string, UnknownSourceRecord[]>();
+  permanentFailures: Array<{ effectId: string; reason: string }> = [];
 
   put(reviewState: ReviewState): void { this.states.set(reviewState.id, reviewState); }
   readById(reviewId: string): ReviewState | null {
@@ -121,6 +123,13 @@ class FakeReviewStore implements PublisherStore {
       row.attempts += 1;
       row.nextAttemptAt = nextAttemptAt;
     },
+    markFailedPermanently: (effectId: string, reason: string): void => {
+      const row = this.row(effectId);
+      row.status = "failed";
+      row.attempts += 1;
+      row.nextAttemptAt = null;
+      this.permanentFailures.push({ effectId, reason });
+    },
     coalesceRefresh: (target: string): number => {
       const pending = this.rows.filter((r) => r.target === target && r.kind === "refresh" && r.status === "pending");
       const newest = pending.reduce<Row | null>((best, r) => (best === null || r.effect_id > best.effect_id ? r : best), null);
@@ -171,6 +180,8 @@ class FakeGitHub implements ReviewGitHubPort {
   gate: Promise<void> | null = null;
   /** A port whose responses carry no id (the App port's `?? 0` fallback). */
   noIds = false;
+  /** What a thread call throws, when set. */
+  threadError: Error | null = null;
   /** As a real request does: once the dispatch's signal fires, the call does nothing on the wire. */
   private refuseIfAborted(signal: AbortSignal): void {
     if (signal.aborted) throw new Error("aborted");
@@ -192,6 +203,7 @@ class FakeGitHub implements ReviewGitHubPort {
   }
   async unresolveThread(input: { commentId: number }, signal: AbortSignal): Promise<void> {
     this.refuseIfAborted(signal);
+    if (this.threadError !== null) throw this.threadError;
     this.threads.push({ commentId: input.commentId, op: "unresolve" });
   }
   async postComment(input: { body: string }, signal: AbortSignal): Promise<{ commentId: number; summonLogin: string }> {
@@ -359,6 +371,46 @@ test("thread refresh resolves a closed comment-sourced finding and unresolves a 
   assert.equal(await publisher.drainOnce(), 3);
   assert.deepEqual(github!.threads, [{ commentId: 9001, op: "resolve" }, { commentId: 9002, op: "unresolve" }]);
   assert.equal(store.row("eff_3").status, "obsolete");
+});
+
+// §8.1: GitHub answering a thread mutation with a GraphQL authorization or validation error is
+// a verdict, not a moment — the row is terminal at once with its reason, not retried fifty
+// times. A transient failure (5xx, rate limit, timeout) still retries behind backoff.
+test("a permanent GitHub refusal terminalizes the row with its reason; a transient failure keeps retrying", async () => {
+  const { store, github, clock, publisher } = fixture({ github: true });
+  store.put(state({
+    findings: [finding({ id: "fnd_2", source: { container_kind: "review_comment", comment_id: 9002, locator: 0 }, status: { open: true, contested: { by: "codex", at: AT, prior: fixedClaim() } } })],
+  }));
+  const quiet = console.error;
+  console.error = () => {};
+  try {
+    store.add({ effect_id: "eff_1", kind: "refresh", target: "thread:9002" });
+    github!.threadError = new GitHubApiError(502, "/graphql", "bad gateway");
+    assert.equal(await publisher.drainOnce(), 0);
+    assert.equal(store.row("eff_1").status, "pending", "a 5xx retries");
+    assert.equal(store.row("eff_1").attempts, 1);
+    clock.advance(60_000);
+    github!.threadError = new GitHubApiError(200, "/graphql", '[{"type":"RATE_LIMITED"}]');
+    assert.equal(await publisher.drainOnce(), 0);
+    assert.equal(store.row("eff_1").status, "pending", "a GraphQL rate limit retries");
+    assert.equal(store.row("eff_1").attempts, 2);
+    assert.equal(store.permanentFailures.length, 0);
+
+    clock.advance(600_000);
+    github!.threadError = new GitHubApiError(200, "/graphql", '[{"type":"FORBIDDEN","path":["unresolveReviewThread"]}]', { permanent: true });
+    assert.equal(await publisher.drainOnce(), 0);
+    const row = store.row("eff_1");
+    assert.equal(row.status, "failed");
+    assert.equal(row.nextAttemptAt, null);
+    assert.equal(row.attempts, 3);
+    assert.equal(store.permanentFailures.length, 1);
+    assert.match(store.permanentFailures[0]!.reason, /FORBIDDEN/u);
+    clock.advance(3_600_000);
+    assert.equal(await publisher.drainOnce(), 0, "a terminal row is never offered again");
+    assert.deepEqual(github!.threads, []);
+  } finally {
+    console.error = quiet;
+  }
 });
 
 // §6.D7: a summon whose request is no longer pending at the current subject is obsolete.

@@ -616,7 +616,13 @@ reads the policy by the Review's version; the batch records it (§B3).
   3. for each Codex record not yet admitted at its version: classify (clean / findings / incomplete /
      quota refusal / connector error / unknown) and admit `AdmitExternalResult` or
      `SetReviewerAvailability`; `unknown` is recorded on the source record and surfaced on the board,
-     never promoted;
+     never promoted. A result at a head the Review never observed (pushed over before any
+     reconcile, or every pre-reset head after `reset-store`, §9.3) is recorded `unobserved_head`
+     and not proposed — §E4 would refuse it `unknown_subject` on every run — and is admitted if
+     that head is ever observed. An admission the reducer refuses is recorded `refused:<code>` on
+     its source record (and once in `review_attempts`) and is not re-proposed at that version: every
+     other refusal an adapter admission meets (`malformed`, `unauthorized`, `lifecycle` on merged)
+     is fixed for the version;
   4. compute exemption evidence (§C6) when the subject changed.
   A delayed older webhook therefore triggers a reconcile that observes the *current* PR; nothing regresses
   (F-14). The three ids stay distinct: `github_inbox.delivery_id` (notification), `source_records`
@@ -685,7 +691,11 @@ reads the policy by the Review's version; the batch records it (§B3).
   itself `obsolete` otherwise. At-least-once remains; summon comments identify the request,
   `effect_id`, and attempt. Interrupted claims retry after backoff; the 50th failed attempt
   atomically queues a durable failure notice in the Review's Slack thread (or the broker channel
-  when the Review has no Slack channel).
+  when the Review has no Slack channel). A GitHub answer that retrying cannot change — a GraphQL
+  error whose every `type` is `FORBIDDEN`, `INSUFFICIENT_SCOPES`, `NOT_FOUND` or `UNPROCESSABLE` —
+  terminalizes the row as `failed` at once and queues the same notice carrying GitHub's answer;
+  rate limits, 5xx, network errors, timeouts and REST statuses (a 403 may be a secondary rate
+  limit, a 422 an unreplicated head) keep retrying behind backoff.
 - **Check run `weave/review`** at the current head: `success` ⇔ `readiness.ready`; otherwise `failure`
   with the first reason in precedence order: merged > closed > hold > exhausted > required request pending
   > requirement unsatisfied > blocking findings > draft. **`neutral`/`skipped` are never published**
@@ -696,7 +706,10 @@ reads the policy by the Review's version; the batch records it (§B3).
   references, holds, charges, the exhaustion gate text, and unknown-severity findings prominently.
 - **Thread resolution** (ruled): a finding whose source is a GitHub `review_comment` gets its review thread resolved
   when its status becomes closed and un-resolved when it becomes contested or re-opened — GraphQL
-  `resolveReviewThread`/`unresolveReviewThread` under the App. The merge skill's "zero open threads" limb
+  `resolveReviewThread`/`unresolveReviewThread` under the App. The refresh renders the verdict: the
+  port reads the thread's `isResolved` and sends no mutation when the thread is already in that
+  state (GitHub answers un-resolving an unresolved thread with `FORBIDDEN`). A human's resolution of
+  a thread over an open finding is still un-resolved — the Review, not the thread, is the authority. The merge skill's "zero open threads" limb
   stays and now agrees with the Review by construction. `issue_comment` findings never emit a
   review-thread operation. Slack thread and opener handles are keyed by channel, so adopting a
   policy with a different channel opens a thread in that channel.

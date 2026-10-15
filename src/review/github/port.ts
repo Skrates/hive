@@ -161,9 +161,32 @@ export interface FetchLike {
 }
 
 export class GitHubApiError extends Error {
-  constructor(readonly status: number, readonly url: string, detail: string) {
+  /**
+   * True when GitHub has answered and the answer cannot change by asking again — a GraphQL
+   * authorization or validation error (see {@link PERMANENT_GRAPHQL_ERROR_TYPES}). A projection
+   * row that hits one is terminalized at once instead of retried to the attempt bound. Every
+   * other failure (non-2xx, rate limit, network, timeout) stays transient.
+   */
+  readonly permanent: boolean;
+
+  constructor(readonly status: number, readonly url: string, detail: string, options: { permanent?: boolean } = {}) {
     super(`GitHub ${status} on ${url}: ${detail}`);
+    this.permanent = options.permanent ?? false;
   }
+}
+
+/**
+ * GraphQL error `type`s that are a verdict on the request, not on the moment: the integration
+ * may not do this (`FORBIDDEN`, `INSUFFICIENT_SCOPES`), the node is not there (`NOT_FOUND`), or
+ * the input is invalid for its target (`UNPROCESSABLE`). `RATE_LIMITED` and anything unnamed
+ * are deliberately absent, so they keep retrying. REST statuses are not classified here: GitHub
+ * answers a secondary rate limit with 403 and a not-yet-replicated head with 422, both transient.
+ */
+export const PERMANENT_GRAPHQL_ERROR_TYPES: ReadonlySet<string> = new Set(["FORBIDDEN", "INSUFFICIENT_SCOPES", "NOT_FOUND", "UNPROCESSABLE"]);
+
+/** Permanent only when every error GitHub returned is: one transient error among them keeps the call retryable. */
+export function graphqlErrorsArePermanent(errors: readonly unknown[]): boolean {
+  return errors.length > 0 && errors.every((error) => isRecord(error) && typeof error.type === "string" && PERMANENT_GRAPHQL_ERROR_TYPES.has(error.type));
 }
 
 export interface AppGitHubPortOptions {
@@ -343,7 +366,7 @@ export class AppGitHubPort implements GitHubPort {
     const token = await this.installationToken(home.installationId, signal);
     const result = await this.tokenRequest(token, "POST", "/graphql", { signal, body: { query, variables } });
     if (isRecord(result.json) && Array.isArray(result.json.errors) && result.json.errors.length > 0) {
-      throw new GitHubApiError(200, "/graphql", JSON.stringify(result.json.errors).slice(0, 200));
+      throw new GitHubApiError(200, "/graphql", JSON.stringify(result.json.errors).slice(0, 200), { permanent: graphqlErrorsArePermanent(result.json.errors) });
     }
     return isRecord(result.json) ? result.json.data : null;
   }
@@ -499,18 +522,29 @@ export class AppGitHubPort implements GitHubPort {
     return { commentId, summonLogin };
   }
 
+  /**
+   * §8.1 thread resolution is a projection: it renders the Review's verdict onto the thread,
+   * so a thread already in the wanted state is left alone. GitHub refuses to unresolve a thread
+   * that is not resolved (and to resolve one that is) with a GraphQL `FORBIDDEN`, so toggling
+   * blindly turned an already-converged thread into a row that could never succeed.
+   */
   async resolveThread(input: { repositoryId: number; commentId: number }, signal: AbortSignal): Promise<void> {
-    const threadId = await this.threadIdForComment(input.repositoryId, input.commentId, signal);
-    await this.graphql(input.repositoryId, "mutation($id: ID!) { resolveReviewThread(input: {threadId: $id}) { thread { id } } }", { id: threadId }, signal);
+    const thread = await this.threadForComment(input.repositoryId, input.commentId, signal);
+    if (thread.isResolved === true) return;
+    await this.graphql(input.repositoryId, "mutation($id: ID!) { resolveReviewThread(input: {threadId: $id}) { thread { id } } }", { id: thread.id }, signal);
   }
 
   async unresolveThread(input: { repositoryId: number; commentId: number }, signal: AbortSignal): Promise<void> {
-    const threadId = await this.threadIdForComment(input.repositoryId, input.commentId, signal);
-    await this.graphql(input.repositoryId, "mutation($id: ID!) { unresolveReviewThread(input: {threadId: $id}) { thread { id } } }", { id: threadId }, signal);
+    const thread = await this.threadForComment(input.repositoryId, input.commentId, signal);
+    if (thread.isResolved === false) return;
+    await this.graphql(input.repositoryId, "mutation($id: ID!) { unresolveReviewThread(input: {threadId: $id}) { thread { id } } }", { id: thread.id }, signal);
   }
 
-  /** A review comment's thread node id: REST for the comment's PR, GraphQL to find the thread holding it. */
-  private async threadIdForComment(repositoryId: number, commentId: number, signal: AbortSignal): Promise<string> {
+  /**
+   * The review thread holding a comment: REST for the comment's PR, GraphQL to find the thread.
+   * `isResolved` is null when GitHub did not say, and the caller then sends its mutation.
+   */
+  private async threadForComment(repositoryId: number, commentId: number, signal: AbortSignal): Promise<{ id: string; isResolved: boolean | null }> {
     const home = await this.home(repositoryId, signal);
     const [owner, name] = home.fullName.split("/");
     const comment = await this.repoRequest(repositoryId, "GET", `/pulls/comments/${commentId}`, { signal });
@@ -519,7 +553,7 @@ export class AppGitHubPort implements GitHubPort {
     const query = `query($owner: String!, $name: String!, $number: Int!, $after: String) {
       repository(owner: $owner, name: $name) { pullRequest(number: $number) {
         reviewThreads(first: 100, after: $after) { pageInfo { hasNextPage endCursor }
-          nodes { id comments(first: 100) { nodes { databaseId } } } } } } }`;
+          nodes { id isResolved comments(first: 100) { nodes { databaseId } } } } } } }`;
     let after: string | null = null;
     for (;;) {
       const data = await this.graphql(repositoryId, query, { owner, name, number: prNumber, after }, signal);
@@ -529,7 +563,9 @@ export class AppGitHubPort implements GitHubPort {
       const nodes = threads !== null && Array.isArray(threads.nodes) ? threads.nodes : [];
       for (const thread of nodes) {
         if (!isRecord(thread) || !isRecord(thread.comments) || !Array.isArray(thread.comments.nodes)) continue;
-        if (thread.comments.nodes.some((c) => isRecord(c) && c.databaseId === commentId)) return str(thread.id);
+        if (thread.comments.nodes.some((c) => isRecord(c) && c.databaseId === commentId)) {
+          return { id: str(thread.id), isResolved: typeof thread.isResolved === "boolean" ? thread.isResolved : null };
+        }
       }
       const pageInfo = threads !== null && isRecord(threads.pageInfo) ? threads.pageInfo : null;
       if (pageInfo === null || pageInfo.hasNextPage !== true) break;

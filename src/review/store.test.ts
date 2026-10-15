@@ -543,6 +543,29 @@ test("effects: markSent / markObsolete / markFailed with backoff and a terminal 
   assert.throws(() => store.effects.markFailed("eff_nope", later), ReviewStoreError);
 });
 
+test("effects: markFailedPermanently is terminal at once and queues one durable notice carrying the reason", () => {
+  const db = new Database(":memory:");
+  const notices: Array<{ channelId: string | null; threadTs: string | null; text: string }> = [];
+  const reducer = fakeReducer();
+  const store = new ReviewStore(db, { ...reducer, onEffectExhausted: (notice) => { notices.push(notice); } });
+  store.putPolicy(KEY.repository_id, policy(1));
+  open(store);
+  store.effects.claim("eff_obs:run_1_2");
+  store.effects.markFailedPermanently("eff_obs:run_1_2", 'GitHub 200 on /graphql: [{"type":"FORBIDDEN"}]');
+  const row = db.prepare("SELECT status, attempts, next_attempt_at FROM review_effects WHERE effect_id = ?").get("eff_obs:run_1_2");
+  assert.deepEqual(row, { status: "failed", attempts: 1, next_attempt_at: null });
+  assert.equal(pendingEverySink(store, "9999-01-01T00:00:00.000Z").some((effect) => effect.effect_id === "eff_obs:run_1_2"), false);
+  assert.equal(notices.length, 1);
+  assert.match(notices[0]!.text, /refused permanently on attempt 1 \(GitHub 200 on \/graphql: \[\{"type":"FORBIDDEN"\}\]\)/u);
+  assert.match(notices[0]!.text, /effect eff_obs:run_1_2\. Operator action is required\./u);
+  // Already terminal: neither path re-notices or revives it.
+  store.effects.markFailedPermanently("eff_obs:run_1_2", "again");
+  store.effects.markFailed("eff_obs:run_1_2", "9999-01-01T00:00:00.000Z");
+  assert.equal(notices.length, 1);
+  assert.equal((db.prepare("SELECT status FROM review_effects WHERE effect_id = ?").get("eff_obs:run_1_2") as { status: string }).status, "failed");
+  assert.throws(() => store.effects.markFailedPermanently("eff_nope", "x"), ReviewStoreError);
+});
+
 // §8.1 / §11 #5 (store half): pending refreshes for one target coalesce into the newest.
 test("effects: coalesceRefresh keeps only the newest pending refresh per target", () => {
   const { db, store } = setup();
