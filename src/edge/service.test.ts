@@ -57,6 +57,12 @@ test("a clean Claude result still wins over earlier assistant turns", () => {
   assert.equal(headlessAcknowledgement(receipt), "Final answer.");
 });
 
+test("a long headless outcome reaches the thread whole", () => {
+  const long = "x".repeat(20_000);
+  const receipt = JSON.stringify({ type: "result", subtype: "success", result: long });
+  assert.equal(headlessAcknowledgement(receipt), long);
+});
+
 function subscription(overrides: Partial<Subscription> = {}): Subscription {
   return {
     actor: "ariadne",
