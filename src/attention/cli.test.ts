@@ -10,7 +10,7 @@ import { Command } from "commander";
 import { AttentionTransportError, defaultAttentionTransport, exitCodeFor, registerAttentionCommands, type AttentionTransport, type HttpAnswer } from "./cli.js";
 import { packet } from "./fixtures.js";
 
-interface Run { out: string[]; err: string[]; code: number; calls: Array<{ kind: string; path: string; body: unknown; journalled: boolean }> }
+interface Run { out: string[]; err: string[]; code: number; calls: Array<{ kind: string; path: string; body: unknown; journalled: boolean }>; edgeHealthProbes: number }
 
 function runCli(
   argv: string[],
@@ -18,7 +18,7 @@ function runCli(
 ): Promise<Run> {
   const home = options.home ?? mkdtempSync(join(tmpdir(), "hive-cli-home-"));
   const env: NodeJS.ProcessEnv = { HIVE_HOME: home, HIVE_BROKER_URL: "http://broker.invalid", HIVE_ADMIN_TOKEN: "t".repeat(40), ...options.env };
-  const run: Run = { out: [], err: [], code: 0, calls: [] };
+  const run: Run = { out: [], err: [], code: 0, calls: [], edgeHealthProbes: 0 };
   const journalled = (body: unknown): boolean => {
     const id = (body as { command_id?: string; command?: { command_id?: string } })?.command_id
       ?? (body as { command?: { command_id?: string } })?.command?.command_id;
@@ -34,7 +34,7 @@ function runCli(
       run.calls.push({ kind: "edge", path, body, journalled: journalled(body) });
       return answer(path, body);
     },
-    async edgeHealth() { return options.edgeUp ?? true; },
+    async edgeHealth() { run.edgeHealthProbes += 1; return options.edgeUp ?? true; },
   };
   const program = new Command().exitOverride();
   registerAttentionCommands(program, transport, env, {
@@ -197,6 +197,48 @@ test("doctor is unhealthy when the edge is down, and healthy for an intentionall
   const ready = JSON.parse(preEnable.out[0]!) as { healthy: boolean; broker: { enabled: boolean } };
   assert.equal(ready.healthy, true);
   assert.equal(ready.broker.enabled, false, "disabled is reported, not treated as broken");
+});
+
+test("doctor --operator-host drops the edge prerequisite but requires the operator credential", async () => {
+  const capabilities = () => ({
+    status: 200,
+    body: { broker_uuid: "00000000-0000-4000-8000-000000000000", enabled: true, schema_version: 1, store_schema_version: 1, return_modes: ["pinned_session", "actor_context", "none"], disabled_note: null },
+  });
+
+  // An operator shell with no edge: healthy, and the edge is never consulted.
+  const operatorHost = await runCli(["doctor", "--json", "--operator-host"], { edgeUp: false, answer: capabilities });
+  assert.equal(operatorHost.code, 0);
+  const report = JSON.parse(operatorHost.out[0]!) as { healthy: boolean; edge: Record<string, unknown>; broker: { reachable: boolean } };
+  assert.equal(report.healthy, true);
+  assert.deepEqual(report.edge, { applicable: false, reason: "operator_host" });
+  assert.equal(report.broker.reachable, true);
+  assert.equal(operatorHost.edgeHealthProbes, 0);
+  assert.deepEqual(operatorHost.calls.map((call) => `${call.kind} ${call.path}`), ["operator GET /v1/attention/capabilities"]);
+
+  // The broker is still a prerequisite on an operator host.
+  const brokerDown = await runCli(["doctor", "--json", "--operator-host"], {
+    edgeUp: false,
+    answer: () => { throw new AttentionTransportError("connection refused"); },
+  });
+  assert.equal(brokerDown.code, 7);
+  assert.equal((JSON.parse(brokerDown.out[0]!) as { healthy: boolean }).healthy, false);
+
+  // A source file is validated through the edge, which an operator host does not have.
+  const withSource = await runCli(["doctor", "--json", "--operator-host", "--source-file", "/nonexistent/source.json"], { edgeUp: false, answer: capabilities });
+  assert.equal(withSource.code, 2);
+  assert.equal(withSource.calls.length, 0);
+
+  // Without the operator credential this is not an operator host.
+  const noCredential = await runCli(["doctor", "--json", "--operator-host"], { env: { HIVE_ADMIN_TOKEN: "" }, edgeUp: false, answer: capabilities });
+  assert.equal(noCredential.code, 3);
+  assert.equal(noCredential.calls.length, 0);
+  const inAgent = await runCli(["doctor", "--json", "--operator-host"], { env: { HIVE_DELIVERY_TOKEN: "d" }, edgeUp: false, answer: capabilities });
+  assert.equal(inAgent.code, 3);
+
+  // The default is unchanged: the same shell without the flag still needs its edge.
+  const seatDefault = await runCli(["doctor", "--json"], { edgeUp: false, answer: capabilities });
+  assert.equal(seatDefault.code, 7);
+  assert.equal((JSON.parse(seatDefault.out[0]!) as { edge: { reachable: boolean } }).edge.reachable, false);
 });
 
 test("bind refuses to guess identity, writes the source file owner-only, and never overwrites one", async () => {

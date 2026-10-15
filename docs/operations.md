@@ -448,11 +448,16 @@ move the work to another seat, bind a source for the same work on that seat firs
 
 ### Doctor, status and logs
 
-`hive attention doctor --json [--source-file …]` reports broker reachability/UUID, enabled state,
+`hive attention doctor --json [--source-file … | --operator-host]` reports broker reachability/UUID, enabled state,
 schema and store versions, CLI compatibility, edge reachability and source validity; it never
 prints secrets. `healthy` (exit 0, else 7) covers the prerequisites — broker, contract, local edge,
 source. An intentionally disabled broker is still healthy and reports `broker.enabled: false`, so
-the same check gates a staged pre-enable deployment. `hive attention queue` shows the active item, eligible/deferred counts, oldest
+the same check gates a staged pre-enable deployment. The operator host (Hákon's Mac: the `hive`
+CLI with `HIVE_BROKER_URL` + `HIVE_ADMIN_TOKEN`, no edge) runs `hive attention doctor
+--operator-host`: the edge is not a prerequisite there and reports `edge: { applicable: false,
+reason: "operator_host" }`, the operator credential is required (exit 3 without it, or inside an
+agent's environment), and `--source-file` is refused (exit 2) because a source binding is validated
+through the edge. Seat hosts run it without the flag. `hive attention queue` shows the active item, eligible/deferred counts, oldest
 eligible age, next due deferral, and pending/blocked/failed returns with route warnings. Logs name
 command/item/source ids, generations and delivery ids — never response bodies, handles or artifact
 contents.
