@@ -173,6 +173,11 @@ export function exemptionEvidence(
   return null;
 }
 
+/** Source-record classification of a Codex result at a head the Review never observed (§6.E4). */
+export const UNOBSERVED_HEAD = "unobserved_head";
+/** Source-record classification prefix of an admission the reducer refused: `refused:<code>`. */
+export const REFUSED_PREFIX = "refused:";
+
 function isCodex(login: string): boolean {
   return CODEX_LOGINS.has(login);
 }
@@ -262,6 +267,7 @@ export async function reconcile(deps: ReconcileDeps, key: ReviewKey, runId: stri
   const membersOf = (reviewId: number): GitHubRecord[] => reviewComments.filter((c) => isCodex(c.authorLogin) && reviewIdOf(c) === reviewId);
   const heads = [...new Set([review.subject.head_sha, ...review.subjects.map((s) => s.head_sha)])];
   const context = { headSha: review.subject.head_sha, heads, repository: `${pr.owner}/${pr.repo}`, reviews, reviewComments, prReactions };
+  const observedHeads = new Set(review.subjects.map((s) => s.head_sha));
   const unadmitted = deps.store.sourceRecords.unadmitted(review.id).filter((row) => isCodex(row.authorLogin));
   const rank = (row: SourceRecordRow): number => (row.recordKey.startsWith("review:") ? 0 : 1);
   unadmitted.sort((a, b) => rank(a) - rank(b));
@@ -273,6 +279,12 @@ export async function reconcile(deps: ReconcileDeps, key: ReviewKey, runId: stri
       deps.store.sourceRecords.setClassification(row.recordKey, row.version, "superseded");
       continue;
     }
+    // An adapter admission the reducer refused is a verdict on this record version: the refusal
+    // is in `review_attempts` once and on the source record, and is not re-proposed every run.
+    // Every refusal an adapter admission can meet is fixed for the version — `malformed`
+    // (content), `unauthorized` (custody), `lifecycle` (merged is terminal) — except
+    // `unknown_subject`, which the unobserved-head check below keeps from being proposed at all.
+    if (row.classification !== null && row.classification.startsWith(REFUSED_PREFIX)) continue;
     const parent = record.kind === "review_comment" ? reviewIdOf(record) : null;
     if (parent !== null && codexReviews.has(parent)) {
       // A finding inside a Codex review is admitted through its envelope (one ExternalResult per round).
@@ -283,6 +295,15 @@ export async function reconcile(deps: ReconcileDeps, key: ReviewKey, runId: stri
       continue;
     }
     const classified = classifyCodexRecord(record, { ...context, members: record.kind === "review" ? membersOf(record.id) : [] });
+    // §6.E4 admits a result only at a head the Review has observed. A Codex review of a head no
+    // observation ever saw — pushed over before a reconcile ran, or every pre-reset head after
+    // `hive review reset-store` (§9.3: history is not rebuilt) — would be refused
+    // `unknown_subject` on every run, forever. It is recorded as `unobserved_head` instead and
+    // re-evaluated each run without an act, so it is admitted if that head is ever observed.
+    if (classified.external !== undefined && !observedHeads.has(classified.external.reviewed_head)) {
+      deps.store.sourceRecords.setClassification(row.recordKey, row.version, UNOBSERVED_HEAD);
+      continue;
+    }
     deps.store.sourceRecords.setClassification(row.recordKey, row.version, classified.classification);
     let action: Action;
     if (classified.external !== undefined) {
@@ -297,6 +318,7 @@ export async function reconcile(deps: ReconcileDeps, key: ReviewKey, runId: stri
     const receipt = deps.store.apply(key, { actId, principal: adapterPrincipal(runId, record.authorLogin), expectedRevision: null, action });
     if ("refused" in receipt.outcome) {
       summary.refused.push({ actId, code: receipt.outcome.code });
+      deps.store.sourceRecords.setClassification(row.recordKey, row.version, `${REFUSED_PREFIX}${receipt.outcome.code}`);
       continue;
     }
     deps.store.sourceRecords.markAdmitted(row.recordKey, row.version, actId);

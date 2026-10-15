@@ -332,6 +332,8 @@ class FakeGitHubPort implements GitHubPort {
   pr: GitHubPullRequest;
   pulls = 0;
   issueComments: GitHubRecord[] = [];
+  reviews: GitHubRecord[] = [];
+  reviewComments: GitHubRecord[] = [];
   prReactions: GitHubReaction[] = [];
   files: GitHubChangedFile[] = [{ path: "src/x.py", sha: "1".repeat(40), status: "modified" }];
   /** Canonical template blobs by path (§6.C6 verbatim_copy). */
@@ -343,8 +345,8 @@ class FakeGitHubPort implements GitHubPort {
     };
   }
   async getPullRequest(): Promise<GitHubPullRequest | "not_modified"> { this.pulls += 1; return { ...this.pr }; }
-  async listReviews(): Promise<GitHubRecord[]> { return []; }
-  async listReviewComments(): Promise<GitHubRecord[]> { return []; }
+  async listReviews(): Promise<GitHubRecord[]> { return [...this.reviews]; }
+  async listReviewComments(): Promise<GitHubRecord[]> { return [...this.reviewComments]; }
   async listIssueComments(): Promise<GitHubRecord[]> { return [...this.issueComments]; }
   async listIssueReactions(): Promise<GitHubReaction[]> { return this.prReactions; }
   async listFiles(): Promise<GitHubChangedFile[]> { return [...this.files]; }
@@ -881,6 +883,47 @@ test("§11.9 `fixed` claim on F → new subject → Codex raises F′ → `same_
   assert.match(board, /contested by ariadne/u);
   assert.match(board, /prior claim: fixed, claimed by talos @ bbbbbbb, unconfirmed/u, "the board shows the prior claim");
   assert.match(board, new RegExp(`same as ${F.replaceAll(":", "\\:")}`, "u"), "the board shows the link");
+  core.close();
+});
+
+// §9.3 + §6.E4, the 2026-10-14 reset-store incident: after `hive review reset-store` the rebuilt
+// Review knows only the live head, while GitHub still lists Codex reviews of the pre-reset
+// heads. Each sweep re-proposed them, the reducer refused `unknown_subject`, and the refusal was
+// logged and appended to review_attempts every five minutes, forever. The record is now held
+// back as `unobserved_head` without an act, and admitted if that head is ever observed again.
+test("§9.3 a Codex review of a head the Review never observed is held back without an act, every run, until that head is observed", async () => {
+  const core = new Core();
+  const reviewedHead = "9ae793d86be8a73a29717e55cb978ee120e72ad9"; // `hive-review-5125461304`'s commit_id
+  const port = new FakeGitHubPort(HIVE_66_HEAD);
+  port.reviews = [codexRecord("hive-review-5125461304")];
+  port.reviewComments = [codexRecord("hive-review_comment-3944094503"), codexRecord("hive-review_comment-3944094508")];
+  const logs: string[] = [];
+  const scheduler = new ReconcileScheduler({ store: core.store, github: port, clock: core.clock, log: (line) => logs.push(line) });
+
+  for (let run = 0; run < 3; run += 1) {
+    scheduler.wake(KEY);
+    await scheduler.idle();
+    core.clock.advance(5 * MINUTE);
+  }
+  core.assertContract();
+  assert.deepEqual(logs, [], "nothing refused, nothing failed: no recurring log line");
+  assert.equal(core.attempts(), 0, "no refusal is appended to review_attempts on any run");
+  assert.deepEqual(core.sourceRecord("review:5125461304"), { classification: "unobserved_head", admitted_act_id: null });
+  assert.deepEqual(core.review().findings, []);
+  assert.deepEqual(core.review().subjects.map((s) => s.head_sha), [HIVE_66_HEAD]);
+
+  // The head is observed after all (a force-push back to it): the held record is admitted at that subject.
+  port.pr.headSha = reviewedHead;
+  scheduler.wake(KEY);
+  await scheduler.idle();
+  core.assertContract();
+  assert.deepEqual(logs, []);
+  assert.equal(core.attempts(), 0);
+  const record = core.sourceRecord("review:5125461304");
+  assert.equal(record.classification, "findings");
+  assert.ok(record.admitted_act_id?.startsWith("src:review:5125461304:"));
+  assert.equal(core.review().findings.length, 2);
+  await scheduler.stop();
   core.close();
 });
 

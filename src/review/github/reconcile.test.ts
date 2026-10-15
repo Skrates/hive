@@ -361,7 +361,7 @@ test("§6.D3: a quota refusal becomes SetReviewerAvailability(false, quota, unti
   assert.deepEqual(summary.admitted, [`src:issue_comment:5350649768:${quotaComment.version}`, `src:issue_comment:5301377491:${connectorComment.version}`]);
 });
 
-test("a refused admission is reported, not marked admitted; a replayed one is marked", async () => {
+test("a refused admission is reported once, recorded on the source record, and never re-proposed at that version", async () => {
   const { store, github, deps } = setup(H2);
   github.issueComments = [cleanComment];
   await reconcile(deps, KEY, "run-0"); // creates the Review
@@ -370,12 +370,46 @@ test("a refused admission is reported, not marked admitted; a replayed one is ma
   const summary = await reconcile(deps, KEY, "run-1");
   assert.deepEqual(summary.refused, [{ actId: "src:issue_comment:2:2026-09-06T16:00:00Z", code: "lifecycle" }]);
   assert.equal(store.records.get("issue_comment:2@2026-09-06T16:00:00Z")?.admittedActId, null);
-  assert.equal(store.records.get("issue_comment:2@2026-09-06T16:00:00Z")?.classification, "clean");
+  assert.equal(store.records.get("issue_comment:2@2026-09-06T16:00:00Z")?.classification, "refused:lifecycle");
+  const proposed = admissions(store).length;
+  const again = await reconcile(deps, KEY, "run-2");
+  assert.deepEqual(again.refused, [], "the same refusal is not re-proposed on every run");
+  assert.equal(admissions(store).length, proposed);
+  assert.equal(store.records.get("issue_comment:2@2026-09-06T16:00:00Z")?.classification, "refused:lifecycle");
+  // A new version of the record is a new record: it is classified and proposed afresh.
   store.refuse = null;
-  store.seenActs.set("src:issue_comment:2:2026-09-06T16:00:00Z", "bat_prior"); // admitted by an earlier process: replay
-  const replayed = await reconcile(deps, KEY, "run-2");
-  assert.deepEqual(replayed.admitted, ["src:issue_comment:2:2026-09-06T16:00:00Z"]);
-  assert.equal(store.records.get("issue_comment:2@2026-09-06T16:00:00Z")?.admittedActId, "src:issue_comment:2:2026-09-06T16:00:00Z");
+  github.issueComments = [{ ...cleanComment, id: 2, version: "2026-09-06T17:00:00Z", raw: { ...(cleanComment.raw as object), id: 2, updated_at: "2026-09-06T17:00:00Z" } }];
+  const edited = await reconcile(deps, KEY, "run-3");
+  assert.deepEqual(edited.admitted, ["src:issue_comment:2:2026-09-06T17:00:00Z"]);
+});
+
+test("a replayed admission (admitted by an earlier process, never marked) is marked admitted", async () => {
+  const { store, github, deps } = setup(H2);
+  github.issueComments = [cleanComment];
+  const actId = `src:issue_comment:5560110170:${cleanComment.version}`;
+  store.seenActs.set(actId, "bat_prior");
+  const replayed = await reconcile(deps, KEY, "run-1");
+  assert.deepEqual(replayed.admitted, [actId]);
+  assert.equal(store.records.get(`issue_comment:5560110170@${cleanComment.version}`)?.admittedActId, actId);
+});
+
+test("§6.E4: a Codex result at a head the Review never observed is held as unobserved_head without an act, and admitted once that head is observed", async () => {
+  const { store, github, deps } = setup(H2);
+  github.reviews = [findingsReview]; // reviewed H1; the Review only ever saw H2 (e.g. after reset-store)
+  github.reviewComments = [...members];
+  for (const run of ["run-1", "run-2", "run-3"]) {
+    const summary = await reconcile(deps, KEY, run);
+    assert.deepEqual(summary.refused, [], `${run}: nothing is proposed, so nothing is refused`);
+    assert.deepEqual(summary.admitted, []);
+  }
+  assert.equal(admissions(store).length, 0, "no act was built for the unobserved head");
+  assert.equal(store.records.get(`review:5125461304@${findingsReview.version}`)?.classification, "unobserved_head");
+  assert.equal(store.records.get(`review:5125461304@${findingsReview.version}`)?.admittedActId, null);
+
+  github.pr = { ...github.pr, headSha: H1 };
+  const observed = await reconcile(deps, KEY, "run-4");
+  assert.deepEqual(observed.admitted, [`src:review:5125461304:${findingsReview.version}`]);
+  assert.equal(store.records.get(`review:5125461304@${findingsReview.version}`)?.classification, "findings");
 });
 
 test("an older version of an edited record is superseded, never admitted", async () => {

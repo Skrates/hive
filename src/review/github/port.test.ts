@@ -266,6 +266,77 @@ test("projections: check run create/update, board comment create/update, summons
   assert.ok(unresolve.query.includes("unresolveReviewThread"));
 });
 
+// §8.1: thread resolution renders the Review onto the thread. A thread already in the wanted
+// state gets no mutation — GitHub answers unresolving an unresolved thread with FORBIDDEN, which
+// left two production rows retrying to exhaustion (thread:4037573277 / 4037573295, 2026-10-14).
+test("thread resolve/unresolve leave a thread already in the wanted state alone", async () => {
+  let resolved: boolean | undefined = false;
+  const { port: p, calls } = port((call) => {
+    if (call.url.endsWith("/pulls/comments/3944094503")) return { json: { pull_request_url: "https://api.github.com/repos/Skrates/hive/pulls/66" } };
+    if (call.url.endsWith("/graphql")) {
+      const body = call.body as { query: string; variables: Record<string, unknown> };
+      if (body.query.startsWith("query")) {
+        assert.ok(body.query.includes("isResolved"), "the thread lookup reads the live resolution");
+        const node = { id: "PRRT_9", comments: { nodes: [{ databaseId: 3944094503 }] }, ...(resolved === undefined ? {} : { isResolved: resolved }) };
+        return { json: { data: { repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [node] } } } } } };
+      }
+      return { json: { data: { ok: { thread: { id: body.variables.id } } } } };
+    }
+    return undefined;
+  });
+  const mutations = (): string[] => calls
+    .filter((c) => c.url.endsWith("/graphql") && (c.body as { query: string }).query.startsWith("mutation"))
+    .map((c) => ((c.body as { query: string }).query.includes("unresolveReviewThread") ? "unresolve" : "resolve"));
+
+  resolved = false;
+  await p.unresolveThread({ repositoryId: 1054, commentId: 3944094503 }, LIVE);
+  assert.deepEqual(mutations(), [], "an unresolved thread is not unresolved again");
+  await p.resolveThread({ repositoryId: 1054, commentId: 3944094503 }, LIVE);
+  assert.deepEqual(mutations(), ["resolve"]);
+
+  resolved = true;
+  await p.resolveThread({ repositoryId: 1054, commentId: 3944094503 }, LIVE);
+  assert.deepEqual(mutations(), ["resolve"], "a resolved thread is not resolved again");
+  await p.unresolveThread({ repositoryId: 1054, commentId: 3944094503 }, LIVE);
+  assert.deepEqual(mutations(), ["resolve", "unresolve"], "§8.1: an open finding un-resolves a resolved thread");
+
+  resolved = undefined;
+  await p.unresolveThread({ repositoryId: 1054, commentId: 3944094503 }, LIVE);
+  assert.deepEqual(mutations(), ["resolve", "unresolve", "unresolve"], "an unknown state sends the mutation");
+});
+
+test("a GraphQL authorization or validation error is permanent; rate limits, mixed errors and REST failures are not", async () => {
+  let errors: unknown[] = [];
+  const { port: p } = port((call) => {
+    if (call.url.endsWith("/pulls/comments/1")) return { json: { pull_request_url: "https://api.github.com/repos/Skrates/hive/pulls/66" } };
+    if (call.url.endsWith("/pulls/comments/2")) return { status: 403, json: { message: "You have exceeded a secondary rate limit" } };
+    if (call.url.endsWith("/graphql")) return { json: { data: null, errors } };
+    return undefined;
+  });
+  const outcome = async (commentId: number): Promise<GitHubApiError> => {
+    try {
+      await p.resolveThread({ repositoryId: 1054, commentId }, LIVE);
+    } catch (error) {
+      assert.ok(error instanceof GitHubApiError);
+      return error;
+    }
+    assert.fail("expected a GitHubApiError");
+  };
+  errors = [{ type: "FORBIDDEN", path: ["unresolveReviewThread"], message: "Resource not accessible by integration" }];
+  assert.equal((await outcome(1)).permanent, true);
+  errors = [{ type: "NOT_FOUND" }, { type: "UNPROCESSABLE" }];
+  assert.equal((await outcome(1)).permanent, true);
+  errors = [{ type: "RATE_LIMITED" }];
+  assert.equal((await outcome(1)).permanent, false);
+  errors = [{ type: "FORBIDDEN" }, { type: "RATE_LIMITED" }];
+  assert.equal((await outcome(1)).permanent, false, "one transient error keeps the call retryable");
+  errors = [{ message: "Something went wrong" }];
+  assert.equal((await outcome(1)).permanent, false, "an untyped error is not a verdict");
+  const rest = await outcome(2);
+  assert.equal(rest.status, 403);
+  assert.equal(rest.permanent, false, "a REST 403 may be a secondary rate limit");
+});
+
 // §8.1 / bundle-1 #9: the publisher's dispatch time-box aborts the call it has given up on, so
 // the signal must reach every request the call makes — App JWT listing and token mint included.
 test("a projection call carries its dispatch signal on every request it makes, token fetch included", async () => {

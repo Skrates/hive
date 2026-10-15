@@ -120,6 +120,8 @@ export interface PublisherStore {
     markSent(effectId: string): void;
     markObsolete(effectId: string): void;
     markFailed(effectId: string, nextAttemptAt: string): void;
+    /** Terminal at once, with a durable notice carrying `reason`: retrying cannot change the answer. */
+    markFailedPermanently(effectId: string, reason: string): void;
     coalesceRefresh(target: string): number;
   };
 }
@@ -140,6 +142,15 @@ const SINKS: readonly EffectSink[] = ["slack", "github"];
 
 /** Thrown by a dispatch that cannot proceed; the row is marked failed and retried behind backoff. */
 class DispatchError extends Error {}
+
+/**
+ * A port error that says retrying cannot help carries `permanent: true` (`GitHubApiError` sets it
+ * for a GraphQL authorization or validation refusal). Read structurally so the publisher does not
+ * depend on the GitHub adapter module.
+ */
+function isPermanent(error: unknown): boolean {
+  return typeof error === "object" && error !== null && (error as { permanent?: unknown }).permanent === true;
+}
 
 /**
  * How long one GitHub port call may take before the row is failed instead of awaited (§8.1).
@@ -369,6 +380,14 @@ export class ReviewPublisher {
   }
 
   private fail(row: PublishableEffect, error: unknown): void {
+    // A remote that answered with a verdict on the request itself (GitHub refusing the App this
+    // operation, or the input) is terminal now: fifty identical refusals add only noise and
+    // delay the operator notice. Everything else — timeouts, 5xx, rate limits, network — retries.
+    if (isPermanent(error)) {
+      console.error("hive review effect refused permanently", row.effect_id, row.target, error);
+      this.store.effects.markFailedPermanently(row.effect_id, error instanceof Error ? error.message : String(error));
+      return;
+    }
     console.error("hive review effect failed", row.effect_id, row.target, error);
     this.store.effects.markFailed(row.effect_id, this.nextAttemptAt(row.attempts));
   }
