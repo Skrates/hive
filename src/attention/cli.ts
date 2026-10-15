@@ -715,9 +715,20 @@ export function registerAttentionCommands(
 
   attention.command("doctor")
     .option("--source-file <path>", "also validate this source binding")
+    .option("--operator-host", "this host runs no edge (an operator shell): the edge is not a prerequisite")
     .option("--json", "one JSON object")
     .description("broker, schema, edge and source binding health — never prints secrets")
-    .action(run(async (options: JsonOption & { sourceFile?: string }) => {
+    .action(run(async (options: JsonOption & { sourceFile?: string; operatorHost?: boolean }) => {
+      // An operator host (the human's shell) runs no edge by doctrine; its prerequisites are the
+      // operator credential and the broker. The edge stays a prerequisite by default, so a dead
+      // edge on a seat host never passes as healthy.
+      if (options.operatorHost) {
+        if (options.sourceFile !== undefined) {
+          throw new CliFailure(EXIT_USAGE, "--operator-host cannot be combined with --source-file: a source binding is validated through the edge",
+            { error: "usage", detail: "--operator-host and --source-file are mutually exclusive" });
+        }
+        assertOperatorContext();
+      }
       const report: Record<string, unknown> = { cli_schema_version: ATTENTION_SCHEMA_VERSION, checked_at: io.now().toISOString() };
       let healthy = true;
       try {
@@ -737,14 +748,19 @@ export function registerAttentionCommands(
       }
       // Health is the prerequisites — broker, contract, edge, source. A broker that is reachable
       // but intentionally disabled is still healthy (`broker.enabled` says which), so the same
-      // check gates a staged, pre-enable deployment.
-      const edgeReachable = await transport.edgeHealth();
-      healthy &&= edgeReachable;
-      report.edge = { socket: resolveEdgeSocketPath(env), reachable: edgeReachable };
+      // check gates a staged, pre-enable deployment. On an operator host the edge is not checked
+      // at all and reports `{ applicable: false }`.
+      const edgeReachable = options.operatorHost ? false : await transport.edgeHealth();
+      if (options.operatorHost) {
+        report.edge = { applicable: false, reason: "operator_host" };
+      } else {
+        healthy &&= edgeReachable;
+        report.edge = { socket: resolveEdgeSocketPath(env), reachable: edgeReachable };
+      }
       // Operator commands go to HIVE_BROKER_URL, binds and seat writes through the edge: both
       // must be the same broker, or the check would certify a split deployment.
       const directUuid = (report.broker as { broker_uuid?: string }).broker_uuid;
-      if (edgeReachable && directUuid !== undefined) {
+      if (!options.operatorHost && edgeReachable && directUuid !== undefined) {
         try {
           const viaEdge = await transport.edge("/attention/read", { op: "capabilities" });
           const edgeUuid = viaEdge.status === 200 ? (viaEdge.body as Capabilities).broker_uuid : null;
