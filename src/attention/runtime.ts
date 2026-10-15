@@ -8,6 +8,7 @@ import type { Clock } from "../time.js";
 import type { AttentionHttpDeps } from "./http.js";
 import { AttentionReturnPublisher } from "./returns.js";
 import { AttentionService } from "./service.js";
+import { AttentionSlackFrontEnd, type AttentionSlackApi } from "./slack.js";
 import { AttentionStore } from "./store.js";
 
 export interface AttentionRuntimeEnv {
@@ -15,6 +16,8 @@ export interface AttentionRuntimeEnv {
   HIVE_ATTENTION_ENABLED?: string | undefined;
   /** A queue identity, not a person-profile lookup. */
   HIVE_ATTENTION_HUMAN_ID?: string | undefined;
+  /** Amendment 1: the human's Slack user id. Unset, the Slack front end is off. */
+  HIVE_ATTENTION_SLACK_USER_ID?: string | undefined;
 }
 
 export interface AttentionRuntimeInput {
@@ -24,6 +27,8 @@ export interface AttentionRuntimeInput {
   env: AttentionRuntimeEnv;
   validateThread: (channelId: string, threadTs: string) => Promise<void>;
   log: (line: string) => void;
+  /** The bot's Slack surface for the front end; absent (tests, CLI-only) means no front end. */
+  slackApi?: AttentionSlackApi;
 }
 
 export interface AttentionRuntime {
@@ -31,7 +36,11 @@ export interface AttentionRuntime {
   service: AttentionService;
   publisher: AttentionReturnPublisher;
   http: AttentionHttpDeps;
+  /** Amendment 1: present only when attention is enabled and the human's Slack user is configured. */
+  slack: AttentionSlackFrontEnd | null;
 }
+
+const SLACK_USER_ID = /^[UW][A-Z0-9]{2,30}$/;
 
 export class AttentionRuntimeConfigError extends Error {}
 
@@ -57,5 +66,17 @@ export function bootAttentionRuntime(input: AttentionRuntimeInput): AttentionRun
   input.log(enabled
     ? `[attention] enabled for ${humanId}: mutations accepted, return publication on the housekeeping tick`
     : "[attention] disabled (HIVE_ATTENTION_ENABLED): reads only; no mutations and no return publication");
-  return { store, service, publisher, http: { service, broker: input.broker, adminToken: input.adminToken, log: input.log } };
+  const slackUser = input.env.HIVE_ATTENTION_SLACK_USER_ID || null;
+  if (slackUser !== null && !SLACK_USER_ID.test(slackUser)) {
+    throw new AttentionRuntimeConfigError(`HIVE_ATTENTION_SLACK_USER_ID ${JSON.stringify(slackUser)} is not a Slack user id`);
+  }
+  const slack = enabled && slackUser !== null && input.slackApi
+    ? new AttentionSlackFrontEnd(store, service, input.slackApi, slackUser, input.clock, input.log)
+    : null;
+  if (enabled) {
+    input.log(slack
+      ? `[attention] Slack front end on for ${slackUser}: one DM card per summons, Home tab queue, decision modal`
+      : "[attention] Slack front end off (HIVE_ATTENTION_SLACK_USER_ID unset): CLI only");
+  }
+  return { store, service, publisher, slack, http: { service, broker: input.broker, adminToken: input.adminToken, log: input.log } };
 }

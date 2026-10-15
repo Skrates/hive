@@ -385,8 +385,19 @@ export class SlackCanaryPoster implements ProbePoster {
   }
 }
 
+/**
+ * ADR-0004 Amendment 1: the attention front end's Slack surfaces — interactive payloads (buttons,
+ * modal submissions) and the Home tab. The ingress only routes; authentication of the human and
+ * every command live behind this interface.
+ */
+export interface SlackInteractionHandler {
+  interactive(payload: Record<string, unknown>): Promise<{ ack?: Record<string, unknown>; after?: () => Promise<void> }>;
+  homeOpened(event: Record<string, unknown>): Promise<void>;
+}
+
 export class SlackSocketIngress implements ProbeWatcher {
   private socket: SocketModeClient | null = null;
+  private interactions: SlackInteractionHandler | null = null;
   private starting = false;
   private lastEventMs: number | null = null;
   private lastConnectMs: number | null = null;
@@ -451,6 +462,11 @@ export class SlackSocketIngress implements ProbeWatcher {
     this.canaries.bind(identity);
   }
 
+  /** Route interactive payloads and Home tab opens to the attention front end (Amendment 1). */
+  attachInteractions(handler: SlackInteractionHandler): void {
+    this.interactions = handler;
+  }
+
   async start(): Promise<void> {
     // Single-flight: never build a second client while one is live or a start is
     // already in flight (the watchdog's restart and a shutdown could otherwise race).
@@ -507,6 +523,33 @@ export class SlackSocketIngress implements ProbeWatcher {
           // visible in logs, while keeping hostile event body data (and any secret- or prompt-shaped
           // text an exception message might carry) out of stderr.
           this.log(`${UNACKNOWLEDGED_SLACK_ENVELOPE_DIAGNOSTIC}: ${safeErrorName(error)}`);
+        }
+      });
+      // Interactive payloads must be acknowledged within Slack's three seconds: the handler decides
+      // synchronously (a modal's response_action rides the ack) and defers slow work to `after`.
+      socket.on("interactive", async ({ body, ack }: { body?: unknown; ack: (response?: Record<string, unknown>) => Promise<void> }) => {
+        let acked = false;
+        try {
+          const handler = this.interactions;
+          if (!handler || !body || typeof body !== "object") {
+            await ack();
+            return;
+          }
+          const result = await handler.interactive(body as Record<string, unknown>);
+          acked = true;
+          await ack(result.ack);
+          if (result.after) await result.after();
+        } catch (error) {
+          this.log(`hive Slack interaction failed: ${safeErrorName(error)}`);
+          if (!acked) await ack().catch(() => {});
+        }
+      });
+      socket.on("app_home_opened", async ({ event, ack }: { event?: unknown; ack: () => Promise<void> }) => {
+        await ack().catch(() => {});
+        try {
+          if (this.interactions && event && typeof event === "object") await this.interactions.homeOpened(event as Record<string, unknown>);
+        } catch (error) {
+          this.log(`hive Slack home tab failed: ${safeErrorName(error)}`);
         }
       });
       try {

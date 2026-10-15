@@ -109,3 +109,72 @@ the item's project and work.
 Priority scheduling, aging, quotas, context-switch scoring, calendar projection, focus
 inference, notification escalation, GUI, natural-language decision execution, autonomous
 approvals and multi-user tenancy.
+
+## Amendment 1 — the Slack front end (2026-10-15)
+
+* Status: Accepted. The CLI pilot of 2026-10-15 proved the queue and the return path on the live
+  fleet; this amendment gives the human a friendlier surface over the same broker commands.
+* Amends: A-2 (no push). Every other ruling stands unchanged.
+
+### Context
+
+Hive is Slack-centric, and the broker already owns the Slack app, its credentials and its Socket
+Mode link. Pull-only inspection proved too quiet in practice: Hákon wants to know that something
+is waiting, as long as he is told no more intrusively than a Slack message tells him.
+
+### Rulings
+
+**S-1 — One notification per summons (amends A-2).** When an item is created, the broker posts one
+card to the human as a direct message from the Hive app. That message is the notification: Slack's
+own pop-up, with no mention, no channel post, no second message and nothing that steals focus.
+Every later change to the item (amend, withdraw, resolve, return processed) updates the same
+message in place and never notifies again. A summons still never selects work: only `next` and its
+variants switch the active item (A-3).
+
+**S-2 — Surfaces.** The DM card holds the brief, rendered from the packet. The app's Home tab holds
+the queue: the active item, the eligible items in FIFO order, deferred items with their due times,
+and returns that are blocked or failed. A modal makes decisions: resolve (outcome and verbatim
+response), defer (until a time, or indefinitely) or cancel (with a reason), with "take next" as an
+option. The CLI stays an equal path to every one of these acts.
+
+**S-3 — FIFO stays the default.** The card's primary button is **Take next**: it claims whatever
+`next` selects (FIFO-1) and opens its decision modal. **Answer this one** is an explicit pick
+(`selection_reason = explicit_pick`, already a recorded event): a visible override meant to be used
+rarely, never a priority. If another item is already active, either button opens that one first
+(A-3: a second `next` returns the active item).
+
+**S-4 — Slack identity is the operator only for queue acts.** An interaction counts only when Slack
+reports it from the configured human's Slack user ID (`HIVE_ATTENTION_SLACK_USER_ID`). It then acts
+as the operator principal for exactly these acts: `next`, `resolve`, `defer` and `cancel`. Everything
+else the operator can do (add, start, requeue, retry or reroute a return, revoke a source) stays on
+the CLI under the operator credential. Any other Slack user is refused, and no command is attempted.
+
+**S-5 — Retries replay, and stale decisions are refused.** Opening a decision modal mints one
+command ID and records the item revision it was rendered at, both carried in the modal's private
+metadata. A resubmission replays that command (A-5), and a revision conflict reopens the modal with
+the current packet instead of applying the decision to an outdated one. Button presses derive their
+command ID from Slack's interaction identity, so a Socket Mode redelivery replays as well.
+
+**S-6 — Rendering is inert.** Every string a seat wrote is rendered as Slack `plain_text`, never
+`mrkdwn`, so a packet cannot forge a mention, a link or formatting. Over-long fields are shortened
+for display with an explicit marker. The stored packet is never altered.
+
+**S-7 — Cards are a projection, never the record.** The broker keeps one row per card (its DM
+channel, message timestamp, and the item revision, state and return phase it last rendered). An
+independent housekeeping job brings each card up to date. Slack being slow or down never blocks or
+fails a command, and an out-of-date card is repaired on a later pass. A broker crash between posting
+a card and recording it can leave one duplicate card: visible and harmless, and never double-applied,
+because acting from either card goes through the same fenced commands.
+
+**S-8 — Off unless configured.** The Slack front end runs only when attention is enabled and
+`HIVE_ATTENTION_SLACK_USER_ID` is set. It also needs these Slack app settings: Interactivity enabled
+(Socket Mode carries it, with no request URL), the Home tab enabled, the `app_home_opened` event
+subscribed, and the bot scopes `chat:write` and `im:write`. A missing setting degrades to the CLI
+with a logged diagnostic, never to a broken queue.
+
+### Consequences
+
+* The attention store moves to schema version 2. That adds one table, `attention_slack_cards`; the
+  broker generation stays 5.
+* Desktop agent threads on Hákon's Mac are still not reachable by a return: Slack carries the human
+  side only. Their delivery path is the spool design, a later amendment.

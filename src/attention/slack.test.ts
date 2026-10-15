@@ -1,0 +1,223 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import type { ItemView } from "./contract.js";
+import { act, harness, liveSource, next, summon, type Harness } from "./fixtures.js";
+import { bootAttentionRuntime } from "./runtime.js";
+import { AttentionService } from "./service.js";
+import {
+  AttentionSlackFrontEnd,
+  cardBlocks,
+  decisionModal,
+  derivedCommandId,
+  type AttentionSlackApi,
+  type SlackView,
+} from "./slack.js";
+
+const HUMAN = "U0HAKON01";
+
+class FakeSlack implements AttentionSlackApi {
+  readonly calls: Array<{ op: string; args: unknown[] }> = [];
+  private ts = 1000;
+  failPost = false;
+  async openDm(userId: string) { this.calls.push({ op: "openDm", args: [userId] }); return "D0HAKON"; }
+  async post(channel: string, text: string, blocks: unknown[]) {
+    this.calls.push({ op: "post", args: [channel, text, blocks] });
+    if (this.failPost) throw Object.assign(new Error("slack down"), { code: "slack_webapi_request_error" });
+    this.ts += 1;
+    return `${this.ts}.000100`;
+  }
+  async update(channel: string, ts: string, text: string, blocks: unknown[]) { this.calls.push({ op: "update", args: [channel, ts, text, blocks] }); }
+  async publishHome(userId: string, view: SlackView) { this.calls.push({ op: "publishHome", args: [userId, view] }); }
+  async openModal(triggerId: string, view: SlackView) { this.calls.push({ op: "openModal", args: [triggerId, view] }); }
+  ops(): string[] { return this.calls.map((call) => call.op); }
+  clear(): void { this.calls.length = 0; }
+}
+
+function frontEnd(h: Harness) {
+  const slack = new FakeSlack();
+  const service = new AttentionService(h.store, h.broker, async () => {});
+  return { slack, front: new AttentionSlackFrontEnd(h.store, service, slack, HUMAN, h.clock) };
+}
+
+/** Every text object that carries seat-written strings must be plain_text (S-6). */
+function mrkdwnTexts(value: unknown): string[] {
+  const found: string[] = [];
+  const walk = (node: unknown): void => {
+    if (Array.isArray(node)) { node.forEach(walk); return; }
+    if (node && typeof node === "object") {
+      const record = node as Record<string, unknown>;
+      if (record.type === "mrkdwn" && typeof record.text === "string") found.push(record.text);
+      Object.values(record).forEach(walk);
+    }
+  };
+  walk(value);
+  return found;
+}
+
+function blockAction(actionId: string, value: string, actionTs = "1792080000.000001", user = HUMAN) {
+  return { type: "block_actions", user: { id: user }, trigger_id: "trig-1", actions: [{ action_id: actionId, value, action_ts: actionTs }] };
+}
+
+function submission(view: SlackView, values: Record<string, unknown>, user = HUMAN) {
+  const state: Record<string, Record<string, unknown>> = {};
+  for (const [block, value] of Object.entries(values)) state[block] = { value };
+  return { type: "view_submission", user: { id: user }, view: { callback_id: view.callback_id, private_metadata: view.private_metadata, state: { values: state } } };
+}
+
+test("S-6 seat text renders only as plain_text; Hive's own labels are the only mrkdwn", () => {
+  const h = harness();
+  const source = liveSource(h.store);
+  const item = summon(h.store, source, { title: "<!channel> *bold* \u001b[2J", requested_action: "<https://evil|click> me", context: "_x_", unblocks: "`y`" }).item!;
+  const view = h.store.item(item.item_id)!;
+  const blocks = cardBlocks(view, h.clock.now());
+  const seatStrings = ["<!channel>", "<https://evil|click>", "_x_", "`y`", "\u001b"];
+  for (const text of mrkdwnTexts(blocks)) {
+    for (const seat of seatStrings) assert.ok(!text.includes(seat), `mrkdwn must not carry seat text: ${text}`);
+  }
+  const serialized = JSON.stringify(blocks);
+  assert.ok(serialized.includes("<!channel> *bold*"), "seat text is shown, verbatim, as plain text");
+  assert.ok(!serialized.includes("\\u001b[2J"), "control characters are made inert");
+  for (const text of mrkdwnTexts(decisionModal(view))) assert.ok(!text.includes("<!channel>"));
+  h.close();
+});
+
+test("S-1/S-3 a queued card offers Take next first and Answer this one; a closed item has no buttons", () => {
+  const h = harness();
+  const source = liveSource(h.store);
+  const item = summon(h.store, source).item!;
+  const actions = (view: ItemView) => cardBlocks(view, h.clock.now()).find((block) => block.type === "actions") as { elements: Array<{ action_id: string; style?: string }> } | undefined;
+  const queued = actions(h.store.item(item.item_id)!)!;
+  assert.deepEqual(queued.elements.map((element) => element.action_id), ["atn_take_next", "atn_answer_this"]);
+  assert.equal(queued.elements[0]!.style, "primary");
+  const taken = next(h.store);
+  assert.deepEqual(actions(h.store.item(item.item_id)!)!.elements.map((element) => element.action_id), ["atn_take_next", "atn_decide"]);
+  act(h.store, { kind: "operator" }, "cancel", { item_id: item.item_id, expected_revision: taken.item!.revision, reason: "moot", select_next: false });
+  assert.equal(actions(h.store.item(item.item_id)!), undefined);
+  h.close();
+});
+
+test("S-1/S-7 one post per summons, later changes update the same card, and a Slack outage is retried", async () => {
+  const h = harness();
+  const { slack, front } = frontEnd(h);
+  const source = liveSource(h.store);
+  slack.failPost = true;
+  const item = summon(h.store, source).item!;
+  assert.equal(await front.drainOnce(), 0, "Slack down: nothing recorded, the command already stood");
+  slack.failPost = false;
+  slack.clear();
+  assert.equal(await front.drainOnce(), 1);
+  assert.deepEqual(slack.ops(), ["post", "publishHome"], "the DM channel opened during the outage is reused");
+  slack.clear();
+  assert.equal(await front.drainOnce(), 0, "an up-to-date card is not touched");
+  assert.deepEqual(slack.ops(), []);
+  act(h.store, source, "amend", { item_id: item.item_id, expected_revision: 1, fields: { title: "A sharper title" } });
+  await front.drainOnce();
+  assert.deepEqual(slack.ops(), ["update", "publishHome"], "an amendment re-renders in place and never notifies again");
+  assert.match(String(slack.calls[0]!.args[2]), /A sharper title/u);
+  h.close();
+});
+
+test("S-4 only the configured human's interactions act; anyone else changes nothing", async () => {
+  const h = harness();
+  const { slack, front } = frontEnd(h);
+  const item = summon(h.store, liveSource(h.store)).item!;
+  const result = await front.interactive(blockAction("atn_take_next", "next", "1.1", "U0STRANGER"));
+  assert.equal(result.after, undefined);
+  assert.equal(h.store.item(item.item_id)!.state, "queued");
+  assert.deepEqual(slack.ops(), []);
+  h.close();
+});
+
+test("S-3 Take next claims FIFO and opens its modal; a redelivered press replays instead of acting twice", async () => {
+  const h = harness();
+  const { slack, front } = frontEnd(h);
+  const source = liveSource(h.store);
+  const first = summon(h.store, source, { intervention_key: "a" }).item!;
+  const second = summon(h.store, source, { intervention_key: "b" }).item!;
+  const press = blockAction("atn_answer_this", String(second.item_id), "1792080000.000002");
+  const result = await front.interactive(press);
+  await result.after!();
+  assert.equal(h.store.item(second.item_id)!.state, "active", "an explicit pick claims that item");
+  assert.equal(h.store.item(first.item_id)!.state, "queued");
+  const opened = slack.calls.find((call) => call.op === "openModal")!;
+  assert.equal((opened.args[1] as SlackView).callback_id, "atn_decision");
+  assert.equal(JSON.parse(String((opened.args[1] as SlackView).private_metadata)).item_id, second.item_id);
+  const before = h.store.events(second.item_id).length;
+  await (await front.interactive(press)).after!();
+  assert.equal(h.store.events(second.item_id).length, before, "the same press replays its committed next");
+  assert.equal(derivedCommandId("x"), derivedCommandId("x"));
+  assert.match(derivedCommandId("x"), /^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u);
+  h.close();
+});
+
+test("S-5 a modal resolves once, replays on resubmit, and refuses an outdated packet", async () => {
+  const h = harness();
+  const { front } = frontEnd(h);
+  const source = liveSource(h.store);
+  const item = summon(h.store, source).item!;
+  next(h.store);
+  const modal = decisionModal(h.store.item(item.item_id)!);
+
+  const incomplete = await front.interactive(submission(modal, { decision: { selected_option: { value: "resolve" } } }));
+  assert.equal(incomplete.ack!.response_action, "errors");
+  assert.deepEqual(Object.keys(incomplete.ack!.errors as object).sort(), ["outcome", "response"]);
+
+  const values = {
+    decision: { selected_option: { value: "resolve" } },
+    outcome: { selected_option: { value: "selected" } },
+    response: { value: "Use candidate C." },
+    next: { selected_options: [] },
+  };
+  const done = await front.interactive(submission(modal, values));
+  assert.equal(done.ack!.response_action, "clear");
+  const resolved = h.store.item(item.item_id)!;
+  assert.equal(resolved.state, "resolved");
+  assert.equal(resolved.response, "Use candidate C.");
+  const again = await front.interactive(submission(modal, values));
+  assert.equal(again.ack!.response_action, "clear", "a resubmission replays the committed decision");
+  assert.equal(h.store.events(item.item_id).filter((event) => event.event_type === "resolved").length, 1);
+
+  // A packet amended after the modal opened: the decision is never applied to the old one.
+  const other = summon(h.store, source, { intervention_key: "later" }).item!;
+  const taken = next(h.store);
+  const stale = decisionModal(h.store.item(other.item_id)!);
+  act(h.store, source, "amend", { item_id: other.item_id, expected_revision: taken.item!.revision, fields: { context: "The artifact changed." } });
+  const refused = await front.interactive(submission(stale, values));
+  assert.equal(refused.ack!.response_action, "update");
+  assert.match(JSON.stringify(refused.ack!.view), /This item changed/u);
+  assert.equal(h.store.item(other.item_id)!.state, "active");
+  h.close();
+});
+
+test("S-2 'take next' after a decision turns the modal into the next item's", async () => {
+  const h = harness();
+  const { front } = frontEnd(h);
+  const source = liveSource(h.store);
+  const first = summon(h.store, source, { intervention_key: "a" }).item!;
+  const second = summon(h.store, source, { intervention_key: "b" }).item!;
+  next(h.store);
+  const modal = decisionModal(h.store.item(first.item_id)!);
+  const result = await front.interactive(submission(modal, {
+    decision: { selected_option: { value: "defer" } },
+    reason: { value: "Waiting on the render." },
+    next: { selected_options: [{ value: "next" }] },
+  }));
+  assert.equal(result.ack!.response_action, "update");
+  assert.equal(JSON.parse(String((result.ack!.view as SlackView).private_metadata)).item_id, second.item_id);
+  assert.equal(h.store.item(first.item_id)!.state, "deferred");
+  assert.equal(h.store.item(second.item_id)!.state, "active");
+  h.close();
+});
+
+test("S-8 the front end exists only when attention is enabled and the human's Slack user is configured", () => {
+  const h = harness();
+  const slackApi = new FakeSlack();
+  const boot = (env: Record<string, string>) => bootAttentionRuntime({
+    broker: h.broker, clock: h.clock, adminToken: "a".repeat(40), env, validateThread: async () => {}, log: () => {}, slackApi,
+  });
+  assert.notEqual(boot({ HIVE_ATTENTION_ENABLED: "true", HIVE_ATTENTION_SLACK_USER_ID: HUMAN }).slack, null);
+  assert.equal(boot({ HIVE_ATTENTION_ENABLED: "true" }).slack, null);
+  assert.equal(boot({ HIVE_ATTENTION_ENABLED: "false", HIVE_ATTENTION_SLACK_USER_ID: HUMAN }).slack, null);
+  assert.throws(() => boot({ HIVE_ATTENTION_ENABLED: "true", HIVE_ATTENTION_SLACK_USER_ID: "hakon" }), /not a Slack user id/u);
+  h.close();
+});

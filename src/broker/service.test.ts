@@ -420,3 +420,20 @@ test("the attention drain runs beside a hung publisher and outbox, and its failu
   assert.equal(published, true);
   assert.deepEqual(log, [["hive attention return drain failed", "attention store busy"]]);
 });
+
+// ADR-0004 Amendment 1 S-7: the Slack card sync is its own job — a slow or failing Slack never
+// holds up a return being minted, and its failure is reported on its own.
+test("the attention Slack sync runs as its own job beside the return drain", async () => {
+  const log: Array<[string, string]> = [];
+  let minted = false;
+  await housekeepingTick({
+    sweep: () => {},
+    publish: async () => 0,
+    drainOutbox: async () => 0,
+    attention: async () => { minted = true; return 0; },
+    attentionSlack: () => Promise.reject(new Error("slack is down")),
+    log: (what, error) => log.push([what, error instanceof Error ? error.message : String(error)]),
+  });
+  assert.equal(minted, true);
+  assert.deepEqual(log, [["hive attention slack sync failed", "slack is down"]]);
+});
