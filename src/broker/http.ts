@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { URL } from "node:url";
-import { canonicalActor, DeliveryResultInputSchema, DispatchNoticesSchema, ReasonSchema, SeatWakeMintSchema, SubscriptionInputSchema, BusySlotFormatError, parseBusySlots, type BusySlot } from "../domain.js";
+import { canonicalActor, DeliveryResultInputSchema, DispatchNoticesSchema, OutcomePartInputSchema, ReasonSchema, SeatWakeMintSchema, SubscriptionInputSchema, BusySlotFormatError, parseBusySlots, type BusySlot } from "../domain.js";
 import { routeReview, type ReviewHttpDeps } from "../review/http.js";
 import { routeAttention, type AttentionHttpDeps } from "../attention/http.js";
 import { BrokerService } from "./service.js";
@@ -158,7 +158,7 @@ export class BrokerHttpServer {
       return json(response, 200, this.broker.recordOutcome(Number(outcome[1]), text));
     }
 
-    const transition = /^\/v1\/deliveries\/(\d+)\/(accept|dispatch|dispatched|renew|reserve-spawn|release|result|reply)$/.exec(url.pathname);
+    const transition = /^\/v1\/deliveries\/(\d+)\/(accept|dispatch|dispatched|renew|reserve-spawn|release|outcome-part|result|reply)$/.exec(url.pathname);
     if (request.method === "POST" && transition?.[1] && transition[2]) {
       const deliveryId = Number(transition[1]);
       const body = await readJson(request);
@@ -178,6 +178,10 @@ export class BrokerHttpServer {
         case "release": {
           const reason = ReasonSchema.parse(body.reason);
           return json(response, 200, this.broker.release(deliveryId, edgeId, generation, reason));
+        }
+        case "outcome-part": {
+          this.broker.stageOutcomePart(deliveryId, edgeId, OutcomePartInputSchema.parse(body));
+          return json(response, 200, { staged: true });
         }
         case "result": {
           const result = DeliveryResultInputSchema.parse(body);

@@ -14,7 +14,7 @@ import type {
   SubscriptionInput,
   TerminalDeliveryStatus,
 } from "../domain.js";
-import { ACTOR_ID_PATTERN, busySlotKey, canonicalActor, EVERYONE, isSlackMessageTs, retryBackoffMs } from "../domain.js";
+import { ACTOR_ID_PATTERN, busySlotKey, canonicalActor, EVERYONE, isSlackMessageTs, retryBackoffMs, splitText } from "../domain.js";
 import type { Clock } from "../time.js";
 import { iso, systemClock } from "../time.js";
 import type { AttentionContinuationTarget } from "../attention/contract.generated.js";
@@ -49,6 +49,13 @@ export const DISPATCHED_OUTCOME_GRACE_MS = 15 * 60_000;
 
 /** An outbox row that keeps failing is retried with backoff and finally abandoned (visibly logged). */
 export const OUTBOX_MAX_ATTEMPTS = 50;
+
+/**
+ * Slack cuts a message's text at 40,000 characters. An outcome longer than one
+ * post goes to the thread as consecutive parts, each under this many code
+ * units plus its delivery footer, so every part arrives whole and identifiable.
+ */
+export const OUTCOME_POST_CHARS = 39_000;
 
 export class StaleLeaseError extends Error {}
 export class InvalidTransitionError extends Error {}
@@ -368,7 +375,16 @@ export class BrokerStore {
         sent_at TEXT,
         attempts INTEGER NOT NULL DEFAULT 0,
         next_attempt_at TEXT,
-        abandoned_at TEXT
+        abandoned_at TEXT,
+        after_outbox_id INTEGER
+      );
+
+      CREATE TABLE IF NOT EXISTS outcome_parts (
+        delivery_id INTEGER NOT NULL,
+        generation INTEGER NOT NULL,
+        part_index INTEGER NOT NULL,
+        text TEXT NOT NULL,
+        PRIMARY KEY (delivery_id, generation, part_index)
       );
 
       CREATE INDEX IF NOT EXISTS outbox_unsent_idx
@@ -525,6 +541,9 @@ export class BrokerStore {
     }
     if (!columns.includes("message_ts")) {
       this.db.exec("ALTER TABLE outbox ADD COLUMN message_ts TEXT");
+    }
+    if (!columns.includes("after_outbox_id")) {
+      this.db.exec("ALTER TABLE outbox ADD COLUMN after_outbox_id INTEGER");
     }
     // The single-timestamp shape never shipped past this branch; no dual readers survive it.
     if (columns.includes("reaction_target_ts")) {
@@ -1508,11 +1527,22 @@ export class BrokerStore {
     status: TerminalDeliveryStatus,
     reasons: Reason[],
     outcomeText: string | null = null,
+    stagedOutcomeParts = 0,
   ): Delivery {
     return this.db.transaction(() => {
       this.assertLease(deliveryId, edgeId, generation);
       const current = this.getDelivery(deliveryId);
       if (TERMINAL.has(current.status)) throw new InvalidTransitionError("delivery already terminal");
+      if (stagedOutcomeParts > 0) {
+        const staged = this.db.prepare(`
+          SELECT text FROM outcome_parts WHERE delivery_id=? AND generation=? AND part_index < ? ORDER BY part_index
+        `).all(deliveryId, generation, stagedOutcomeParts) as Row[];
+        if (staged.length !== stagedOutcomeParts) {
+          throw new InvalidTransitionError(`outcome names ${stagedOutcomeParts} staged part(s), ${staged.length} were staged`);
+        }
+        outcomeText = staged.map((row) => String(row.text)).join("") + (outcomeText ?? "");
+      }
+      this.db.prepare("DELETE FROM outcome_parts WHERE delivery_id=?").run(deliveryId);
       const now = iso(this.clock);
       this.db.prepare(`
         UPDATE deliveries SET status=?, reasons_json=?, terminal_at=?, updated_at=? WHERE delivery_id=?
@@ -1522,7 +1552,7 @@ export class BrokerStore {
       } else if (outcomeText !== null) {
         // R-6: a headless outcome commits with the terminal transition so a
         // Slack outage can neither lose it nor rerun the trusted instruction.
-        this.enqueueOutbox(current, outcomePost(current, outcomeText), REACTION_PROCESSED);
+        this.enqueueOutcome(current, outcomeText);
       }
       return this.getDelivery(deliveryId);
     })();
@@ -1535,6 +1565,23 @@ export class BrokerStore {
    * thread-visible notice; otherwise the delivery requeues behind exponential
    * backoff and the retry is announced in the thread.
    */
+  /**
+   * One part of an outcome too large for a single request, staged under the
+   * delivery's lease until `finish` joins it. Re-staging an index replaces it,
+   * so a retried upload is harmless; parts of an older claim are dropped.
+   */
+  stageOutcomePart(deliveryId: number, edgeId: string, generation: number, index: number, text: string): void {
+    this.db.transaction(() => {
+      this.assertLease(deliveryId, edgeId, generation);
+      const current = this.getDelivery(deliveryId);
+      if (TERMINAL.has(current.status)) throw new InvalidTransitionError("delivery already terminal");
+      this.db.prepare("DELETE FROM outcome_parts WHERE delivery_id=? AND generation<>?").run(deliveryId, generation);
+      this.db.prepare(`
+        INSERT OR REPLACE INTO outcome_parts(delivery_id, generation, part_index, text) VALUES (?, ?, ?, ?)
+      `).run(deliveryId, generation, index, text);
+    })();
+  }
+
   release(deliveryId: number, edgeId: string, generation: number, reason: Reason): Delivery {
     return this.db.transaction(() => {
       this.assertLease(deliveryId, edgeId, generation);
@@ -1585,6 +1632,7 @@ export class BrokerStore {
   }
 
   private requeueOrFail(delivery: Delivery, reason: Reason): void {
+    this.db.prepare("DELETE FROM outcome_parts WHERE delivery_id=?").run(delivery.id);
     const now = iso(this.clock);
     if (delivery.attempts >= delivery.subscription.maxAttempts) {
       this.db.prepare(`
@@ -1624,7 +1672,7 @@ export class BrokerStore {
           WHERE delivery_id=?
         `).run(JSON.stringify([{ code: "agent_outcome_reported", detail: "the agent reported its outcome" }]), now, now, deliveryId);
       }
-      this.enqueueOutbox(current, outcomePost(current, text), REACTION_PROCESSED);
+      this.enqueueOutcome(current, text);
       return this.getDelivery(deliveryId);
     })();
   }
@@ -1636,7 +1684,26 @@ export class BrokerStore {
     `).run(channelId, threadTs, text, iso(this.clock));
   }
 
-  enqueueOutbox(delivery: Delivery, text: string, reaction: string | null = null): void {
+  /**
+   * An outcome posts as one message, or as ordered parts when Slack could not
+   * carry it whole: each part names its place and the delivery, waits for the
+   * part before it, and only the last one stamps the wake messages processed.
+   */
+  private enqueueOutcome(delivery: Delivery, text: string): void {
+    const parts = splitText(text, OUTCOME_POST_CHARS, true);
+    let previous: number | null = null;
+    parts.forEach((part, index) => {
+      const last = index === parts.length - 1;
+      previous = this.enqueueOutbox(
+        delivery,
+        outcomePost(delivery, part, parts.length === 1 ? null : { index: index + 1, of: parts.length }),
+        last ? REACTION_PROCESSED : null,
+        previous,
+      );
+    });
+  }
+
+  enqueueOutbox(delivery: Delivery, text: string, reaction: string | null = null, afterOutboxId: number | null = null): number {
     // A coalesced delivery answers several wake messages at once; the stamp
     // must land on every one of them, not only the primary event's. A
     // seat-minted wake contributes no stampable message — its ledger row
@@ -1649,9 +1716,9 @@ export class BrokerStore {
     ])].filter(isSlackMessageTs);
     const effectiveReaction = reaction !== null && stampable.length > 0 ? reaction : null;
     const targets = effectiveReaction === null ? null : JSON.stringify(stampable);
-    this.db.prepare(`
-      INSERT INTO outbox(delivery_id, channel_id, thread_ts, text, reaction, reaction_targets_json, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+    const inserted = this.db.prepare(`
+      INSERT INTO outbox(delivery_id, channel_id, thread_ts, text, reaction, reaction_targets_json, created_at, after_outbox_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       delivery.id,
       delivery.event.channelId,
@@ -1660,7 +1727,9 @@ export class BrokerStore {
       effectiveReaction,
       targets,
       iso(this.clock),
+      afterOutboxId,
     );
+    return Number(inserted.lastInsertRowid);
   }
 
   /**
@@ -1672,10 +1741,14 @@ export class BrokerStore {
   listUnsentOutbox(limit = 32): OutboxEntry[] {
     const now = iso(this.clock);
     const rows = this.db.prepare(`
-      SELECT * FROM outbox
-      WHERE sent_at IS NULL AND abandoned_at IS NULL
-        AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
-      ORDER BY outbox_id LIMIT ?
+      SELECT o.* FROM outbox o
+      WHERE o.sent_at IS NULL AND o.abandoned_at IS NULL
+        AND (o.next_attempt_at IS NULL OR o.next_attempt_at <= ?)
+        AND (o.after_outbox_id IS NULL OR EXISTS (
+          SELECT 1 FROM outbox p
+          WHERE p.outbox_id = o.after_outbox_id AND (p.sent_at IS NOT NULL OR p.abandoned_at IS NOT NULL)
+        ))
+      ORDER BY o.outbox_id LIMIT ?
     `).all(now, limit) as Row[];
     return rows.map(outboxFromRow);
   }
@@ -1805,8 +1878,9 @@ function dispatchedNotice(delivery: Delivery, notices: Reason[]): string {
   return [head, ...notices.map((notice) => `⚠ ${notice.code} — ${notice.detail}`)].join("\n");
 }
 
-function outcomePost(delivery: Delivery, text: string): string {
-  return `${text}\n\n[delivery ${delivery.id} · dedupe ${delivery.event.messageTs}:${delivery.id} · ${delivery.actor}]`;
+function outcomePost(delivery: Delivery, text: string, part: { index: number; of: number } | null = null): string {
+  const place = part === null ? "" : ` · part ${part.index}/${part.of}`;
+  return `${text}\n\n[delivery ${delivery.id}${place} · dedupe ${delivery.event.messageTs}:${delivery.id} · ${delivery.actor}]`;
 }
 
 function failureNotice(delivery: Delivery, status: "failed" | "undeliverable", reasons: Reason[]): string {
