@@ -115,6 +115,7 @@ export function cardBlocks(item: ItemView, now: Date): Block[] {
     blocks.push({ type: "section", text: plain(packet.artifacts.map((artifact) => `• ${artifactLine(artifact)}`).join("\n")) });
   }
   const estimate = packet.estimate_minutes === null ? "" : ` · about ${packet.estimate_minutes} min of your time`;
+  if (packet.deadline_at !== null) blocks.push({ type: "context", elements: [label(`⏰ *Deadline* ${packet.deadline_at} (display only)`)] });
   blocks.push({ type: "section", text: label(`*Unblocks*${estimate}`) });
   blocks.push({ type: "section", text: plain(packet.unblocks) });
   blocks.push({
@@ -162,7 +163,10 @@ export function homeView(page: QueuePage, now: Date): SlackView {
       accessory: { type: "button", action_id: "atn_decide", text: { type: "plain_text", text: "Decide" }, value: String(active.item_id) },
     });
   }
-  const queued = page.items.filter((item) => item.state === "queued");
+  // A deferral whose time has come is eligible (the next `next` promotes it), so it is listed
+  // with what Take next would select, not among the deferred.
+  const due = (item: ItemView): boolean => item.state === "deferred" && item.deferred_until !== null && item.deferred_until <= now.toISOString();
+  const queued = page.items.filter((item) => item.state === "queued" || due(item));
   blocks.push({ type: "section", text: label(queued.length === 0 ? "*Next up* — nothing waiting" : "*Next up* (FIFO)") });
   for (const item of queued.slice(0, HOME_LIST_LIMIT)) {
     blocks.push({
@@ -172,7 +176,7 @@ export function homeView(page: QueuePage, now: Date): SlackView {
     });
   }
   if (queued.length > HOME_LIST_LIMIT) blocks.push({ type: "context", elements: [label(`… and ${queued.length - HOME_LIST_LIMIT} more`)] });
-  const deferred = page.items.filter((item) => item.state === "deferred");
+  const deferred = page.items.filter((item) => item.state === "deferred" && !due(item));
   if (deferred.length > 0) {
     blocks.push({ type: "section", text: label("*Deferred*") });
     for (const item of deferred.slice(0, HOME_LIST_LIMIT)) {
@@ -197,7 +201,8 @@ export function decisionModal(item: ItemView, commandId: string = randomUUID(), 
   const blocks: Block[] = [];
   if (notice !== null) blocks.push({ type: "context", elements: [label(notice)] });
   blocks.push(
-    { type: "section", text: plain(`${packet.title}\n\nDo: ${packet.requested_action}\n\nContext: ${packet.context}\n\nUnblocks: ${packet.unblocks}`) },
+    { type: "section", text: plain(`${packet.title}\n\nDo: ${packet.requested_action}\n\nContext: ${packet.context}\n\nUnblocks: ${packet.unblocks}`
+      + (packet.deadline_at === null ? "" : `\n\nDeadline: ${packet.deadline_at} (display only)`)) },
     { type: "context", elements: [plain(`${packet.kind} · ${packet.project_id} / ${packet.work_id} · revision ${item.revision} · return: ${returnDescription(item.source, item.return_mode)}`, 2000)] },
     {
       type: "input", block_id: "decision", label: { type: "plain_text", text: "Decision" },
@@ -263,6 +268,9 @@ export const SLACK_CARD_BATCH = 25;
 export class AttentionSlackFrontEnd {
   private running: Promise<number> | null = null;
   private dmChannel: string | null = null;
+  private since: string | null = null;
+  /** A Home publication that failed is retried on the next pass even if no card changed. */
+  private homeDirty = false;
 
   constructor(
     private readonly store: AttentionStore,
@@ -289,16 +297,17 @@ export class AttentionSlackFrontEnd {
 
   private async drain(): Promise<number> {
     let changed = 0;
-    for (const { item, card } of this.store.cardsDue(SLACK_CARD_BATCH)) {
+    this.since ??= this.store.slackCardsSince(this.clock.now().toISOString());
+    for (const { item, card } of this.store.cardsDue(this.humanSlackUserId, this.since, SLACK_CARD_BATCH)) {
       try {
         const now = this.clock.now();
         if (card === null) {
           const channel = await this.dm();
           const ts = await this.api.post(channel, cardText(item), cardBlocks(item, now));
-          this.store.recordCard(item.item_id, channel, ts, item);
+          this.store.recordCard(item.item_id, this.humanSlackUserId, channel, ts, item);
         } else {
           await this.api.update(card.channelId, card.messageTs, cardText(item), cardBlocks(item, now));
-          this.store.recordCard(item.item_id, card.channelId, card.messageTs, item);
+          this.store.recordCard(item.item_id, this.humanSlackUserId, card.channelId, card.messageTs, item);
         }
         changed += 1;
       } catch (error) {
@@ -306,7 +315,7 @@ export class AttentionSlackFrontEnd {
         this.log(`[attention-slack] card for ${itemLabel(item.item_id)} not synced: ${errorName(error)}`);
       }
     }
-    if (changed > 0) await this.refreshHome();
+    if (changed > 0 || this.homeDirty) await this.refreshHome();
     return changed;
   }
 
@@ -319,7 +328,9 @@ export class AttentionSlackFrontEnd {
     try {
       const page = this.store.queue(this.store.humanId, { states: ["active", "queued", "deferred"], limit: 100 });
       await this.api.publishHome(this.humanSlackUserId, homeView(page, this.clock.now()));
+      this.homeDirty = false;
     } catch (error) {
+      this.homeDirty = true;
       this.log(`[attention-slack] home tab not published: ${errorName(error)}`);
     }
   }
@@ -399,7 +410,8 @@ export class AttentionSlackFrontEnd {
     const field = (block: string): Record<string, unknown> | undefined => values[block]?.value;
     const decision = (field("decision")?.selected_option as { value?: string } | undefined)?.value ?? "resolve";
     const outcome = (field("outcome")?.selected_option as { value?: string } | undefined)?.value;
-    const response = typeof field("response")?.value === "string" ? String(field("response")!.value).trim() : "";
+    // Verbatim (S-2): the seat receives exactly what was typed; trimming only decides emptiness.
+    const response = typeof field("response")?.value === "string" ? String(field("response")!.value) : "";
     const reason = typeof field("reason")?.value === "string" ? String(field("reason")!.value).trim() : "";
     const until = typeof field("until")?.selected_date_time === "number" ? new Date(Number(field("until")!.selected_date_time) * 1000).toISOString() : null;
     const selectNext = ((field("next")?.selected_options as unknown[] | undefined) ?? []).length > 0;
@@ -409,7 +421,7 @@ export class AttentionSlackFrontEnd {
     if (decision === "resolve") {
       const errors: Record<string, string> = {};
       if (!outcome) errors.outcome = "Choose an outcome.";
-      if (response.length === 0) errors.response = "Write the response the seat will receive.";
+      if (response.trim().length === 0) errors.response = "Write the response the seat will receive.";
       if (Object.keys(errors).length > 0) return { ack: { response_action: "errors", errors } };
       command = { schema_version: 1, command_id: metadata.command_id, action: "resolve", payload: { ...base, outcome: outcome as ResolutionOutcome, response } };
     } else if (decision === "defer" || decision === "cancel") {

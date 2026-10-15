@@ -7,6 +7,7 @@ import { AttentionService } from "./service.js";
 import {
   AttentionSlackFrontEnd,
   cardBlocks,
+  homeView,
   decisionModal,
   derivedCommandId,
   type AttentionSlackApi,
@@ -19,6 +20,7 @@ class FakeSlack implements AttentionSlackApi {
   readonly calls: Array<{ op: string; args: unknown[] }> = [];
   private ts = 1000;
   failPost = false;
+  failHome = 0;
   async openDm(userId: string) { this.calls.push({ op: "openDm", args: [userId] }); return "D0HAKON"; }
   async post(channel: string, text: string, blocks: unknown[]) {
     this.calls.push({ op: "post", args: [channel, text, blocks] });
@@ -27,16 +29,18 @@ class FakeSlack implements AttentionSlackApi {
     return `${this.ts}.000100`;
   }
   async update(channel: string, ts: string, text: string, blocks: unknown[]) { this.calls.push({ op: "update", args: [channel, ts, text, blocks] }); }
-  async publishHome(userId: string, view: SlackView) { this.calls.push({ op: "publishHome", args: [userId, view] }); }
+  async publishHome(userId: string, view: SlackView) {
+    this.calls.push({ op: "publishHome", args: [userId, view] });
+    if (this.failHome > 0) { this.failHome -= 1; throw new Error("views.publish failed"); }
+  }
   async openModal(triggerId: string, view: SlackView) { this.calls.push({ op: "openModal", args: [triggerId, view] }); }
   ops(): string[] { return this.calls.map((call) => call.op); }
   clear(): void { this.calls.length = 0; }
 }
 
-function frontEnd(h: Harness) {
-  const slack = new FakeSlack();
+function frontEnd(h: Harness, user = HUMAN, slack = new FakeSlack()) {
   const service = new AttentionService(h.store, h.broker, async () => {});
-  return { slack, front: new AttentionSlackFrontEnd(h.store, service, slack, HUMAN, h.clock) };
+  return { slack, front: new AttentionSlackFrontEnd(h.store, service, slack, user, h.clock) };
 }
 
 /** Every text object that carries seat-written strings must be plain_text (S-6). */
@@ -219,5 +223,87 @@ test("S-8 the front end exists only when attention is enabled and the human's Sl
   assert.equal(boot({ HIVE_ATTENTION_ENABLED: "true" }).slack, null);
   assert.equal(boot({ HIVE_ATTENTION_ENABLED: "false", HIVE_ATTENTION_SLACK_USER_ID: HUMAN }).slack, null);
   assert.throws(() => boot({ HIVE_ATTENTION_ENABLED: "true", HIVE_ATTENTION_SLACK_USER_ID: "hakon" }), /not a Slack user id/u);
+  h.close();
+});
+
+test("S-1 a summons closed before the first sync still gets its one card; older closed items never do", async () => {
+  const h = harness();
+  const source = liveSource(h.store);
+  const old = summon(h.store, source, { intervention_key: "old" }).item!;
+  act(h.store, source, "withdraw", { item_id: old.item_id, expected_revision: 1, reason: "moot" });
+  h.clock.advance(1000);
+  const { slack, front } = frontEnd(h);
+  await front.drainOnce();
+  assert.deepEqual(slack.ops(), [], "nothing older than the front end is announced after the fact");
+  const quick = summon(h.store, source, { intervention_key: "quick" }).item!;
+  act(h.store, source, "withdraw", { item_id: quick.item_id, expected_revision: 1, reason: "moot" });
+  await front.drainOnce();
+  const posted = slack.calls.filter((call) => call.op === "post");
+  assert.equal(posted.length, 1);
+  assert.equal((posted[0]!.args[2] as Array<{ type: string }>).some((block) => block.type === "actions"), false, "rendered closed, without buttons");
+  h.close();
+});
+
+test("the Home tab lists a due deferral with what Take next selects, and shows packet deadlines", () => {
+  const h = harness();
+  const source = liveSource(h.store);
+  const item = summon(h.store, source, { deadline_at: "2026-10-20T12:00:00.000Z" }).item!;
+  const taken = next(h.store);
+  act(h.store, { kind: "operator" }, "defer", { item_id: item.item_id, expected_revision: taken.item!.revision, reason: "later", until: new Date(h.clock.now().getTime() + 60_000).toISOString(), select_next: false });
+  h.clock.advance(120_000);
+  const page = h.store.queue("hakon", { states: ["active", "queued", "deferred"] });
+  const home = JSON.stringify(homeView(page, h.clock.now()));
+  assert.doesNotMatch(home, /nothing waiting/u);
+  assert.doesNotMatch(home, /Deferred/u, "a due deferral is eligible, not deferred");
+  const view = h.store.item(item.item_id)!;
+  assert.match(JSON.stringify(cardBlocks(view, h.clock.now())), /Deadline\* 2026-10-20T12:00:00.000Z/u);
+  assert.match(JSON.stringify(decisionModal(view)), /Deadline: 2026-10-20T12:00:00.000Z/u);
+  h.close();
+});
+
+test("S-2 the response reaches the seat verbatim, whitespace included", async () => {
+  const h = harness();
+  const { front } = frontEnd(h);
+  const item = summon(h.store, liveSource(h.store)).item!;
+  next(h.store);
+  const modal = decisionModal(h.store.item(item.item_id)!);
+  const response = "  keep this indentation:\n    return 1\n";
+  await front.interactive(submission(modal, {
+    decision: { selected_option: { value: "resolve" } }, outcome: { selected_option: { value: "answered" } }, response: { value: response },
+  }));
+  assert.equal(h.store.item(item.item_id)!.response, response);
+  h.close();
+});
+
+test("S-7 a failed Home publication is retried on the next pass even with no card change", async () => {
+  const h = harness();
+  const { slack, front } = frontEnd(h);
+  summon(h.store, liveSource(h.store));
+  slack.failHome = 1;
+  await front.drainOnce();
+  slack.clear();
+  await front.drainOnce();
+  assert.deepEqual(slack.ops(), ["publishHome"]);
+  slack.clear();
+  await front.drainOnce();
+  assert.deepEqual(slack.ops(), [], "once published, nothing repeats");
+  h.close();
+});
+
+test("S-4 a changed Slack human gets the cards; the former account stops receiving updates", async () => {
+  const h = harness();
+  const source = liveSource(h.store);
+  const item = summon(h.store, source).item!;
+  const before = frontEnd(h);
+  await before.front.drainOnce();
+  const after = frontEnd(h, "U0NEWHUMAN");
+  await after.front.drainOnce();
+  assert.deepEqual(after.slack.ops(), ["openDm", "post", "publishHome"]);
+  assert.equal(after.slack.calls[0]!.args[0], "U0NEWHUMAN");
+  act(h.store, source, "amend", { item_id: item.item_id, expected_revision: 1, fields: { title: "Retitled" } });
+  before.slack.clear();
+  await after.front.drainOnce();
+  assert.equal(after.slack.ops()[after.slack.ops().length - 2], "update");
+  assert.deepEqual(before.slack.ops(), [], "the former account's card is no longer touched");
   h.close();
 });

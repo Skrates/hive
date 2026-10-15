@@ -362,12 +362,19 @@ export class AttentionStore {
       this.db.exec(`
         CREATE TABLE IF NOT EXISTS attention_slack_cards (
           item_id INTEGER PRIMARY KEY,
+          slack_user_id TEXT NOT NULL,
           channel_id TEXT NOT NULL,
           message_ts TEXT NOT NULL,
           rendered_revision INTEGER NOT NULL,
           rendered_state TEXT NOT NULL,
           rendered_return_phase TEXT,
           updated_at TEXT NOT NULL
+        );
+        -- When the front end first ran: an item created since then gets its card even if it
+        -- closed before the first sync; nothing older is ever announced after the fact.
+        CREATE TABLE IF NOT EXISTS attention_slack_meta (
+          singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+          cards_since TEXT NOT NULL
         );
       `);
       this.db.prepare("INSERT OR IGNORE INTO attention_schema(singleton, version, created_at) VALUES (1, ?, ?)")
@@ -1234,25 +1241,33 @@ export class AttentionStore {
 
   // ───────────────────────────── slack cards (Amendment 1) ─────────────────────────────
 
+  /** The instant the front end first ran (recorded once, durably). */
+  slackCardsSince(nowIso: string): string {
+    this.db.prepare("INSERT OR IGNORE INTO attention_slack_meta(singleton, cards_since) VALUES (1, ?)").run(nowIso);
+    return String((this.db.prepare("SELECT cards_since FROM attention_slack_meta WHERE singleton=1").get() as Row).cards_since);
+  }
+
   /**
-   * Items whose Slack card is missing or out of date. A card is posted only for an item that is
-   * still open (queued, active, deferred) — the one notification is for work that is waiting —
-   * and every posted card is kept current through its item's terminal state and return phase.
+   * Items whose Slack card for `slackUserId` is missing or out of date. Every summons created since
+   * the front end first ran gets its one card — even one already closed before the first sync, then
+   * rendered in its closed state — and an older item gets one only while still open. A card posted
+   * to a different Slack user (the configured human changed) counts as missing: the new human gets
+   * a card, and the old one stops receiving updates.
    */
-  cardsDue(limit: number): Array<{ item: ItemView; card: SlackCardRow | null }> {
+  cardsDue(slackUserId: string, since: string, limit: number): Array<{ item: ItemView; card: SlackCardRow | null }> {
     const rows = this.db.prepare(`
       SELECT i.item_id, c.channel_id, c.message_ts, c.rendered_revision, c.rendered_state, c.rendered_return_phase,
              (SELECT r.phase FROM attention_returns r WHERE r.item_id=i.item_id AND r.phase!='superseded'
               ORDER BY r.generation DESC LIMIT 1) AS return_phase
-      FROM attention_items i LEFT JOIN attention_slack_cards c ON c.item_id=i.item_id
+      FROM attention_items i LEFT JOIN attention_slack_cards c ON c.item_id=i.item_id AND c.slack_user_id=?
       WHERE i.human_id=? AND (
-        (c.item_id IS NULL AND i.state IN ('queued', 'active', 'deferred'))
+        (c.item_id IS NULL AND (i.state IN ('queued', 'active', 'deferred') OR i.created_at >= ?))
         OR (c.item_id IS NOT NULL AND (
           c.rendered_revision != i.revision OR c.rendered_state != i.state
           OR COALESCE(c.rendered_return_phase, '') != COALESCE(return_phase, '')))
       )
       ORDER BY i.item_id LIMIT ?
-    `).all(this.humanId, limit) as Array<Row & { item_id: number; channel_id: string | null; message_ts: string | null }>;
+    `).all(slackUserId, this.humanId, since, limit) as Array<Row & { item_id: number; channel_id: string | null; message_ts: string | null }>;
     const now = this.clock.now();
     return rows.map((row) => ({
       item: this.view(this.itemRow(row.item_id)!, now),
@@ -1267,14 +1282,14 @@ export class AttentionStore {
   }
 
   /** Record what a card now shows (after a successful post or update). */
-  recordCard(itemId: number, channelId: string, messageTs: string, item: ItemView): void {
+  recordCard(itemId: number, slackUserId: string, channelId: string, messageTs: string, item: ItemView): void {
     this.db.prepare(`
-      INSERT INTO attention_slack_cards(item_id, channel_id, message_ts, rendered_revision, rendered_state, rendered_return_phase, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(item_id) DO UPDATE SET channel_id=excluded.channel_id, message_ts=excluded.message_ts,
+      INSERT INTO attention_slack_cards(item_id, slack_user_id, channel_id, message_ts, rendered_revision, rendered_state, rendered_return_phase, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(item_id) DO UPDATE SET slack_user_id=excluded.slack_user_id, channel_id=excluded.channel_id, message_ts=excluded.message_ts,
         rendered_revision=excluded.rendered_revision, rendered_state=excluded.rendered_state,
         rendered_return_phase=excluded.rendered_return_phase, updated_at=excluded.updated_at
-    `).run(itemId, channelId, messageTs, item.revision, item.state, item.return?.phase ?? null, this.nowIso());
+    `).run(itemId, slackUserId, channelId, messageTs, item.revision, item.state, item.return?.phase ?? null, this.nowIso());
   }
 
   item(itemId: number): ItemView | null {
