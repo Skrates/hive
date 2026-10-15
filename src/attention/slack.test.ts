@@ -7,6 +7,8 @@ import { AttentionService } from "./service.js";
 import {
   AttentionSlackFrontEnd,
   cardBlocks,
+  cardText,
+  webClientSlackApi,
   homeView,
   decisionModal,
   derivedCommandId,
@@ -322,5 +324,89 @@ test("S-4 a changed Slack human gets the cards; the former account stops receivi
   await after.front.drainOnce();
   assert.equal(after.slack.ops()[after.slack.ops().length - 2], "update");
   assert.deepEqual(before.slack.ops(), [], "the former account's card is no longer touched");
+  h.close();
+});
+
+test("S-7 time alone makes Home stale: a deferral that comes due is published without any write", async () => {
+  const h = harness();
+  const { slack, front } = frontEnd(h);
+  const item = summon(h.store, liveSource(h.store)).item!;
+  const taken = next(h.store);
+  act(h.store, { kind: "operator" }, "defer", { item_id: item.item_id, expected_revision: taken.item!.revision, reason: "later", until: new Date(h.clock.now().getTime() + 60_000).toISOString(), select_next: false });
+  await front.drainOnce();
+  assert.match(JSON.stringify(slack.calls.filter((c) => c.op === "publishHome").at(-1)!.args[1]), /nothing waiting/u);
+  slack.clear();
+  await front.drainOnce();
+  assert.deepEqual(slack.ops(), [], "before it is due nothing repeats");
+  h.clock.advance(120_000);
+  await front.drainOnce();
+  assert.deepEqual(slack.ops(), ["publishHome"]);
+  assert.doesNotMatch(JSON.stringify(slack.calls[0]!.args[1]), /nothing waiting/u);
+  slack.clear();
+  await front.drainOnce();
+  assert.deepEqual(slack.ops(), [], "published once");
+  h.close();
+});
+
+test("S-6 the notification fallback carries no Slack control characters and the adapter disables parsing", async () => {
+  const h = harness();
+  const item = summon(h.store, liveSource(h.store), { title: "<@U_TEST> <https://x.test|go> *bold* & more" }).item!;
+  const text = cardText(h.store.item(item.item_id)!);
+  assert.doesNotMatch(text, /[<>&]/u);
+  const sent: Array<Record<string, unknown>> = [];
+  const web = {
+    chat: {
+      postMessage: async (args: Record<string, unknown>) => { sent.push(args); return { ts: "1.1" }; },
+      update: async (args: Record<string, unknown>) => { sent.push(args); },
+    },
+  };
+  const api = webClientSlackApi(web as never);
+  await api.post("D1", text, []);
+  await api.update("D1", "1.1", text, []);
+  for (const args of sent) {
+    assert.equal(args.parse, "none");
+    assert.equal(args.link_names, false);
+  }
+  assert.equal(sent[0]!.mrkdwn, false);
+  h.close();
+});
+
+test("S-7 a card whose message is gone for good is re-posted once; a transient error is not mistaken for it", async () => {
+  const h = harness();
+  const source = liveSource(h.store);
+  const item = summon(h.store, source).item!;
+  const slack = new FakeSlack();
+  const { front } = frontEnd(h, HUMAN, slack);
+  await front.drainOnce();
+  const original = slack.calls.find((c) => c.op === "post")!;
+  let mode: "gone" | "transient" = "transient";
+  slack.update = async (channel: string, ts: string, text: string, blocks: unknown[]) => {
+    slack.calls.push({ op: "update", args: [channel, ts, text, blocks] });
+    throw Object.assign(new Error("x"), mode === "gone" ? { data: { error: "message_not_found" } } : { code: "slack_webapi_request_error" });
+  };
+  act(h.store, source, "amend", { item_id: item.item_id, expected_revision: 1, fields: { title: "Retitled" } });
+  slack.clear();
+  await front.drainOnce();
+  assert.deepEqual(slack.ops().filter((op) => op === "post"), [], "transient failure keeps the card due, no recovery post");
+  mode = "gone";
+  slack.clear();
+  await front.drainOnce();
+  assert.equal(slack.ops().filter((op) => op === "post").length, 1);
+  assert.notEqual(slack.calls.find((c) => c.op === "post")!.args[0], undefined);
+  assert.ok(original);
+  slack.clear();
+  await front.drainOnce();
+  assert.deepEqual(slack.ops().filter((op) => op === "update" || op === "post"), [], "the recovered card is current: no further retries");
+  h.close();
+});
+
+test("S-2 required decision fields survive their display budgets in the modal", () => {
+  const h = harness();
+  const item = summon(h.store, liveSource(h.store), {
+    requested_action: "a".repeat(1500), context: "c".repeat(3000), unblocks: "UNBLOCKS-MARK", deadline_at: "2026-10-20T12:00:00.000Z",
+  }).item!;
+  const modal = JSON.stringify(decisionModal(h.store.item(item.item_id)!));
+  assert.match(modal, /Unblocks: UNBLOCKS-MARK/u);
+  assert.match(modal, /Deadline: 2026-10-20T12:00:00.000Z/u);
   h.close();
 });

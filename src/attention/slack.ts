@@ -46,6 +46,8 @@ export function webClientSlackApi(web: WebClient): AttentionSlackApi {
     async post(channel, text, blocks) {
       const result = await web.chat.postMessage({
         channel, text, blocks, unfurl_links: false, unfurl_media: false,
+        // The fallback text is notification-only: Slack must not parse mentions, links or markup in it.
+        mrkdwn: false, parse: "none", link_names: false,
         // hive_* metadata: the ingress never treats a Hive post as a wake (ADR-0003).
         metadata: { event_type: "hive_attention_card", event_payload: {} },
       } as Parameters<WebClient["chat"]["postMessage"]>[0]);
@@ -53,7 +55,7 @@ export function webClientSlackApi(web: WebClient): AttentionSlackApi {
       return result.ts;
     },
     async update(channel, ts, text, blocks) {
-      await web.chat.update({ channel, ts, text, blocks } as Parameters<WebClient["chat"]["update"]>[0]);
+      await web.chat.update({ channel, ts, text, blocks, parse: "none", link_names: false } as Parameters<WebClient["chat"]["update"]>[0]);
     },
     async publishHome(userId, view) {
       await web.views.publish({ user_id: userId, view } as unknown as Parameters<WebClient["views"]["publish"]>[0]);
@@ -85,7 +87,10 @@ const OUTCOMES: readonly ResolutionOutcome[] = ["approved", "changes_requested",
 
 /** The notification text (what the pop-up shows): the item and its title, nothing else. */
 export function cardText(item: ItemView): string {
-  return plain(`${itemLabel(item.item_id)} · ${item.packet.title}`, 150).text;
+  // `<`, `>` and `&` are Slack's control characters; the adapter also disables parsing, but the
+  // text itself carries nothing parseable.
+  const inertText = `${itemLabel(item.item_id)} · ${item.packet.title}`.replace(/</gu, "‹").replace(/>/gu, "›").replace(/&/gu, "＆");
+  return plain(inertText, 150).text;
 }
 
 function statusLine(item: ItemView): string {
@@ -200,9 +205,16 @@ export function decisionModal(item: ItemView, commandId: string = randomUUID(), 
   const packet = item.packet;
   const blocks: Block[] = [];
   if (notice !== null) blocks.push({ type: "context", elements: [label(notice)] });
+  // One section per field: each has its own display budget, so a long field can never push
+  // Unblocks or the Deadline out of the decision.
   blocks.push(
-    { type: "section", text: plain(`${packet.title}\n\nDo: ${packet.requested_action}\n\nContext: ${packet.context}\n\nUnblocks: ${packet.unblocks}`
-      + (packet.deadline_at === null ? "" : `\n\nDeadline: ${packet.deadline_at} (display only)`)) },
+    { type: "section", text: plain(packet.title, 3000) },
+    { type: "section", text: plain(`Do: ${packet.requested_action}`) },
+    { type: "section", text: plain(`Context: ${packet.context}`) },
+    { type: "section", text: plain(`Unblocks: ${packet.unblocks}`) },
+  );
+  if (packet.deadline_at !== null) blocks.push({ type: "section", text: plain(`Deadline: ${packet.deadline_at} (display only)`) });
+  blocks.push(
     { type: "context", elements: [plain(`${packet.kind} · ${packet.project_id} / ${packet.work_id} · revision ${item.revision} · return: ${returnDescription(item.source, item.return_mode)}`, 2000)] },
     {
       type: "input", block_id: "decision", label: { type: "plain_text", text: "Decision" },
@@ -272,6 +284,8 @@ export class AttentionSlackFrontEnd {
   private readonly since: string;
   /** A Home publication that failed is retried on the next pass even if no card changed. */
   private homeDirty = false;
+  /** Earliest future deferral time in the last published Home; passing it makes Home stale by time alone. */
+  private homeStaleAt: string | null = null;
 
   constructor(
     private readonly store: AttentionStore,
@@ -303,13 +317,22 @@ export class AttentionSlackFrontEnd {
     for (const { item, card } of this.store.cardsDue(this.humanSlackUserId, this.since, SLACK_CARD_BATCH)) {
       try {
         const now = this.clock.now();
-        if (card === null) {
+        const post = async (): Promise<void> => {
           const channel = await this.dm();
           const ts = await this.api.post(channel, cardText(item), cardBlocks(item, now));
           this.store.recordCard(item.item_id, this.humanSlackUserId, channel, ts, item);
+        };
+        if (card === null) {
+          await post();
         } else {
-          await this.api.update(card.channelId, card.messageTs, cardText(item), cardBlocks(item, now));
-          this.store.recordCard(item.item_id, this.humanSlackUserId, card.channelId, card.messageTs, item);
+          try {
+            await this.api.update(card.channelId, card.messageTs, cardText(item), cardBlocks(item, now));
+            this.store.recordCard(item.item_id, this.humanSlackUserId, card.channelId, card.messageTs, item);
+          } catch (error) {
+            // The card's message is gone for good (deleted): re-post the current projection once.
+            if (slackErrorCode(error) !== "message_not_found") throw error;
+            await post();
+          }
         }
         changed += 1;
       } catch (error) {
@@ -317,7 +340,9 @@ export class AttentionSlackFrontEnd {
         this.log(`[attention-slack] card for ${itemLabel(item.item_id)} not synced: ${errorName(error)}`);
       }
     }
-    if (changed > 0 || this.homeDirty) await this.refreshHome();
+    // Home is also stale by the clock alone: a deferral that has come due is eligible without any write.
+    const timeStale = this.homeStaleAt !== null && this.homeStaleAt <= this.clock.now().toISOString();
+    if (changed > 0 || this.homeDirty || timeStale) await this.refreshHome();
     return changed;
   }
 
@@ -329,8 +354,14 @@ export class AttentionSlackFrontEnd {
   async refreshHome(): Promise<void> {
     try {
       const page = this.store.queue(this.store.humanId, { states: ["active", "queued", "deferred"], limit: 100 });
-      await this.api.publishHome(this.humanSlackUserId, homeView(page, this.clock.now()));
+      const now = this.clock.now();
+      await this.api.publishHome(this.humanSlackUserId, homeView(page, now));
       this.homeDirty = false;
+      const nowIso = now.toISOString();
+      this.homeStaleAt = page.items
+        .map((item) => (item.state === "deferred" ? item.deferred_until : null))
+        .filter((until): until is string => until !== null && until > nowIso)
+        .sort()[0] ?? null;
     } catch (error) {
       this.homeDirty = true;
       this.log(`[attention-slack] home tab not published: ${errorName(error)}`);
@@ -474,9 +505,17 @@ export function derivedCommandId(identity: string): string {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-5${hex.slice(13, 16)}-${variant}${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
 }
 
-function errorName(error: unknown): string {
+function slackErrorCode(error: unknown): string | null {
   if (error && typeof error === "object") {
     const code = (error as { code?: unknown; data?: { error?: unknown } }).data?.error ?? (error as { code?: unknown }).code;
+    return typeof code === "string" ? code : null;
+  }
+  return null;
+}
+
+function errorName(error: unknown): string {
+  if (error && typeof error === "object") {
+    const code = slackErrorCode(error);
     const name = error instanceof Error ? error.name : "Error";
     return typeof code === "string" ? `${name} (${code})` : name;
   }
