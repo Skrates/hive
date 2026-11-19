@@ -1,14 +1,14 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { homedir, tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { Delivery, Subscription } from "../domain.js";
 import { prepareSocketPath } from "../local/uds.js";
 import type { LiveIngress } from "./live-registry.js";
 import { delimiter, dirname } from "node:path";
-import { ingressInboxDirectory, ClaudeProvider, claudePromptSlotArgs, CODEX_NETWORK_DOMAINS, codexPermissionArgs, codexSpawnArgs, codexResumeTurn, codexSpawnTurn, CodexProvider, composeChildEnv, GrokProvider, grokPermissionArgs, prependPathEntry, ProviderPreDispatchError, requireAccountProfile, resolveEdgeSocketPath } from "./providers.js";
+import { ingressInboxDirectory, ClaudeProvider, claudePromptSlotArgs, CODEX_NETWORK_DOMAINS, codexPermissionArgs, codexSpawnArgs, codexResumeTurn, codexSpawnTurn, CodexProvider, composeChildEnv, GeminiProvider, GrokProvider, grokPermissionArgs, prependPathEntry, ProviderPreDispatchError, requireAccountProfile, resolveEdgeSocketPath } from "./providers.js";
 import { drainInbox } from "../channel/claude-hook.js";
 
 function subscription(overrides: Partial<Subscription> = {}): Subscription {
@@ -180,6 +180,76 @@ test("Grok and Claude share all three Hive permission profiles; unknowns fail pr
     () => claude.preflight(subscription({ provider: "claude", permissionProfile: "yolo", accountProfile: directory })),
     (error: unknown) => error instanceof ProviderPreDispatchError && error.code === "provider_permission_profile_invalid",
   );
+});
+
+test("Gemini requires the dedicated Unix user's home and rejects unsupported routes and permissions", async t => {
+  const other = mkdtempSync(join(tmpdir(), "hive-gemini-profile-"));
+  t.after(() => rmSync(other, { recursive: true, force: true }));
+  const gemini = new GeminiProvider();
+  const seat = subscription({ provider: "gemini", permissionProfile: "workspace-write", accountProfile: userInfo().homedir });
+  gemini.preflight(seat);
+  for (const [override, code] of [
+    [{ accountProfile: join(other, "missing") }, "account_profile_missing"],
+    [{ accountProfile: other }, "account_profile_user_mismatch"],
+    [{ permissionProfile: "read-only" }, "provider_permission_profile_invalid"],
+    [{ permissionProfile: "yolo" }, "provider_permission_profile_invalid"],
+  ] as const) {
+    assert.throws(() => gemini.preflight({ ...seat, ...override }),
+      (error: unknown) => error instanceof ProviderPreDispatchError && error.code === code);
+  }
+  await assert.rejects(gemini.deliverLive(), /no Hive live-ingress/);
+  await assert.rejects(gemini.resume({ ...seat, sessionId: null }, other, "framed",
+    { deliveryId: 1, token: "test", effort: null }), /resume target missing/);
+});
+
+test("Gemini maps spawn and exact resume to agy and records the complete reply and conversation ID", async t => {
+  const cwd = mkdtempSync(join(tmpdir(), "hive-gemini-turn-"));
+  const command = join(cwd, "fake-agy.cjs");
+  const previous = process.env.HIVE_GEMINI_COMMAND;
+  process.env.HIVE_GEMINI_COMMAND = command;
+  t.after(() => {
+    if (previous === undefined) delete process.env.HIVE_GEMINI_COMMAND;
+    else process.env.HIVE_GEMINI_COMMAND = previous;
+    rmSync(cwd, { recursive: true, force: true });
+  });
+  writeFileSync(command, `#!${process.execPath}
+const fs = require("node:fs");
+fs.writeFileSync("invocation", JSON.stringify({args: process.argv.slice(2), home: process.env.HOME, id: process.env.HIVE_DELIVERY_ID}));
+process.stdout.write(fs.readFileSync("stream"));
+`, { mode: 0o700 });
+
+  const gemini = new GeminiProvider();
+  const home = userInfo().homedir;
+  const seat = subscription({ provider: "gemini", permissionProfile: "workspace-write", accountProfile: home, sessionId: "requested-id" });
+  const context = { deliveryId: 42, token: "test", effort: null };
+  const outcome = "final reply\n".repeat(800);
+  const terminal = (sessionId: string, status = "SUCCESS") => JSON.stringify({
+    event: "result", result: { status, conversation_id: sessionId, response: outcome },
+  });
+  const stream = join(cwd, "stream");
+  writeFileSync(stream, JSON.stringify({ event: "step_update", step_update: { text_delta: "partial" } })
+    + "\n" + terminal("spawned-id") + "\n");
+  const framed = "Wake instruction\nwith more than one line";
+  const invoked = () => JSON.parse(readFileSync(join(cwd, "invocation"), "utf8"));
+  const spawned = await gemini.spawn(seat, cwd, framed, context);
+  assert.deepEqual(spawned, { processed: true, outcome, receipt: JSON.stringify({ conversation_id: "spawned-id" }) });
+  assert.deepEqual(invoked(), { args: ["--output-format", "stream-json", "--mode", "accept-edits", "--sandbox", "-p", framed], home, id: "42" });
+
+  writeFileSync(stream, terminal("requested-id"));
+  for (const effort of ["low", "medium", "high", "xhigh", "max", "ultra"] as const) {
+    const resumed = await gemini.resume(seat, cwd, framed, { ...context, effort });
+    assert.deepEqual(resumed, { processed: true, outcome, receipt: JSON.stringify({ conversation_id: "requested-id" }) });
+    assert.deepEqual(invoked().args, ["--output-format", "stream-json", "--mode", "accept-edits", "--sandbox",
+      "--conversation", "requested-id", "--effort", effort === "ultra" ? "max" : effort, "-p", framed]);
+  }
+  await gemini.spawn({ ...seat, permissionProfile: "danger-full-access" }, cwd, framed, context);
+  assert.deepEqual(invoked().args, ["--output-format", "stream-json", "--dangerously-skip-permissions", "-p", framed]);
+  writeFileSync(stream, terminal("different-id"));
+  await assert.rejects(gemini.resume(seat, cwd, framed, context), /different conversation/);
+  for (const invalid of [terminal("requested-id", "ERROR"), terminal(""), '{"event":"init"}']) {
+    writeFileSync(stream, invalid);
+    await assert.rejects(gemini.spawn(seat, cwd, framed, context), /successful turn result/);
+  }
 });
 
 test("Claude prompt-slot flags compose exactly when the rendered artifact exists", () => {

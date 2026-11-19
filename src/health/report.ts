@@ -1,11 +1,12 @@
 import { z } from "zod";
+import { ProviderSchema } from "../domain.js";
 
 const Name = z.string().min(1).max(512);
 const State = z.enum(["unverified", "observed", "profile_missing", "inventory_incomplete", "check_failed", "reauth_required",
   "local_login_present", "connected", "tools_available", "none_configured", "disabled", "connection_failed", "configured_connection_unverified"]);
 const Check = z.object({ state: State, observedAt: z.iso.datetime() }).strict();
 export const ProfileReport = z.object({
-  actor: Name, provider: z.enum(["claude", "codex", "grok"]), accountProfile: Name, sourceHost: Name,
+  actor: Name, provider: ProviderSchema, accountProfile: Name, sourceHost: Name,
   skillsRoot: Name.nullable(), observedAt: z.iso.datetime(),
   usageProfileId: Name.nullable(), usageEdgeId: Name.nullable(), auth: Check,
   mcp: z.array(Check.extend({ name: Name }).strict()).max(200),

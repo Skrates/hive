@@ -2,9 +2,12 @@ import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 
 /** Read-only provider status methods, without creating a conversation or model turn. */
-export async function providerStatus(command: string, provider: "codex" | "grok", env: NodeJS.ProcessEnv): Promise<{
-  loggedIn: boolean; servers: Array<{ name: string; authStatus: string; toolsAvailable: boolean }>;
+export async function providerStatus(command: string, provider: "codex" | "grok" | "gemini", env: NodeJS.ProcessEnv): Promise<{
+  loggedIn: boolean | null; servers: Array<{ name: string; authStatus: string; toolsAvailable: boolean }>;
 }> {
+  // agy documents no non-interactive subscription status query. A profile on disk
+  // cannot attest to a login in the Unix user's keyring.
+  if (provider === "gemini") return { loggedIn: null, servers: [] };
   const child = spawn(command, provider === "codex" ? ["app-server"] : ["agent", "--no-leader", "stdio"], {
     env, cwd: provider === "codex" ? env.CODEX_HOME : env.HOME, stdio: ["pipe", "pipe", "ignore"],
   });

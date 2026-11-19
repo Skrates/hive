@@ -13,7 +13,7 @@
     },
     "ActorId": { "title": "ActorId", "type": "string", "pattern": "^[a-z][a-z0-9_-]{0,63}$" },
     "EdgeId": { "title": "EdgeId", "type": "string", "minLength": 1, "maxLength": 80, "pattern": "^[^\\u0000-\\u001f\\u007f]+$" },
-    "Provider": { "title": "Provider", "type": "string", "enum": ["codex", "claude", "grok"] },
+    "Provider": { "title": "Provider", "type": "string", "enum": ["codex", "claude", "grok", "gemini"] },
     "ProjectId": { "title": "ProjectId", "type": "string", "minLength": 1, "maxLength": 80, "pattern": "^[a-z0-9][a-z0-9._-]*$" },
     "WorkId": { "title": "WorkId", "type": "string", "minLength": 1, "maxLength": 200, "pattern": "^[^\\u0000-\\u001f\\u007f]+$" },
     "InterventionKey": { "title": "InterventionKey", "type": "string", "minLength": 1, "maxLength": 160, "pattern": "^[^\\u0000-\\u001f\\u007f]+$" },
