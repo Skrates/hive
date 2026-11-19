@@ -630,6 +630,7 @@ function preDispatchDetail(code: string): string {
     case "live_ingress_rejected": return "the live surface rejected dispatch before starting a provider turn";
     case "provider_permission_profile_invalid": return "the configured provider permission profile was invalid";
     case "account_profile_missing": return "the pinned account profile directory does not exist on this edge (ADR-0003 R-5: profile misbinding is a hard failure)";
+    case "account_profile_user_mismatch": return "the Antigravity account profile must be the home of the dedicated Unix user running the edge";
     case "account_profile_mismatch": return "the foreground Codex Desktop account does not match the subscription's pinned account profile";
     default: return "provider dispatch was rejected before invocation";
   }

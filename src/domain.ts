@@ -13,7 +13,7 @@ export type WakePolicy = z.infer<typeof WakePolicySchema>;
  */
 export const EVERYONE = "everyone";
 
-export const ProviderSchema = z.enum(["codex", "claude", "grok"]);
+export const ProviderSchema = z.enum(["codex", "claude", "grok", "gemini"]);
 export type Provider = z.infer<typeof ProviderSchema>;
 
 /**

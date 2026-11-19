@@ -20,7 +20,7 @@ import { BrokerClient } from "./edge/broker-client.js";
 import { EdgeControlServer } from "./edge/control.js";
 import { LiveIngressRegistry } from "./edge/live-registry.js";
 import { ProxyAgent, setGlobalDispatcher } from "undici";
-import { ClaudeProvider, CodexProvider, GrokProvider, resolveEdgeSocketPath } from "./edge/providers.js";
+import { ClaudeProvider, CodexProvider, GeminiProvider, GrokProvider, resolveEdgeSocketPath } from "./edge/providers.js";
 import { EdgeService } from "./edge/service.js";
 import { EdgeStore } from "./edge/store.js";
 import { udsRequestJson, UdsHttpError } from "./local/uds.js";
@@ -201,6 +201,7 @@ program.command("edge")
       new CodexProvider(),
       new ClaudeProvider({ ingressRoot }),
       new GrokProvider(),
+      new GeminiProvider(),
     ]);
     const control = new EdgeControlServer(edge, { socketPath });
     await control.start();

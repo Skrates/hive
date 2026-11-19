@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, userInfo } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { canonicalActor, type Delivery, type Provider, type Subscription } from "../domain.js";
 import { UdsHttpError, udsRequestJson } from "../local/uds.js";
@@ -37,6 +37,7 @@ export type ProviderPreDispatchErrorCode =
   | "attention_session_mismatch"
   | "live_ingress_rejected"
   | "provider_permission_profile_invalid"
+  | "account_profile_user_mismatch"
   | "account_profile_missing"
   | "account_profile_mismatch";
 
@@ -341,6 +342,83 @@ export function grokEffortArgs(effort: WakeEffort | null): string[] {
   return ["--reasoning-effort", clampEffortToXhigh(effort)];
 }
 
+// agy settings live under ~/.gemini, but subscription login uses the OS keyring.
+// A directory under a shared edge user's home cannot select a different keyring.
+// Metis's edge must run as her dedicated Unix user, with that user's home enrolled.
+// https://antigravity.google/docs/cli/install/
+function geminiAccountHome(subscription: Subscription): string {
+  const home = requireAccountProfile(subscription);
+  if (home !== userInfo().homedir) throw new ProviderPreDispatchError("account_profile_user_mismatch");
+  return home;
+}
+
+function geminiPermissionArgs(profile: string): string[] {
+  switch (profile) {
+    // agy plan mode prepends /plan and its terminal sandbox permits workspace
+    // writes. Neither documents a read-only permission boundary.
+    case "workspace-write": return ["--mode", "accept-edits", "--sandbox"];
+    case "danger-full-access": return ["--dangerously-skip-permissions"];
+    default: throw new ProviderPreDispatchError("provider_permission_profile_invalid");
+  }
+}
+
+export class GeminiProvider implements ProviderAdapter {
+  readonly provider = "gemini" as const;
+
+  preflight(subscription: Subscription): void {
+    geminiPermissionArgs(subscription.permissionProfile);
+    geminiAccountHome(subscription);
+  }
+
+  deliverLive(): Promise<ProviderDispatch> {
+    return Promise.reject(new Error("Antigravity CLI has no Hive live-ingress surface"));
+  }
+
+  async resume(subscription: Subscription, cwd: string, framed: string, context: HeadlessDispatch): Promise<ProviderDispatch> {
+    if (!subscription.sessionId) throw new Error("resume target missing");
+    return this.run(subscription, cwd, framed, context, subscription.sessionId);
+  }
+
+  spawn(subscription: Subscription, cwd: string, framed: string, context: HeadlessDispatch): Promise<ProviderDispatch> {
+    return this.run(subscription, cwd, framed, context, null);
+  }
+
+  private run(subscription: Subscription, cwd: string, framed: string, context: HeadlessDispatch, sessionId: string | null) {
+    const args = ["--output-format", "stream-json", ...geminiPermissionArgs(subscription.permissionProfile)];
+    if (sessionId !== null) args.push("--conversation", sessionId);
+    if (context.effort !== null) args.push("--effort", clampEffortToMax(context.effort));
+    args.push("-p", framed);
+    return runHeadless(process.env.HIVE_GEMINI_COMMAND ?? "agy", args, cwd, null, {
+      HOME: geminiAccountHome(subscription),
+      ANTIGRAVITY_GEMINI_DIR: undefined,
+      ANTIGRAVITY_APP_DATA_DIR: undefined,
+      ANTIGRAVITY_CONFIG_REL_DIR: undefined,
+      ANTIGRAVITY_CREDENTIAL_SCOPE: undefined,
+      AGY_ADC_AUTH: "false",
+      GEMINI_API_KEY: undefined,
+      AGY_LLM_GATEWAY_URL: undefined,
+    }, context, output => geminiResult(output, sessionId));
+  }
+}
+
+// The final stream-json event carries both the complete reply and the ID accepted
+// by --conversation. Keep that ID in the durable receipt even for a very long reply.
+// https://antigravity.google/docs/cli/headless/
+function geminiResult(output: string, expectedSession: string | null): ProviderDispatch {
+  const stream = output.trimEnd();
+  const event = JSON.parse(stream.slice(stream.lastIndexOf("\n") + 1));
+  const result = event?.result;
+  if (event?.event !== "result" || result?.status !== "SUCCESS"
+    || typeof result.response !== "string" || !result.response.trim()
+    || typeof result.conversation_id !== "string" || !result.conversation_id.trim()) {
+    throw new Error("Antigravity CLI did not return a successful turn result");
+  }
+  if (expectedSession !== null && result.conversation_id !== expectedSession) {
+    throw new Error("Antigravity CLI returned a different conversation from the resume target");
+  }
+  return { processed: true, outcome: result.response, receipt: JSON.stringify({ conversation_id: result.conversation_id }) };
+}
+
 export interface ClaudeInboxConfig {
   /** Root directory for per-actor ingress inboxes (owner-only). */
   ingressRoot: string;
@@ -502,7 +580,7 @@ export function resolveEdgeSocketPath(
  * Guarantee the running runtime's directory is first on the child's PATH.
  */
 export function composeChildEnv(
-  profileEnv: Record<string, string>,
+  profileEnv: NodeJS.ProcessEnv,
   context: HeadlessDispatch,
 ): NodeJS.ProcessEnv {
   const composed: NodeJS.ProcessEnv = {
@@ -539,8 +617,9 @@ async function runHeadless(
   args: string[],
   cwd: string,
   stdin: string | null,
-  profileEnv: Record<string, string>,
+  profileEnv: NodeJS.ProcessEnv,
   context: HeadlessDispatch,
+  parseOutput?: (output: string) => ProviderDispatch,
 ): Promise<ProviderDispatch> {
   const child = spawn(command, args, {
     cwd,
@@ -558,6 +637,7 @@ async function runHeadless(
   });
   if (code !== 0) throw new Error(`${command} exited ${code}: ${Buffer.concat(stderr).toString("utf8").slice(-2_000)}`);
   const output = Buffer.concat(stdout).toString("utf8");
+  if (parseOutput) return parseOutput(output);
   return { receipt: output.slice(-4_000), outcome: headlessAcknowledgement(output), processed: true };
 }
 

@@ -7,6 +7,7 @@ import { execFileSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import type { z } from "zod";
 import type { ProfileReport } from "./report.js";
+import { ProviderSchema } from "../domain.js";
 import { providerStatus } from "./provider-status.js";
 
 export type ProfileObservation = z.infer<typeof ProfileReport>;
@@ -45,7 +46,7 @@ function run(command: string[], env: NodeJS.ProcessEnv): string {
     maxBuffer: 2 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] });
 }
 
-export async function probeProfile(actor: string, root: string, provider: ProfileObservation["provider"], skillsDirectory: string | null = join(root, "skills")): Promise<ProfileObservation> {
+export async function probeProfile(actor: string, root: string, provider: ProfileObservation["provider"], skillsDirectory: string | null = join(root, provider === "gemini" ? ".gemini/antigravity-cli/skills" : "skills")): Promise<ProfileObservation> {
   const now = () => new Date().toISOString();
   const skillsRoot = skillsDirectory?.startsWith("~/") ? join(homedir(), skillsDirectory.slice(2)) : skillsDirectory;
   const result: ProfileObservation = { actor, provider, accountProfile: root, sourceHost: hostname(), skillsRoot, observedAt: now(),
@@ -66,7 +67,7 @@ export async function probeProfile(actor: string, root: string, provider: Profil
       try { if (lstatSync(join(skillsRoot, name)).isDirectory()) result.skills[name] = treeDigest(join(skillsRoot, name)); }
       catch { result.skills[name] = "unverified"; }
     }
-    const settings = optionalJson(join(root, "settings.json"));
+    const settings = provider === "gemini" ? {} : optionalJson(join(root, "settings.json"));
     const expected = settings.enabledPlugins ?? {};
     const native = provider === "claude" ? JSON.parse(run([claude, "plugin", "list", "--json"], env)) : [];
     if (!Array.isArray(native)) throw new Error("invalid native plugin inventory");
@@ -132,8 +133,9 @@ export async function probeProfile(actor: string, root: string, provider: Profil
   } else {
     try {
       if (provider === "grok") { env.HOME = root; delete env.GROK_HOME; }
-      const status = await providerStatus(provider === "codex" ? "codex" : process.env.HIVE_GROK_COMMAND ?? "grok", provider, env);
-      result.auth = { state: status.loggedIn ? "local_login_present" : "reauth_required", observedAt: now() };
+      const command = provider === "grok" ? process.env.HIVE_GROK_COMMAND ?? "grok" : provider === "gemini" ? "agy" : "codex";
+      const status = await providerStatus(command, provider, env);
+      result.auth = { state: status.loggedIn === null ? "unverified" : status.loggedIn ? "local_login_present" : "reauth_required", observedAt: now() };
       for (const server of status.servers) result.mcp.push({ name: server.name,
         state: server.authStatus === "notLoggedIn" ? "reauth_required" : server.toolsAvailable ? "tools_available" : "unverified", observedAt: now() });
       if (provider === "codex" && !status.servers.length) result.mcp.push({ name: "MCP inventory", state: "none_configured", observedAt: now() });
@@ -153,10 +155,11 @@ export async function probeProfile(actor: string, root: string, provider: Profil
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  const [actor, provider, root, skillsDirectory] = process.argv.slice(2);
-  if (!actor || !root || (provider !== "codex" && provider !== "claude" && provider !== "grok")) throw new Error("usage: profile-probe ACTOR PROVIDER PROFILE_PATH");
+  const [actor, providerName, root, skillsDirectory] = process.argv.slice(2);
+  const provider = ProviderSchema.safeParse(providerName).data;
+  if (!actor || !root || !provider) throw new Error("usage: profile-probe ACTOR PROVIDER PROFILE_PATH");
   const expanded = root.startsWith("~/") ? join(homedir(), root.slice(2)) : root;
   // An absent probe is different from an absent profile. Always report the explicit requested profile.
   process.stdout.write(JSON.stringify(await probeProfile(actor, expanded, provider,
-    skillsDirectory === "null" ? null : skillsDirectory ?? join(expanded, "skills"))) + "\n");
+    skillsDirectory === "null" ? null : skillsDirectory)) + "\n");
 }

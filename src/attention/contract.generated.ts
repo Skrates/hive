@@ -31,7 +31,7 @@ export type EdgeId = string;
  * This interface was referenced by `AttentionContract`'s JSON-Schema
  * via the `definition` "Provider".
  */
-export type Provider = "codex" | "claude" | "grok";
+export type Provider = "codex" | "claude" | "grok" | "gemini";
 /**
  * This interface was referenced by `AttentionContract`'s JSON-Schema
  * via the `definition` "ProjectId".
