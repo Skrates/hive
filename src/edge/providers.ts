@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { delimiter, dirname, join } from "node:path";
@@ -37,6 +37,7 @@ export type ProviderPreDispatchErrorCode =
   | "attention_session_mismatch"
   | "live_ingress_rejected"
   | "provider_permission_profile_invalid"
+  | "provider_sandbox_unavailable"
   | "account_profile_user_mismatch"
   | "account_profile_missing"
   | "account_profile_mismatch";
@@ -362,12 +363,49 @@ function geminiPermissionArgs(profile: string): string[] {
   }
 }
 
+/**
+ * `--sandbox` is the whole workspace-write boundary, and since agy 1.4.4 it has
+ * "no effect" where the sandbox is unavailable — "Linux hosts and some
+ * containers that block unprivileged user namespaces" — with no error, stream
+ * event or strict setting to tell the caller. The turn would still report
+ * success. https://antigravity.google/docs/sandbox/#if-the-sandbox-isnt-available
+ *
+ * So the edge proves the precondition itself, as the Unix user the turn runs
+ * as. On Linux the sandbox is kernel namespaces that isolate the filesystem,
+ * hide host processes and cut off networking; the probe creates exactly those
+ * (user, mount, PID, network) unprivileged. Ubuntu 24.04's default AppArmor
+ * restriction fails it, as does a container that blocks the syscalls or a
+ * missing `unshare` (pin one with HIVE_UNSHARE_COMMAND). macOS sandboxes with
+ * the system's sandbox-exec. Any other platform is refused.
+ */
+export function antigravitySandboxAvailable(
+  platform: NodeJS.Platform = process.platform,
+  unshareCommand = process.env.HIVE_UNSHARE_COMMAND ?? "unshare",
+): boolean {
+  if (platform === "darwin") return existsSync("/usr/bin/sandbox-exec");
+  if (platform !== "linux") return false;
+  const probe = spawnSync(unshareCommand, ["--user", "--map-root-user", "--mount", "--pid", "--net", "--fork", "--", "true"],
+    { stdio: "ignore", timeout: 5_000 });
+  return probe.error === undefined && probe.status === 0;
+}
+
 export class GeminiProvider implements ProviderAdapter {
   readonly provider = "gemini" as const;
 
+  constructor(private readonly sandboxAvailable: () => boolean = antigravitySandboxAvailable) {}
+
   preflight(subscription: Subscription): void {
-    geminiPermissionArgs(subscription.permissionProfile);
+    this.permissionArgs(subscription.permissionProfile);
     geminiAccountHome(subscription);
+  }
+
+  /** Every route that passes `--sandbox` proves the sandbox first; none can skip it. */
+  private permissionArgs(profile: string): string[] {
+    const args = geminiPermissionArgs(profile);
+    if (args.includes("--sandbox") && !this.sandboxAvailable()) {
+      throw new ProviderPreDispatchError("provider_sandbox_unavailable");
+    }
+    return args;
   }
 
   deliverLive(): Promise<ProviderDispatch> {
@@ -384,7 +422,7 @@ export class GeminiProvider implements ProviderAdapter {
   }
 
   private run(subscription: Subscription, cwd: string, framed: string, context: HeadlessDispatch, sessionId: string | null) {
-    const args = ["--output-format", "stream-json", ...geminiPermissionArgs(subscription.permissionProfile)];
+    const args = ["--output-format", "stream-json", ...this.permissionArgs(subscription.permissionProfile)];
     if (sessionId !== null) args.push("--conversation", sessionId);
     if (context.effort !== null) args.push("--effort", clampEffortToMax(context.effort));
     args.push("-p", framed);

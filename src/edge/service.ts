@@ -629,6 +629,7 @@ function preDispatchDetail(code: string): string {
     case "spawn_rate_limited": return "the actor spawn window was exhausted";
     case "live_ingress_rejected": return "the live surface rejected dispatch before starting a provider turn";
     case "provider_permission_profile_invalid": return "the configured provider permission profile was invalid";
+    case "provider_sandbox_unavailable": return "the Antigravity sandbox is unavailable on this edge (its Unix user cannot create unprivileged user, mount, PID and network namespaces), so a workspace-write turn would run outside its boundary";
     case "account_profile_missing": return "the pinned account profile directory does not exist on this edge (ADR-0003 R-5: profile misbinding is a hard failure)";
     case "account_profile_user_mismatch": return "the Antigravity account profile must be the home of the dedicated Unix user running the edge";
     case "account_profile_mismatch": return "the foreground Codex Desktop account does not match the subscription's pinned account profile";
