@@ -1,14 +1,14 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { Delivery, Subscription } from "../domain.js";
 import { prepareSocketPath } from "../local/uds.js";
 import type { LiveIngress } from "./live-registry.js";
 import { delimiter, dirname } from "node:path";
-import { ingressInboxDirectory, ClaudeProvider, claudePromptSlotArgs, CODEX_NETWORK_DOMAINS, codexPermissionArgs, codexSpawnArgs, codexResumeTurn, codexSpawnTurn, CodexProvider, composeChildEnv, GrokProvider, grokPermissionArgs, prependPathEntry, ProviderPreDispatchError, requireAccountProfile, resolveEdgeSocketPath } from "./providers.js";
+import { antigravitySandboxAvailable, ingressInboxDirectory, ClaudeProvider,claudePromptSlotArgs, CODEX_NETWORK_DOMAINS, codexPermissionArgs, codexSpawnArgs, codexResumeTurn, codexSpawnTurn, CodexProvider, composeChildEnv, GeminiProvider, GrokProvider, grokPermissionArgs, prependPathEntry, ProviderPreDispatchError, requireAccountProfile, resolveEdgeSocketPath } from "./providers.js";
 import { drainInbox } from "../channel/claude-hook.js";
 
 function subscription(overrides: Partial<Subscription> = {}): Subscription {
@@ -180,6 +180,133 @@ test("Grok and Claude share all three Hive permission profiles; unknowns fail pr
     () => claude.preflight(subscription({ provider: "claude", permissionProfile: "yolo", accountProfile: directory })),
     (error: unknown) => error instanceof ProviderPreDispatchError && error.code === "provider_permission_profile_invalid",
   );
+});
+
+test("Gemini requires the dedicated Unix user's home and rejects unsupported routes and permissions", async t => {
+  const other = mkdtempSync(join(tmpdir(), "hive-gemini-profile-"));
+  t.after(() => rmSync(other, { recursive: true, force: true }));
+  const gemini = new GeminiProvider(() => true);
+  const seat = subscription({ provider: "gemini", permissionProfile: "workspace-write", accountProfile: userInfo().homedir });
+  gemini.preflight(seat);
+  for (const [override, code] of [
+    [{ accountProfile: join(other, "missing") }, "account_profile_missing"],
+    [{ accountProfile: other }, "account_profile_user_mismatch"],
+    [{ permissionProfile: "read-only" }, "provider_permission_profile_invalid"],
+    [{ permissionProfile: "yolo" }, "provider_permission_profile_invalid"],
+  ] as const) {
+    assert.throws(() => gemini.preflight({ ...seat, ...override }),
+      (error: unknown) => error instanceof ProviderPreDispatchError && error.code === code);
+  }
+  await assert.rejects(gemini.deliverLive(), /no Hive live-ingress/);
+  await assert.rejects(gemini.resume({ ...seat, sessionId: null }, other, "framed",
+    { deliveryId: 1, token: "test", effort: null }), /resume target missing/);
+});
+
+test("Gemini maps spawn and exact resume to agy and records the complete reply and conversation ID", async t => {
+  const cwd = mkdtempSync(join(tmpdir(), "hive-gemini-turn-"));
+  const command = join(cwd, "fake-agy.cjs");
+  const previous = process.env.HIVE_GEMINI_COMMAND;
+  process.env.HIVE_GEMINI_COMMAND = command;
+  t.after(() => {
+    if (previous === undefined) delete process.env.HIVE_GEMINI_COMMAND;
+    else process.env.HIVE_GEMINI_COMMAND = previous;
+    rmSync(cwd, { recursive: true, force: true });
+  });
+  writeFileSync(command, `#!${process.execPath}
+const fs = require("node:fs");
+fs.writeFileSync("invocation", JSON.stringify({args: process.argv.slice(2), home: process.env.HOME, id: process.env.HIVE_DELIVERY_ID}));
+process.stdout.write(fs.readFileSync("stream"));
+`, { mode: 0o700 });
+
+  const gemini = new GeminiProvider(() => true);
+  const home = userInfo().homedir;
+  const seat = subscription({ provider: "gemini", permissionProfile: "workspace-write", accountProfile: home, sessionId: "requested-id" });
+  const context = { deliveryId: 42, token: "test", effort: null };
+  const outcome = "final reply\n".repeat(800);
+  const terminal = (sessionId: string, status = "SUCCESS") => JSON.stringify({
+    event: "result", result: { status, conversation_id: sessionId, response: outcome },
+  });
+  const stream = join(cwd, "stream");
+  writeFileSync(stream, JSON.stringify({ event: "step_update", step_update: { text_delta: "partial" } })
+    + "\n" + terminal("spawned-id") + "\n");
+  const framed = "Wake instruction\nwith more than one line";
+  const invoked = () => JSON.parse(readFileSync(join(cwd, "invocation"), "utf8"));
+  const spawned = await gemini.spawn(seat, cwd, framed, context);
+  assert.deepEqual(spawned, { processed: true, outcome, receipt: JSON.stringify({ conversation_id: "spawned-id" }) });
+  assert.deepEqual(invoked(), { args: ["--output-format", "stream-json", "--mode", "accept-edits", "--sandbox", "-p", framed], home, id: "42" });
+
+  writeFileSync(stream, terminal("requested-id"));
+  for (const effort of ["low", "medium", "high", "xhigh", "max", "ultra"] as const) {
+    const resumed = await gemini.resume(seat, cwd, framed, { ...context, effort });
+    assert.deepEqual(resumed, { processed: true, outcome, receipt: JSON.stringify({ conversation_id: "requested-id" }) });
+    assert.deepEqual(invoked().args, ["--output-format", "stream-json", "--mode", "accept-edits", "--sandbox",
+      "--conversation", "requested-id", "--effort", effort === "ultra" ? "max" : effort, "-p", framed]);
+  }
+  await gemini.spawn({ ...seat, permissionProfile: "danger-full-access" }, cwd, framed, context);
+  assert.deepEqual(invoked().args, ["--output-format", "stream-json", "--dangerously-skip-permissions", "-p", framed]);
+  writeFileSync(stream, terminal("different-id"));
+  await assert.rejects(gemini.resume(seat, cwd, framed, context), /different conversation/);
+  for (const invalid of [terminal("requested-id", "ERROR"), terminal(""), '{"event":"init"}']) {
+    writeFileSync(stream, invalid);
+    await assert.rejects(gemini.spawn(seat, cwd, framed, context), /successful turn result/);
+  }
+});
+
+test("Gemini refuses a sandboxed turn before invoking agy when the Antigravity sandbox is unavailable", async t => {
+  const cwd = mkdtempSync(join(tmpdir(), "hive-gemini-nosandbox-"));
+  const command = join(cwd, "fake-agy.cjs");
+  const invoked = join(cwd, "invoked");
+  const previous = process.env.HIVE_GEMINI_COMMAND;
+  process.env.HIVE_GEMINI_COMMAND = command;
+  t.after(() => {
+    if (previous === undefined) delete process.env.HIVE_GEMINI_COMMAND;
+    else process.env.HIVE_GEMINI_COMMAND = previous;
+    rmSync(cwd, { recursive: true, force: true });
+  });
+  // agy >= 1.4.4 ignores --sandbox without one and still reports success; the stand-in does the same.
+  writeFileSync(command, `#!${process.execPath}
+require("node:fs").writeFileSync(${JSON.stringify(invoked)}, "");
+process.stdout.write(JSON.stringify({ event: "result", result: { status: "SUCCESS", conversation_id: "c", response: "ran" } }));
+`, { mode: 0o700 });
+
+  let probes = 0;
+  const gemini = new GeminiProvider(() => { probes += 1; return false; });
+  const seat = subscription({ provider: "gemini", permissionProfile: "workspace-write", accountProfile: userInfo().homedir, sessionId: "c" });
+  const context = { deliveryId: 7, token: "test", effort: null };
+  const unavailable = (error: unknown) => error instanceof ProviderPreDispatchError && error.code === "provider_sandbox_unavailable";
+  assert.throws(() => gemini.preflight(seat), unavailable);
+  await assert.rejects(async () => gemini.spawn(seat, cwd, "framed", context), unavailable);
+  await assert.rejects(async () => gemini.resume(seat, cwd, "framed", context), unavailable);
+  assert.equal(existsSync(invoked), false);
+  assert.equal(probes, 3);
+
+  // danger-full-access claims no sandbox: it neither probes nor refuses.
+  const full = { ...seat, permissionProfile: "danger-full-access" };
+  gemini.preflight(full);
+  await gemini.spawn(full, cwd, "framed", context);
+  assert.equal(existsSync(invoked), true);
+  assert.equal(probes, 3);
+});
+
+test("the Antigravity sandbox probe creates the sandbox's namespaces unprivileged and fails closed", t => {
+  const dir = mkdtempSync(join(tmpdir(), "hive-unshare-probe-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const argv = join(dir, "argv");
+  const fakeUnshare = (exitCode: number) => {
+    const path = join(dir, `unshare-${exitCode}.cjs`);
+    writeFileSync(path, `#!${process.execPath}
+require("node:fs").writeFileSync(${JSON.stringify(argv)}, JSON.stringify(process.argv.slice(2)));
+process.exit(${exitCode});
+`, { mode: 0o700 });
+    return path;
+  };
+  assert.equal(antigravitySandboxAvailable("linux", fakeUnshare(0)), true);
+  assert.deepEqual(JSON.parse(readFileSync(argv, "utf8")),
+    ["--user", "--map-root-user", "--mount", "--pid", "--net", "--fork", "--", "true"]);
+  // Ubuntu 24.04's AppArmor restriction makes unshare exit 1: "write failed /proc/self/uid_map".
+  assert.equal(antigravitySandboxAvailable("linux", fakeUnshare(1)), false);
+  assert.equal(antigravitySandboxAvailable("linux", join(dir, "no-such-unshare")), false);
+  assert.equal(antigravitySandboxAvailable("win32", fakeUnshare(0)), false);
 });
 
 test("Claude prompt-slot flags compose exactly when the rendered artifact exists", () => {

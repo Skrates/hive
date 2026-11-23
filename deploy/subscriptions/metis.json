@@ -1,0 +1,24 @@
+{
+  "actor": "metis",
+  "provider": "gemini",
+  "providerSurface": "antigravity-cli",
+  "providerVersion": "1.5.11",
+  "sessionId": null,
+  "homeEdge": "cx53-metis",
+  "workspace": "work-metis",
+  "edgeWorkspaces": [{ "edgeId": "cx53-metis", "cwd": "/home/metis/work-metis", "worktree": null }],
+  "wakePolicy": "spawn",
+  "permissionProfile": "workspace-write",
+  "accountProfile": "/home/metis",
+  "leaseTtlMs": 60000,
+  "deliveryTtlMs": 86400000,
+  "homeGraceMs": 30000,
+  "spawnRateLimit": 2,
+  "maxAttempts": 5,
+  "expiresAt": null,
+  "TODO(verify)": [
+    "providerVersion on cx53-metis, accountProfile as the dedicated Unix user's home, and that user's subscription login",
+    "workspace, edgeWorkspaces[0].cwd and worktree, permissionProfile and sandbox availability on cx53-metis",
+    "sessionId, wakePolicy, leaseTtlMs, deliveryTtlMs, homeGraceMs, spawnRateLimit, maxAttempts and expiresAt mirror the theoros spawn subscription"
+  ]
+}
