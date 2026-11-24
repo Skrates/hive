@@ -1,6 +1,14 @@
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 
+/**
+ * Bound on everything the provider writes to stdout during one probe. Codex returns each MCP
+ * server's full tool schemas in `mcpServerStatus/list`, and a ChatGPT login with apps enabled
+ * lists them under `codex_apps`: 1,079 tools in one 4.4 MB response line (measured 2026-11-24 on
+ * Ariadne's profile). The earlier 2 MiB bound rejected that healthy profile as unavailable.
+ */
+export const MAX_STATUS_OUTPUT_BYTES = 32 * 1024 * 1024;
+
 /** Read-only provider status methods, without creating a conversation or model turn. */
 export async function providerStatus(command: string, provider: "codex" | "grok" | "gemini", env: NodeJS.ProcessEnv): Promise<{
   loggedIn: boolean | null; servers: Array<{ name: string; authStatus: string; toolsAvailable: boolean }>;
@@ -20,7 +28,7 @@ export async function providerStatus(command: string, provider: "codex" | "grok"
   let bytes = 0;
   lines.on("line", line => {
     bytes += Buffer.byteLength(line);
-    if (bytes > 2 * 1024 * 1024) { fail(); child.kill("SIGKILL"); return; }
+    if (bytes > MAX_STATUS_OUTPUT_BYTES) { fail(); child.kill("SIGKILL"); return; }
     try {
       const message = JSON.parse(line);
       const request = pending.get(message.id);
