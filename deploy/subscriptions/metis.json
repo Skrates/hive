@@ -4,12 +4,12 @@
   "providerSurface": "antigravity-cli",
   "providerVersion": "1.5.11",
   "sessionId": null,
-  "homeEdge": "cx53-metis",
+  "homeEdge": "cpx42-metis",
   "workspace": "work-metis",
-  "edgeWorkspaces": [{ "edgeId": "cx53-metis", "cwd": "/home/metis/work-metis", "worktree": null }],
+  "edgeWorkspaces": [{ "edgeId": "cpx42-metis", "cwd": "/persist/agents/metis/work", "worktree": null }],
   "wakePolicy": "spawn",
   "permissionProfile": "workspace-write",
-  "accountProfile": "/home/metis",
+  "accountProfile": "/persist/agents/metis",
   "leaseTtlMs": 60000,
   "deliveryTtlMs": 86400000,
   "homeGraceMs": 30000,
@@ -17,8 +17,8 @@
   "maxAttempts": 5,
   "expiresAt": null,
   "TODO(verify)": [
-    "providerVersion on cx53-metis, accountProfile as the dedicated Unix user's home, and that user's subscription login",
-    "workspace, edgeWorkspaces[0].cwd and worktree, permissionProfile and sandbox availability on cx53-metis",
+    "providerVersion on cpx42-metis, and the subscription login in accountProfile (her home under the estate's per-seat layout)",
+    "workspace, edgeWorkspaces[0].cwd and worktree, permissionProfile and sandbox availability on cpx42-metis",
     "sessionId, wakePolicy, leaseTtlMs, deliveryTtlMs, homeGraceMs, spawnRateLimit, maxAttempts and expiresAt mirror the theoros spawn subscription"
   ]
 }

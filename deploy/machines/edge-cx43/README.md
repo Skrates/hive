@@ -1,5 +1,11 @@
 # Edge: cx43 (`coolify-fsn1`, Hetzner) — seat talos (Grok Build, SuperGrok subscription)
 
+**Retired 2026-11-21.** cx43 was reinstalled as NixOS and, since 2026-11-24, is Ariadne's host
+(edge `ariadne`, unit `hive-edge-ariadne`), deployed from weave-doctrine `estate/hosts/ariadne`
+rather than by this recipe. The Coolify demo stack and Talos's `hive`-user edge described below
+no longer exist on it. `deploy/subscriptions/talos.json` still names edge `cx43` and needs a new
+home before Talos is woken again.
+
 Talos's live body since 2026-08-16 (moved off the RunPod pod; subscription and registry cutover
 2026-09-05, KRA-1322). The host is also the **public Coolify demo box** (tailnet `100.104.23.33`,
 public `167.233.120.83`): the demo stack and the seat share 8 vCPU / 15 GB with no swap.
