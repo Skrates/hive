@@ -426,8 +426,11 @@ test("a permanent GitHub refusal terminalizes the row with its reason; a transie
 });
 
 // §6.D7: a summon whose request is no longer pending at the current subject is obsolete.
-test("an obsolete summon is marked obsolete and never posted", async () => {
-  const { store, github, publisher } = fixture({ github: true });
+test("an obsolete summon is marked obsolete and never posted", async t => {
+  const exporter = new InMemorySpanExporter();
+  const telemetry = new ReviewTelemetry([new SimpleSpanProcessor(exporter)]);
+  t.after(() => telemetry.stop());
+  const { store, github, publisher } = fixture({ github: true, telemetry });
   store.put(state({ requests: [request({ id: "req_1", status: "answered", answered_by: "ans_1" })] }));
   store.add({
     effect_id: "eff_1", kind: "actionable", target: "summon:req_1",
@@ -436,6 +439,8 @@ test("an obsolete summon is marked obsolete and never posted", async () => {
   assert.equal(await publisher.drainOnce(), 1);
   assert.deepEqual(github!.comments, []);
   assert.equal(store.row("eff_1").status, "obsolete");
+  assert.deepEqual(exporter.getFinishedSpans().filter(span => span.name === "review.publish")
+    .map(span => span.attributes.outcome), ["obsolete"]);
 });
 
 test("an applicable summon posts the comment; a summon at a superseded subject is obsolete", async () => {

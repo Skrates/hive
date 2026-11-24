@@ -323,8 +323,7 @@ export class ReviewPublisher {
     const review = this.store.readById(row.reviewId);
     if (review === null) {
       // No Review to render or to check against: the row can never become applicable.
-      this.store.effects.markObsolete(row.effect_id);
-      return true;
+      return this.mark(row, "obsolete");
     }
 
     if (row.kind === "actionable") {
@@ -355,27 +354,13 @@ export class ReviewPublisher {
     if (claimed === null) return false;
 
     try {
-      if (row.kind === "refresh") {
-        // Re-read after the claim: the render is from the Review *now*, never from whatever
-        // state existed when the row was queued.
-        const current = this.store.readById(row.reviewId);
-        if (current === null) {
-          this.store.effects.markObsolete(row.effect_id);
-          return true;
-        }
-        return this.mark(row, await this.refresh(target, current));
-      }
-      // §D7 / §8.1: applicability is re-checked against the current Review at dispatch.
+      // §D7 / §8.1: render or check applicability against the Review as it stands after the claim.
       const current = this.store.readById(row.reviewId);
-      if (current === null) {
-        this.store.effects.markObsolete(row.effect_id);
-        return true;
-      }
+      if (current === null) return this.mark(row, "obsolete");
+      if (row.kind === "refresh") return this.mark(row, await this.refresh(target, current));
+
       const verdict = applicability(target, current);
-      if (verdict === "obsolete") {
-        this.store.effects.markObsolete(row.effect_id);
-        return true;
-      }
+      if (verdict === "obsolete") return this.mark(row, "obsolete");
       if (verdict === "withheld") {
         // Claimed between the pre-check and now; give it back to the queue behind a short
         // backoff rather than hold the claim.
