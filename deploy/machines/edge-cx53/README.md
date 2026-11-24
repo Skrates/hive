@@ -1,4 +1,9 @@
-# Edge: cx53 (dedicated Hetzner VM) — seats gnomon, theoros (Claude Team, rationallyprime@gmail.com) and ariadne (Codex, ChatGPT Max)
+# Edge: cx53 (dedicated Hetzner VM) — seats gnomon and theoros (Claude Team, rationallyprime@gmail.com)
+
+**Ariadne left this edge on 2026-11-24** for her own NixOS host on cx43 (edge `ariadne`, see
+`../README.md`). Her `/home/hive/work-ariadne` and `/home/hive/.hive/profiles/ariadne` stay here
+untouched as the pre-move copy; the notes below that mention her describe the 2026-09-06 to
+2026-11-24 arrangement.
 
 **Provisioned 2026-08-03:** `agent-cx53` (16 shared vCPU / 32 GB / 320 GB, ~€29/mo) at
 **hel1 / 62.238.51.63** (fsn1 and nbg1 had no cx53 stock), firewall `agent-cx53-fw` (inbound
