@@ -1539,15 +1539,7 @@ export class BrokerStore {
       this.assertLease(deliveryId, edgeId, generation);
       const current = this.getDelivery(deliveryId);
       if (TERMINAL.has(current.status)) throw new InvalidTransitionError("delivery already terminal");
-      if (stagedOutcomeParts > 0) {
-        const staged = this.db.prepare(`
-          SELECT text FROM outcome_parts WHERE delivery_id=? AND generation=? AND part_index < ? ORDER BY part_index
-        `).all(deliveryId, generation, stagedOutcomeParts) as Row[];
-        if (staged.length !== stagedOutcomeParts) {
-          throw new InvalidTransitionError(`outcome names ${stagedOutcomeParts} staged part(s), ${staged.length} were staged`);
-        }
-        outcomeText = staged.map((row) => String(row.text)).join("") + (outcomeText ?? "");
-      }
+      const outcome = this.assembleOutcome(deliveryId, generation, outcomeText, stagedOutcomeParts);
       this.db.prepare("DELETE FROM outcome_parts WHERE delivery_id=?").run(deliveryId);
       const now = iso(this.clock);
       this.db.prepare(`
@@ -1555,25 +1547,18 @@ export class BrokerStore {
       `).run(status, JSON.stringify(reasons), now, now, deliveryId);
       if (status !== "processed") {
         this.enqueueOutbox(current, failureNotice(current, status, reasons), REACTION_FAILED);
-      } else if (outcomeText !== null) {
+      } else if (outcome !== null) {
         // R-6: a headless outcome commits with the terminal transition so a
         // Slack outage can neither lose it nor rerun the trusted instruction.
-        this.enqueueOutcome(current, outcomeText);
+        this.enqueueOutcome(current, outcome, REACTION_PROCESSED);
       }
       return this.getDelivery(deliveryId);
     })();
   }
 
   /**
-   * ADR-0003 R-3: an edge that hit uncertainty (crash-adjacent failure, lost
-   * provider outcome) releases the delivery for another attempt instead of
-   * declaring it. Exhausted attempts terminalize as `failed` with a
-   * thread-visible notice; otherwise the delivery requeues behind exponential
-   * backoff and the retry is announced in the thread.
-   */
-  /**
    * One part of an outcome too large for a single request, staged under the
-   * delivery's lease until `finish` joins it. Re-staging an index replaces it,
+   * delivery's lease until finish or release joins it. Re-staging an index replaces it,
    * so a retried upload is harmless; parts of an older claim are dropped.
    */
   stageOutcomePart(deliveryId: number, edgeId: string, generation: number, index: number, text: string): void {
@@ -1588,12 +1573,36 @@ export class BrokerStore {
     })();
   }
 
-  release(deliveryId: number, edgeId: string, generation: number, reason: Reason): Delivery {
+  private assembleOutcome(deliveryId: number, generation: number, tail: string | null, stagedCount: number): string | null {
+    if (stagedCount === 0) return tail;
+    const rows = this.db.prepare(`
+      SELECT text FROM outcome_parts WHERE delivery_id=? AND generation=? AND part_index < ? ORDER BY part_index
+    `).all(deliveryId, generation, stagedCount) as Row[];
+    if (rows.length !== stagedCount) {
+      throw new InvalidTransitionError(`outcome names ${stagedCount} staged part(s), ${rows.length} were staged`);
+    }
+    return rows.map(row => String(row.text)).join("") + (tail ?? "");
+  }
+
+  /**
+   * ADR-0003 R-3: an edge that hit uncertainty (crash-adjacent failure, lost
+   * provider outcome) releases the delivery for another attempt instead of
+   * declaring it. Exhausted attempts terminalize as `failed` with a
+   * thread-visible notice; otherwise the delivery requeues behind exponential
+   * backoff and the retry is announced in the thread.
+   */
+  release(
+    deliveryId: number, edgeId: string, generation: number, reason: Reason,
+    outcome: string | null = null, stagedOutcomeParts = 0,
+  ): Delivery {
     return this.db.transaction(() => {
       this.assertLease(deliveryId, edgeId, generation);
       const current = this.getDelivery(deliveryId);
       if (TERMINAL.has(current.status)) throw new InvalidTransitionError("terminal delivery cannot be released");
+      const text = this.assembleOutcome(deliveryId, generation, outcome, stagedOutcomeParts);
       this.requeueOrFail(current, reason);
+      // requeueOrFail owns the lifecycle reaction: only exhaustion stamps x.
+      if (text !== null) this.enqueueOutcome(current, text, null);
       return this.getDelivery(deliveryId);
     })();
   }
@@ -1651,10 +1660,10 @@ export class BrokerStore {
     const nextAttemptAt = new Date(this.clock.now().getTime() + retryBackoffMs(delivery.attempts)).toISOString();
     this.db.prepare(`
       UPDATE deliveries
-      SET status='pending', lease_generation=NULL, lease_slot=NULL, claimed_by=NULL, next_attempt_at=?,
+      SET status='pending', reasons_json=?, lease_generation=NULL, lease_slot=NULL, claimed_by=NULL, next_attempt_at=?,
           accepted_at=NULL, dispatch_started_at=NULL, dispatched_at=NULL, updated_at=?
       WHERE delivery_id=? AND status IN ('claimed', 'accepted_local', 'dispatching', 'dispatched')
-    `).run(nextAttemptAt, now, delivery.id);
+    `).run(JSON.stringify([reason]), nextAttemptAt, now, delivery.id);
     this.enqueueOutbox(
       delivery,
       `⟳ retrying delivery ${delivery.id} to ${delivery.actor} (attempt ${delivery.attempts}/${delivery.subscription.maxAttempts} did not confirm: ${reason.code})`,
@@ -1678,7 +1687,7 @@ export class BrokerStore {
           WHERE delivery_id=?
         `).run(JSON.stringify([{ code: "agent_outcome_reported", detail: "the agent reported its outcome" }]), now, now, deliveryId);
       }
-      this.enqueueOutcome(current, text);
+      this.enqueueOutcome(current, text, REACTION_PROCESSED);
       return this.getDelivery(deliveryId);
     })();
   }
@@ -1692,10 +1701,10 @@ export class BrokerStore {
 
   /**
    * An outcome posts as one message, or as ordered parts when Slack could not
-   * carry it whole: each part names its place and the delivery, waits for the
-   * part before it, and only the last one stamps the wake messages processed.
+   * carry it whole: each part names its place and attempt, waits for the
+   * part before it, and only the last can carry a lifecycle reaction.
    */
-  private enqueueOutcome(delivery: Delivery, text: string): void {
+  private enqueueOutcome(delivery: Delivery, text: string, finalReaction: string | null): void {
     const parts = splitText(text, OUTCOME_POST_CHARS, true);
     let previous: number | null = null;
     parts.forEach((part, index) => {
@@ -1703,7 +1712,7 @@ export class BrokerStore {
       previous = this.enqueueOutbox(
         delivery,
         outcomePost(delivery, part, parts.length === 1 ? null : { index: index + 1, of: parts.length }),
-        last ? REACTION_PROCESSED : null,
+        last ? finalReaction : null,
         previous,
       );
     });
@@ -1886,7 +1895,7 @@ function dispatchedNotice(delivery: Delivery, notices: Reason[]): string {
 
 function outcomePost(delivery: Delivery, text: string, part: { index: number; of: number } | null = null): string {
   const place = part === null ? "" : ` · part ${part.index}/${part.of}`;
-  return `${text}\n\n[delivery ${delivery.id}${place} · dedupe ${delivery.event.messageTs}:${delivery.id} · ${delivery.actor}]`;
+  return `${text}\n\n[delivery ${delivery.id} · attempt ${delivery.attempts}${place} · dedupe ${delivery.event.messageTs}:${delivery.id} · ${delivery.actor}]`;
 }
 
 function failureNotice(delivery: Delivery, status: "failed" | "undeliverable", reasons: Reason[]): string {

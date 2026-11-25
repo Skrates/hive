@@ -373,6 +373,10 @@ export const DeliveryResultInputSchema = z.object({
 });
 export type DeliveryResultInput = z.infer<typeof DeliveryResultInputSchema>;
 
+export const DeliveryReleaseInputSchema = DeliveryResultInputSchema
+  .pick({ generation: true, outcome: true, stagedOutcomeParts: true })
+  .extend({ reason: ReasonSchema });
+
 export const OutcomePartInputSchema = z.object({
   generation: z.number().int().positive(),
   index: z.number().int().min(0),

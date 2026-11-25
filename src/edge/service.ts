@@ -332,7 +332,9 @@ export class EdgeService {
             outcome: dispatch.outcome,
           });
           this.store.setStatus(current.id, generation, "processed", dispatch.receipt);
-          return;
+        } else if (dispatch.failure) {
+          await this.broker.release(current, dispatch.failure, dispatch.outcome);
+          this.store.setStatus(current.id, generation, "released", dispatch.receipt);
         }
       });
       // A non-completion-tracked live delivery (currently Claude inbox write)
