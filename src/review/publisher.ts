@@ -36,6 +36,7 @@ import {
 } from "./effects.js";
 import { boardComment, checkRun, slackBoardLine, threadState } from "./render.js";
 import type { UnknownSourceRecord } from "./store.js";
+import { noReviewTelemetry, type ReviewTelemetry } from "./telemetry.js";
 
 /**
  * GitHub-side projections (M1). `null` in M0: the Slack board line is the one projection.
@@ -114,6 +115,8 @@ export interface PublisherStore {
     unknown(reviewId: string): UnknownSourceRecord[];
   };
   readonly effects: {
+    /** Unfinished rows, including backoff and terminal failures invisible to the due-row query. */
+    backlog(sink: EffectSink): { pending_rows: number; stuck_rows: number };
     /** §8.1: the due rows of one sink (plus any row whose target names no sink — see the store). */
     pendingByTarget(now: string, sink: EffectSink, limit?: number): PublishableEffect[];
     claim(effectId: string): PublishableEffect | null;
@@ -211,6 +214,7 @@ export class ReviewPublisher {
     ports: ReviewPublisherPorts,
     private readonly clock: Clock,
     githubTimeoutMs: number = REVIEW_GITHUB_DISPATCH_TIMEOUT_MS,
+    private readonly telemetry: ReviewTelemetry = noReviewTelemetry,
   ) {
     this.ports = {
       slack: ports.slack,
@@ -252,12 +256,24 @@ export class ReviewPublisher {
   }
 
   private async pass(sink: EffectSink): Promise<number> {
-    const rows = this.boardFirst(this.store.effects.pendingByTarget(iso(this.clock), sink));
-    let handled = 0;
-    for (const row of rows) {
-      if (await this.handle(row)) handled += 1;
-    }
-    return handled;
+    return this.telemetry.run("review.outbox", { sink }, async span => {
+      const rows = this.boardFirst(this.store.effects.pendingByTarget(iso(this.clock), sink));
+      span.setAttributes({ ...this.store.effects.backlog(sink), due_targets: rows.length,
+        retries: rows.filter(row => row.attempts > 0).length });
+      let handled = 0;
+      for (const row of rows) {
+        const result = await this.telemetry.run("review.publish", {
+          effect_id: row.effect_id, target: row.target, attempts: row.attempts, outcome: "pending",
+        }, async publication => {
+          const result = await this.handle(row);
+          publication.setAttribute("handled", result);
+          return result;
+        });
+        if (result) handled += 1;
+      }
+      span.setAttribute("handled", handled);
+      return handled;
+    });
   }
 
   /**
@@ -307,8 +323,7 @@ export class ReviewPublisher {
     const review = this.store.readById(row.reviewId);
     if (review === null) {
       // No Review to render or to check against: the row can never become applicable.
-      this.store.effects.markObsolete(row.effect_id);
-      return true;
+      return this.mark(row, "obsolete");
     }
 
     if (row.kind === "actionable") {
@@ -339,27 +354,13 @@ export class ReviewPublisher {
     if (claimed === null) return false;
 
     try {
-      if (row.kind === "refresh") {
-        // Re-read after the claim: the render is from the Review *now*, never from whatever
-        // state existed when the row was queued.
-        const current = this.store.readById(row.reviewId);
-        if (current === null) {
-          this.store.effects.markObsolete(row.effect_id);
-          return true;
-        }
-        return this.mark(row, await this.refresh(target, current));
-      }
-      // §D7 / §8.1: applicability is re-checked against the current Review at dispatch.
+      // §D7 / §8.1: render or check applicability against the Review as it stands after the claim.
       const current = this.store.readById(row.reviewId);
-      if (current === null) {
-        this.store.effects.markObsolete(row.effect_id);
-        return true;
-      }
+      if (current === null) return this.mark(row, "obsolete");
+      if (row.kind === "refresh") return this.mark(row, await this.refresh(target, current));
+
       const verdict = applicability(target, current);
-      if (verdict === "obsolete") {
-        this.store.effects.markObsolete(row.effect_id);
-        return true;
-      }
+      if (verdict === "obsolete") return this.mark(row, "obsolete");
       if (verdict === "withheld") {
         // Claimed between the pre-check and now; give it back to the queue behind a short
         // backoff rather than hold the claim.
@@ -374,6 +375,7 @@ export class ReviewPublisher {
   }
 
   private mark(row: PublishableEffect, outcome: "sent" | "obsolete"): boolean {
+    this.telemetry.attributes({ outcome });
     if (outcome === "sent") this.store.effects.markSent(row.effect_id);
     else this.store.effects.markObsolete(row.effect_id);
     return true;
@@ -384,10 +386,12 @@ export class ReviewPublisher {
     // operation, or the input) is terminal now: fifty identical refusals add only noise and
     // delay the operator notice. Everything else — timeouts, 5xx, rate limits, network — retries.
     if (isPermanent(error)) {
+      this.telemetry.attributes({ outcome: "failed_permanently" });
       console.error("hive review effect refused permanently", row.effect_id, row.target, error);
       this.store.effects.markFailedPermanently(row.effect_id, error instanceof Error ? error.message : String(error));
       return;
     }
+    this.telemetry.attributes({ outcome: "failed" });
     console.error("hive review effect failed", row.effect_id, row.target, error);
     this.store.effects.markFailed(row.effect_id, this.nextAttemptAt(row.attempts));
   }

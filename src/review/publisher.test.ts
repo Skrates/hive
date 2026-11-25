@@ -12,6 +12,8 @@ import {
   type SystemWakePort,
 } from "./publisher.js";
 import type { UnknownSourceRecord } from "./store.js";
+import { InMemorySpanExporter, SimpleSpanProcessor } from "@opentelemetry/sdk-trace-base";
+import { ReviewTelemetry } from "./telemetry.js";
 import { GitHubApiError } from "./github/port.js";
 
 class FakeClock implements Clock {
@@ -97,6 +99,11 @@ class FakeReviewStore implements PublisherStore {
     return found;
   }
   readonly effects = {
+    backlog: (sink: EffectSink): { pending_rows: number; stuck_rows: number } => {
+      const rows = this.rows.filter(row => inSink(row.target, sink) && ["pending", "claimed", "failed"].includes(row.status));
+      return { pending_rows: rows.filter(row => row.status !== "failed").length,
+        stuck_rows: rows.filter(row => row.status === "failed" || row.attempts > 0).length };
+    },
     pendingByTarget: (now: string, sink: EffectSink): PublishableEffect[] => {
       const byTarget = new Map<string, Row>();
       const eligible = this.rows.filter((r) => r.status === "pending" && (r.nextAttemptAt === null || r.nextAttemptAt <= now) && inSink(r.target, sink));
@@ -213,7 +220,7 @@ class FakeGitHub implements ReviewGitHubPort {
   }
 }
 
-function fixture(options: { github?: boolean; threadReady?: boolean } = {}) {
+function fixture(options: { github?: boolean; threadReady?: boolean; telemetry?: ReviewTelemetry } = {}) {
   const store = new FakeReviewStore();
   const slack = new FakeSlack();
   const github = options.github === true ? new FakeGitHub() : null;
@@ -221,7 +228,7 @@ function fixture(options: { github?: boolean; threadReady?: boolean } = {}) {
   store.policies.set("42:1", policy());
   store.put(state());
   if (options.threadReady !== false) store.projections.recordSlackThread("rev_obs:run_1", "C0123ABCD", "1700.1");
-  const publisher = new ReviewPublisher(store, { github, slack }, clock);
+  const publisher = new ReviewPublisher(store, { github, slack }, clock, undefined, options.telemetry);
   return { store, slack, github, clock, publisher };
 }
 
@@ -376,8 +383,11 @@ test("thread refresh resolves a closed comment-sourced finding and unresolves a 
 // §8.1: GitHub answering a thread mutation with a GraphQL authorization or validation error is
 // a verdict, not a moment — the row is terminal at once with its reason, not retried fifty
 // times. A transient failure (5xx, rate limit, timeout) still retries behind backoff.
-test("a permanent GitHub refusal terminalizes the row with its reason; a transient failure keeps retrying", async () => {
-  const { store, github, clock, publisher } = fixture({ github: true });
+test("a permanent GitHub refusal terminalizes the row with its reason; a transient failure keeps retrying", async t => {
+  const exporter = new InMemorySpanExporter();
+  const telemetry = new ReviewTelemetry([new SimpleSpanProcessor(exporter)]);
+  t.after(() => telemetry.stop());
+  const { store, github, clock, publisher } = fixture({ github: true, telemetry });
   store.put(state({
     findings: [finding({ id: "fnd_2", source: { container_kind: "review_comment", comment_id: 9002, locator: 0 }, status: { open: true, contested: { by: "codex", at: AT, prior: fixedClaim() } } })],
   }));
@@ -405,6 +415,8 @@ test("a permanent GitHub refusal terminalizes the row with its reason; a transie
     assert.equal(row.attempts, 3);
     assert.equal(store.permanentFailures.length, 1);
     assert.match(store.permanentFailures[0]!.reason, /FORBIDDEN/u);
+    assert.deepEqual(exporter.getFinishedSpans().filter(span => span.name === "review.publish")
+      .map(span => span.attributes.outcome), ["failed", "failed", "failed_permanently"]);
     clock.advance(3_600_000);
     assert.equal(await publisher.drainOnce(), 0, "a terminal row is never offered again");
     assert.deepEqual(github!.threads, []);
@@ -414,8 +426,11 @@ test("a permanent GitHub refusal terminalizes the row with its reason; a transie
 });
 
 // §6.D7: a summon whose request is no longer pending at the current subject is obsolete.
-test("an obsolete summon is marked obsolete and never posted", async () => {
-  const { store, github, publisher } = fixture({ github: true });
+test("an obsolete summon is marked obsolete and never posted", async t => {
+  const exporter = new InMemorySpanExporter();
+  const telemetry = new ReviewTelemetry([new SimpleSpanProcessor(exporter)]);
+  t.after(() => telemetry.stop());
+  const { store, github, publisher } = fixture({ github: true, telemetry });
   store.put(state({ requests: [request({ id: "req_1", status: "answered", answered_by: "ans_1" })] }));
   store.add({
     effect_id: "eff_1", kind: "actionable", target: "summon:req_1",
@@ -424,6 +439,8 @@ test("an obsolete summon is marked obsolete and never posted", async () => {
   assert.equal(await publisher.drainOnce(), 1);
   assert.deepEqual(github!.comments, []);
   assert.equal(store.row("eff_1").status, "obsolete");
+  assert.deepEqual(exporter.getFinishedSpans().filter(span => span.name === "review.publish")
+    .map(span => span.attributes.outcome), ["obsolete"]);
 });
 
 test("an applicable summon posts the comment; a summon at a superseded subject is obsolete", async () => {

@@ -35,6 +35,7 @@ import type {
   TransportRef,
 } from "./contract.js";
 import { validateAction } from "./contract.js";
+import { noReviewTelemetry, type ReviewTelemetry } from "./telemetry.js";
 import { BOARD_SINKS, parseTarget, sinkOf, type EffectSink } from "./effects.js";
 import type { DecideContext, ReviewIdentity, decide as reducerDecide, fold as reducerFold, read as reducerRead } from "./reducer.js";
 
@@ -55,6 +56,7 @@ interface Row { [key: string]: unknown }
 export type { DecideContext, ReviewIdentity };
 
 export interface ReviewStoreDeps {
+  telemetry?: ReviewTelemetry;
   decide: typeof reducerDecide;
   fold: typeof reducerFold;
   read: typeof reducerRead;
@@ -413,7 +415,24 @@ export class ReviewStore {
    * `state_json`, effect rows → Receipt.
    */
   apply(key: ReviewKey, input: ApplyInput): Receipt {
-    return this.applyTx(key, input);
+    return (this.deps.telemetry ?? noReviewTelemetry).sync("review.admit", {
+      repository_id: key.repository_id, pr_number: key.pr_number, act_id: input.actId,
+      action: input.action.kind, principal_kind: input.principal.kind,
+    }, span => {
+      const receipt = this.applyTx(key, input);
+      span.setAttribute("code", "refused" in receipt.outcome ? receipt.outcome.code
+        : "replayed" in receipt.outcome ? "replayed" : "applied");
+      if ("applied" in receipt.outcome) {
+        const row = this.db.prepare("SELECT consequences_json FROM review_batches WHERE act_id = ?").get(input.actId) as { consequences_json: string };
+        const consequences = JSON.parse(row.consequences_json) as Batch["consequences"];
+        (this.deps.telemetry ?? noReviewTelemetry).housekeepingCounts({
+          stalls: consequences.filter(c => c.kind === "request_retransported").length,
+          reassignments: consequences.filter(c => c.kind === "request_cancelled" && c.reason.startsWith("reviewer_unavailable")).length,
+          transport_exhaustion: consequences.filter(c => c.kind === "request_transport_exhausted").length,
+        });
+      }
+      return receipt;
+    });
   }
 
   private applyInTransaction(key: ReviewKey, input: ApplyInput): Receipt {
@@ -761,6 +780,12 @@ export class ReviewStore {
   // effects (§8.1)
 
   readonly effects = {
+    backlog: (sink: EffectSink): { pending_rows: number; stuck_rows: number } => {
+      const rows = this.db.prepare("SELECT target, status, attempts FROM review_effects WHERE status IN ('pending', 'claimed', 'failed')").all() as Array<{ target: string; status: string; attempts: number }>;
+      const matching = rows.filter(row => inSink(row.target, sink));
+      return { pending_rows: matching.filter(row => row.status !== "failed").length,
+        stuck_rows: matching.filter(row => row.status === "failed" || row.attempts > 0).length };
+    },
     /**
      * The due rows of one sink, one row per target: the newest pending refresh (a refresh
      * re-renders from `read()`, so only the latest matters) or the oldest pending actionable
