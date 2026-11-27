@@ -1,0 +1,25 @@
+{
+  "actor": "neo",
+  "provider": "gemini",
+  "providerSurface": "antigravity-cli",
+  "providerVersion": "1.5.11",
+  "sessionId": null,
+  "homeEdge": "cpx42-neo",
+  "workspace": "work-neo",
+  "edgeWorkspaces": [
+    {
+      "edgeId": "cpx42-neo",
+      "cwd": "/persist/agents/neo/work",
+      "worktree": null
+    }
+  ],
+  "wakePolicy": "spawn",
+  "permissionProfile": "workspace-write",
+  "accountProfile": "/persist/agents/neo",
+  "leaseTtlMs": 60000,
+  "deliveryTtlMs": 86400000,
+  "homeGraceMs": 30000,
+  "spawnRateLimit": 2,
+  "maxAttempts": 5,
+  "expiresAt": null
+}
