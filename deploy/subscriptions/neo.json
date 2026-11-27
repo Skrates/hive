@@ -14,7 +14,7 @@
     }
   ],
   "wakePolicy": "spawn",
-  "permissionProfile": "workspace-write",
+  "permissionProfile": "danger-full-access",
   "accountProfile": "/persist/agents/neo",
   "leaseTtlMs": 60000,
   "deliveryTtlMs": 86400000,
