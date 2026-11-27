@@ -368,7 +368,12 @@ function geminiPermissionArgs(profile: string): string[] {
   switch (profile) {
     // agy plan mode prepends /plan and its terminal sandbox permits workspace
     // writes. Neither documents a read-only permission boundary.
-    case "workspace-write": return ["--mode", "accept-edits", "--sandbox"];
+    // accept-edits approves only file edits: in print mode agy soft-denies every
+    // shell command and still reports SUCCESS with an empty reply, so a turn
+    // that needs git or gh ends with nothing (Metis, deliveries 3272/3274,
+    // 2026-11-27). auto approves edits and the commands its safety monitor
+    // allows; --sandbox remains the workspace-write boundary.
+    case "workspace-write": return ["--mode", "auto", "--sandbox"];
     case "danger-full-access": return ["--dangerously-skip-permissions"];
     default: throw new ProviderPreDispatchError("provider_permission_profile_invalid");
   }

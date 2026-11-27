@@ -234,13 +234,13 @@ if (fs.existsSync("exit-code")) process.exitCode = Number(fs.readFileSync("exit-
   const invoked = () => JSON.parse(readFileSync(join(cwd, "invocation"), "utf8"));
   const spawned = await gemini.spawn(seat, cwd, framed, context);
   assert.deepEqual(spawned, { processed: true, outcome, receipt: JSON.stringify({ conversation_id: "spawned-id" }) });
-  assert.deepEqual(invoked(), { args: ["--output-format", "stream-json", "--mode", "accept-edits", "--sandbox", "-p", framed], home, id: "42" });
+  assert.deepEqual(invoked(), { args: ["--output-format", "stream-json", "--mode", "auto", "--sandbox", "-p", framed], home, id: "42" });
 
   writeFileSync(stream, terminal("requested-id"));
   for (const effort of ["low", "medium", "high", "xhigh", "max", "ultra"] as const) {
     const resumed = await gemini.resume(seat, cwd, framed, { ...context, effort });
     assert.deepEqual(resumed, { processed: true, outcome, receipt: JSON.stringify({ conversation_id: "requested-id" }) });
-    assert.deepEqual(invoked().args, ["--output-format", "stream-json", "--mode", "accept-edits", "--sandbox",
+    assert.deepEqual(invoked().args, ["--output-format", "stream-json", "--mode", "auto", "--sandbox",
       "--conversation", "requested-id", "--effort", effort === "ultra" ? "max" : effort, "-p", framed]);
   }
   await gemini.spawn({ ...seat, permissionProfile: "danger-full-access" }, cwd, framed, context);
