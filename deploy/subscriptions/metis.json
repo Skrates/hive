@@ -6,9 +6,15 @@
   "sessionId": null,
   "homeEdge": "cpx42-metis",
   "workspace": "work-metis",
-  "edgeWorkspaces": [{ "edgeId": "cpx42-metis", "cwd": "/persist/agents/metis/work", "worktree": null }],
+  "edgeWorkspaces": [
+    {
+      "edgeId": "cpx42-metis",
+      "cwd": "/persist/agents/metis/work",
+      "worktree": null
+    }
+  ],
   "wakePolicy": "spawn",
-  "permissionProfile": "workspace-write",
+  "permissionProfile": "danger-full-access",
   "accountProfile": "/persist/agents/metis",
   "leaseTtlMs": 60000,
   "deliveryTtlMs": 86400000,
